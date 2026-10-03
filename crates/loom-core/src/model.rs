@@ -7,6 +7,42 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Token accounting for one model request, or accumulated over a task.
+///
+/// Provider adapters fill this from the wire response; the agent loop sums
+/// it per task. `cached_input_tokens` is `Option` because not every
+/// provider reports cache hits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Usage {
+    /// Tokens in the request prompt.
+    pub input_tokens: u64,
+    /// Tokens the model generated.
+    pub output_tokens: u64,
+    /// Prompt tokens served from a provider-side cache, if reported.
+    pub cached_input_tokens: Option<u64>,
+}
+
+impl std::ops::Add for Usage {
+    type Output = Usage;
+
+    /// Sums two usage records. Cache hits merge per the accumulation
+    /// rules: `Some(a) + Some(b) = Some(a + b)`, and a single `Some` wins
+    /// over `None`. Note this means a total built from a mix of
+    /// providers that do and don't report cache hits shows a partial
+    /// count; consumers comparing cache ratios must account for that.
+    fn add(self, rhs: Usage) -> Usage {
+        Usage {
+            input_tokens: self.input_tokens + rhs.input_tokens,
+            output_tokens: self.output_tokens + rhs.output_tokens,
+            cached_input_tokens: match (self.cached_input_tokens, rhs.cached_input_tokens) {
+                (Some(a), Some(b)) => Some(a + b),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            },
+        }
+    }
+}
+
 /// Why the model stopped generating in a response that completed
 /// successfully.
 ///
