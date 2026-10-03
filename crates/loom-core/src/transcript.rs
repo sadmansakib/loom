@@ -145,7 +145,7 @@ pub struct ReasoningTrace {
 /// files.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderData {
-    /// Identifies the provider that owns `data` (e.g. `"glm"`).
+    /// Identifies the provider that owns `data` (e.g. `"deepseek"`).
     pub provider: String,
     /// The opaque payload, replayed verbatim to the same provider.
     pub data: Value,
@@ -387,7 +387,7 @@ mod tests {
             reasoning: Some(ReasoningTrace {
                 text: "  user wants config …\n\todd whitespace + ünicode ✓ ".into(),
                 provider_data: Some(ProviderData {
-                    provider: "glm".into(),
+                    provider: "deepseek".into(),
                     data: serde_json::json!({"signature": "abc123", "nested": {"b": 1, "a": 2}}),
                 }),
             }),

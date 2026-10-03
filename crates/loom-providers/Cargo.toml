@@ -1,6 +1,6 @@
 [package]
 name = "loom-providers"
-description = "Model provider adapters for Loom (GLM via the OpenAI-compatible wire format)."
+description = "Model provider adapters for Loom (DeepSeek via the OpenAI-compatible wire format)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

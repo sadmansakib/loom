@@ -4,7 +4,7 @@
 //! they prove that a *different crate* can implement `ModelProvider` and
 //! build the values it needs. `#[non_exhaustive]` types that only
 //! `loom-core`'s own tests construct would hide construction gaps until
-//! the real GLM adapter hits them.
+//! the real DeepSeek adapter hits them.
 
 use loom_core::model::{
     Message, ModelCapabilities, ModelError, ModelErrorKind, ModelEvent, ModelProvider,

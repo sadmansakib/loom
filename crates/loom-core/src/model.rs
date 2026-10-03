@@ -62,9 +62,9 @@ impl std::ops::Add for Usage {
 /// decision at all:
 ///
 /// - cancellation is signalled by a `CancellationToken`, not a stop reason;
-/// - protocol / transport failures are `ModelError`s (e.g. GLM's
-///   `finish_reason: "network_error"` is a transport error, not a stop
-///   reason).
+/// - protocol / transport failures are `ModelError`s (e.g. DeepSeek's
+///   `finish_reason: "aborted"` is a transport error and
+///   `"insufficient_system_resource"` an overload, not stop reasons).
 ///
 /// Semantics (iteration 1):
 ///
@@ -160,8 +160,8 @@ impl Message {
 /// included (§8) — the agent loop never builds a `ModelRequest` itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelRequest {
-    /// Provider-specific model identifier (e.g. `"glm-5.3"`). The provider
-    /// resolves it to concrete [`ModelCapabilities`] (§6.4).
+    /// Provider-specific model identifier (e.g. `"deepseek-flash"`). The
+    /// provider resolves it to concrete [`ModelCapabilities`] (§6.4).
     pub model: String,
     /// The full projected conversation: system prompt first, then turns in
     /// transcript order.
@@ -412,12 +412,13 @@ pub type ModelStream<'a> = futures::stream::BoxStream<'a, Result<ModelEvent, Mod
 /// The provider seam (§2): everything the agent loop knows about a model
 /// backend.
 ///
-/// Implementations live in `loom-providers` (e.g. the GLM adapter); the
+/// Implementations live in `loom-providers` (e.g. the DeepSeek adapter); the
 /// core depends only on this trait. Cancellation is by *dropping* the
 /// returned stream — no token is passed in (§6.6), so the trait carries no
 /// redundant cancellation path.
 pub trait ModelProvider: Send + Sync {
-    /// Short provider identifier (e.g. `"glm"`), used in tracing and config.
+    /// Short provider identifier (e.g. `"deepseek"`), used in tracing and
+    /// config.
     fn name(&self) -> &str;
 
     /// Capabilities of one model served by this provider.
@@ -546,7 +547,7 @@ mod tests {
     #[test]
     fn model_request_round_trips() {
         let request = ModelRequest {
-            model: "glm-5.3".into(),
+            model: "deepseek-flash".into(),
             messages: vec![Message::User { text: "hi".into() }],
             tools: vec![ToolSpec {
                 name: "read_file".into(),
