@@ -7,3 +7,5 @@
 //! `ModelProvider` and `Tool` traits (linked once those modules land).
 
 pub mod id;
+pub mod model;
+pub mod transcript;
