@@ -90,6 +90,11 @@ pub enum Item {
 ///
 /// Built by the provider adapter from a finished model response; nothing in
 /// here is provisional.
+///
+/// Part of the event wire format (via `ModelCompleted`): adding a field
+/// bumps `EVENT_SCHEMA_VERSION` in `crate::event`. The event form is
+/// full-fidelity — including reasoning `provider_data` — so traces carry
+/// the same data as the saved session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssistantMessage {
     /// The assistant's visible text output.
@@ -133,6 +138,11 @@ pub struct ReasoningTrace {
 /// byte-identical re-serialization is not (JSON object key order may
 /// differ). Providers that need stricter fidelity must encode it inside
 /// the value themselves.
+///
+/// Part of the event wire format (via `ModelCompleted`): adding a field
+/// bumps `EVENT_SCHEMA_VERSION` in `crate::event`. Appears verbatim in
+/// `--json` traces — treat shared traces with the same care as session
+/// files.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderData {
     /// Identifies the provider that owns `data` (e.g. `"glm"`).
@@ -282,6 +292,9 @@ fn json_kind(value: &Value) -> &'static str {
 /// An invocation only — no execution state (`status`, `duration`, retries,
 /// read-only classification all live elsewhere: results, events, the
 /// registered `Tool`, `ToolSpec`).
+///
+/// Part of the event wire format (via `ModelCompleted`): adding a field
+/// bumps `EVENT_SCHEMA_VERSION` in `crate::event`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     /// Opaque correlation id; see [`ToolCallId`].

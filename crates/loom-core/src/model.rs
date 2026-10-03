@@ -20,6 +20,9 @@ use serde::{Deserialize, Serialize};
 /// Provider adapters fill this from the wire response; the agent loop sums
 /// it per task. `cached_input_tokens` is `Option` because not every
 /// provider reports cache hits.
+///
+/// Part of the event wire format (via `ModelCompleted`): adding a field
+/// bumps `EVENT_SCHEMA_VERSION` in `crate::event`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Usage {
     /// Tokens in the request prompt.
@@ -80,6 +83,9 @@ impl std::ops::Add for Usage {
 ///
 /// "No tool calls" is *not* synonymous with success — completion is decided
 /// from this value and task state.
+///
+/// Part of the event wire format (via `ModelCompleted`): adding a variant
+/// bumps `EVENT_SCHEMA_VERSION`.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -281,6 +287,9 @@ pub struct ModelResponse {
 /// Retry decisions are made on this classification (plus provider metadata
 /// like `retry_after`), never by matching error strings. Classification is
 /// set by the provider adapter when the error is built.
+///
+/// Part of the event wire format (via `ModelRetry`): adding a variant
+/// bumps `EVENT_SCHEMA_VERSION` in `crate::event`.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
