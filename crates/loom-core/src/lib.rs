@@ -9,4 +9,5 @@
 pub mod id;
 pub mod model;
 pub mod session;
+pub mod tool;
 pub mod transcript;
