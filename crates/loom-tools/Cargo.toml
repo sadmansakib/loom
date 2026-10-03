@@ -1,0 +1,22 @@
+[package]
+name = "loom-tools"
+description = "Built-in deterministic tools for Loom: read_file, list_dir, search."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+loom-core = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

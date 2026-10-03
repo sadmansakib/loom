@@ -1,0 +1,19 @@
+[package]
+name = "loom-core"
+description = "Loom domain model and orchestration: sessions, transcript, model/tool abstractions, context compiler, agent loop."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

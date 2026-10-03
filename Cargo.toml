@@ -1,0 +1,64 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/loom-core",
+    "crates/loom-providers",
+    "crates/loom-tools",
+    "crates/loom-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# internal crates
+loom-core = { path = "crates/loom-core" }
+loom-providers = { path = "crates/loom-providers" }
+loom-tools = { path = "crates/loom-tools" }
+
+# async runtime (research.md §2: tokio 1.x + tokio-util CancellationToken)
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "process", "signal"] }
+tokio-util = "0.7.19"
+
+# error handling (research.md §2: thiserror in libraries, anyhow only in the binary)
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+
+# HTTP client (research.md §3; rustls avoids a system OpenSSL dependency)
+# NOTE: reqwest 0.13 renamed the TLS features — `rustls-tls` is now `rustls`.
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream", "rustls"] }
+
+# serialization
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "1.1.6"
+
+# observability (libraries emit `tracing`; only loom-cli installs a subscriber)
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+# async combinators (BoxStream / BoxFuture for dyn seams)
+futures = "0.3.34"
+
+# identifiers: UUID v7, time-ordered (architecture.md §2 `id` module)
+uuid = { version = "1.27.0", features = ["v7"] }
+
+# CLI
+clap = { version = "4.6.7", features = ["derive"] }
+
+# dev / test-only
+wiremock = "0.6.5"
+tempfile = "3.27.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+lto = "thin"
