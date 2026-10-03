@@ -4,4 +4,6 @@
 //! model and tool abstractions, the context compiler boundary, and the agent
 //! turn loop. It must not depend on any concrete provider or tool crate
 //! (ADR-001); provider- and tool-specific behavior lives behind the
-//! [`ModelProvider`](crate::model) and [`Tool`](crate::tool) traits.
+//! `ModelProvider` and `Tool` traits (linked once those modules land).
+
+pub mod id;

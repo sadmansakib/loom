@@ -43,7 +43,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 futures = "0.3.34"
 
 # identifiers: UUID v7, time-ordered (architecture.md §2 `id` module)
-uuid = { version = "1.27.0", features = ["v7"] }
+uuid = { version = "1.27.0", features = ["v7", "serde"] }
 
 # CLI
 clap = { version = "4.6.7", features = ["derive"] }
