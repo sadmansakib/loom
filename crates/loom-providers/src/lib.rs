@@ -9,3 +9,14 @@
 //! timeout enforcement, drop-to-cancel, and normalization of wire stop
 //! signals into `loom_core` semantics — so that no provider specifics leak
 //! into the core.
+
+mod deepseek;
+mod openai_wire;
+mod secret;
+mod sse;
+
+pub use deepseek::{
+    DeepSeekConfig, DeepSeekProvider, ParseReasoningEffortError, ReasoningEffort, ThinkingMode,
+    TimeoutConfig,
+};
+pub use secret::SecretString;
