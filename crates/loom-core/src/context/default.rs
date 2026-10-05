@@ -1,18 +1,18 @@
-//! The iteration-1 [`ContextCompiler`]: full transcript, all tools,
-//! reasoning replayed, budget enforced by a bytes/3 token estimate.
-//!
 //! Projection rules (§8.3) — the only omissions a [`DefaultContextCompiler`]
 //! makes:
 //!
 //! 1. **`ContentFilter` assistant turns are never replayed.** The item stays
 //!    in the transcript (inspectable) but is omitted from every later
-//!    projection, together with nothing else — the assistant text and its
-//!    (impossible-by-construction) tool calls go with it, because a turn
-//!    forms one unit.
-//! 2. **`MaxTokens` assistant turns project as text only.** They never carry
-//!    tool calls (§5.1 normalization), so they always project verbatim
-//!    anyway; the distinction is kept explicit in case a future change
-//!    needs it.
+//!    projection, alone: the `Item::Assistant` with
+//!    `stop_reason = ContentFilter` is dropped, and every other item —
+//!    including any tool results that might follow it in the transcript —
+//!    projects normally. In practice a refused turn carries no tool calls
+//!    (§5.1 normalization), so nothing follows it.
+//! 2. **`MaxTokens` assistant turns project verbatim, as text.** They never
+//!    carry tool calls (§5.1 normalization), so the projection is exactly
+//!    the stored message; the §8.3 rule is documented here because a future
+//!    normalization change could otherwise re-introduce tool calls on a
+//!    `MaxTokens` item, which must project as text only.
 //!
 //! Everything else — including all reasoning (§4.2) — is projected verbatim
 //! in transcript order. Reasoning is replayed byte-exact because the
@@ -46,7 +46,7 @@ impl super::ContextCompiler for DefaultContextCompiler {
         let messages = project_messages(input.session, input.config);
         let tools = exposed_tools(input.tools, input.capabilities);
         let request = ModelRequest {
-            model: String::new(), // resolved by the caller (§6.4)
+            model: input.model.to_owned(),
             messages,
             tools,
             max_tokens: input
@@ -111,7 +111,9 @@ fn exposed_tools(
 /// cover per-message framing overhead (§8).
 fn estimated_tokens(request: &ModelRequest) -> u32 {
     let messages = super::messages_serialized(&request.messages);
-    let tools = serde_json::to_string(&request.tools).unwrap_or_default();
+    let tools = serde_json::to_string(&request.tools);
+    debug_assert!(tools.is_ok(), "tool-spec serialization must not fail");
+    let tools = tools.unwrap_or_default();
     let bytes = messages.len() + tools.len();
     // saturating to avoid u32 overflow on absurd inputs; a compiler that
     // reports `u32::MAX` estimated tokens will simply exceed any budget.
@@ -217,6 +219,7 @@ mod tests {
             task,
             budget,
             capabilities,
+            model: "deepseek-flash",
             config,
         }
     }
@@ -423,8 +426,75 @@ mod tests {
     #[test]
     fn reserved_output_caps_max_tokens() {
         let compiled = compile(&session(), &registry(), budget()).expect("within budget");
-        // min(max_output_tokens=4096, reserved=4096)
+        // min(max_output_tokens=4096, reserved=4096) — equal, both win.
         assert_eq!(compiled.request.max_tokens, Some(4_096));
+    }
+
+    #[test]
+    fn max_tokens_reservation_wins_when_smaller() {
+        let caps = capabilities().with_max_output_tokens(8_192); // reserved 4096
+        let compiled = DefaultContextCompiler
+            .compile(input(
+                &session(),
+                &registry(),
+                &task_record(),
+                budget(),
+                &caps,
+                &config(),
+            ))
+            .expect("within budget");
+        assert_eq!(
+            compiled.request.max_tokens,
+            Some(4_096),
+            "reservation caps the request"
+        );
+    }
+
+    #[test]
+    fn max_tokens_model_limit_wins_when_smaller() {
+        let caps = capabilities().with_max_output_tokens(1_000); // reserved 4096
+        let compiled = DefaultContextCompiler
+            .compile(input(
+                &session(),
+                &registry(),
+                &task_record(),
+                budget(),
+                &caps,
+                &config(),
+            ))
+            .expect("within budget");
+        assert_eq!(
+            compiled.request.max_tokens,
+            Some(1_000),
+            "model limit caps the request"
+        );
+    }
+
+    #[test]
+    fn max_tokens_none_when_model_reports_no_limit() {
+        let caps = ModelCapabilities::new(100_000)
+            .with_tool_calls(true)
+            .with_reasoning(true);
+        let compiled = DefaultContextCompiler
+            .compile(input(
+                &session(),
+                &registry(),
+                &task_record(),
+                budget(),
+                &caps,
+                &config(),
+            ))
+            .expect("within budget");
+        assert_eq!(
+            compiled.request.max_tokens, None,
+            "no output limit -> no cap"
+        );
+    }
+
+    #[test]
+    fn model_name_flows_into_request() {
+        let compiled = compile(&session(), &registry(), budget()).expect("within budget");
+        assert_eq!(compiled.request.model, "deepseek-flash");
     }
 
     #[test]

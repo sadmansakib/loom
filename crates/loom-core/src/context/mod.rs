@@ -28,6 +28,19 @@ use crate::session::{Session, TaskRecord};
 use crate::tool::ToolRegistry;
 use std::path::PathBuf;
 
+/// Serializes a list of [`Message`]s into a canonical string for token
+/// estimation and cache keys.
+///
+/// Infallible for the message types in this crate: every field is a
+/// `String` or a serde-supported `Value`, so JSON string serialization
+/// cannot fail. A `debug_assert` documents the invariant and catches a
+/// future field type that could make it fallible.
+fn messages_serialized(messages: &[Message]) -> String {
+    let json = serde_json::to_string(messages);
+    debug_assert!(json.is_ok(), "message serialization must not fail");
+    json.unwrap_or_default()
+}
+
 /// How much of a model's context window a request may consume.
 ///
 /// Derived by the caller (agent loop) from [`ModelCapabilities`] and agent
@@ -89,6 +102,11 @@ pub struct ContextInput<'a> {
     /// The target model's capabilities, so unsupported requests are never
     /// built (e.g. tools to a model without `tool_calls`).
     pub capabilities: &'a ModelCapabilities,
+    /// The provider-specific model identifier the request targets
+    /// (§6.4). This is the `model` string the agent resolves via
+    /// [`ModelProvider::capabilities`]; the compiler copies it into
+    /// [`ModelRequest::model`] so a request always names its target model.
+    pub model: &'a str,
     /// Agent configuration: workspace root (for relative tool arguments)
     /// plus any future knobs the compiler reads.
     pub config: &'a AgentConfig,
@@ -171,10 +189,4 @@ pub trait ContextCompiler: Send + Sync {
     /// budget, so the caller fails before sending a request known to
     /// overflow.
     fn compile(&self, input: ContextInput<'_>) -> Result<CompiledContext, ContextError>;
-}
-
-/// Serializes a list of [`Message`]s into a canonical string for token
-/// estimation and cache keys.
-fn messages_serialized(messages: &[Message]) -> String {
-    serde_json::to_string(messages).unwrap_or_default()
 }
