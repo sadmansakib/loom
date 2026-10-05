@@ -82,7 +82,14 @@ fn login(
         }
     };
 
-    store.insert(&account, true)?;
+    if let Err(error) = store.insert(&account, true) {
+        // The keychain entry is keyed by the account id and has no other
+        // owner; drop it so a failed insert cannot orphan it.
+        if account.method == Method::Key {
+            let _ = secrets.delete(&account.id);
+        }
+        return Err(error.into());
+    }
     println!(
         "added {provider} account `{label}` ({}){}",
         account.method.as_str(),
@@ -165,8 +172,13 @@ fn remove(
                 target: args.target.clone(),
             })?;
     store.remove(&account.id)?;
-    if account.method == Method::Key {
-        secrets.delete(&account.id)?;
+    if account.method == Method::Key
+        && let Err(error) = secrets.delete(&account.id)
+    {
+        // The row is gone, so the entry is inert; do not abort before
+        // promoting a replacement, or the provider could be left with no
+        // active account.
+        eprintln!("warning: could not remove the keychain secret: {error}");
     }
     if account.active
         && let Some(next) = store.newest(&args.provider)?

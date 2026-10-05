@@ -385,15 +385,19 @@ impl AuthStore for SqliteAuthStore {
                 params![id.as_str(), provider],
             )
             .map_err(|error| AuthError::Store(error.to_string()))?;
-        transaction
-            .commit()
-            .map_err(|error| AuthError::Store(error.to_string()))?;
         if updated == 0 {
+            // The demotion above matched the provider but the activation
+            // matched no row. Returning here drops the transaction, rolling
+            // the demotion back; committing it would leave the provider with
+            // no active account.
             return Err(AuthError::NoAccount {
                 provider: provider.to_owned(),
                 target: id.as_str().to_owned(),
             });
         }
+        transaction
+            .commit()
+            .map_err(|error| AuthError::Store(error.to_string()))?;
         Ok(())
     }
 
@@ -766,6 +770,19 @@ mod tests {
         };
         let error = store.insert(&clashing, false).unwrap_err();
         assert!(matches!(error, AuthError::Store(_)));
+    }
+
+    #[test]
+    fn set_active_rejects_an_absent_account_without_demoting() {
+        let store = store();
+        let acct = account("deepseek", "work", Method::Key);
+        store.insert(&acct, true).unwrap();
+
+        let missing = AccountId::new();
+        let error = store.set_active("deepseek", &missing).unwrap_err();
+        assert!(matches!(error, AuthError::NoAccount { .. }));
+        // The rollback left the previous active account in place.
+        assert_eq!(store.active("deepseek").unwrap().unwrap().label, "work");
     }
 
     #[test]

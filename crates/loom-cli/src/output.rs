@@ -140,12 +140,17 @@ impl Renderer {
 }
 
 /// Prints the efficiency summary for a completed task.
-pub fn print_summary(summary: &TaskSummary, session_path: Option<&Path>, json: bool) {
+pub fn print_summary(
+    summary: &TaskSummary,
+    end_reason: &str,
+    session_path: Option<&Path>,
+    json: bool,
+) {
     if json {
         let line = serde_json::json!({
             "type": "summary",
             "task_id": summary.task_id.to_string(),
-            "end_reason": "completed",
+            "end_reason": end_reason,
             "turns": summary.turns,
             "model_requests": summary.model_requests,
             "input_tokens": summary.input_tokens,
@@ -164,7 +169,7 @@ pub fn print_summary(summary: &TaskSummary, session_path: Option<&Path>, json: b
     }
 
     let mut err = std::io::stderr().lock();
-    let _ = writeln!(err, "task {} completed", summary.task_id);
+    let _ = writeln!(err, "task {} {end_reason}", summary.task_id);
     let _ = writeln!(
         err,
         "  turns {}  requests {}  tools {} ok / {} failed",

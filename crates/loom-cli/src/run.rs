@@ -147,7 +147,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let session_path = save_session(&session, args.no_save)?;
     match outcome {
         Ok(summary) => {
-            output::print_summary(&summary, session_path.as_deref(), args.json);
+            output::print_summary(&summary, "completed", session_path.as_deref(), args.json);
             runtime.shutdown_timeout(Duration::from_secs(5));
             Ok(ExitCode::SUCCESS)
         }

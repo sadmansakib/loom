@@ -163,10 +163,10 @@ async fn b1_read_only_repository_inspection() {
         Ok(summary) => {
             let (hit, miss) = cache_split(summary);
             let (multiplier, window) = price_multiplier(SystemTime::now());
-            let prices = if model == "deepseek-v4-pro" {
-                &PRO
-            } else {
-                &FLASH
+            let prices = match model.as_str() {
+                "deepseek-flash" => &FLASH,
+                "deepseek-v4-pro" => &PRO,
+                other => panic!("no price table for model `{other}`; add it to benchmark.rs"),
             };
             let cost = cost_usd(prices, hit, miss, summary.output_tokens) * multiplier;
             serde_json::json!({
