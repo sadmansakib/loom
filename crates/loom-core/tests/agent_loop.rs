@@ -152,11 +152,12 @@ impl Tool for FakeTool {
     }
 }
 
-/// A tool that cancels the task's own token on entry and then returns.
+/// A tool that cancels the task's own token on entry and then hangs.
 ///
-/// `execute_call` polls the cancellation future before the tool future, so
-/// this yields a deterministic `ToolStatus::Cancelled { started: true }`
-/// without needing the test to race the batch from another task.
+/// `execute_call`'s first poll drives the tool future, which cancels the
+/// token and then stays pending. The next poll sees the now-ready
+/// cancellation future and reports `ToolStatus::Cancelled { started: true }`
+/// deterministically, without the test racing the batch from another task.
 struct BlockingTool {
     spec: ToolSpec,
 }
@@ -253,6 +254,22 @@ fn tool_call(id: &str, name: &str, arguments: Value) -> ToolCall {
 }
 
 fn agent(provider: FakeProvider, registry: ToolRegistry, max_turns: u32) -> Agent {
+    agent_with_retry(
+        provider,
+        registry,
+        max_turns,
+        RetryPolicy::new()
+            .with_initial_backoff(Duration::from_millis(1))
+            .with_jitter_fraction(0.0),
+    )
+}
+
+fn agent_with_retry(
+    provider: FakeProvider,
+    registry: ToolRegistry,
+    max_turns: u32,
+    retry: RetryPolicy,
+) -> Agent {
     Agent::new(
         Box::new(provider),
         Box::new(DefaultContextCompiler),
@@ -261,19 +278,14 @@ fn agent(provider: FakeProvider, registry: ToolRegistry, max_turns: u32) -> Agen
         "fake-model",
     )
     .with_max_turns(max_turns)
-    .with_retry(
-        RetryPolicy::new()
-            .with_initial_backoff(Duration::from_millis(1))
-            .with_jitter_fraction(0.0),
-    )
+    .with_retry(retry)
 }
 
 fn drain(receiver: &mut UnboundedReceiver<EventEnvelope>) -> Vec<EventKind> {
-    let mut kinds = Vec::new();
-    while let Ok(envelope) = receiver.try_recv() {
-        kinds.push(envelope.kind);
-    }
-    kinds
+    drain_envelopes(receiver)
+        .into_iter()
+        .map(|envelope| envelope.kind)
+        .collect()
 }
 
 fn usage(input: u64, output: u64, cached: Option<u64>) -> Usage {
@@ -652,15 +664,10 @@ async fn exhausted_attempts_fail_without_committing() {
     let mut session = Session::new(SessionId::new());
     let (sink, mut receiver) = ChannelEventSink::new();
     let token = CancellationToken::new();
-    let agent = Agent::new(
-        Box::new(provider),
-        Box::new(DefaultContextCompiler),
+    let agent = agent_with_retry(
+        provider,
         ToolRegistry::new(),
-        AgentConfig::new(PathBuf::from("."), "you are a test agent"),
-        "fake-model",
-    )
-    .with_max_turns(10)
-    .with_retry(
+        10,
         RetryPolicy::new()
             .with_max_attempts(3)
             .with_initial_backoff(Duration::from_millis(1))
