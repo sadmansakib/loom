@@ -29,7 +29,7 @@ use crate::tool::ToolRegistry;
 use std::path::PathBuf;
 
 /// Serializes a list of [`Message`]s into a canonical string for token
-/// estimation and cache keys.
+/// estimation.
 ///
 /// Infallible for the message types in this crate: every field is a
 /// `String` or a serde-supported `Value`, so JSON string serialization
@@ -104,8 +104,9 @@ pub struct ContextInput<'a> {
     pub capabilities: &'a ModelCapabilities,
     /// The provider-specific model identifier the request targets
     /// (§6.4). This is the `model` string the agent resolves via
-    /// [`ModelProvider::capabilities`]; the compiler copies it into
-    /// [`ModelRequest::model`] so a request always names its target model.
+    /// [`crate::model::ModelProvider::capabilities`]; the compiler copies
+    /// it into [`ModelRequest::model`] so a request always names its target
+    /// model.
     pub model: &'a str,
     /// Agent configuration: workspace root (for relative tool arguments)
     /// plus any future knobs the compiler reads.
