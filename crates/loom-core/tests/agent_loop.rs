@@ -1,0 +1,490 @@
+//! Agent-loop integration tests (plan 1F) driven by a scripted fake
+//! `ModelProvider` and a fake tool.
+//!
+//! These exercise the real `Agent::run_task` loop end to end: context
+//! compilation, the streaming seam, stop-reason handling, atomic turn
+//! commits, the tool engine, usage accounting, and terminal events.
+
+// Integration tests are a separate crate; helpers below are not `#[test]`
+// functions, so the workspace's `unwrap_used` / `expect_used` warnings are
+// allowed file-wide for test ergonomics.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use futures::future::BoxFuture;
+use futures::stream;
+use loom_core::agent::{Agent, RetryPolicy, TaskError};
+use loom_core::context::{AgentConfig, DefaultContextCompiler};
+use loom_core::event::{ChannelEventSink, EventEnvelope, EventKind};
+use loom_core::id::SessionId;
+use loom_core::model::{
+    Message, ModelCapabilities, ModelError, ModelErrorKind, ModelEvent, ModelProvider,
+    ModelRequest, ModelResponse, ModelStream, StopReason, Usage,
+};
+use loom_core::session::{Session, TaskStatus};
+use loom_core::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolSpec};
+use loom_core::transcript::{AssistantMessage, Item, ToolArguments, ToolCall, ToolCallId};
+use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio_util::sync::CancellationToken;
+
+/// One scripted stream: the events and errors a single `stream()` call emits
+/// before ending.
+type Script = Vec<Result<ModelEvent, ModelError>>;
+
+/// A provider that replays a scripted list of event sequences, one per
+/// `stream()` call, and records every request it received.
+struct FakeProvider {
+    capabilities: ModelCapabilities,
+    scripts: Mutex<VecDeque<Script>>,
+    requests: Arc<Mutex<Vec<ModelRequest>>>,
+    repeat_last: bool,
+}
+
+impl FakeProvider {
+    fn new(capabilities: ModelCapabilities, scripts: Vec<Script>) -> Self {
+        Self {
+            capabilities,
+            scripts: Mutex::new(VecDeque::from(scripts)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            repeat_last: false,
+        }
+    }
+
+    /// Repeats the final script for every further `stream()` call — used by
+    /// the turn-limit test, where the model keeps requesting tools.
+    fn repeat_last(mut self) -> Self {
+        self.repeat_last = true;
+        self
+    }
+
+    /// A shared handle to the recorded requests, usable after the provider is
+    /// moved into the agent.
+    fn requests_handle(&self) -> Arc<Mutex<Vec<ModelRequest>>> {
+        Arc::clone(&self.requests)
+    }
+}
+
+impl ModelProvider for FakeProvider {
+    fn name(&self) -> &str {
+        "fake"
+    }
+
+    fn capabilities(&self, _model: &str) -> Option<ModelCapabilities> {
+        Some(self.capabilities)
+    }
+
+    fn stream<'a>(&'a self, request: &'a ModelRequest) -> ModelStream<'a> {
+        self.requests.lock().unwrap().push(request.clone());
+        let events = {
+            let mut scripts = self.scripts.lock().unwrap();
+            if scripts.len() > 1 {
+                scripts.pop_front().unwrap()
+            } else if self.repeat_last {
+                scripts.front().cloned().unwrap_or_default()
+            } else {
+                scripts.pop_front().unwrap_or_default()
+            }
+        };
+        Box::pin(stream::iter(events))
+    }
+}
+
+/// A read-only tool that echoes its input, enough to exercise the engine.
+struct FakeTool {
+    spec: ToolSpec,
+}
+
+impl Tool for FakeTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
+    fn call<'a>(
+        &'a self,
+        input: Value,
+        _ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
+        Box::pin(async move { Ok(ToolOutput::new(format!("echo: {input}"))) })
+    }
+}
+
+fn capabilities() -> ModelCapabilities {
+    ModelCapabilities::new(100_000)
+        .with_max_output_tokens(4_096)
+        .with_tool_calls(true)
+}
+
+fn spec(name: &str) -> ToolSpec {
+    ToolSpec {
+        name: name.to_owned(),
+        description: "test tool".to_owned(),
+        parameters: json!({ "type": "object", "properties": {} }),
+    }
+}
+
+fn registry_with(tool: &str) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(FakeTool { spec: spec(tool) }))
+        .unwrap();
+    registry
+}
+
+fn assistant(content: &str, stop_reason: StopReason, calls: Vec<ToolCall>) -> AssistantMessage {
+    AssistantMessage {
+        content: content.to_owned(),
+        reasoning: None,
+        tool_calls: calls,
+        stop_reason,
+    }
+}
+
+fn completed(message: AssistantMessage, usage: Usage) -> Script {
+    vec![Ok(ModelEvent::Completed(ModelResponse { message, usage }))]
+}
+
+fn tool_call(id: &str, name: &str, arguments: Value) -> ToolCall {
+    ToolCall {
+        id: ToolCallId::try_from(id.to_owned()).unwrap(),
+        name: name.to_owned(),
+        arguments: ToolArguments::try_from(arguments).unwrap(),
+    }
+}
+
+fn agent(provider: FakeProvider, registry: ToolRegistry, max_turns: u32) -> Agent {
+    Agent::new(
+        Box::new(provider),
+        Box::new(DefaultContextCompiler),
+        registry,
+        AgentConfig::new(PathBuf::from("."), "you are a test agent"),
+        "fake-model",
+    )
+    .with_max_turns(max_turns)
+    .with_retry(
+        RetryPolicy::new()
+            .with_initial_backoff(Duration::from_millis(1))
+            .with_jitter_fraction(0.0),
+    )
+}
+
+fn drain(receiver: &mut UnboundedReceiver<EventEnvelope>) -> Vec<EventKind> {
+    let mut kinds = Vec::new();
+    while let Ok(envelope) = receiver.try_recv() {
+        kinds.push(envelope.kind);
+    }
+    kinds
+}
+
+fn usage(input: u64, output: u64, cached: Option<u64>) -> Usage {
+    Usage {
+        input_tokens: input,
+        output_tokens: output,
+        cached_input_tokens: cached,
+    }
+}
+
+#[tokio::test]
+async fn end_turn_completes_the_task_and_commits_the_assistant() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![completed(
+            assistant("done", StopReason::EndTurn, Vec::new()),
+            usage(10, 3, Some(2)),
+        )],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = agent(provider, ToolRegistry::new(), 10);
+
+    let summary = agent
+        .run_task(&mut session, "hello", &sink, &token)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.turns, 1);
+    assert_eq!(summary.model_requests, 1);
+    assert_eq!(summary.input_tokens, 10);
+    assert_eq!(summary.output_tokens, 3);
+    assert_eq!(summary.cached_input_tokens, Some(2));
+    assert_eq!(summary.successful_tool_calls, 0);
+
+    // Transcript: the user item then the committed assistant.
+    assert_eq!(session.transcript.len(), 2);
+    assert!(matches!(&session.transcript[0], Item::User { text } if text == "hello"));
+    assert!(matches!(&session.transcript[1], Item::Assistant(_)));
+
+    // Task record finalized as success.
+    let record = &session.tasks[0];
+    assert_eq!(record.status, TaskStatus::Completed);
+    assert_eq!(record.turns, 1);
+    assert_eq!(record.usage, usage(10, 3, Some(2)));
+    assert_eq!(record.end_reason.as_deref(), Some("end_turn"));
+
+    // Ordered events, starting and ending terminal.
+    let kinds = drain(&mut receiver);
+    assert!(matches!(kinds[0], EventKind::TaskStarted));
+    assert!(matches!(kinds[1], EventKind::TurnStarted { turn: 1 }));
+    assert!(matches!(
+        kinds[2],
+        EventKind::ModelRequestStarted { attempt: 1 }
+    ));
+    assert!(matches!(kinds[3], EventKind::ModelCompleted { .. }));
+    assert!(matches!(kinds[4], EventKind::TaskCompleted));
+    assert_eq!(kinds.len(), 5);
+}
+
+#[tokio::test]
+async fn tool_round_trip_executes_and_commits_one_turn_per_model_response() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            completed(
+                assistant(
+                    "",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_1", "echo", json!({ "q": "hi" }))],
+                ),
+                usage(20, 5, None),
+            ),
+            completed(
+                assistant("all done", StopReason::EndTurn, Vec::new()),
+                usage(30, 7, None),
+            ),
+        ],
+    );
+    let requests = provider.requests_handle();
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = agent(provider, registry_with("echo"), 10);
+
+    let summary = agent
+        .run_task(&mut session, "run the tool", &sink, &token)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.turns, 2);
+    assert_eq!(summary.model_requests, 2);
+    assert_eq!(summary.successful_tool_calls, 1);
+    assert_eq!(summary.failed_tool_calls, 0);
+    assert_eq!(summary.input_tokens, 50);
+    assert_eq!(summary.output_tokens, 12);
+
+    // user, assistant(call), result, assistant(end)
+    assert_eq!(session.transcript.len(), 4);
+    assert!(matches!(&session.transcript[0], Item::User { .. }));
+    assert!(matches!(&session.transcript[1], Item::Assistant(a) if a.tool_calls.len() == 1));
+    let Item::ToolResult(result) = &session.transcript[2] else {
+        panic!("expected a tool result");
+    };
+    assert_eq!(result.call_id.as_str(), "call_1");
+    assert_eq!(result.content, "echo: {\"q\":\"hi\"}");
+    assert!(matches!(&session.transcript[3], Item::Assistant(a) if a.tool_calls.is_empty()));
+
+    let record = &session.tasks[0];
+    assert_eq!(record.status, TaskStatus::Completed);
+    assert_eq!(record.turns, 2);
+
+    // Both requests went through the compiler: system prefix, model id, and
+    // exposed tool in the first; the tool result replayed in the second.
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].model, "fake-model");
+    assert_eq!(requests[0].max_tokens, Some(4_096));
+    assert!(
+        requests[0].tools.iter().any(|tool| tool.name == "echo"),
+        "the registered tool must be exposed"
+    );
+    assert!(
+        matches!(&requests[0].messages[0], Message::System { text } if text == "you are a test agent")
+    );
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::ToolResult(_))),
+        "the second request must replay the tool result"
+    );
+
+    let kinds = drain(&mut receiver);
+    assert!(
+        kinds
+            .iter()
+            .any(|kind| matches!(kind, EventKind::ToolStarted { name, .. } if name == "echo"))
+    );
+    assert!(
+        kinds
+            .iter()
+            .any(|kind| matches!(kind, EventKind::ToolCompleted { name, .. } if name == "echo"))
+    );
+    assert!(matches!(kinds.last().unwrap(), EventKind::TaskCompleted));
+}
+
+#[tokio::test]
+async fn max_tokens_commits_the_assistant_then_fails() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![completed(
+            assistant("truncated", StopReason::MaxTokens, Vec::new()),
+            usage(15, 4, None),
+        )],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, _receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = agent(provider, ToolRegistry::new(), 10);
+
+    let error = agent
+        .run_task(&mut session, "go", &sink, &token)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        TaskError::UnrecoverableStop {
+            stop_reason: "max_tokens"
+        }
+    ));
+    // The truncated reply is still committed for inspection.
+    assert_eq!(session.transcript.len(), 2);
+    assert!(matches!(&session.transcript[1], Item::Assistant(a) if a.content == "truncated"));
+
+    let record = &session.tasks[0];
+    assert_eq!(record.status, TaskStatus::Failed);
+    assert_eq!(record.end_reason.as_deref(), Some("max_tokens"));
+}
+
+#[tokio::test]
+async fn persistent_tool_calls_hit_the_turn_limit() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![completed(
+            assistant(
+                "",
+                StopReason::ToolCalls,
+                vec![tool_call("call_1", "echo", json!({}))],
+            ),
+            usage(5, 1, None),
+        )],
+    )
+    .repeat_last();
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = agent(provider, registry_with("echo"), 3);
+
+    let error = agent
+        .run_task(&mut session, "loop", &sink, &token)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, TaskError::MaxTurns { max_turns: 3 }));
+    // user + 3 (assistant + result) turns.
+    assert_eq!(session.transcript.len(), 7);
+    let record = &session.tasks[0];
+    assert_eq!(record.status, TaskStatus::Failed);
+    assert_eq!(record.turns, 3);
+    assert_eq!(record.end_reason.as_deref(), Some("max_turns"));
+
+    let kinds = drain(&mut receiver);
+    assert!(matches!(
+        kinds.last().unwrap(),
+        EventKind::TaskFailed { .. }
+    ));
+}
+
+#[tokio::test]
+async fn retryable_failure_is_retried_and_partial_output_discarded() {
+    let failed_attempt: Script = vec![
+        Ok(ModelEvent::TextDelta("partial".to_owned())),
+        Err(ModelError::new(ModelErrorKind::Transport, "dropped")),
+    ];
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            failed_attempt,
+            completed(
+                assistant("recovered", StopReason::EndTurn, Vec::new()),
+                usage(8, 2, None),
+            ),
+        ],
+    );
+    let requests = provider.requests_handle();
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = agent(provider, ToolRegistry::new(), 10);
+
+    let summary = agent
+        .run_task(&mut session, "go", &sink, &token)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.turns, 1);
+    assert_eq!(summary.model_requests, 2);
+    assert_eq!(requests.lock().unwrap().len(), 2);
+
+    // Nothing from the failed attempt entered the transcript: only the user
+    // item and the recovered assistant remain.
+    assert_eq!(session.transcript.len(), 2);
+    assert!(matches!(&session.transcript[1], Item::Assistant(a) if a.content == "recovered"));
+
+    let kinds = drain(&mut receiver);
+    assert!(kinds.iter().any(|kind| matches!(
+        kind,
+        EventKind::ModelRetry {
+            attempt: 1,
+            response_started: true,
+            ..
+        }
+    )));
+    assert!(
+        kinds
+            .iter()
+            .any(|kind| matches!(kind, EventKind::ModelRequestStarted { attempt: 2 }))
+    );
+    assert!(matches!(kinds.last().unwrap(), EventKind::TaskCompleted));
+}
+
+#[tokio::test]
+async fn a_pre_cancelled_task_commits_nothing() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![completed(
+            assistant("never seen", StopReason::EndTurn, Vec::new()),
+            usage(1, 1, None),
+        )],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    token.cancel();
+    let agent = agent(provider, ToolRegistry::new(), 10);
+
+    let error = agent
+        .run_task(&mut session, "go", &sink, &token)
+        .await
+        .unwrap_err();
+
+    assert!(error.is_cancelled());
+    assert!(matches!(&error, TaskError::Cancelled));
+    // Only the user input was appended; no model output was committed.
+    assert_eq!(session.transcript.len(), 1);
+    assert!(matches!(&session.transcript[0], Item::User { .. }));
+    let record = &session.tasks[0];
+    assert_eq!(record.status, TaskStatus::Cancelled);
+    assert_eq!(record.end_reason.as_deref(), Some("user_cancelled"));
+
+    let kinds = drain(&mut receiver);
+    assert!(matches!(kinds.last().unwrap(), EventKind::TaskCancelled));
+}

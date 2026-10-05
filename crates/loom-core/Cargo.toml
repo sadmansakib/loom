@@ -12,8 +12,9 @@ thiserror = { workspace = true }
 futures = { workspace = true }
 # Event channel (ModelStream); declared here rather than relying on
 # tokio-util transitively enabling tokio/sync. The tool engine adds
-# `time` for ToolContext::timeout enforcement.
-tokio = { workspace = true, features = ["sync", "time"] }
+# `time` for ToolContext::timeout enforcement; the agent loop adds
+# `macros` for `tokio::select!` (cancellation races).
+tokio = { workspace = true, features = ["sync", "time", "macros"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
