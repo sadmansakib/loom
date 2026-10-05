@@ -1,9 +1,14 @@
-//! Agent-loop integration tests (plan 1F) driven by a scripted fake
-//! `ModelProvider` and a fake tool.
+//! Agent-loop integration tests (plan 1F and 1G) driven by a scripted fake
+//! `ModelProvider` and fake tools.
 //!
-//! These exercise the real `Agent::run_task` loop end to end: context
-//! compilation, the streaming seam, stop-reason handling, atomic turn
-//! commits, the tool engine, usage accounting, and terminal events.
+//! 1F: the real `Agent::run_task` loop end to end — context compilation, the
+//! streaming seam, stop-reason handling, atomic turn commits, the tool
+//! engine, usage accounting, and terminal events.
+//!
+//! 1G: cross-cutting scenarios — retry before/after output, exhausted
+//! attempts, non-retryable kinds, cancellation during stream and during a
+//! tool batch, discarded deltas, a broken event consumer, and monotonic
+//! event sequences.
 
 // Integration tests are a separate crate; helpers below are not `#[test]`
 // functions, so the workspace's `unwrap_used` / `expect_used` warnings are
@@ -27,7 +32,9 @@ use loom_core::model::{
 };
 use loom_core::session::{Session, TaskStatus};
 use loom_core::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolSpec};
-use loom_core::transcript::{AssistantMessage, Item, ToolArguments, ToolCall, ToolCallId};
+use loom_core::transcript::{
+    AssistantMessage, Item, ToolArguments, ToolCall, ToolCallId, ToolStatus,
+};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
@@ -43,6 +50,12 @@ struct FakeProvider {
     scripts: Mutex<VecDeque<Script>>,
     requests: Arc<Mutex<Vec<ModelRequest>>>,
     repeat_last: bool,
+    /// When set, `stream()` returns a stream that never yields — used to
+    /// exercise cancellation while a request is in flight (§6.6).
+    pending: bool,
+    /// When set, `stream()` cancels this token as soon as a request begins,
+    /// so the test needs no concurrent cancel task.
+    cancel_token: Option<CancellationToken>,
 }
 
 impl FakeProvider {
@@ -52,6 +65,8 @@ impl FakeProvider {
             scripts: Mutex::new(VecDeque::from(scripts)),
             requests: Arc::new(Mutex::new(Vec::new())),
             repeat_last: false,
+            pending: false,
+            cancel_token: None,
         }
     }
 
@@ -59,6 +74,17 @@ impl FakeProvider {
     /// the turn-limit test, where the model keeps requesting tools.
     fn repeat_last(mut self) -> Self {
         self.repeat_last = true;
+        self
+    }
+
+    /// Cancels `token` the moment a request begins and then hangs the stream
+    /// — used by the cancel-during-stream test. `run_task` observes the
+    /// token in its biased `select!` and drops the stream (§6.6), so the task
+    /// returns without ever committing, and the test needs no concurrent
+    /// cancel task.
+    fn cancel_on_stream(mut self, token: CancellationToken) -> Self {
+        self.pending = true;
+        self.cancel_token = Some(token);
         self
     }
 
@@ -80,6 +106,14 @@ impl ModelProvider for FakeProvider {
 
     fn stream<'a>(&'a self, request: &'a ModelRequest) -> ModelStream<'a> {
         self.requests.lock().unwrap().push(request.clone());
+        if self.pending {
+            if let Some(token) = &self.cancel_token {
+                token.cancel();
+            }
+            // A stream that never yields; the loop's biased `select!` sees
+            // the token and returns, dropping this stream (§6.6).
+            return Box::pin(stream::pending());
+        }
         let events = {
             let mut scripts = self.scripts.lock().unwrap();
             if scripts.len() > 1 {
@@ -97,6 +131,7 @@ impl ModelProvider for FakeProvider {
 /// A read-only tool that echoes its input, enough to exercise the engine.
 struct FakeTool {
     spec: ToolSpec,
+    read_only: bool,
 }
 
 impl Tool for FakeTool {
@@ -105,7 +140,7 @@ impl Tool for FakeTool {
     }
 
     fn is_read_only(&self) -> bool {
-        true
+        self.read_only
     }
 
     fn call<'a>(
@@ -114,6 +149,40 @@ impl Tool for FakeTool {
         _ctx: &'a ToolContext,
     ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
         Box::pin(async move { Ok(ToolOutput::new(format!("echo: {input}"))) })
+    }
+}
+
+/// A tool that cancels the task's own token on entry and then returns.
+///
+/// `execute_call` polls the cancellation future before the tool future, so
+/// this yields a deterministic `ToolStatus::Cancelled { started: true }`
+/// without needing the test to race the batch from another task.
+struct BlockingTool {
+    spec: ToolSpec,
+}
+
+impl Tool for BlockingTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    fn call<'a>(
+        &'a self,
+        _input: Value,
+        ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
+        Box::pin(async move {
+            ctx.cancellation.cancel();
+            // Never resolve: the tool is "in flight" while the engine's
+            // select observes the now-ready cancellation future and reports
+            // `Cancelled { started: true }`.
+            std::future::pending::<()>().await;
+            Ok(ToolOutput::new("cancelled"))
+        })
     }
 }
 
@@ -134,7 +203,30 @@ fn spec(name: &str) -> ToolSpec {
 fn registry_with(tool: &str) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry
-        .register(Box::new(FakeTool { spec: spec(tool) }))
+        .register(Box::new(FakeTool {
+            spec: spec(tool),
+            read_only: true,
+        }))
+        .unwrap();
+    registry
+}
+
+/// A registry with a fast echo and a blocking tool. The echo is marked
+/// mutating so the batch runs sequentially in call order: the echo's result
+/// is committed before the blocking call is even polled, making the
+/// "completed results plus cancelled filler" split deterministic.
+fn registry_for_cancel_batch() -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(FakeTool {
+            spec: spec("echo"),
+            read_only: false,
+        }))
+        .unwrap();
+    registry
+        .register(Box::new(BlockingTool {
+            spec: spec("block"),
+        }))
         .unwrap();
     registry
 }
@@ -487,4 +579,362 @@ async fn a_pre_cancelled_task_commits_nothing() {
 
     let kinds = drain(&mut receiver);
     assert!(matches!(kinds.last().unwrap(), EventKind::TaskCancelled));
+}
+
+// ---------------------------------------------------------------------------
+// 1G: cancellation / retry / event scenarios
+// ---------------------------------------------------------------------------
+
+fn retryable(kind: ModelErrorKind, message: &str) -> Script {
+    vec![Err(ModelError::new(kind, message))]
+}
+
+fn drain_envelopes(receiver: &mut UnboundedReceiver<EventEnvelope>) -> Vec<EventEnvelope> {
+    let mut envelopes = Vec::new();
+    while let Ok(envelope) = receiver.try_recv() {
+        envelopes.push(envelope);
+    }
+    envelopes
+}
+
+/// Retry before any output: the failed attempt emitted no delta, so the
+/// retry event reports `response_started: false`.
+#[tokio::test]
+async fn retry_before_output_started_reports_no_response() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            retryable(ModelErrorKind::Transport, "connect failed"),
+            completed(
+                assistant("clean", StopReason::EndTurn, Vec::new()),
+                usage(4, 1, None),
+            ),
+        ],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = agent(provider, ToolRegistry::new(), 10);
+
+    let summary = agent
+        .run_task(&mut session, "go", &sink, &token)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.turns, 1);
+    assert_eq!(summary.model_requests, 2);
+
+    let kinds = drain(&mut receiver);
+    assert!(kinds.iter().any(|kind| matches!(
+        kind,
+        EventKind::ModelRetry {
+            attempt: 1,
+            response_started: false,
+            ..
+        }
+    )));
+    assert!(matches!(kinds.last().unwrap(), EventKind::TaskCompleted));
+}
+
+/// Exhausted retries: with a budget of three attempts and a provider that
+/// always fails retryably, the loop issues exactly three requests, emits two
+/// retry events, and then fails the task with no commit.
+#[tokio::test]
+async fn exhausted_attempts_fail_without_committing() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            retryable(ModelErrorKind::Overloaded, "busy 1"),
+            retryable(ModelErrorKind::Overloaded, "busy 2"),
+            retryable(ModelErrorKind::Overloaded, "busy 3"),
+        ],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = Agent::new(
+        Box::new(provider),
+        Box::new(DefaultContextCompiler),
+        ToolRegistry::new(),
+        AgentConfig::new(PathBuf::from("."), "you are a test agent"),
+        "fake-model",
+    )
+    .with_max_turns(10)
+    .with_retry(
+        RetryPolicy::new()
+            .with_max_attempts(3)
+            .with_initial_backoff(Duration::from_millis(1))
+            .with_jitter_fraction(0.0),
+    );
+
+    let error = agent
+        .run_task(&mut session, "go", &sink, &token)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, TaskError::Model(_)));
+    // Only the user item was appended; the failed turn never committed.
+    assert_eq!(session.transcript.len(), 1);
+    let record = &session.tasks[0];
+    assert_eq!(record.status, TaskStatus::Failed);
+    assert_eq!(record.end_reason.as_deref(), Some("model_error"));
+
+    let kinds = drain(&mut receiver);
+    let requests = kinds
+        .iter()
+        .filter(|kind| matches!(kind, EventKind::ModelRequestStarted { .. }))
+        .count();
+    let retries = kinds
+        .iter()
+        .filter(|kind| matches!(kind, EventKind::ModelRetry { .. }))
+        .count();
+    assert_eq!(requests, 3);
+    assert_eq!(retries, 2);
+    assert!(matches!(
+        kinds.last().unwrap(),
+        EventKind::TaskFailed { .. }
+    ));
+}
+
+/// A non-retryable kind fails on the first attempt: no retry event, one
+/// request, no commit.
+#[tokio::test]
+async fn non_retryable_kind_fails_immediately() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![retryable(ModelErrorKind::Auth, "invalid key")],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = agent(provider, ToolRegistry::new(), 10);
+
+    let error = agent
+        .run_task(&mut session, "go", &sink, &token)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, TaskError::Model(_)));
+    assert_eq!(session.transcript.len(), 1);
+
+    let kinds = drain(&mut receiver);
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| matches!(kind, EventKind::ModelRequestStarted { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        !kinds
+            .iter()
+            .any(|kind| matches!(kind, EventKind::ModelRetry { .. }))
+    );
+    assert!(matches!(
+        kinds.last().unwrap(),
+        EventKind::TaskFailed { .. }
+    ));
+}
+
+/// Cancellation while a request is in flight: the streaming `select!` sees
+/// the token, drops the stream, and the task ends with nothing committed.
+#[tokio::test]
+async fn cancellation_during_stream_commits_nothing() {
+    let token = CancellationToken::new();
+    let provider = FakeProvider::new(capabilities(), Vec::new()).cancel_on_stream(token.clone());
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let agent = agent(provider, ToolRegistry::new(), 10);
+
+    let error = agent
+        .run_task(&mut session, "go", &sink, &token)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(&error, TaskError::Cancelled));
+
+    // Only the user item; the in-flight turn never committed.
+    assert_eq!(session.transcript.len(), 1);
+    let record = &session.tasks[0];
+    assert_eq!(record.status, TaskStatus::Cancelled);
+    assert_eq!(record.end_reason.as_deref(), Some("user_cancelled"));
+
+    let kinds = drain(&mut receiver);
+    // The request did start before cancellation was observed.
+    assert!(
+        kinds
+            .iter()
+            .any(|kind| matches!(kind, EventKind::ModelRequestStarted { .. }))
+    );
+    assert!(matches!(kinds.last().unwrap(), EventKind::TaskCancelled));
+}
+
+/// Cancellation during a tool batch: the turn is still committed, with the
+/// completed result preserved and the cancelled call recorded as a filler.
+#[tokio::test]
+async fn cancellation_during_batch_commits_turn_with_fillers() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![completed(
+            assistant(
+                "",
+                StopReason::ToolCalls,
+                vec![
+                    tool_call("call_echo", "echo", json!({ "q": "hi" })),
+                    tool_call("call_block", "block", json!({})),
+                ],
+            ),
+            usage(12, 6, None),
+        )],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = agent(provider, registry_for_cancel_batch(), 10);
+
+    let error = agent
+        .run_task(&mut session, "run both", &sink, &token)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(&error, TaskError::Cancelled));
+    // user, assistant(2 calls), result(echo), result(block)
+    assert_eq!(session.transcript.len(), 4);
+
+    let Item::ToolResult(first) = &session.transcript[2] else {
+        panic!("expected the echo result");
+    };
+    assert_eq!(first.call_id.as_str(), "call_echo");
+    assert_eq!(first.status, ToolStatus::Success);
+
+    let Item::ToolResult(second) = &session.transcript[3] else {
+        panic!("expected the block result");
+    };
+    assert_eq!(second.call_id.as_str(), "call_block");
+    assert_eq!(second.status, ToolStatus::Cancelled { started: true });
+
+    let record = &session.tasks[0];
+    assert_eq!(record.status, TaskStatus::Cancelled);
+    assert_eq!(record.turns, 1);
+
+    let kinds = drain(&mut receiver);
+    assert!(matches!(kinds.last().unwrap(), EventKind::TaskCancelled));
+}
+
+/// Retried deltas never reach the transcript: the failed attempt streams
+/// text, then errors; only the successful attempt's content is committed.
+#[tokio::test]
+async fn retried_deltas_are_never_committed() {
+    let failed: Script = vec![
+        Ok(ModelEvent::TextDelta("ghost".to_owned())),
+        Ok(ModelEvent::ReasoningDelta("phantom".to_owned())),
+        Err(ModelError::new(ModelErrorKind::Server, "lost")),
+    ];
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            failed,
+            completed(
+                assistant("clean", StopReason::EndTurn, Vec::new()),
+                usage(6, 2, None),
+            ),
+        ],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = agent(provider, ToolRegistry::new(), 10);
+
+    agent
+        .run_task(&mut session, "go", &sink, &token)
+        .await
+        .unwrap();
+
+    assert_eq!(session.transcript.len(), 2);
+    assert!(matches!(&session.transcript[1], Item::Assistant(a) if a.content == "clean"));
+    // No committed text carries the discarded attempt's content.
+    for item in &session.transcript {
+        if let Item::Assistant(message) = item {
+            assert!(!message.content.contains("ghost"));
+            assert!(message.reasoning.is_none());
+        }
+    }
+
+    let kinds = drain(&mut receiver);
+    assert!(matches!(kinds.last().unwrap(), EventKind::TaskCompleted));
+}
+
+/// A closed event consumer does not change the task outcome; the drop count
+/// is reported in the summary.
+#[tokio::test]
+async fn a_broken_event_consumer_does_not_change_the_outcome() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![completed(
+            assistant("done", StopReason::EndTurn, Vec::new()),
+            usage(3, 1, None),
+        )],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, receiver) = ChannelEventSink::new();
+    // Drop the consumer before the task runs: every emit is now a drop.
+    drop(receiver);
+    let token = CancellationToken::new();
+    let agent = agent(provider, ToolRegistry::new(), 10);
+
+    let summary = agent
+        .run_task(&mut session, "go", &sink, &token)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.turns, 1);
+    assert!(summary.events_dropped > 0, "drops must be reported");
+    assert_eq!(session.transcript.len(), 2);
+    assert_eq!(session.tasks[0].status, TaskStatus::Completed);
+}
+
+/// Envelope sequence numbers are strictly increasing within a task.
+#[tokio::test]
+async fn event_sequence_is_monotonic() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            completed(
+                assistant(
+                    "",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_1", "echo", json!({}))],
+                ),
+                usage(9, 3, None),
+            ),
+            completed(
+                assistant("done", StopReason::EndTurn, Vec::new()),
+                usage(7, 2, None),
+            ),
+        ],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = agent(provider, registry_with("echo"), 10);
+
+    agent
+        .run_task(&mut session, "go", &sink, &token)
+        .await
+        .unwrap();
+
+    let envelopes = drain_envelopes(&mut receiver);
+    assert!(envelopes.len() > 1);
+    for pair in envelopes.windows(2) {
+        assert!(
+            pair[0].sequence < pair[1].sequence,
+            "sequence must strictly increase: {} then {}",
+            pair[0].sequence,
+            pair[1].sequence
+        );
+    }
+    assert!(matches!(
+        envelopes.last().unwrap().kind,
+        EventKind::TaskCompleted
+    ));
 }
