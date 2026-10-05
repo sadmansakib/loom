@@ -13,12 +13,25 @@ path = "src/main.rs"
 loom-core = { workspace = true }
 loom-providers = { workspace = true }
 loom-tools = { workspace = true }
-futures = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# The binary owns the runtime: multi-thread (the provider's timeouts need the
+# time driver), macros (async main / select), signal (Ctrl-C), sync, rt.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+tokio-util = { workspace = true }
+# Account metadata store + OS-keychain secret backend (ADR-009, §18.3).
+rusqlite = { workspace = true }
+keyring = { workspace = true }
+rpassword = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

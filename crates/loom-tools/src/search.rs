@@ -300,10 +300,10 @@ fn build_ancestor_matcher(
     // search produces.
     let mut builder = GitignoreBuilder::new(rel_base);
     for file in ancestors {
-        if file.is_file() {
-            if let Some(err) = builder.add(file) {
-                return Err(format!("cannot read ignore file {}: {err}", file.display()));
-            }
+        if file.is_file()
+            && let Some(err) = builder.add(file)
+        {
+            return Err(format!("cannot read ignore file {}: {err}", file.display()));
         }
     }
     Ok(Some(builder.build().map_err(|err| {

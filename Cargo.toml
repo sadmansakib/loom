@@ -10,7 +10,9 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# Raised from 1.85 for `keyring` 4.x (1.88), the CLI's OS-keychain backend
+# (ADR-009). Everything else still builds on 1.85.
+rust-version = "1.88"
 
 [workspace.dependencies]
 # internal crates
@@ -53,6 +55,14 @@ regex = "1.13.1"
 
 # CLI
 clap = { version = "4.6.7", features = ["derive"] }
+
+# CLI state + credentials (iteration 1H pulls these forward from iteration 2,
+# ADR-008/ADR-009). `bundled` ships SQLite with FTS5/JSON1 so behaviour does
+# not depend on the system library. `keyring` uses the OS keychain by default.
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+keyring = "4.2.0"
+# Hidden secret prompt for `loom auth login` (no echo in a terminal).
+rpassword = "7.5.4"
 
 # dev / test-only
 wiremock = "0.6.5"

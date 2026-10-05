@@ -293,17 +293,17 @@ impl ChunkAccumulator {
         if let Some(reason) = choice.finish_reason {
             self.finish_reason = Some(reason);
         }
-        if let Some(fragment) = choice.delta.content {
-            if !fragment.is_empty() {
-                self.text.push_str(&fragment);
-                deltas.push(ModelEvent::TextDelta(fragment));
-            }
+        if let Some(fragment) = choice.delta.content
+            && !fragment.is_empty()
+        {
+            self.text.push_str(&fragment);
+            deltas.push(ModelEvent::TextDelta(fragment));
         }
-        if let Some(fragment) = choice.delta.reasoning_content {
-            if !fragment.is_empty() {
-                self.reasoning.push_str(&fragment);
-                deltas.push(ModelEvent::ReasoningDelta(fragment));
-            }
+        if let Some(fragment) = choice.delta.reasoning_content
+            && !fragment.is_empty()
+        {
+            self.reasoning.push_str(&fragment);
+            deltas.push(ModelEvent::ReasoningDelta(fragment));
         }
         for fragment in choice.delta.tool_calls {
             let index = match fragment.index {
@@ -320,16 +320,16 @@ impl ChunkAccumulator {
                 },
             };
             let call = self.tool_calls.entry(index).or_default();
-            if let Some(id) = fragment.id {
-                if !id.is_empty() {
-                    call.id = Some(id);
-                }
+            if let Some(id) = fragment.id
+                && !id.is_empty()
+            {
+                call.id = Some(id);
             }
             if let Some(function) = fragment.function {
-                if let Some(name) = function.name {
-                    if !name.is_empty() {
-                        call.name = Some(name);
-                    }
+                if let Some(name) = function.name
+                    && !name.is_empty()
+                {
+                    call.name = Some(name);
                 }
                 if let Some(args) = function.arguments {
                     call.arguments.push_str(&args);

@@ -1,14 +1,48 @@
-//! `loom` binary — the composition root.
+//! The `loom` binary: argument parsing, tracing setup, and dispatch.
 //!
-//! Owns configuration (TOML + environment secrets), installs the
-//! `tracing` subscriber (logs to stderr), wires the agent to a provider and
-//! tool registry, translates Ctrl-C into `CancellationToken` cancellation,
-//! and shuts the runtime down with a bounded timeout so orphaned blocking
-//! work cannot hang process exit.
-//!
-//! This is the only crate allowed to depend on all three library crates and
-//! the only one allowed to use `anyhow`.
+//! Responsibilities that belong to the process, not the domain: install a
+//! stderr tracing subscriber (`RUST_LOG`, default `warn`), keep stdout for
+//! results only, and translate the command outcome into a process exit code.
 
-fn main() {
-    println!("loom");
+use std::process::ExitCode;
+
+use clap::Parser;
+use tracing_subscriber::EnvFilter;
+
+mod args;
+mod auth;
+mod auth_command;
+mod output;
+mod paths;
+mod run;
+
+use args::{Cli, Command};
+
+fn main() -> ExitCode {
+    init_tracing();
+
+    let cli = Cli::parse();
+    let outcome = match cli.command {
+        Command::Run(args) => run::run(*args),
+        Command::Auth(args) => auth_command::run(args.command).map(|()| ExitCode::SUCCESS),
+    };
+
+    match outcome {
+        Ok(code) => code,
+        Err(error) => {
+            // `{:#}` prints the whole anyhow context chain on one line.
+            eprintln!("error: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Installs the tracing subscriber on stderr (`RUST_LOG`, default `warn`).
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    // A second subscriber in the same process (tests) is not an error here.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
 }

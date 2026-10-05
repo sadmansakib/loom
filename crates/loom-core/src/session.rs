@@ -79,10 +79,10 @@ impl Session {
     /// item carrying tool calls in **every** build — committing one
     /// without its results would break the turn invariant.
     pub fn push_item(&mut self, item: Item) -> Result<ItemIndex, SessionError> {
-        if let Item::Assistant(assistant) = &item {
-            if !assistant.tool_calls.is_empty() {
-                return Err(SessionError::AssistantToolCallsNeedAppendTurn);
-            }
+        if let Item::Assistant(assistant) = &item
+            && !assistant.tool_calls.is_empty()
+        {
+            return Err(SessionError::AssistantToolCallsNeedAppendTurn);
         }
         let index = self.next_index();
         self.transcript.push(item);
