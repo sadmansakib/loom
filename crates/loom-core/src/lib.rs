@@ -6,6 +6,7 @@
 //! (ADR-001); provider- and tool-specific behavior lives behind the
 //! `ModelProvider` and `Tool` traits (linked once those modules land).
 
+pub mod agent;
 pub mod event;
 pub mod id;
 pub mod model;

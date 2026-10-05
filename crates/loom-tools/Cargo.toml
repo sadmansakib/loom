@@ -12,9 +12,18 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# gitignore-aware directory walk (search) and line matching
+ignore = { workspace = true }
+regex = { workspace = true }
+# spawn_blocking wraps the blocking std::fs work (architecture.md §12)
+tokio = { workspace = true, features = ["rt"] }
+# CancellationToken in the search walk (per-file cancellation check)
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# #[tokio::test] runtime for tool tests
+tokio = { workspace = true, features = ["rt", "macros"] }
 
 [lints]
 workspace = true
