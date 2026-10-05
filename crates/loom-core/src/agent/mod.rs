@@ -76,6 +76,12 @@ pub enum TaskError {
     /// `ToolCalls` with none). Nothing was committed for that turn.
     #[error("model response violated the protocol: {0}")]
     Protocol(String),
+    /// A session invariant broke during a commit. Unreachable in Iteration 1
+    /// — the loop always builds valid call↔result pairs — but kept distinct
+    /// from the model-facing [`TaskError::Protocol`] so the recorded end
+    /// reason stays honest.
+    #[error("session invariant violated: {0}")]
+    Internal(String),
     /// The task reached `max_turns` while the model kept requesting tools.
     #[error("task exceeded the maximum of {max_turns} turns")]
     MaxTurns {
@@ -122,6 +128,7 @@ impl TaskError {
             TaskError::Context(_) => "context_error",
             TaskError::Model(_) => "model_error",
             TaskError::Protocol(_) => "protocol",
+            TaskError::Internal(_) => "internal",
             TaskError::MaxTurns { .. } => "max_turns",
             TaskError::Cancelled => "user_cancelled",
             TaskError::UnrecoverableStop { stop_reason } => stop_reason,
@@ -268,7 +275,7 @@ impl Agent {
         //    panic-free and the failure honest if it ever became reachable.
         session
             .push_item(Item::User { text: input.into() })
-            .map_err(|error| TaskError::Protocol(error.to_string()))?;
+            .map_err(|error| TaskError::Internal(error.to_string()))?;
 
         // 2. The task record and its start event.
         let task_id = TaskId::new();
@@ -285,7 +292,6 @@ impl Agent {
         //    build the summary. The record is finished before the summary is
         //    returned so callers can read either.
         let wall_time = started.elapsed();
-        let events_dropped = sink.dropped();
         let status = match &outcome {
             Ok(()) => TerminalTaskStatus::Completed,
             Err(error) if error.is_cancelled() => TerminalTaskStatus::Cancelled,
@@ -310,6 +316,9 @@ impl Agent {
                 },
             ),
         }
+        // Sampled after the terminal emit so a closed sink's drop of that
+        // event is counted too (§11).
+        let events_dropped = sink.dropped();
 
         let summary = TaskSummary {
             task_id,
@@ -640,7 +649,7 @@ impl Agent {
     ) -> Result<(), TaskError> {
         session
             .append_turn(assistant, results)
-            .map_err(|error| TaskError::Protocol(error.to_string()))?;
+            .map_err(|error| TaskError::Internal(error.to_string()))?;
         Ok(())
     }
 }
