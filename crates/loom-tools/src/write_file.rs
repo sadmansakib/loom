@@ -5,7 +5,9 @@
 //! tools, so an escape is an execution-invariant violation, not policy.
 
 use futures::future::BoxFuture;
-use loom_kernel::tool::{Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec};
+use loom_kernel::tool::{
+    PathTouch, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -45,6 +47,13 @@ impl Tool for WriteFileTool {
 
     fn is_read_only(&self) -> bool {
         false
+    }
+
+    fn touched_paths(&self, input: &Value) -> Option<Vec<PathTouch>> {
+        Some(match serde_json::from_value::<WriteInput>(input.clone()) {
+            Ok(parsed) => vec![PathTouch::write(parsed.path)],
+            Err(_) => Vec::new(),
+        })
     }
 
     fn call<'a>(

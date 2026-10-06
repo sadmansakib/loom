@@ -9,7 +9,7 @@
 
 use futures::future::BoxFuture;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use loom_kernel::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
+use loom_kernel::tool::{PathTouch, Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
 use regex::Regex;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -92,6 +92,15 @@ impl Tool for SearchTool {
 
     fn is_read_only(&self) -> bool {
         true
+    }
+
+    fn touched_paths(&self, input: &Value) -> Option<Vec<PathTouch>> {
+        Some(match serde_json::from_value::<SearchInput>(input.clone()) {
+            Ok(parsed) => vec![PathTouch::read(
+                parsed.path.unwrap_or_else(|| ".".to_owned()),
+            )],
+            Err(_) => Vec::new(),
+        })
     }
 
     fn call<'a>(

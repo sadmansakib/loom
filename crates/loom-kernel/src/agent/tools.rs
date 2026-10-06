@@ -9,9 +9,10 @@
 //! a dropped call.
 //!
 //! [`ToolBatch`] executes the calls of one assistant turn with the
-//! concurrency rules of architecture.md §10: read-only tools run
-//! concurrently up to a bound, any mutating tool forces the whole
-//! batch sequential. Results return in the model's call order
+//! concurrency rules of architecture.md §10 and ADR-018: touched paths
+//! are derived from the tool engine (never from model declarations), calls
+//! with disjoint paths run concurrently up to a bound, and any shared path
+//! keeps model order. Results return in the model's call order
 //! (`buffered`), and cancellation preserves completed results while
 //! marking the rest [`ToolStatus::Cancelled`] with an honest
 //! `started` flag (§6.5).
@@ -25,7 +26,9 @@ use futures::stream::{self, StreamExt};
 use tokio::time::timeout;
 
 use crate::artifact::ArtifactRef;
-use crate::tool::{ToolContext, ToolEffects, ToolError, ToolOutput, ToolRegistry};
+use crate::tool::{
+    PathAccess, PathTouch, ToolContext, ToolEffects, ToolError, ToolOutput, ToolRegistry,
+};
 use crate::transcript::{ToolCall, ToolFailure, ToolResult, ToolStatus};
 
 /// Upper bound on tool output entering the model context
@@ -294,13 +297,15 @@ fn finish(
     }
 }
 
-/// Executes the tool calls of one assistant turn under the §10 rules:
+/// Executes the tool calls of one assistant turn under the §10 rules and
+/// ADR-018:
 ///
-/// * every call read-only (or unknown/not-exposed) → concurrent,
-///   bounded by `max_concurrency` (default
-///   [`DEFAULT_MAX_CONCURRENCY`]);
-/// * any call resolving to a registered mutating tool → the whole
-///   batch sequential, in call order;
+/// * calls whose touched-path sets are disjoint run concurrently, bounded
+///   by `max_concurrency` (default [`DEFAULT_MAX_CONCURRENCY`]);
+/// * a shared path keeps model order — a conflicting later call runs in a
+///   strictly later wave, so a read after a write sees the write;
+/// * a mutating call that cannot describe its paths (e.g. `run_command`)
+///   is treated as a wildcard and serializes against the rest;
 /// * results always in the model's call order (`buffered`), failures
 ///   included — no early abort;
 /// * on cancellation: results already written are preserved verbatim,
@@ -336,22 +341,19 @@ impl<'a> ToolBatch<'a> {
     /// Executes `calls` under `ctx`; see the type docs. The returned
     /// vector has one result per call, in call order.
     pub async fn execute(&self, calls: &[ToolCall], ctx: &ToolContext) -> Vec<ToolResult> {
-        // Only calls that will actually run a registered mutating tool
-        // force sequential mode — a mutating tool that is unknown or
-        // not exposed never executes, so it must not serialize the
-        // batch either.
-        let mutating = calls.iter().any(|call| {
-            self.exposure.contains(&call.name)
-                && self
-                    .registry
-                    .get(&call.name)
-                    .is_some_and(|tool| !tool.is_read_only())
-        });
-        let bound = if mutating { 1 } else { self.max_concurrency };
+        // Derive each call's touched paths (ADR-018) and schedule into
+        // waves: within a wave every pair is conflict-free, and conflicting
+        // calls are always in strictly increasing waves, so model order is
+        // preserved for anything that shares a path.
+        let accesses: Vec<CallAccess> = calls
+            .iter()
+            .map(|call| call_access(call, self.registry, self.exposure))
+            .collect();
+        let waves = schedule(&accesses);
 
-        // Each future writes its result into its slot on completion,
-        // so results completed but not yet yielded when cancellation
-        // fires are still recoverable after the stream is dropped.
+        // Each future writes its result into its slot on completion, so
+        // results completed but not yet yielded when cancellation fires are
+        // still recoverable.
         let slots: Vec<Arc<Mutex<Option<ToolResult>>>> =
             calls.iter().map(|_| Arc::new(Mutex::new(None))).collect();
         let started_flags: Vec<Arc<AtomicBool>> = calls
@@ -359,28 +361,38 @@ impl<'a> ToolBatch<'a> {
             .map(|_| Arc::new(AtomicBool::new(false)))
             .collect();
 
-        let mut stream = stream::iter(calls.iter().zip(slots.iter().zip(started_flags.iter())))
-            .map(|(call, (slot, started))| async move {
-                let result = execute_call(self.registry, self.exposure, call, ctx, started).await;
-                // Record file effects before the next call in a sequential
-                // batch starts, so a `verify` later in this same batch links
-                // to a write earlier in it (same-batch linkage, 2F). Read-only
-                // batches run concurrently and report no effects.
-                ctx.note_effects(&result.effects);
-                lock_slot(slot).replace(result);
-            })
-            .buffered(bound);
+        'waves: for wave in &waves {
+            let mut stream = stream::iter(wave.iter().map(|&index| {
+                let call = &calls[index];
+                let slot = &slots[index];
+                let started = &started_flags[index];
+                async move {
+                    let result =
+                        execute_call(self.registry, self.exposure, call, ctx, started).await;
+                    // Record file effects before the next call in a
+                    // sequential batch starts, so a `verify` later in this
+                    // same batch links to a write earlier in it
+                    // (same-batch linkage, 2F). Conflict-free waves record
+                    // no conflicting effects.
+                    ctx.note_effects(&result.effects);
+                    lock_slot(slot).replace(result);
+                }
+            }))
+            .buffered(self.max_concurrency);
 
-        let mut remaining = calls.len();
-        while remaining > 0 {
-            let mut cancelled = std::pin::pin!(ctx.cancellation.cancelled());
-            match future::select(cancelled.as_mut(), stream.next()).await {
-                Either::Right((Some(_), _)) => remaining -= 1,
-                Either::Right((None, _)) => break,
-                Either::Left(_) => break,
+            let mut remaining = wave.len();
+            while remaining > 0 {
+                let mut cancelled = std::pin::pin!(ctx.cancellation.cancelled());
+                match future::select(cancelled.as_mut(), stream.next()).await {
+                    Either::Right((Some(_), _)) => remaining -= 1,
+                    Either::Right((None, _)) => break,
+                    Either::Left(_) => {
+                        drop(stream);
+                        break 'waves;
+                    }
+                }
             }
         }
-        drop(stream);
 
         calls
             .iter()
@@ -395,6 +407,146 @@ impl<'a> ToolBatch<'a> {
     }
 }
 
+/// The paths one call will touch, split into read/write sets for the
+/// scheduler. [`Access::Unknown`] is a wildcard: possible conflict with
+/// anything that touches a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CallAccess {
+    reads: Access,
+    writes: Access,
+}
+
+/// One side of a [`CallAccess`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Access {
+    /// Touches no path of this kind.
+    Nothing,
+    /// Cannot be described — a wildcard.
+    Unknown,
+    /// Exactly these workspace-relative paths.
+    Known(HashSet<String>),
+}
+
+/// Derives a call's access from its tool: a not-exposed/unknown call never
+/// executes and so touches nothing; a read-only tool contributes its declared
+/// reads; a mutating tool contributes its declared writes and treats its own
+/// reads as unknown (it may read anything before writing).
+fn call_access(call: &ToolCall, registry: &ToolRegistry, exposure: &ToolExposure) -> CallAccess {
+    let tool = exposure
+        .contains(&call.name)
+        .then(|| registry.get(&call.name))
+        .flatten();
+    let Some(tool) = tool else {
+        return CallAccess {
+            reads: Access::Nothing,
+            writes: Access::Nothing,
+        };
+    };
+    let (reads, writes) = split_access(tool.touched_paths(&call.arguments));
+    if tool.is_read_only() {
+        // A read-only tool never writes, whatever it declares.
+        CallAccess {
+            reads,
+            writes: Access::Nothing,
+        }
+    } else {
+        // A mutating tool contributes exactly the paths it declares (its
+        // reads are usually empty); undeclared paths stay `Unknown` via
+        // `split_access` and therefore serialize.
+        CallAccess { reads, writes }
+    }
+}
+
+/// Splits declared touches into read/write sets; `None` (undeclared) is a
+/// wildcard on both sides.
+fn split_access(declared: Option<Vec<PathTouch>>) -> (Access, Access) {
+    let Some(touches) = declared else {
+        return (Access::Unknown, Access::Unknown);
+    };
+    let mut reads = HashSet::new();
+    let mut writes = HashSet::new();
+    for touch in touches {
+        match touch.access {
+            PathAccess::Read => {
+                reads.insert(touch.path);
+            }
+            PathAccess::Write => {
+                writes.insert(touch.path);
+            }
+        }
+    }
+    (known(reads), known(writes))
+}
+
+/// A non-empty set becomes [`Access::Known`]; an empty one is
+/// [`Access::Nothing`] (touches nothing).
+fn known(paths: HashSet<String>) -> Access {
+    if paths.is_empty() {
+        Access::Nothing
+    } else {
+        Access::Known(paths)
+    }
+}
+
+/// Whether two calls conflict: one writes a path the other touches.
+fn conflicts(a: &CallAccess, b: &CallAccess) -> bool {
+    writes_overlap(&a.writes, &b.reads)
+        || writes_overlap(&a.writes, &b.writes)
+        || writes_overlap(&b.writes, &a.reads)
+}
+
+/// Whether `writer` writes anything `other` touches.
+fn writes_overlap(writer: &Access, other: &Access) -> bool {
+    match (writer, other) {
+        (Access::Nothing, _) | (_, Access::Nothing) => false,
+        (Access::Unknown, _) | (_, Access::Unknown) => true,
+        (Access::Known(written), Access::Known(touched)) => written
+            .iter()
+            .any(|w| touched.iter().any(|t| paths_overlap(w, t))),
+    }
+}
+
+/// Whether two workspace-relative paths overlap: identical, or one is an
+/// ancestor directory of the other (segment-wise). A read of `src` and a
+/// write to `src/a.rs` contend; `src/a.rs` and `src/b.rs` do not. `.` (the
+/// workspace root) is an ancestor of everything.
+fn paths_overlap(a: &str, b: &str) -> bool {
+    a == b || is_ancestor(a, b) || is_ancestor(b, a)
+}
+
+/// Whether `dir` is a strict ancestor directory of `path`.
+fn is_ancestor(dir: &str, path: &str) -> bool {
+    let dir = dir.trim_end_matches('/');
+    if dir.is_empty() || dir == "." {
+        return !path.is_empty() && path != ".";
+    }
+    path.strip_prefix(dir)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Assigns each call to a wave: the longest path over conflict edges. Two
+/// calls share a wave only when conflict-free, and a conflict always puts the
+/// later call in a strictly later wave, preserving model order on shared
+/// paths. Waves run in order; calls within a wave run concurrently.
+fn schedule(accesses: &[CallAccess]) -> Vec<Vec<usize>> {
+    let mut level = vec![0usize; accesses.len()];
+    for later in 0..accesses.len() {
+        for earlier in 0..later {
+            if conflicts(&accesses[earlier], &accesses[later]) {
+                level[later] = level[later].max(level[earlier] + 1);
+            }
+        }
+    }
+    let mut waves: Vec<Vec<usize>> = Vec::new();
+    for (index, &wave) in level.iter().enumerate() {
+        if waves.len() <= wave {
+            waves.resize(wave + 1, Vec::new());
+        }
+        waves[wave].push(index);
+    }
+    waves
+}
+
 /// Locks a result slot, surviving poisoning (a panicked tool future
 /// must not poison cancellation assembly).
 fn lock_slot(slot: &Mutex<Option<ToolResult>>) -> MutexGuard<'_, Option<ToolResult>> {
@@ -405,7 +557,7 @@ fn lock_slot(slot: &Mutex<Option<ToolResult>>) -> MutexGuard<'_, Option<ToolResu
 mod tests {
     use super::*;
     use crate::store::ArtifactStore;
-    use crate::tool::{CommandEffect, Tool, ToolEffects, ToolOutput, ToolSpec};
+    use crate::tool::{CommandEffect, PathTouch, Tool, ToolEffects, ToolOutput, ToolSpec};
     use crate::transcript::{ToolArguments, ToolCallId};
     use futures::future::BoxFuture;
     use serde_json::{Value, json};
@@ -443,6 +595,19 @@ mod tests {
         Hang,
         /// Succeeds and reports side effects (the effects seam).
         Effects { effects: ToolEffects },
+        /// Tracks concurrency and records completion order, and — when
+        /// `declared` — declares its touched paths to the scheduler
+        /// (ADR-018 probes).
+        Track {
+            reads: Vec<String>,
+            writes: Vec<String>,
+            declared: bool,
+            active: Arc<AtomicUsize>,
+            max_seen: Arc<AtomicUsize>,
+            log: Arc<Mutex<Vec<String>>>,
+            label: String,
+            ms: u64,
+        },
     }
 
     struct MockTool {
@@ -476,6 +641,23 @@ mod tests {
 
         fn is_read_only(&self) -> bool {
             self.read_only
+        }
+
+        fn touched_paths(&self, _input: &Value) -> Option<Vec<PathTouch>> {
+            match &self.action {
+                Action::Track {
+                    reads,
+                    writes,
+                    declared: true,
+                    ..
+                } => {
+                    let mut touches: Vec<PathTouch> =
+                        reads.iter().cloned().map(PathTouch::read).collect();
+                    touches.extend(writes.iter().cloned().map(PathTouch::write));
+                    Some(touches)
+                }
+                _ => None,
+            }
         }
 
         fn call<'a>(
@@ -514,6 +696,21 @@ mod tests {
                     }
                     Action::Effects { effects } => {
                         Ok(ToolOutput::new("touched the world").with_effects(effects))
+                    }
+                    Action::Track {
+                        active,
+                        max_seen,
+                        log,
+                        label,
+                        ms,
+                        ..
+                    } => {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_seen.fetch_max(now, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        log.lock().expect("log lock").push(label);
+                        Ok(ToolOutput::new("tracked"))
                     }
                 }
             })
@@ -855,36 +1052,193 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_mutating_call_forces_sequential() {
+    async fn wildcard_mutation_runs_after_concurrent_readers() {
+        // A mutating call that cannot describe its paths (no declaration)
+        // is a wildcard: it conflicts with everything, but the read-only
+        // calls it runs after are still concurrent with each other
+        // (ADR-018).
         let active = Arc::new(AtomicUsize::new(0));
         let max_seen = Arc::new(AtomicUsize::new(0));
-        let mut names: Vec<String> = (0..6).map(|i| format!("r{i}")).collect();
-        names.push("writer".to_owned());
+        let log = Arc::new(Mutex::new(Vec::new()));
         let mut reg = ToolRegistry::default();
+        let mut names: Vec<String> = (0..6).map(|i| format!("r{i}")).collect();
         for name in &names {
-            let is_writer = name == "writer";
             reg.register(Box::new(MockTool {
                 spec: spec(name),
-                read_only: !is_writer,
-                action: Action::CountSleep {
+                read_only: true,
+                action: Action::Track {
+                    reads: vec![format!("{name}.txt")],
+                    writes: Vec::new(),
+                    declared: true,
                     active: active.clone(),
                     max_seen: max_seen.clone(),
-                    ms: 10,
+                    log: log.clone(),
+                    label: name.clone(),
+                    ms: 20,
                 },
             }))
             .expect("unique");
         }
-        // Put the mutating call in the middle: the whole batch must
-        // still run one at a time, in order.
+        names.push("writer".to_owned());
+        reg.register(Box::new(MockTool {
+            spec: spec("writer"),
+            read_only: false,
+            action: Action::Track {
+                reads: Vec::new(),
+                writes: Vec::new(),
+                declared: false,
+                active: active.clone(),
+                max_seen: max_seen.clone(),
+                log: log.clone(),
+                label: "writer".to_owned(),
+                ms: 1,
+            },
+        }))
+        .expect("unique");
+
         let exposure = ToolExposure::from_names(names.clone());
         let token = CancellationToken::new();
         let ctx = test_ctx(Duration::from_secs(10), &token);
         let calls: Vec<ToolCall> = names.iter().map(|n| make_call(n)).collect();
         let batch = ToolBatch::new(&reg, &exposure).with_max_concurrency(8);
         let results = batch.execute(&calls, &ctx).await;
-        assert_eq!(results.len(), 7);
+        assert!(results.iter().all(|r| r.status == ToolStatus::Success));
+        assert_eq!(max_seen.load(Ordering::SeqCst), 6);
+        let entries = log.lock().expect("log lock").clone();
+        assert_eq!(entries.len(), 7);
+        assert_eq!(entries.last().map(String::as_str), Some("writer"));
+        assert!(entries[..6].iter().all(|entry| entry != "writer"));
+    }
+
+    #[tokio::test]
+    async fn disjoint_writes_run_concurrently() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut reg = ToolRegistry::default();
+        for (name, path) in [("w0", "a.txt"), ("w1", "b.txt")] {
+            reg.register(Box::new(MockTool {
+                spec: spec(name),
+                read_only: false,
+                action: Action::Track {
+                    reads: Vec::new(),
+                    writes: vec![path.to_owned()],
+                    declared: true,
+                    active: active.clone(),
+                    max_seen: max_seen.clone(),
+                    log: log.clone(),
+                    label: name.to_owned(),
+                    ms: 20,
+                },
+            }))
+            .expect("unique");
+        }
+        let names = ["w0", "w1"];
+        let exposure = ToolExposure::from_names(names);
+        let token = CancellationToken::new();
+        let ctx = test_ctx(Duration::from_secs(10), &token);
+        let calls: Vec<ToolCall> = names.iter().map(|n| make_call(n)).collect();
+        let batch = ToolBatch::new(&reg, &exposure);
+        let results = batch.execute(&calls, &ctx).await;
+        assert!(results.iter().all(|r| r.status == ToolStatus::Success));
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            2,
+            "writes to disjoint paths must overlap"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_path_write_then_read_keeps_model_order() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut reg = ToolRegistry::default();
+        reg.register(Box::new(MockTool {
+            spec: spec("writer"),
+            read_only: false,
+            action: Action::Track {
+                reads: Vec::new(),
+                writes: vec!["a.txt".to_owned()],
+                declared: true,
+                active: active.clone(),
+                max_seen: max_seen.clone(),
+                log: log.clone(),
+                label: "write".to_owned(),
+                ms: 30,
+            },
+        }))
+        .expect("unique");
+        reg.register(Box::new(MockTool {
+            spec: spec("reader"),
+            read_only: true,
+            action: Action::Track {
+                reads: vec!["a.txt".to_owned()],
+                writes: Vec::new(),
+                declared: true,
+                active: active.clone(),
+                max_seen: max_seen.clone(),
+                log: log.clone(),
+                label: "read".to_owned(),
+                ms: 1,
+            },
+        }))
+        .expect("unique");
+        let names = ["writer", "reader"];
+        let exposure = ToolExposure::from_names(names);
+        let token = CancellationToken::new();
+        let ctx = test_ctx(Duration::from_secs(10), &token);
+        let calls: Vec<ToolCall> = names.iter().map(|n| make_call(n)).collect();
+        let batch = ToolBatch::new(&reg, &exposure);
+        let results = batch.execute(&calls, &ctx).await;
+        assert!(results.iter().all(|r| r.status == ToolStatus::Success));
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "a read after a write to the same path must not overlap it"
+        );
+        assert_eq!(
+            &*log.lock().expect("log lock"),
+            &["write".to_owned(), "read".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_writes_serialize_in_model_order() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut reg = ToolRegistry::default();
+        for name in ["w0", "w1"] {
+            reg.register(Box::new(MockTool {
+                spec: spec(name),
+                read_only: false,
+                action: Action::Track {
+                    reads: Vec::new(),
+                    writes: vec!["a.txt".to_owned()],
+                    declared: true,
+                    active: active.clone(),
+                    max_seen: max_seen.clone(),
+                    log: log.clone(),
+                    label: name.to_owned(),
+                    ms: 10,
+                },
+            }))
+            .expect("unique");
+        }
+        let names = ["w0", "w1"];
+        let exposure = ToolExposure::from_names(names);
+        let token = CancellationToken::new();
+        let ctx = test_ctx(Duration::from_secs(10), &token);
+        let calls: Vec<ToolCall> = names.iter().map(|n| make_call(n)).collect();
+        let batch = ToolBatch::new(&reg, &exposure);
+        let results = batch.execute(&calls, &ctx).await;
         assert!(results.iter().all(|r| r.status == ToolStatus::Success));
         assert_eq!(max_seen.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            &*log.lock().expect("log lock"),
+            &["w0".to_owned(), "w1".to_owned()]
+        );
     }
 
     #[tokio::test]

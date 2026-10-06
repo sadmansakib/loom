@@ -6,7 +6,7 @@
 //! ([`READ_FILE_HEAD_BYTES`]); both cuts are explicit.
 
 use futures::future::BoxFuture;
-use loom_kernel::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
+use loom_kernel::tool::{PathTouch, Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -53,6 +53,13 @@ impl Tool for ReadFileTool {
 
     fn is_read_only(&self) -> bool {
         true
+    }
+
+    fn touched_paths(&self, input: &Value) -> Option<Vec<PathTouch>> {
+        Some(match serde_json::from_value::<ReadInput>(input.clone()) {
+            Ok(parsed) => vec![PathTouch::read(parsed.path)],
+            Err(_) => Vec::new(),
+        })
     }
 
     fn call<'a>(

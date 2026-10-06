@@ -5,7 +5,9 @@
 //! occurrence the model meant.
 
 use futures::future::BoxFuture;
-use loom_kernel::tool::{Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec};
+use loom_kernel::tool::{
+    PathTouch, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -51,6 +53,13 @@ impl Tool for EditFileTool {
 
     fn is_read_only(&self) -> bool {
         false
+    }
+
+    fn touched_paths(&self, input: &Value) -> Option<Vec<PathTouch>> {
+        Some(match serde_json::from_value::<EditInput>(input.clone()) {
+            Ok(parsed) => vec![PathTouch::write(parsed.path)],
+            Err(_) => Vec::new(),
+        })
     }
 
     fn call<'a>(

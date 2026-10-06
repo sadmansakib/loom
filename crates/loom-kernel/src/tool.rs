@@ -53,6 +53,50 @@ pub struct ToolSpec {
     pub parameters: Value,
 }
 
+/// How a call touches a path, for dependency-aware scheduling (ADR-018).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PathAccess {
+    /// The call reads the path. Concurrent reads never conflict.
+    Read,
+    /// The call creates, overwrites, or deletes the path. A write
+    /// conflicts with any other access to the same path.
+    Write,
+}
+
+/// A workspace-relative path a call will touch and how (ADR-018).
+///
+/// Declared by the tool *before* execution on the raw arguments — never
+/// model-declared — and reused by scheduling (V13), result caching (V14)
+/// and pruning. Compared as given, so a tool must report the same string
+/// the model used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathTouch {
+    /// Workspace-relative, `/`-separated.
+    pub path: String,
+    /// Read or write.
+    pub access: PathAccess,
+}
+
+impl PathTouch {
+    /// A read of `path`.
+    #[must_use]
+    pub fn read(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            access: PathAccess::Read,
+        }
+    }
+
+    /// A write to `path`.
+    #[must_use]
+    pub fn write(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            access: PathAccess::Write,
+        }
+    }
+}
+
 /// The execution seam for one tool.
 ///
 /// Implementations live in `loom-tools`; the engine (and only the engine)
@@ -71,6 +115,25 @@ pub trait Tool: Send + Sync {
     /// may run concurrently, mutating calls run sequentially in call
     /// order (§10). A tool lying here breaks the execution contract.
     fn is_read_only(&self) -> bool;
+
+    /// The workspace paths this call will touch, for dependency-aware
+    /// scheduling (ADR-018).
+    ///
+    /// * `None` — the tool cannot describe its paths; the engine treats it
+    ///   as touching anything, so such a call serializes against the rest
+    ///   of the batch. This is the conservative default.
+    /// * `Some(vec![])` — the call provably touches no workspace path
+    ///   (e.g. `artifact_read`), so it never conflicts.
+    /// * `Some(touches)` — exactly these paths.
+    ///
+    /// The engine calls this before execution, on the raw arguments; it
+    /// must be cheap and must not block. Arguments that fail to parse are
+    /// reported as touching nothing, since the call will then fail without
+    /// mutating.
+    fn touched_paths(&self, input: &Value) -> Option<Vec<PathTouch>> {
+        let _ = input;
+        None
+    }
 
     /// Executes the tool.
     ///

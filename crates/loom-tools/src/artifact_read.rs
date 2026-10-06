@@ -9,7 +9,7 @@
 
 use futures::future::BoxFuture;
 use loom_kernel::id::ArtifactId;
-use loom_kernel::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
+use loom_kernel::tool::{PathTouch, Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -55,6 +55,11 @@ impl Tool for ArtifactReadTool {
 
     fn is_read_only(&self) -> bool {
         true
+    }
+
+    fn touched_paths(&self, _input: &Value) -> Option<Vec<PathTouch>> {
+        // Reads from the artifact store, not the workspace: no path conflict.
+        Some(Vec::new())
     }
 
     fn call<'a>(
