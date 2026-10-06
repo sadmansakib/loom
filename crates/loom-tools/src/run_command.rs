@@ -357,6 +357,11 @@ mod tests {
             "status must survive truncation: {}",
             output.content
         );
+        assert!(
+            output.content.contains("200000"),
+            "the stream tail must survive the per-stream cap: {}",
+            &output.content[output.content.len().saturating_sub(200)..]
+        );
     }
 
     #[test]
