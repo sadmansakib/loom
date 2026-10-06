@@ -17,6 +17,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,10 +31,11 @@ use loom_kernel::model::{
     Message, ModelCapabilities, ModelError, ModelErrorKind, ModelEvent, ModelProvider,
     ModelRequest, ModelResponse, ModelStream, StopReason, Usage,
 };
-use loom_kernel::session::{Session, TaskStatus};
+use loom_kernel::session::{PlannedTurn, Session, TaskRecord, TaskStatus};
+use loom_kernel::store::{MemorySessionStore, SessionStore, StoreError};
 use loom_kernel::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolSpec};
 use loom_kernel::transcript::{
-    AssistantMessage, Item, ToolArguments, ToolCall, ToolCallId, ToolFailure, ToolStatus,
+    AssistantMessage, Item, ItemIndex, ToolArguments, ToolCall, ToolCallId, ToolFailure, ToolStatus,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -1416,4 +1418,187 @@ async fn cancellation_during_retry_backoff_stops_the_task() {
         session.tasks[0].end_reason.as_deref(),
         Some("user_cancelled")
     );
+}
+
+// ------------------------------------------------------------------ store ---
+
+/// A [`SessionStore`] that can be told to fail the turn append, so the tests
+/// can prove persist-then-commit: the store is written *before* the in-memory
+/// transcript, so a store failure leaves memory untouched.
+struct TestStore {
+    inner: MemorySessionStore,
+    fail_turn: AtomicBool,
+}
+
+impl SessionStore for TestStore {
+    fn ensure_session(&self, session: &SessionId) -> Result<(), StoreError> {
+        self.inner.ensure_session(session)
+    }
+
+    fn append_item(
+        &self,
+        session: &SessionId,
+        index: ItemIndex,
+        item: &Item,
+    ) -> Result<(), StoreError> {
+        self.inner.append_item(session, index, item)
+    }
+
+    fn append_turn(&self, session: &SessionId, turn: &PlannedTurn) -> Result<(), StoreError> {
+        if self.fail_turn.load(Ordering::SeqCst) {
+            return Err(StoreError::Backend("disk is full".to_owned()));
+        }
+        self.inner.append_turn(session, turn)
+    }
+
+    fn upsert_task(&self, session: &SessionId, record: &TaskRecord) -> Result<(), StoreError> {
+        self.inner.upsert_task(session, record)
+    }
+
+    fn load(&self, session: &SessionId) -> Result<Option<Session>, StoreError> {
+        self.inner.load(session)
+    }
+
+    fn session_ids(&self) -> Result<Vec<SessionId>, StoreError> {
+        self.inner.session_ids()
+    }
+}
+
+/// Hands the agent a `Box<dyn SessionStore>` while the test keeps the `Arc` to
+/// inspect what was persisted.
+struct StoreHandle(Arc<TestStore>);
+
+impl StoreHandle {
+    fn new(store: &Arc<TestStore>) -> Self {
+        Self(Arc::clone(store))
+    }
+}
+
+impl SessionStore for StoreHandle {
+    fn ensure_session(&self, session: &SessionId) -> Result<(), StoreError> {
+        self.0.ensure_session(session)
+    }
+
+    fn append_item(
+        &self,
+        session: &SessionId,
+        index: ItemIndex,
+        item: &Item,
+    ) -> Result<(), StoreError> {
+        self.0.append_item(session, index, item)
+    }
+
+    fn append_turn(&self, session: &SessionId, turn: &PlannedTurn) -> Result<(), StoreError> {
+        self.0.append_turn(session, turn)
+    }
+
+    fn upsert_task(&self, session: &SessionId, record: &TaskRecord) -> Result<(), StoreError> {
+        self.0.upsert_task(session, record)
+    }
+
+    fn load(&self, session: &SessionId) -> Result<Option<Session>, StoreError> {
+        self.0.load(session)
+    }
+
+    fn session_ids(&self) -> Result<Vec<SessionId>, StoreError> {
+        self.0.session_ids()
+    }
+}
+
+#[tokio::test]
+async fn a_store_failure_fails_the_task_without_committing_memory() {
+    // The turn append is the one durable write the loop makes per model
+    // response. When it fails, persist-then-commit means the in-memory
+    // transcript never gains the turn, and the task fails as `Persistence`.
+    let store = Arc::new(TestStore {
+        inner: MemorySessionStore::new(),
+        fail_turn: AtomicBool::new(true),
+    });
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            completed(
+                assistant(
+                    "",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_1", "echo", json!({ "q": "hi" }))],
+                ),
+                usage(20, 5, None),
+            ),
+            completed(
+                assistant("all done", StopReason::EndTurn, Vec::new()),
+                usage(30, 7, None),
+            ),
+        ],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent =
+        agent(provider, registry_with("echo"), 10).with_store(Box::new(StoreHandle::new(&store)));
+
+    let error = agent
+        .run_task(&mut session, "run the tool", &sink, &token)
+        .await
+        .expect_err("the store rejected the turn");
+
+    assert!(matches!(error, TaskError::Persistence(_)));
+    assert_eq!(error.end_reason(), "persistence");
+
+    // Persist-then-commit: only the user item (persisted before the turn) and
+    // the task record exist in memory; the failed assistant turn does not.
+    assert_eq!(session.transcript.len(), 1);
+    assert!(matches!(&session.transcript[0], Item::User { .. }));
+    let stored = store.load(&session.id).unwrap().unwrap();
+    assert_eq!(stored.transcript.len(), 1);
+
+    let record = &session.tasks[0];
+    assert_eq!(record.status, TaskStatus::Failed);
+    assert_eq!(record.end_reason.as_deref(), Some("persistence"));
+
+    let kinds = drain(&mut receiver);
+    assert!(matches!(kinds.last(), Some(EventKind::TaskFailed { .. })));
+}
+
+#[tokio::test]
+async fn a_committed_task_is_mirrored_in_the_store() {
+    let store = Arc::new(TestStore {
+        inner: MemorySessionStore::new(),
+        fail_turn: AtomicBool::new(false),
+    });
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            completed(
+                assistant(
+                    "",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_1", "echo", json!({ "q": "hi" }))],
+                ),
+                usage(20, 5, None),
+            ),
+            completed(
+                assistant("all done", StopReason::EndTurn, Vec::new()),
+                usage(30, 7, None),
+            ),
+        ],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, _receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent =
+        agent(provider, registry_with("echo"), 10).with_store(Box::new(StoreHandle::new(&store)));
+
+    agent
+        .run_task(&mut session, "run the tool", &sink, &token)
+        .await
+        .unwrap();
+
+    // The durable record mirrors the completed in-memory transcript and task.
+    let stored = store.load(&session.id).unwrap().unwrap();
+    assert_eq!(stored.transcript, session.transcript);
+    assert_eq!(stored.tasks, session.tasks);
+    assert_eq!(stored.tasks[0].status, TaskStatus::Completed);
+    assert_eq!(stored.tasks[0].turns, 2);
+    assert_eq!(store.session_ids().unwrap(), vec![session.id]);
 }

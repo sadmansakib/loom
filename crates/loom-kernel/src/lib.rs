@@ -12,5 +12,6 @@ pub mod event;
 pub mod id;
 pub mod model;
 pub mod session;
+pub mod store;
 pub mod tool;
 pub mod transcript;

@@ -94,8 +94,7 @@ impl Session {
     ///
     /// Validation happens fully before the first append, so on
     /// [`SessionError`] the transcript is unchanged — the in-memory mirror
-    /// of §6.1's "commit = turn" guarantee. Callers persist the new items
-    /// in one transaction right after this returns.
+    /// of §6.1's "commit = turn" guarantee.
     ///
     /// Returns `[assistant_start, results_start]`. When the turn has no
     /// tool calls (EndTurn), `results_start` equals the index one past the
@@ -103,11 +102,32 @@ impl Session {
     /// slot no item of this turn occupies. Persistence should slice
     /// `[assistant_start, next_index())`, not read through
     /// `results_start`.
+    ///
+    /// This is plan-then-apply in one call. The agent loop instead calls
+    /// [`Session::plan_turn`], persists the [`PlannedTurn`], and then
+    /// [`Session::apply_planned_turn`] — persist-then-commit (ADR-012).
     pub fn append_turn(
         &mut self,
         assistant: AssistantMessage,
         results: Vec<ToolResult>,
     ) -> Result<[ItemIndex; 2], SessionError> {
+        let planned = self.plan_turn(assistant, results)?;
+        Ok(self.apply_planned_turn(planned))
+    }
+
+    /// Validates one turn and computes the indices it will occupy, without
+    /// mutating the transcript.
+    ///
+    /// Split from [`Session::append_turn`] so a caller can write the turn to
+    /// durable storage **before** committing it in memory (ADR-012,
+    /// persist-then-commit): the store persists the returned [`PlannedTurn`],
+    /// then [`Session::apply_planned_turn`] commits it. Validation is
+    /// identical to the old `append_turn`, so a planned turn always applies.
+    pub fn plan_turn(
+        &self,
+        assistant: AssistantMessage,
+        results: Vec<ToolResult>,
+    ) -> Result<PlannedTurn, SessionError> {
         // Pairwise check first: results must answer the calls 1:1, in order.
         for (call, result) in assistant.tool_calls.iter().zip(results.iter()) {
             if call.id != result.call_id {
@@ -130,12 +150,44 @@ impl Session {
         }
 
         let assistant_at = self.next_index();
+        let results_at = ItemIndex::from(assistant_at.as_u32() + 1);
+        Ok(PlannedTurn {
+            assistant_at,
+            results_at,
+            assistant,
+            results,
+        })
+    }
+
+    /// Applies a turn produced by [`Session::plan_turn`].
+    ///
+    /// Infallible: planning validated the call↔result pairing and fixed the
+    /// indices. Returns `[assistant_start, results_start]` like
+    /// [`Session::append_turn`].
+    ///
+    /// # Panics
+    ///
+    /// In debug builds only, if `planned` was not produced against the
+    /// current transcript tip (its `assistant_at` is not
+    /// [`Session::next_index`]); a `PlannedTurn` from this session's
+    /// immediately preceding [`Session::plan_turn`] always holds.
+    pub fn apply_planned_turn(&mut self, planned: PlannedTurn) -> [ItemIndex; 2] {
+        let PlannedTurn {
+            assistant_at,
+            results_at,
+            assistant,
+            results,
+        } = planned;
+        debug_assert_eq!(
+            assistant_at,
+            self.next_index(),
+            "planned turn applied against a moved transcript tip"
+        );
         self.transcript.push(Item::Assistant(assistant));
-        let results_at = self.next_index();
         for result in results {
             self.transcript.push(Item::ToolResult(result));
         }
-        Ok([assistant_at, results_at])
+        [assistant_at, results_at]
     }
 
     /// Records a task run in this session. The task's input is *not*
@@ -147,6 +199,60 @@ impl Session {
     /// Mutable access to a task record by id, if present.
     pub fn task_mut(&mut self, id: TaskId) -> Option<&mut TaskRecord> {
         self.tasks.iter_mut().find(|task| task.id == id)
+    }
+}
+
+/// A validated turn, planned before it is written anywhere.
+///
+/// [`Session::plan_turn`] returns one, fixing the indices it will occupy;
+/// a store persists it and [`Session::apply_planned_turn`] commits it to the
+/// in-memory transcript. Because the indices are frozen at plan time, storing
+/// the turn and applying it cannot disagree (persist-then-commit, ADR-012).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannedTurn {
+    assistant_at: ItemIndex,
+    results_at: ItemIndex,
+    assistant: AssistantMessage,
+    results: Vec<ToolResult>,
+}
+
+impl PlannedTurn {
+    /// Index the assistant item occupies.
+    pub fn assistant_at(&self) -> ItemIndex {
+        self.assistant_at
+    }
+
+    /// Index the first tool result occupies. For a turn with no tool calls
+    /// (EndTurn) no item occupies it; it equals [`PlannedTurn::end_index`].
+    pub fn results_at(&self) -> ItemIndex {
+        self.results_at
+    }
+
+    /// Index one past the last item of this turn.
+    pub fn end_index(&self) -> ItemIndex {
+        ItemIndex::from(self.results_at.as_u32() + self.results.len() as u32)
+    }
+
+    /// The assistant message.
+    pub fn assistant(&self) -> &AssistantMessage {
+        &self.assistant
+    }
+
+    /// The tool results, in original call order.
+    pub fn results(&self) -> &[ToolResult] {
+        &self.results
+    }
+
+    /// The `(index, item)` pairs in append order: the assistant item first,
+    /// then one item per tool result.
+    pub fn items(&self) -> impl Iterator<Item = (ItemIndex, Item)> + '_ {
+        let assistant =
+            std::iter::once((self.assistant_at, Item::Assistant(self.assistant.clone())));
+        let results = self.results.iter().enumerate().map(|(offset, result)| {
+            let index = ItemIndex::from(self.results_at.as_u32() + offset as u32);
+            (index, Item::ToolResult(result.clone()))
+        });
+        assistant.chain(results)
     }
 }
 

@@ -150,6 +150,16 @@ define_id! {
     TaskId
 }
 
+define_id! {
+    /// Identifies a stored artifact body (`artifacts.id`).
+    ///
+    /// Content identity is the artifact's sha256 column, not this id: two
+    /// identical bodies may be stored under different ids, and a transcript
+    /// `ArtifactRef` carries this id as the stable row key. v7 keeps stored
+    /// artifacts in creation order, like sessions and tasks.
+    ArtifactId
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

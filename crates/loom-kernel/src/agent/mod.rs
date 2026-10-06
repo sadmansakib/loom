@@ -29,7 +29,8 @@ use crate::model::{
     ModelError, ModelErrorKind, ModelEvent, ModelProvider, ModelRequest, ModelResponse, StopReason,
     Usage,
 };
-use crate::session::{Session, TaskRecord, TerminalTaskStatus};
+use crate::session::{PlannedTurn, Session, TaskRecord, TerminalTaskStatus};
+use crate::store::{SessionStore, StoreError};
 use crate::tool::{ToolContext, ToolRegistry};
 use crate::transcript::{AssistantMessage, Item, ToolCall, ToolFailure, ToolResult, ToolStatus};
 
@@ -114,8 +115,10 @@ pub enum TaskError {
         /// Which stop reason ended the task.
         stop_reason: &'static str,
     },
-    /// A future session store failed. Reserved for the persistence seam
-    /// (§12); the in-memory session cannot fail.
+    /// A durable [`SessionStore`](crate::store::SessionStore) failed while
+    /// persisting the session (ADR-012, persist-then-commit). The step that
+    /// failed is not mirrored in the in-memory session, so nothing is applied
+    /// on top of a store that did not accept it.
     #[error("session store failed: {0}")]
     Persistence(String),
     /// The configured model is unknown to the provider, so its capabilities
@@ -151,6 +154,11 @@ impl TaskError {
             TaskError::UnknownModel { .. } => "unknown_model",
         }
     }
+}
+
+/// Maps a store failure to the task-level persistence error (ADR-012).
+fn persistence(error: StoreError) -> TaskError {
+    TaskError::Persistence(error.to_string())
 }
 
 /// Efficiency accounting for one completed task (§14).
@@ -358,6 +366,7 @@ pub struct Agent {
     reserved_output_tokens: u32,
     tool_timeout: Duration,
     max_tool_concurrency: usize,
+    store: Option<Box<dyn SessionStore>>,
 }
 
 impl Agent {
@@ -384,6 +393,7 @@ impl Agent {
             reserved_output_tokens: DEFAULT_RESERVED_OUTPUT_TOKENS,
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
             max_tool_concurrency: DEFAULT_MAX_TOOL_CONCURRENCY,
+            store: None,
         }
     }
 
@@ -429,6 +439,21 @@ impl Agent {
         self
     }
 
+    /// Attaches a durable [`SessionStore`] (§§6.1, 18; ADR-012).
+    ///
+    /// With a store attached the loop is **persist-then-commit**: each item,
+    /// task record, and turn is written to the store *before* the in-memory
+    /// [`Session`] mirrors it, so a crash can never lose the record of an
+    /// effect that already ran. A store failure returns
+    /// [`TaskError::Persistence`] and leaves the in-memory session unchanged
+    /// for that step. Without a store the loop behaves exactly as before
+    /// (in-memory only).
+    #[must_use]
+    pub fn with_store(mut self, store: Box<dyn SessionStore>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
     /// The model identifier this agent targets.
     #[must_use]
     pub fn model(&self) -> &str {
@@ -454,17 +479,28 @@ impl Agent {
     ) -> Result<TaskSummary, TaskError> {
         let started = Instant::now();
 
-        // 1. The input becomes the transcript's next user item. `push_item`
-        //    only fails for an assistant item carrying tool calls, so the
-        //    branch is unreachable here; mapping it keeps the loop
-        //    panic-free and the failure honest if it ever became reachable.
+        // 1. The input becomes the transcript's next user item. Persisted to
+        //    the store *before* the in-memory push (ADR-012,
+        //    persist-then-commit). `push_item` only fails for an assistant
+        //    item carrying tool calls, so the mapped branch is unreachable
+        //    here; mapping it keeps the loop panic-free and the failure
+        //    honest if it ever became reachable.
+        let user = Item::User { text: input.into() };
+        if let Some(store) = &self.store {
+            store.ensure_session(&session.id).map_err(persistence)?;
+            store
+                .append_item(&session.id, session.next_index(), &user)
+                .map_err(persistence)?;
+        }
         session
-            .push_item(Item::User { text: input.into() })
+            .push_item(user)
             .map_err(|error| TaskError::Internal(error.to_string()))?;
 
-        // 2. The task record and its start event.
+        // 2. The task record, persisted then mirrored before its start event.
         let task_id = TaskId::new();
-        session.push_task(TaskRecord::new(task_id, now_millis()));
+        let record = TaskRecord::new(task_id, now_millis());
+        self.persist_task(session, &record)?;
+        session.push_task(record);
         sink.emit(task_id, EventKind::TaskStarted);
 
         // 3. The turn loop; the epilogue below always finalizes the record.
@@ -497,6 +533,17 @@ impl Agent {
             record.turns = accounting.turns;
             record.usage = accounting.usage;
             record.finish(status, now_millis(), end_reason);
+        }
+        // Persist the terminal record before announcing it: a store failure
+        // fails the task, and no terminal event claims a completion the store
+        // never saw.
+        let finished = session
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .cloned();
+        if let Some(record) = finished {
+            self.persist_task(session, &record)?;
         }
         match &outcome {
             Ok(_) => sink.emit(task_id, EventKind::TaskCompleted),
@@ -906,15 +953,36 @@ impl Agent {
 
     /// The single atomic commit point of a turn (§6.1): the assistant item
     /// and one result per call, or nothing on a validation failure.
+    ///
+    /// With a store attached this is persist-then-commit: the planned turn is
+    /// written first (one store transaction), then applied in memory. A store
+    /// failure returns [`TaskError::Persistence`] and the transcript is
+    /// untouched (ADR-012).
     fn commit(
         &self,
         session: &mut Session,
         assistant: AssistantMessage,
         results: Vec<ToolResult>,
     ) -> Result<(), TaskError> {
-        session
-            .append_turn(assistant, results)
+        let planned: PlannedTurn = session
+            .plan_turn(assistant, results)
             .map_err(|error| TaskError::Internal(error.to_string()))?;
+        if let Some(store) = &self.store {
+            store
+                .append_turn(&session.id, &planned)
+                .map_err(persistence)?;
+        }
+        session.apply_planned_turn(planned);
+        Ok(())
+    }
+
+    /// Mirrors a task record to the store, if one is attached.
+    fn persist_task(&self, session: &Session, record: &TaskRecord) -> Result<(), TaskError> {
+        if let Some(store) = &self.store {
+            store
+                .upsert_task(&session.id, record)
+                .map_err(persistence)?;
+        }
         Ok(())
     }
 }
