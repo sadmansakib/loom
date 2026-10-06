@@ -21,8 +21,8 @@
 
 use super::{AgentConfig, CompiledContext, ContextCensus, ContextError, ContextInput};
 use crate::model::{Message, ModelCapabilities, ModelRequest};
-use crate::tool::ToolRegistry;
-use crate::transcript::Item;
+use crate::tool::{ToolEffects, ToolRegistry};
+use crate::transcript::{Item, ToolResult};
 
 /// How many bytes of serialized projection one estimated token stands for.
 ///
@@ -85,7 +85,15 @@ fn project_messages(session: &crate::session::Session, config: &AgentConfig) -> 
                     Some(Message::Assistant(assistant.clone()))
                 }
             }
-            Item::ToolResult(result) => Some(Message::ToolResult(result.clone())),
+            Item::ToolResult(result) => Some(Message::ToolResult(ToolResult {
+                // Effects are Loom-side state (ADR-012): they persist in the
+                // transcript but are never model-visible, so the projection
+                // strips them. This also keeps request recordings, the
+                // provider wire shape, and the byte census independent of
+                // effect bookkeeping.
+                effects: ToolEffects::none(),
+                ..result.clone()
+            })),
         };
         if let Some(message) = message {
             messages.push(message);
@@ -234,12 +242,12 @@ mod tests {
     }
 
     fn result_for(id: &str) -> ToolResult {
-        ToolResult {
-            call_id: ToolCallId::try_from(id.to_owned()).unwrap(),
-            status: ToolStatus::Success,
-            content: "ok".into(),
-            truncated: false,
-        }
+        ToolResult::new(
+            ToolCallId::try_from(id.to_owned()).unwrap(),
+            ToolStatus::Success,
+            "ok",
+            false,
+        )
     }
 
     fn input<'a>(
@@ -365,6 +373,26 @@ mod tests {
         assert!(matches!(messages[2], Message::Assistant(_)));
         assert!(matches!(&messages[3], Message::ToolResult(r) if r.call_id.as_str() == "c1"));
         assert!(matches!(&messages[4], Message::ToolResult(r) if r.call_id.as_str() == "c2"));
+    }
+
+    #[test]
+    fn tool_result_effects_stay_out_of_the_model_projection() {
+        let mut s = session();
+        s.push_item(Item::User { text: TASK.into() }).unwrap();
+        let mut msg = assistant("calling", StopReason::ToolCalls);
+        msg.tool_calls = vec![call("c1", "read_file")];
+        let mut result = result_for("c1");
+        result.effects = ToolEffects::none().with_file_written("src/lib.rs");
+        s.append_turn(msg, vec![result]).unwrap();
+
+        let compiled = compile(&s, &registry(), budget()).expect("within budget");
+        let Some(Message::ToolResult(projected)) = compiled.request.messages.last() else {
+            panic!("expected a tool result last");
+        };
+        assert!(
+            projected.effects.is_empty(),
+            "effects are Loom-side state and must not reach the model"
+        );
     }
 
     #[test]

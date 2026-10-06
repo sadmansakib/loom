@@ -961,17 +961,17 @@ fn ledger_key(call: &ToolCall) -> (String, String) {
 /// The loop's refusal result for a repeated failed call: the tool never runs,
 /// so no side effect occurs, and the model is told to change approach.
 fn repeated_call_result(call: &ToolCall) -> ToolResult {
-    ToolResult {
-        call_id: call.id.clone(),
-        status: ToolStatus::Error(ToolFailure::RepeatedCall),
-        content: format!(
+    ToolResult::new(
+        call.id.clone(),
+        ToolStatus::Error(ToolFailure::RepeatedCall),
+        format!(
             "error: you already called \"{}\" with these exact arguments and it failed; \
              repeating it unchanged is not permitted. Reassess before calling again: read \
              the failure above, change the arguments, or use a different tool.",
             call.name
         ),
-        truncated: false,
-    }
+        false,
+    )
 }
 
 /// Appends a deterministic next-step hint to a failure the model will see.

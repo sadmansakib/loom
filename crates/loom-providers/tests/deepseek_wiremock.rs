@@ -695,12 +695,12 @@ async fn request_body_shape_and_reasoning_replay() {
                 tool_calls: vec![call],
                 stop_reason: StopReason::ToolCalls,
             }),
-            Message::ToolResult(ToolResult {
-                call_id: ToolCallId::try_from("call_1".to_owned()).unwrap(),
-                status: ToolStatus::Success,
-                content: "file body".into(),
-                truncated: false,
-            }),
+            Message::ToolResult(ToolResult::new(
+                ToolCallId::try_from("call_1".to_owned()).unwrap(),
+                ToolStatus::Success,
+                "file body",
+                false,
+            )),
         ],
         tools: vec![ToolSpec {
             name: "read_file".into(),

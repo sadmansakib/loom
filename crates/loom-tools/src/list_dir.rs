@@ -62,10 +62,7 @@ impl Tool for ListDirTool {
             // A miss is an answer, not a fault: the caller asked what is
             // there, and "nothing" is the honest result (§13).
             Ok(match outcome {
-                ListOutcome::Entries(entries) => ToolOutput {
-                    content: entries.join("\n"),
-                    truncated: false,
-                },
+                ListOutcome::Entries(entries) => ToolOutput::new(entries.join("\n")),
                 ListOutcome::Missing => {
                     ToolOutput::new(format!("path \"{display}\" does not exist"))
                 }

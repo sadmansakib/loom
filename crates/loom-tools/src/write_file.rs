@@ -5,13 +5,13 @@
 //! tools, so an escape is an execution-invariant violation, not policy.
 
 use futures::future::BoxFuture;
-use loom_kernel::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
+use loom_kernel::tool::{Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::OnceLock;
 
-use crate::confinement::resolve_within;
+use crate::confinement::{resolve_within, workspace_relative};
 
 /// Creates or overwrites one UTF-8 text file, confined to the workspace
 /// root, creating missing parent directories.
@@ -67,6 +67,7 @@ impl Tool for WriteFileTool {
                 .map_err(|err| ToolError::InvalidInput(format!("invalid arguments: {err}")))?;
             let display = input.path;
             let path = resolve_within(&ctx.workspace_root, &display)?;
+            let relative = workspace_relative(&ctx.workspace_root, &path);
             let bytes = input.content.into_bytes();
             let written = bytes.len();
             tokio::task::spawn_blocking(move || write_file(&path, &bytes))
@@ -75,9 +76,10 @@ impl Tool for WriteFileTool {
                 .map_err(|err| {
                     ToolError::Execution(format!("cannot write \"{display}\": {err}"))
                 })?;
-            Ok(ToolOutput::new(format!(
-                "wrote {written} bytes to {display}"
-            )))
+            Ok(
+                ToolOutput::new(format!("wrote {written} bytes to {display}"))
+                    .with_effects(ToolEffects::none().with_file_written(relative)),
+            )
         })
     }
 }
@@ -128,6 +130,12 @@ mod tests {
         .expect("ok");
         assert_eq!(output.content, "wrote 10 bytes to nested/dir/note.txt");
         assert!(!output.truncated);
+        assert_eq!(
+            output.effects.files_written,
+            vec!["nested/dir/note.txt".to_string()]
+        );
+        assert!(output.effects.files_deleted.is_empty());
+        assert!(output.effects.commands_run.is_empty());
         assert_eq!(
             std::fs::read_to_string(guard.path().join("nested/dir/note.txt")).expect("read"),
             "hello loom"

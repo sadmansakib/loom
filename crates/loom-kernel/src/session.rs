@@ -274,12 +274,12 @@ mod tests {
     }
 
     fn result_for(call_id: &str) -> ToolResult {
-        ToolResult {
-            call_id: ToolCallId::try_from(call_id.to_string()).unwrap(),
-            status: ToolStatus::Success,
-            content: "ok".into(),
-            truncated: false,
-        }
+        ToolResult::new(
+            ToolCallId::try_from(call_id.to_string()).unwrap(),
+            ToolStatus::Success,
+            "ok",
+            false,
+        )
     }
 
     #[test]

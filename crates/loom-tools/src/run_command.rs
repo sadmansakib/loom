@@ -25,7 +25,9 @@ use std::sync::OnceLock;
 
 use futures::future::BoxFuture;
 use loom_kernel::agent::tools::MAX_TOOL_OUTPUT_BYTES;
-use loom_kernel::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
+use loom_kernel::tool::{
+    CommandEffect, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
@@ -199,10 +201,16 @@ where
     Ok(kept)
 }
 
-/// Renders one completed process as model-visible text. A non-zero exit
-/// is a *successful* tool call: the command ran and the model must see
-/// the failure, so it is never mapped to [`ToolError::Execution`].
+/// Renders one completed process as model-visible text, recording the
+/// command as an effect (ADR-012). A non-zero exit is a *successful*
+/// tool call: the command ran and the model must see the failure, so it
+/// is never mapped to [`ToolError::Execution`].
 fn render(program: &str, args: &[String], output: &std::process::Output) -> ToolOutput {
+    let effects = ToolEffects::none().with_command(CommandEffect::new(
+        program,
+        args.to_vec(),
+        output.status.code(),
+    ));
     let mut text = format!("$ {program}");
     for arg in args {
         text.push(' ');
@@ -218,16 +226,18 @@ fn render(program: &str, args: &[String], output: &std::process::Output) -> Tool
         text.push_str("\n--- stderr ---\n");
         text.push_str(&String::from_utf8_lossy(&output.stderr));
     }
-    if text.len() <= MAX_TOOL_OUTPUT_BYTES {
-        return ToolOutput::new(text);
-    }
-    let mut cut = MAX_TOOL_OUTPUT_BYTES;
-    while !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    text.truncate(cut);
-    text.push_str("\n...[output truncated]");
-    ToolOutput::new(text).with_truncated()
+    let rendered = if text.len() <= MAX_TOOL_OUTPUT_BYTES {
+        ToolOutput::new(text)
+    } else {
+        let mut cut = MAX_TOOL_OUTPUT_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push_str("\n...[output truncated]");
+        ToolOutput::new(text).with_truncated()
+    };
+    rendered.with_effects(effects)
 }
 
 /// `exit status: N`, or a signal note when the platform reports none.
@@ -283,6 +293,15 @@ mod tests {
             output.content
         );
         assert!(output.content.contains("hi there"), "{}", output.content);
+        assert_eq!(
+            output.effects.commands_run,
+            vec![CommandEffect::new(
+                "echo",
+                vec!["hi".to_string(), "there".to_string()],
+                Some(0)
+            )]
+        );
+        assert!(output.effects.files_written.is_empty());
     }
 
     #[tokio::test]
@@ -386,5 +405,13 @@ mod tests {
             "$ cargo test\nexit status: 2\n--- stdout ---\nout\n--- stderr ---\nerr"
         );
         assert!(!rendered.truncated);
+        assert_eq!(
+            rendered.effects.commands_run,
+            vec![CommandEffect::new(
+                "cargo",
+                vec!["test".to_string()],
+                Some(2)
+            )]
+        );
     }
 }

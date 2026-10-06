@@ -24,7 +24,7 @@ use futures::future::{self, Either};
 use futures::stream::{self, StreamExt};
 use tokio::time::timeout;
 
-use crate::tool::{ToolContext, ToolError, ToolOutput, ToolRegistry};
+use crate::tool::{ToolContext, ToolEffects, ToolError, ToolOutput, ToolRegistry};
 use crate::transcript::{ToolCall, ToolFailure, ToolResult, ToolStatus};
 
 /// Upper bound on tool output entering the model context
@@ -110,6 +110,7 @@ pub async fn execute_call(
             ToolStatus::Error(ToolFailure::UnknownTool),
             unknown_tool_content(registry, &call.name),
             false,
+            ToolEffects::none(),
         );
     };
     if !exposure.contains(&call.name) {
@@ -121,6 +122,7 @@ pub async fn execute_call(
                 call.name
             ),
             false,
+            ToolEffects::none(),
         );
     }
     if ctx.cancellation.is_cancelled() {
@@ -137,20 +139,22 @@ pub async fn execute_call(
         // Cancelled mid-flight: the tool future is dropped here.
         Either::Left(((), _timed)) => cancelled_result(call, true),
         Either::Right((Ok(Ok(output)), _)) => {
-            let (content, truncated) = bound(output);
-            finish(call, ToolStatus::Success, content, truncated)
+            let (content, truncated, effects) = bound(output);
+            finish(call, ToolStatus::Success, content, truncated, effects)
         }
         Either::Right((Ok(Err(ToolError::InvalidInput(msg))), _)) => finish(
             call,
             ToolStatus::Error(ToolFailure::InvalidInput),
             format!("error: invalid input: {msg}"),
             false,
+            ToolEffects::none(),
         ),
         Either::Right((Ok(Err(ToolError::Execution(msg))), _)) => finish(
             call,
             ToolStatus::Error(ToolFailure::Execution),
             format!("error: execution failed: {msg}"),
             false,
+            ToolEffects::none(),
         ),
         Either::Right((Err(_elapsed), _)) => finish(
             call,
@@ -160,6 +164,7 @@ pub async fn execute_call(
                 call.name, ctx.timeout
             ),
             false,
+            ToolEffects::none(),
         ),
     }
 }
@@ -179,11 +184,16 @@ fn unknown_tool_content(registry: &ToolRegistry, name: &str) -> String {
 }
 
 /// Applies [`MAX_TOOL_OUTPUT_BYTES`] on a char boundary; a tool-set
-/// `truncated` flag is never cleared.
-fn bound(output: ToolOutput) -> (String, bool) {
-    let ToolOutput { content, truncated } = output;
+/// `truncated` flag is never cleared. Effects pass through untouched —
+/// truncating text never changes what the call did.
+fn bound(output: ToolOutput) -> (String, bool, ToolEffects) {
+    let ToolOutput {
+        content,
+        truncated,
+        effects,
+    } = output;
     if content.len() <= MAX_TOOL_OUTPUT_BYTES {
-        return (content, truncated);
+        return (content, truncated, effects);
     }
     let mut cut = MAX_TOOL_OUTPUT_BYTES;
     while !content.is_char_boundary(cut) {
@@ -191,7 +201,7 @@ fn bound(output: ToolOutput) -> (String, bool) {
     }
     let mut content = content;
     content.truncate(cut);
-    (content, true)
+    (content, true, effects)
 }
 
 /// A cancelled call's result; `started` decides which honest message
@@ -207,11 +217,18 @@ fn cancelled_result(call: &ToolCall, started: bool) -> ToolResult {
         ToolStatus::Cancelled { started },
         content.to_owned(),
         false,
+        ToolEffects::none(),
     )
 }
 
 /// Assembles and traces the final result (`tool.status`, §9.3).
-fn finish(call: &ToolCall, status: ToolStatus, content: String, truncated: bool) -> ToolResult {
+fn finish(
+    call: &ToolCall,
+    status: ToolStatus,
+    content: String,
+    truncated: bool,
+    effects: ToolEffects,
+) -> ToolResult {
     tracing::debug!(
         target: "tool",
         tool = call.name,
@@ -224,6 +241,7 @@ fn finish(call: &ToolCall, status: ToolStatus, content: String, truncated: bool)
         status,
         content,
         truncated,
+        effects,
     }
 }
 
@@ -332,7 +350,7 @@ fn lock_slot(slot: &Mutex<Option<ToolResult>>) -> MutexGuard<'_, Option<ToolResu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::{Tool, ToolOutput, ToolSpec};
+    use crate::tool::{CommandEffect, Tool, ToolEffects, ToolOutput, ToolSpec};
     use crate::transcript::{ToolArguments, ToolCallId};
     use futures::future::BoxFuture;
     use serde_json::{Value, json};
@@ -368,6 +386,8 @@ mod tests {
         },
         /// Sleeps for a minute (a call that must be cancelled).
         Hang,
+        /// Succeeds and reports side effects (the effects seam).
+        Effects { effects: ToolEffects },
     }
 
     struct MockTool {
@@ -437,6 +457,9 @@ mod tests {
                         tokio::time::sleep(Duration::from_secs(60)).await;
                         Ok(ToolOutput::new("finally"))
                     }
+                    Action::Effects { effects } => {
+                        Ok(ToolOutput::new("touched the world").with_effects(effects))
+                    }
                 }
             })
         }
@@ -470,6 +493,53 @@ mod tests {
         assert_eq!(exposure.len(), 2);
         assert!(!exposure.is_empty());
         assert!(ToolExposure::default().is_empty());
+    }
+
+    #[tokio::test]
+    async fn successful_call_persists_the_effects_it_reported() {
+        let effects = ToolEffects::none()
+            .with_file_written("src/lib.rs")
+            .with_file_deleted("src/old.rs")
+            .with_command(CommandEffect::new("cargo", vec!["test".into()], Some(101)));
+        let mut tool = MockTool::text("edit_file", "ignored");
+        tool.read_only = false;
+        tool.action = Action::Effects {
+            effects: effects.clone(),
+        };
+        let registry = registry(vec![tool]);
+        let exposure = ToolExposure::from_names(["edit_file"]);
+        let token = CancellationToken::new();
+        let ctx = test_ctx(Duration::from_secs(5), &token);
+        let started = AtomicBool::new(false);
+        let result = execute_call(
+            &registry,
+            &exposure,
+            &make_call("edit_file"),
+            &ctx,
+            &started,
+        )
+        .await;
+        assert_eq!(result.status, ToolStatus::Success);
+        assert_eq!(result.effects, effects);
+    }
+
+    #[tokio::test]
+    async fn a_call_that_never_ran_reports_no_effects() {
+        let registry = registry(vec![MockTool::text("read_file", "unused")]);
+        let exposure = ToolExposure::from_names(["read_file"]);
+        let token = CancellationToken::new();
+        let ctx = test_ctx(Duration::from_secs(5), &token);
+        let started = AtomicBool::new(false);
+        let result = execute_call(
+            &registry,
+            &exposure,
+            &make_call("edit_file"),
+            &ctx,
+            &started,
+        )
+        .await;
+        assert_eq!(result.status, ToolStatus::Error(ToolFailure::UnknownTool));
+        assert!(result.effects.is_empty());
     }
 
     #[tokio::test]

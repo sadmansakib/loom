@@ -161,12 +161,12 @@ async fn effort_none_tools_two_turns() {
                 text: "Call list_files exactly once. Do not say anything else.".into(),
             },
             Message::Assistant(first.message.clone()),
-            Message::ToolResult(ToolResult {
-                call_id: ToolCallId::try_from(call.id.as_str().to_string()).expect("id"),
-                status: ToolStatus::Success,
-                content: "Cargo.toml\nCargo.lock\ncrates".into(),
-                truncated: false,
-            }),
+            Message::ToolResult(ToolResult::new(
+                ToolCallId::try_from(call.id.as_str().to_string()).expect("id"),
+                ToolStatus::Success,
+                "Cargo.toml\nCargo.lock\ncrates",
+                false,
+            )),
             Message::User {
                 text: "Now reply with exactly one word: done".into(),
             },
@@ -286,18 +286,13 @@ async fn parallel_calls_replay_roundtrip() {
             text: "Call list_files exactly once. Do not say anything else.".into(),
         },
         Message::Assistant(two_calls),
-        Message::ToolResult(ToolResult {
-            call_id: first.message.tool_calls[0].id.clone(),
-            status: ToolStatus::Success,
-            content: "Cargo.toml\nCargo.lock\ncrates".into(),
-            truncated: false,
-        }),
-        Message::ToolResult(ToolResult {
-            call_id: id_b,
-            status: ToolStatus::Success,
-            content: "docs".into(),
-            truncated: false,
-        }),
+        Message::ToolResult(ToolResult::new(
+            first.message.tool_calls[0].id.clone(),
+            ToolStatus::Success,
+            "Cargo.toml\nCargo.lock\ncrates",
+            false,
+        )),
+        Message::ToolResult(ToolResult::new(id_b, ToolStatus::Success, "docs", false)),
         Message::User {
             text: "Now reply with exactly one word: done".into(),
         },

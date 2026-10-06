@@ -137,10 +137,13 @@ impl Tool for SearchTool {
             .map_err(|err| ToolError::Execution(format!("search task failed: {err}")))?;
 
             match entries {
-                Ok((lines, truncated)) => Ok(ToolOutput {
-                    content: lines.join("\n"),
-                    truncated,
-                }),
+                Ok((lines, truncated)) => {
+                    let mut output = ToolOutput::new(lines.join("\n"));
+                    if truncated {
+                        output = output.with_truncated();
+                    }
+                    Ok(output)
+                }
                 Err(msg) => Err(ToolError::Execution(msg)),
             }
         })

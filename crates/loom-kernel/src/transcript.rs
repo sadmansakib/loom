@@ -23,6 +23,7 @@
 //! provider-neutral messages.
 
 use crate::model::StopReason;
+use crate::tool::ToolEffects;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -329,6 +330,34 @@ pub struct ToolResult {
     /// Whether `content` was cut short. Orthogonal to [`ToolStatus`]: an
     /// error result may also be truncated.
     pub truncated: bool,
+    /// What the call changed outside Loom, recorded at execution time
+    /// (ADR-012). Empty for read-only calls and for every failure — a
+    /// call that never started cannot have effects. Deserializes to the
+    /// empty value for results persisted before Iteration 2 step 2B.
+    #[serde(default)]
+    pub effects: ToolEffects,
+}
+
+impl ToolResult {
+    /// A result carrying no recorded effects.
+    ///
+    /// Used by the engine for failures and read-only calls, and by
+    /// fixtures; the engine attaches a successful call's effects from
+    /// the tool's [`crate::tool::ToolOutput`].
+    pub fn new(
+        call_id: ToolCallId,
+        status: ToolStatus,
+        content: impl Into<String>,
+        truncated: bool,
+    ) -> Self {
+        Self {
+            call_id,
+            status,
+            content: content.into(),
+            truncated,
+            effects: ToolEffects::none(),
+        }
+    }
 }
 
 /// Structured outcome of a tool call.
@@ -383,6 +412,7 @@ pub enum ToolFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::CommandEffect;
 
     /// Builds a representative assistant message exercising every nested
     /// type at once.
@@ -440,12 +470,12 @@ mod tests {
         let assistant = serde_json::to_value(Item::Assistant(sample_assistant())).unwrap();
         assert_eq!(assistant["kind"], "assistant");
 
-        let result = serde_json::to_value(Item::ToolResult(ToolResult {
-            call_id: ToolCallId::try_from("call_1".to_string()).unwrap(),
-            status: ToolStatus::Success,
-            content: "file contents".into(),
-            truncated: false,
-        }))
+        let result = serde_json::to_value(Item::ToolResult(ToolResult::new(
+            ToolCallId::try_from("call_1".to_string()).unwrap(),
+            ToolStatus::Success,
+            "file contents",
+            false,
+        )))
         .unwrap();
         assert_eq!(result["kind"], "tool_result");
         assert_eq!(result["call_id"], "call_1");
@@ -497,12 +527,7 @@ mod tests {
             name: "read_file".into(),
             arguments: ToolArguments::try_from(serde_json::json!({"path": "x"})).unwrap(),
         };
-        let result = ToolResult {
-            call_id: call.id.clone(),
-            status: ToolStatus::Success,
-            content: "ok".into(),
-            truncated: false,
-        };
+        let result = ToolResult::new(call.id.clone(), ToolStatus::Success, "ok", false);
         assert_eq!(result.call_id, call.id);
         assert_eq!(result.call_id.as_str(), "call_77");
     }
@@ -652,5 +677,39 @@ mod tests {
         assert_eq!(serde_json::to_string(&a).unwrap(), "41");
         let back: ItemIndex = serde_json::from_str("41").unwrap();
         assert_eq!(a, back);
+    }
+
+    #[test]
+    fn tool_result_effects_round_trip() {
+        let effects = ToolEffects::none()
+            .with_file_written("src/lib.rs")
+            .with_file_deleted("src/old.rs")
+            .with_command(CommandEffect::new(
+                "cargo",
+                vec!["test".to_owned()],
+                Some(0),
+            ));
+        let mut result = ToolResult::new(
+            ToolCallId::try_from("call_1".to_string()).unwrap(),
+            ToolStatus::Success,
+            "wrote src/lib.rs",
+            false,
+        );
+        result.effects = effects.clone();
+        let json = serde_json::to_string(&result).unwrap();
+        let back: ToolResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.effects, effects);
+    }
+
+    #[test]
+    fn effects_default_to_empty_when_a_record_predates_them() {
+        let legacy = serde_json::json!({
+            "call_id": "call_1",
+            "status": "success",
+            "content": "ok",
+            "truncated": false,
+        });
+        let result: ToolResult = serde_json::from_value(legacy).unwrap();
+        assert!(result.effects.is_empty());
     }
 }

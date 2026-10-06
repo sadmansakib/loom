@@ -524,12 +524,12 @@ mod tests {
                 tool_calls: Vec::new(),
                 stop_reason: StopReason::EndTurn,
             }),
-            Message::ToolResult(ToolResult {
-                call_id: ToolCallId::try_from("call_1".to_owned()).unwrap(),
-                status: ToolStatus::Success,
-                content: "[package]".into(),
-                truncated: false,
-            }),
+            Message::ToolResult(ToolResult::new(
+                ToolCallId::try_from("call_1".to_owned()).unwrap(),
+                ToolStatus::Success,
+                "[package]",
+                false,
+            )),
         ];
         let expected_roles = ["system", "user", "assistant", "tool_result"];
         for (msg, role) in messages.iter().zip(expected_roles) {

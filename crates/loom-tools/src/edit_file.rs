@@ -5,13 +5,13 @@
 //! occurrence the model meant.
 
 use futures::future::BoxFuture;
-use loom_kernel::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
+use loom_kernel::tool::{Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::OnceLock;
 
-use crate::confinement::resolve_within;
+use crate::confinement::{resolve_within, workspace_relative};
 
 /// Edits larger than this are refused: the whole file is read into memory and
 /// rewritten, so an unbounded read is a memory spike (a large generated file
@@ -76,12 +76,16 @@ impl Tool for EditFileTool {
                 .map_err(|err| ToolError::InvalidInput(format!("invalid arguments: {err}")))?;
             let display = input.path;
             let path = resolve_within(&ctx.workspace_root, &display)?;
+            let relative = workspace_relative(&ctx.workspace_root, &path);
             let old = input.old_string;
             let new = input.new_string;
             tokio::task::spawn_blocking(move || apply_edit(&path, &old, &new))
                 .await
                 .map_err(|err| ToolError::Execution(format!("edit task failed: {err}")))?
-                .map(|detail| ToolOutput::new(format!("edited {display}: {detail}")))
+                .map(|detail| {
+                    ToolOutput::new(format!("edited {display}: {detail}"))
+                        .with_effects(ToolEffects::none().with_file_written(relative))
+                })
         })
     }
 }
@@ -164,6 +168,7 @@ mod tests {
         .await
         .expect("ok");
         assert_eq!(output.content, "edited f.rs: replaced 1 occurrence");
+        assert_eq!(output.effects.files_written, vec!["f.rs".to_string()]);
         assert_eq!(
             std::fs::read_to_string(guard.path().join("f.rs")).expect("read"),
             "fn add() { 1 }\n"

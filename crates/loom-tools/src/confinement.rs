@@ -50,6 +50,23 @@ pub(crate) fn resolve_within(root: &Path, user: &str) -> Result<PathBuf, ToolErr
     walk(&canonical_root, &canonical_root, Path::new(user), 0)
 }
 
+/// The workspace-relative, `/`-separated form of a path that came from
+/// [`resolve_within`], for tool effect records (ADR-012).
+///
+/// Effect paths are stored relative so a record means the same thing on
+/// any machine and never leaks an absolute home directory. If `path`
+/// does not sit under `root` (defensive — `resolve_within` guarantees
+/// it does) the path is rendered as-is.
+pub(crate) fn workspace_relative(root: &Path, path: &Path) -> String {
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let relative = path.strip_prefix(&canonical_root).unwrap_or(path);
+    relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Maximum nested **dangling**-link resolution depth before the walk
 /// fails loudly. The kernel reports ELOOP past 40 symlink levels;
 /// dangling targets are resolved recursively here, so they need

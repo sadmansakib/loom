@@ -613,12 +613,12 @@ mod tests {
                         tool_calls: vec![call],
                         stop_reason: StopReason::ToolCalls,
                     }),
-                    Message::ToolResult(ToolResult {
-                        call_id: ToolCallId::try_from("call_1".to_owned()).unwrap(),
-                        status: loom_kernel::transcript::ToolStatus::Success,
-                        content: "file body".into(),
-                        truncated: false,
-                    }),
+                    Message::ToolResult(ToolResult::new(
+                        ToolCallId::try_from("call_1".to_owned()).unwrap(),
+                        loom_kernel::transcript::ToolStatus::Success,
+                        "file body",
+                        false,
+                    )),
                 ],
                 ..request()
             },

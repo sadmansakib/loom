@@ -77,7 +77,11 @@ impl Tool for ReadFileTool {
                 crate::text::decode_capped(bytes, MAX_TOOL_OUTPUT_BYTES).ok_or_else(|| {
                     ToolError::Execution(format!("cannot read \"{display}\": not valid UTF-8"))
                 })?;
-            Ok(ToolOutput { content, truncated })
+            let mut output = ToolOutput::new(content);
+            if truncated {
+                output = output.with_truncated();
+            }
+            Ok(output)
         })
     }
 }

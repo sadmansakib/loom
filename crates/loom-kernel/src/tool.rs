@@ -17,6 +17,8 @@
 //!   token, timeout budget).
 //! - [`ToolOutput`]/[`ToolError`] — what a call returns; the engine maps
 //!   these onto transcript `ToolResult`s.
+//! - [`ToolEffects`] — what a call changed outside Loom (files, commands),
+//!   recorded at execution; never declared by the model (ADR-012).
 //! - [`ToolRegistry`] — name-keyed set of tools the engine dispatches
 //!   against.
 
@@ -124,12 +126,99 @@ impl ToolContext {
     }
 }
 
+/// One external command a tool ran, recorded at execution time.
+///
+/// Part of [`ToolEffects`]; kept structured — not a rendered shell
+/// string — so later policy (dependency scheduling, change→failure
+/// linkage, cache invalidation) can reason over it without re-parsing.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandEffect {
+    /// The executable name (bare, never a path).
+    pub program: String,
+    /// The arguments, one entry each.
+    pub args: Vec<String>,
+    /// Process exit code, or `None` when the platform reported none
+    /// (e.g. terminated by signal).
+    pub exit_code: Option<i32>,
+}
+
+impl CommandEffect {
+    /// Records one executed command and its exit status.
+    pub fn new(program: impl Into<String>, args: Vec<String>, exit_code: Option<i32>) -> Self {
+        Self {
+            program: program.into(),
+            args,
+            exit_code,
+        }
+    }
+}
+
+/// The side effects one tool call had on the outside world.
+///
+/// Recorded by the tool at execution time, never declared by the model
+/// and never inferred after the fact (ADR-012, Invariant 12). Read-only
+/// tools return [`ToolEffects::none`]. Paths are workspace-relative and
+/// `/`-separated so a record is stable across platforms.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolEffects {
+    /// Files created or overwritten, workspace-relative.
+    pub files_written: Vec<String>,
+    /// Files deleted, workspace-relative.
+    pub files_deleted: Vec<String>,
+    /// External commands executed.
+    pub commands_run: Vec<CommandEffect>,
+}
+
+impl ToolEffects {
+    /// No effects — the read-only default.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Whether the call changed anything outside Loom's own state.
+    pub fn is_empty(&self) -> bool {
+        self.files_written.is_empty()
+            && self.files_deleted.is_empty()
+            && self.commands_run.is_empty()
+    }
+
+    /// Records a file the call created or overwrote.
+    #[must_use]
+    pub fn with_file_written(mut self, path: impl Into<String>) -> Self {
+        self.files_written.push(path.into());
+        self
+    }
+
+    /// Records a file the call deleted.
+    #[must_use]
+    pub fn with_file_deleted(mut self, path: impl Into<String>) -> Self {
+        self.files_deleted.push(path.into());
+        self
+    }
+
+    /// Records a command the call executed.
+    #[must_use]
+    pub fn with_command(mut self, command: CommandEffect) -> Self {
+        self.commands_run.push(command);
+        self
+    }
+}
+
 /// What a successful tool call produced.
 ///
 /// The engine stores `content` as the model-visible
 /// [`ToolResult::content`](crate::transcript::ToolResult::content);
 /// `truncated` flows to
-/// [`ToolResult::truncated`](crate::transcript::ToolResult::truncated).
+/// [`ToolResult::truncated`](crate::transcript::ToolResult::truncated)
+/// and `effects` to
+/// [`ToolResult::effects`](crate::transcript::ToolResult::effects).
+///
+/// `#[non_exhaustive]`: construct with [`ToolOutput::new`] and the
+/// builder methods so later iterations can carry more metadata (ADR-012)
+/// without another breaking change.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutput {
     /// Model-visible text. Concise by convention — the model reads this,
@@ -138,21 +227,37 @@ pub struct ToolOutput {
     /// Whether `content` was cut short (e.g. a byte cap); orthogonal to
     /// success/failure.
     pub truncated: bool,
+    /// What the call changed outside Loom's own state.
+    pub effects: ToolEffects,
 }
 
 impl ToolOutput {
-    /// Full (untruncated) output.
+    /// Full (untruncated) output with no recorded effects.
     pub fn new(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             truncated: false,
+            effects: ToolEffects::none(),
         }
     }
 
     /// Marks the output as truncated (builder style).
+    #[must_use]
     pub fn with_truncated(mut self) -> Self {
         self.truncated = true;
         self
+    }
+
+    /// Attaches the call's recorded side effects (builder style).
+    #[must_use]
+    pub fn with_effects(mut self, effects: ToolEffects) -> Self {
+        self.effects = effects;
+        self
+    }
+
+    /// The call's recorded side effects.
+    pub fn effects(&self) -> &ToolEffects {
+        &self.effects
     }
 }
 
