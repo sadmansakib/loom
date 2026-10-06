@@ -23,7 +23,7 @@
 //!   against.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -118,20 +118,35 @@ pub struct ToolContext {
     /// ADR-017). Derived from the turn's recorded [`ToolEffects`], not
     /// from a model declaration, so verification can link a failure to a
     /// recent change without a symbol graph. Empty for read-only runs.
-    pub recent_changes: Vec<String>,
+    ///
+    /// Shared rather than snapshotted so effects recorded by calls earlier
+    /// in the *same* batch are visible to a later `verify` call in that
+    /// batch (same-batch change→failure linkage); the loop seeds it from
+    /// committed results and the tool engine appends as calls finish.
+    pub recent_changes: Arc<Mutex<Vec<String>>>,
 }
+
+/// Cap on [`ToolContext::recent_changes`]: the most recent mutations are
+/// what verification links to.
+pub const MAX_RECENT_CHANGES: usize = 32;
 
 impl std::fmt::Debug for ToolContext {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // `dyn ArtifactStore` is not `Debug`; report only whether a store
-        // is attached, which is all a caller needs from a log line.
+        // is attached, which is all a caller needs from a log line. The
+        // recent-change list is behind a lock, so read its length first.
+        let recent_changes = self
+            .recent_changes
+            .lock()
+            .map(|paths| paths.len())
+            .unwrap_or(0);
         formatter
             .debug_struct("ToolContext")
             .field("workspace_root", &self.workspace_root)
             .field("cancellation", &self.cancellation)
             .field("timeout", &self.timeout)
             .field("artifacts", &self.artifacts.is_some())
-            .field("recent_changes", &self.recent_changes.len())
+            .field("recent_changes", &recent_changes)
             .finish()
     }
 }
@@ -152,7 +167,7 @@ impl ToolContext {
             cancellation,
             timeout,
             artifacts: None,
-            recent_changes: Vec::new(),
+            recent_changes: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -168,8 +183,41 @@ impl ToolContext {
     /// (builder style, 2F). Oldest first; the derive is workspace-relative.
     #[must_use]
     pub fn with_recent_changes(mut self, recent_changes: Vec<String>) -> Self {
-        self.recent_changes = recent_changes;
+        self.recent_changes = Arc::new(Mutex::new(recent_changes));
         self
+    }
+
+    /// A snapshot of the recently changed paths, oldest first — what
+    /// verification links failures to.
+    #[must_use]
+    pub fn recent_changes(&self) -> Vec<String> {
+        self.recent_changes
+            .lock()
+            .map(|paths| paths.clone())
+            .unwrap_or_default()
+    }
+
+    /// Records a completed call's file effects so calls later in the same
+    /// batch see them (same-batch change→failure linkage, 2F). Deduped and
+    /// capped at [`MAX_RECENT_CHANGES`]; the tool engine calls this as each
+    /// call finishes, before the next call in a sequential batch starts.
+    pub fn note_effects(&self, effects: &ToolEffects) {
+        let Ok(mut paths) = self.recent_changes.lock() else {
+            return;
+        };
+        for path in effects
+            .files_written
+            .iter()
+            .chain(effects.files_deleted.iter())
+        {
+            if !paths.contains(path) {
+                paths.push(path.clone());
+            }
+        }
+        if paths.len() > MAX_RECENT_CHANGES {
+            let excess = paths.len() - MAX_RECENT_CHANGES;
+            paths.drain(..excess);
+        }
     }
 }
 

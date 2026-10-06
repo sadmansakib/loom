@@ -415,12 +415,28 @@ pub fn nextest_junit(output: &str) -> Vec<TestFailure> {
 }
 
 /// Reads `attr="value"` from a tag string.
+///
+/// The attribute name must start at a boundary — the start of the tag or a
+/// preceding whitespace, `<`, or `/` — so a request for `name="…"` cannot be
+/// satisfied by `classname="…"` (or any other attribute sharing the suffix).
 fn attribute(tag: &str, attr: &str) -> Option<String> {
     let needle = format!("{attr}=\"");
-    let start = tag.find(&needle)? + needle.len();
-    let rest = &tag[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_owned())
+    let mut from = 0;
+    while let Some(offset) = tag[from..].find(&needle) {
+        let start = from + offset;
+        let boundary = start == 0
+            || matches!(
+                tag.as_bytes()[start - 1],
+                b' ' | b'\t' | b'\n' | b'\r' | b'<' | b'/'
+            );
+        if boundary {
+            let rest = &tag[start + needle.len()..];
+            let end = rest.find('"')?;
+            return Some(rest[..end].to_owned());
+        }
+        from = start + 1;
+    }
+    None
 }
 
 /// The text between the first `>` and the next `<` in a tag fragment.
@@ -516,6 +532,21 @@ test result: FAILED. 1 passed; 1 failed
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].name, "a::b");
         assert!(failures[0].location.is_none());
+    }
+
+    #[test]
+    fn nextest_junit_attribute_requires_a_boundary() {
+        // `classname` precedes `name`; a substring match would return the
+        // classname as the test name.
+        let output = r#"<testsuites><testsuite>
+    <testcase classname="app::payment" name="payment::rejects_negative" time="0.02">
+      <failure message="assertion failed">left: 200, right: 400</failure>
+    </testcase>
+</testsuite></testsuites>"#;
+        let failures = nextest_junit(output);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].name, "payment::rejects_negative");
+        assert_eq!(failures[0].message, "assertion failed");
     }
 
     #[test]

@@ -362,6 +362,11 @@ impl<'a> ToolBatch<'a> {
         let mut stream = stream::iter(calls.iter().zip(slots.iter().zip(started_flags.iter())))
             .map(|(call, (slot, started))| async move {
                 let result = execute_call(self.registry, self.exposure, call, ctx, started).await;
+                // Record file effects before the next call in a sequential
+                // batch starts, so a `verify` later in this same batch links
+                // to a write earlier in it (same-batch linkage, 2F). Read-only
+                // batches run concurrently and report no effects.
+                ctx.note_effects(&result.effects);
                 lock_slot(slot).replace(result);
             })
             .buffered(bound);

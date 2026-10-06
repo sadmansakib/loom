@@ -114,7 +114,8 @@ impl Tool for VerifyTool {
                 args.clone(),
                 output.status.code(),
             ));
-            Ok(render(program, &args, &output, &ctx.recent_changes).with_effects(effects))
+            let recent_changes = ctx.recent_changes();
+            Ok(render(program, &args, &output, &recent_changes).with_effects(effects))
         })
     }
 }
@@ -151,15 +152,25 @@ fn render(
     text.push('\n');
 
     if evidence.is_empty() {
-        // Nothing parseable: fall back to the bounded raw output so a failure
-        // is never hidden, just capped.
-        if !raw.trim().is_empty() {
-            text.push_str("--- output ---\n");
-            text.push_str(&raw);
-        }
-        if !stderr.trim().is_empty() {
-            text.push_str("--- stderr ---\n");
-            text.push_str(&stderr);
+        if output.status.success() {
+            // A clean run is a pass, not a log: report the harness summary
+            // line (or a fixed statement) and omit the raw output, so the
+            // success path honours "Output is never a full log".
+            let summary = pass_summary(&raw)
+                .unwrap_or_else(|| String::from("no diagnostics, no failing tests"));
+            text.push_str(&summary);
+            text.push('\n');
+        } else {
+            // Nothing parseable but the command failed: fall back to the
+            // bounded raw output so the failure is never hidden, just capped.
+            if !raw.trim().is_empty() {
+                text.push_str("--- output ---\n");
+                text.push_str(&raw);
+            }
+            if !stderr.trim().is_empty() {
+                text.push_str("--- stderr ---\n");
+                text.push_str(&stderr);
+            }
         }
     } else {
         text.push_str(&evidence.render());
@@ -172,6 +183,16 @@ fn render(
     );
     let output = ToolOutput::new(text);
     if cut { output.with_truncated() } else { output }
+}
+
+/// The libtest summary line (`test result: ok. …`), if present, so a passing
+/// run reports counts rather than the raw log.
+fn pass_summary(raw: &str) -> Option<String> {
+    raw.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.starts_with("test result:"))
+        .map(str::to_owned)
 }
 
 /// `exit status: N`, or the signal form. A non-zero exit is a successful tool
@@ -223,6 +244,37 @@ mod tests {
                 .contains("[error] mismatched types (E0308) at src/lib.rs:3:9")
         );
         assert!(rendered.content.contains("relevant change: src/lib.rs"));
+    }
+
+    #[test]
+    fn render_reports_a_compact_pass_on_success() {
+        let rendered = render(
+            "cargo",
+            &["test".to_owned()],
+            &output(
+                0,
+                "running 2 tests\ntest a ... ok\ntest b ... ok\ntest result: ok. 2 passed; 0 failed\n",
+                "",
+            ),
+            &["src/lib.rs".to_owned()],
+        );
+        assert!(
+            rendered.content.contains("exit status: 0"),
+            "{}",
+            rendered.content
+        );
+        assert!(
+            rendered
+                .content
+                .contains("test result: ok. 2 passed; 0 failed"),
+            "{}",
+            rendered.content
+        );
+        assert!(
+            !rendered.content.contains("--- output ---"),
+            "{}",
+            rendered.content
+        );
     }
 
     #[test]

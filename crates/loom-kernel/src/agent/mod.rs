@@ -1087,17 +1087,15 @@ fn ledger_key(call: &ToolCall) -> (String, String) {
     )
 }
 
-/// The loop's refusal result for a repeated failed call: the tool never runs,
-/// so no side effect occurs, and the model is told to change approach.
 /// Workspace-relative paths the task has mutated so far (2F, ADR-017).
 ///
 /// Derived from the recorded [`ToolEffects`](crate::tool::ToolEffects) on
 /// each committed tool result — never diffed and never model-declared — so
 /// verification links a failure to what the loop actually changed. Deduped
-/// oldest-first and capped, most recent retained.
+/// oldest-first and capped, most recent retained. Effects from calls in the
+/// *current* batch are appended to the shared [`ToolContext`] list as those
+/// calls finish (`ToolContext::note_effects`), covering same-batch writes.
 fn recent_changes(session: &Session) -> Vec<String> {
-    /// Keep the evidence block small; the most recent mutations matter most.
-    const MAX: usize = 32;
     let mut seen = std::collections::HashSet::new();
     let mut paths = Vec::new();
     for item in &session.transcript {
@@ -1115,12 +1113,14 @@ fn recent_changes(session: &Session) -> Vec<String> {
             }
         }
     }
-    if paths.len() > MAX {
-        paths.drain(..paths.len() - MAX);
+    if paths.len() > crate::tool::MAX_RECENT_CHANGES {
+        paths.drain(..paths.len() - crate::tool::MAX_RECENT_CHANGES);
     }
     paths
 }
 
+/// The loop's refusal result for a repeated failed call: the tool never runs,
+/// so no side effect occurs, and the model is told to change approach.
 fn repeated_call_result(call: &ToolCall) -> ToolResult {
     ToolResult::new(
         call.id.clone(),
