@@ -1,0 +1,8 @@
+{
+  "id": "B1",
+  "prompt": "Inspect this repository, find the implementation of the retry and cancellation handling in the agent loop, explain how it works, and identify the relevant files.",
+  "tools": "read-only",
+  "heavy": false,
+  "system_prompt_file": "system-prompt.txt",
+  "workspace": "repo"
+}

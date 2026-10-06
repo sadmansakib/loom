@@ -2,13 +2,15 @@
 //!
 //! Precedes all optimization work. Four pieces:
 //!
-//! 1. **Pinned task set B1–B4 (plus heavy B5).** B1 inspects the Loom
-//!    repo with the read-only tools; B2–B4 exercise the mutating tools
-//!    against a generated fixture crate under the eval dir. B5 is a
-//!    read-then-edit long-context task over a generated corpus (each read
-//!    is superseded by the following edit, so pruning is safe); it is far
-//!    slower and costlier, so it runs only when named in
-//!    `LOOM_EVAL_TASKS`. Prompts are frozen.
+//! 1. **Task directories** under `tests/eval-tasks/<ID>/`: a `task.json`
+//!    (prompt, tools, workspace kind, gate, `heavy`), an optional
+//!    `system-prompt.txt`, and an optional `workspace/` tree copied
+//!    verbatim into a fresh run root per run. B1 inspects the Loom repo
+//!    with the read-only tools; B2–B4 mutate a small copied crate; B5 is
+//!    a read-then-edit long-context task over a generated corpus (each
+//!    read is superseded by the following edit, so pruning is safe); B6
+//!    and B7 seed real shipped bugs. Heavy tasks (B5, B7) run only when
+//!    named in `LOOM_EVAL_TASKS`. Prompts are frozen.
 //! 2. **N-run protocol.** B1 showed 1.85× input-token variance on a pinned
 //!    task (thinking mode ignores temperature), so live evaluation always
 //!    runs N ≥ 5 times and reports mean/median/min/max — never a single
@@ -18,12 +20,17 @@
 //!    agent offline (canned responses, real tools) and require the
 //!    transcript's assistant items to equal the recordings verbatim — the
 //!    V3 / Invariant-10 replayability claim, tested without a network.
-//! 4. **Outcome grading.** B2–B4 are gated on the workspace state they
-//!    leave behind (files, code, green tests) and B6–B7 on real shipped
-//!    bugs (protected regression tests pass, untouched) — the model
-//!    claiming success is never sufficient. Lab tasks (B1/B5) keep
-//!    pinned prompts as regression instruments; field tasks run with
-//!    the engine-default prompt users actually get.
+//! 4. **Outcome grading.** Field tasks are gated on the workspace state
+//!    they leave behind — outcome checks (exact bytes, substrings, a
+//!    green suite) for B2–B4, and for the real-bug tasks (B6–B7) the
+//!    SWE-bench shape: FAIL_TO_PASS tests that must flip green,
+//!    PASS_TO_PASS tests that must stay green, and protected test files
+//!    compared byte-for-byte. The model claiming success is never
+//!    sufficient. Lab tasks (B1/B5) stay un-gated on purpose — they are
+//!    regression instruments with pinned prompts; field tasks run with
+//!    the engine-default prompt users actually get. Every live run
+//!    produces a suite report with a gated pass-rate headline
+//!    (`report-suite-<model>.json`).
 //!
 //! Also: a **context census** per turn, reported as **exact serialized bytes
 //! by source** (system / user / assistant / tool_result / tool specs) plus the
@@ -89,92 +96,6 @@ use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------- tasks ---
 
-/// Which workspace a task runs against.
-#[derive(Clone, Copy)]
-enum Workspace {
-    /// The Loom repository itself (read-only inspection, B1).
-    Repo,
-    /// A generated throwaway crate under the eval dir (B2–B4).
-    Fixture,
-    /// A generated long-context corpus of ~40 KB markdown documents
-    /// (B5); sized so a sequential read pushes the projection past the
-    /// 64 K pruning trigger.
-    Corpus,
-    /// A crate seeded with a **real shipped bug** from Loom's history
-    /// (B6–B7): the failing regression test ships alongside the faulty
-    /// implementation, and the run is graded by a post-task gate —
-    /// `cargo test` green with the protected test files untouched.
-    Bugfix(&'static BugfixCrate),
-}
-
-/// Spec for a [`Workspace::Bugfix`] task: a self-contained crate whose
-/// `src/` reproduces a real past fault verbatim (trimmed of workspace
-/// machinery), with the real regression tests that exposed it placed in
-/// protected files the agent may not touch. The gate after the run is
-/// SWE-bench-shaped: the tests that failed before must pass after, and
-/// the tests must not have been modified.
-struct BugfixCrate {
-    /// Crate (and directory) name under the eval dir.
-    name: &'static str,
-    /// `(path, contents)` written on setup; wiped and rewritten per run.
-    files: &'static [(&'static str, &'static str)],
-    /// Files the agent must not modify; the gate compares their bytes.
-    protected: &'static [&'static str],
-    /// Tests the protected suite must report passing after the fix. Guards
-    /// against gaming the manifest: disabling a test target would still
-    /// print `test result: ok`, just with too few tests run.
-    expected_passed: u64,
-}
-
-/// Post-task outcome checks for fixture tasks (B2–B4): the run is graded
-/// by the workspace state it leaves behind, not by the model claiming
-/// success. Checks are deliberately cheap and objective — exact bytes
-/// where the prompt pins them, distinctive substrings where it does not,
-/// and `cargo test` where the task is code. Live runs only, like the
-/// bugfix gate: replay re-executes recorded edits for determinism, not
-/// for grading.
-struct OutcomeSpec {
-    /// `(relative path, required bytes)` pairs; one optional trailing
-    /// newline is tolerated (editors and writers emit it, and the prompt
-    /// pins the text, not the byte count).
-    exact_files: &'static [(&'static str, &'static str)],
-    /// `(relative path, required substring)` pairs, case-insensitive: a
-    /// proxy for "the file addresses this subject".
-    contains: &'static [(&'static str, &'static str)],
-    /// When set, `cargo test` must exit 0 with at least this many passing
-    /// tests — the task must not break the suite it touched.
-    tests_green: Option<u64>,
-}
-
-/// B2: greeting.txt must hold exactly the requested text.
-const B2_OUTCOME: OutcomeSpec = OutcomeSpec {
-    exact_files: &[("eval-notes/greeting.txt", "hello eval")],
-    contains: &[],
-    tests_green: None,
-};
-
-/// B3: `sub` must exist beside `add`, and the crate's own suite (1 test
-/// ships with the fixture) must still pass.
-const B3_OUTCOME: OutcomeSpec = OutcomeSpec {
-    exact_files: &[],
-    contains: &[("src/calc.rs", "fn sub")],
-    tests_green: Some(1),
-};
-
-/// B4: summaries.md must exist and address every source document. The
-/// prompt asks for one paragraph per file; a paragraph that never names
-/// its subject cannot be a summary of it, so the distinctive keyword per
-/// document is the proxy. (File order is required by the prompt but not
-/// checked — ordering prose would over-fit the gate.)
-const B4_OUTCOME: OutcomeSpec = OutcomeSpec {
-    exact_files: &[],
-    contains: &[
-        ("docs-notes/summaries.md", "alpha"),
-        ("docs-notes/summaries.md", "beta"),
-    ],
-    tests_green: None,
-};
-
 /// The tools a task may call. Deliberately coarse: the point is to pin
 /// which capabilities a baseline exercised, not to configure the agent.
 #[derive(Debug, Clone, Copy)]
@@ -182,7 +103,7 @@ enum ToolSet {
     /// `read_file`, `list_dir`, `search` (B1's 2026-10-06 baseline).
     ReadOnly,
     /// Read-only set plus `write_file`, `edit_file`, `run_command`,
-    /// `verify` (B2–B4).
+    /// `verify` (B2–B4, B6–B7).
     Coding,
     /// `read_file` + `list_dir` + `edit_file` (B5). The task reads each file
     /// and then edits it, so every read becomes stale (superseded by the
@@ -191,305 +112,199 @@ enum ToolSet {
     ReadEdit,
 }
 
-/// A pinned evaluation task. Prompts are frozen: changing one invalidates
-/// every baseline recorded against it.
-struct EvalTask {
-    id: &'static str,
-    prompt: &'static str,
-    workspace: Workspace,
-    /// Capabilities available to the task; B1 keeps the read-only set so its
-    /// 2026-10-06 baseline stays comparable.
-    tools: ToolSet,
-    /// Long-context task: skipped unless explicitly named in
-    /// `LOOM_EVAL_TASKS` (it is far slower and costlier than B1–B4).
-    heavy: bool,
-    /// System prompt: `None` runs with the engine default — coding tasks
-    /// must measure the prompt users actually get, so parity cannot drift.
-    /// Read-only (B1) and long-context (B5) keep task-specific prompts
-    /// deliberately: they pin baselines and force whole-file reading.
-    system_prompt: Option<&'static str>,
-    /// Outcome gate for fixture tasks: the workspace state a run leaves
-    /// behind. `None` for lab tasks (B1/B5) and bugfix tasks (graded by
-    /// their own gate).
-    outcome: Option<&'static OutcomeSpec>,
+/// Which workspace a task runs against.
+enum TaskWorkspace {
+    /// The Loom repository itself (read-only inspection, B1).
+    Repo,
+    /// The task's `workspace/` directory, copied verbatim under the eval
+    /// dir per run (B2–B4, B6–B7). Copying — not symlinking — keeps the
+    /// run writable and byte-identical at start.
+    Copy(PathBuf),
+    /// A generated long-context corpus of ~40 KB markdown documents
+    /// (B5); sized so a sequential read pushes the projection past the
+    /// 64 K pruning trigger.
+    Corpus,
 }
 
-const TASKS: &[EvalTask] = &[
-    EvalTask {
-        id: "B1",
-        prompt: "Inspect this repository, find the implementation of the \
-                 retry and cancellation handling in the agent loop, explain \
-                 how it works, and identify the relevant files.",
-        workspace: Workspace::Repo,
-        tools: ToolSet::ReadOnly,
-        heavy: false,
-        system_prompt: Some(READ_ONLY_SYSTEM_PROMPT),
-        outcome: None,
-    },
-    EvalTask {
-        id: "B2",
-        prompt: "Create the file eval-notes/greeting.txt containing exactly \
-                 the text 'hello eval', then read it back and verify its \
-                 content.",
-        workspace: Workspace::Fixture,
-        tools: ToolSet::Coding,
-        heavy: false,
-        system_prompt: None,
-        outcome: Some(&B2_OUTCOME),
-    },
-    EvalTask {
-        id: "B3",
-        prompt: "Add a function `sub(a: i64, b: i64)` to src/calc.rs \
-                 mirroring the existing `add` function, then run the tests \
-                 covering src/calc.rs and report any failures.",
-        workspace: Workspace::Fixture,
-        tools: ToolSet::Coding,
-        heavy: false,
-        system_prompt: None,
-        outcome: Some(&B3_OUTCOME),
-    },
-    EvalTask {
-        id: "B4",
-        prompt: "Read every markdown file under docs-notes/, then write a \
-                 one-paragraph summary of each file into \
-                 docs-notes/summaries.md, in file order.",
-        workspace: Workspace::Fixture,
-        tools: ToolSet::Coding,
-        heavy: false,
-        system_prompt: None,
-        outcome: Some(&B4_OUTCOME),
-    },
-    EvalTask {
-        id: "B5",
-        prompt: "There are 8 markdown files in corpus/, named doc-01.md \
-                 through doc-08.md. Process them in ascending filename \
-                 order. For each file: read it with read_file, then append a \
-                 line to it with edit_file by setting old_string to the \
-                 file's current last line and new_string to that same last \
-                 line followed by a newline and the text 'Reviewed.'. Issue \
-                 exactly one tool call per turn and stop after that single \
-                 call so the next turn continues with the next file. Do not \
-                 search or read partial ranges, do not skip any file, and do \
-                 not stop before all 8 files are processed: stopping early \
-                 fails the task. After the last file is edited, reply with a \
-                 single line DONE.",
-        workspace: Workspace::Corpus,
-        tools: ToolSet::ReadEdit,
-        heavy: true,
-        system_prompt: Some(LONG_CONTEXT_SYSTEM_PROMPT),
-        outcome: None,
-    },
-    EvalTask {
-        id: "B6",
-        prompt: "The test suite of this crate fails. Find the fault in the \
-                 implementation, fix it, and make `cargo test` pass. The \
-                 tests are the specification: do not modify anything under \
-                 tests/.",
-        workspace: Workspace::Bugfix(&B6_CRATE),
-        tools: ToolSet::Coding,
-        heavy: false,
-        system_prompt: None,
-        outcome: None,
-    },
-    EvalTask {
-        id: "B7",
-        prompt: "The test suite of this crate fails, and it leaks processes. \
-                 Find the fault in the implementation, fix it, and make \
-                 `cargo test` pass. The tests are the specification: do not \
-                 modify anything under tests/.",
-        workspace: Workspace::Bugfix(&B7_CRATE),
-        tools: ToolSet::Coding,
-        // Heavy, and honestly hard: in measurement (2026-10-06,
-        // deepseek-flash, N=2) the model understood the fault and
-        // attempted real fixes but exhausted its turns iterating
-        // compile-test cycles through full fixture rebuilds — 33–47
-        // exchanges, 12–40 minutes, both runs unsolved. Kept as an
-        // opt-in difficulty probe, not a default-suite task.
-        heavy: true,
-        system_prompt: None,
-        outcome: None,
-    },
-];
+/// Post-task outcome checks: the run is graded by the workspace state it
+/// leaves behind, not by the model claiming success. Checks are
+/// deliberately cheap and objective — exact bytes where the prompt pins
+/// them, distinctive substrings where it does not, and `cargo test`
+/// where the task is code. Live runs only: replay re-executes recorded
+/// edits for determinism, not for grading.
+struct OutcomeSpec {
+    /// `(relative path, required bytes)` pairs; one optional trailing
+    /// newline is tolerated (editors and writers emit it, and the prompt
+    /// pins the text, not the byte count).
+    exact_files: Vec<(String, String)>,
+    /// `(relative path, required substring)` pairs, case-insensitive: a
+    /// proxy for "the file addresses this subject".
+    contains: Vec<(String, String)>,
+    /// When set, `cargo test` must exit 0 with at least this many passing
+    /// tests — the task must not break the suite it touched.
+    tests_green: Option<u64>,
+}
 
-/// B1's original read-only prompt, kept byte-identical to the 2026-10-06
-/// baseline (and to `benchmark.rs`).
-const READ_ONLY_SYSTEM_PROMPT: &str = "You are Loom, a minimal coding agent working read-only inside one workspace. \
-     Use the provided tools to inspect the workspace: list directories and search \
-     before reading large files, and prefer reading the smallest relevant range. \
-     When you answer, be concise and name the workspace-relative paths you relied on.";
+/// SWE-bench-shaped gate for real-bug tasks: `cargo test` must exit 0,
+/// every FAIL_TO_PASS test must have flipped from failing to passing,
+/// every PASS_TO_PASS test must still pass (so the fix cannot trade one
+/// regression for another), and the protected test files must be
+/// byte-identical to their pre-run snapshot. Grading by name subsumes
+/// the old passing-count check: disabling the test target removes the
+/// names from the passing set.
+struct BugfixSpec {
+    /// Files the agent must not modify; the gate compares their bytes.
+    protected: Vec<String>,
+    /// Test names, exactly as libtest prints them, that fail on the
+    /// seeded bug and must pass after the run.
+    fail_to_pass: Vec<String>,
+    /// Test names that pass on the seed and must keep passing.
+    pass_to_pass: Vec<String>,
+}
 
-/// B5's prompt: the opposite of the read-only default. A long-context task
-/// must read whole files without searching, so the model cannot satisfy it
-/// with a few small ranges and never exercises the pruning trigger.
-const LONG_CONTEXT_SYSTEM_PROMPT: &str = "You are Loom, a minimal coding agent working inside one workspace. \
-     This task requires reading whole files and then editing them, one after another. \
-     Use read_file to read whole files and edit_file to change them; do not search, \
-     sample, or read partial ranges. Keep going until every requested file has been \
-     processed, then answer exactly as instructed. When you answer, be concise and name \
-     the workspace-relative paths you relied on.";
+enum TaskGate {
+    Outcome(OutcomeSpec),
+    Bugfix(BugfixSpec),
+}
 
-// ------------------------------------------------------------ real bugs ---
-//
-// Field tasks: real faults that shipped in this repository, reproduced
-// as self-contained crates with the regression tests that exposed them.
-// They run with the engine-default system prompt (what users get) and
-// are graded by outcome — see `gate` in `run_once`.
+/// A loaded evaluation task. Tasks live as directories under
+/// `tests/eval-tasks/<id>/` — a `task.json` manifest, an optional
+/// `system-prompt.txt`, and a `workspace/` tree — so the corpus grows by
+/// adding files, not harness code. Prompts are frozen: changing one
+/// invalidates every baseline recorded against it.
+struct EvalTask {
+    id: String,
+    prompt: String,
+    workspace: TaskWorkspace,
+    tools: ToolSet,
+    /// Long-context or otherwise costly: skipped unless explicitly named
+    /// in `LOOM_EVAL_TASKS` (B5, B7).
+    heavy: bool,
+    /// System prompt: `None` runs with the engine default — coding tasks
+    /// must measure the prompt users actually get, so parity cannot
+    /// drift. Lab tasks (B1/B5) pin theirs in a file deliberately.
+    system_prompt: Option<String>,
+    gate: Option<TaskGate>,
+    /// Free-form provenance note carried into reports (e.g. the commit a
+    /// real-bug task reproduces).
+    notes: Option<String>,
+}
 
-/// B6 — the "capability lie" (shipped in 26bcf0b, fixed in 62ea5a6):
-/// `parallel_tool_calls` was claimed for every tool-capable catalog
-/// model, so a tools-capable model that rejects parallel calls would
-/// fail the turn with a permanent InvalidRequest. The implementation
-/// below reproduces the fault; the protected tests are adapted from the
-/// real fix's regression assertions.
-static B6_CRATE: BugfixCrate = BugfixCrate {
-    name: "loom-eval-b6",
-    files: &[
-        (
-            "Cargo.toml",
-            "[package]\nname = \"loom-eval-b6\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-             \n[workspace]\n\n[dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\n\
-             \n[dev-dependencies]\nserde_json = \"1\"\n",
-        ),
-        (
-            "src/lib.rs",
-            "//! Capabilities resolved from a provider model catalog.\n\
-             use serde::Deserialize;\n\n\
-             /// One raw catalog entry, as served by the provider.\n\
-             #[derive(Debug, Clone, Deserialize)]\n\
-             pub struct RawModel {\n    \
-             pub id: String,\n    \
-             pub context_length: u64,\n    \
-             #[serde(default)]\n    \
-             pub supported_parameters: Vec<String>,\n\
-             }\n\n\
-             /// What the agent loop needs to know before it schedules calls.\n\
-             #[derive(Debug, Clone, PartialEq)]\n\
-             pub struct Capabilities {\n    \
-             pub max_context_tokens: u64,\n    \
-             pub tool_calls: bool,\n    \
-             pub parallel_tool_calls: bool,\n\
-             }\n\n\
-             impl RawModel {\n    \
-             fn supports(&self, parameter: &str) -> bool {\n        \
-             self.supported_parameters.iter().any(|listed| listed == parameter)\n    \
-             }\n\n    \
-             /// Capabilities for this model.\n    \
-             pub fn capabilities(&self) -> Capabilities {\n        \
-             Capabilities {\n            \
-             max_context_tokens: self.context_length,\n            \
-             tool_calls: self.supports(\"tools\"),\n            \
-             parallel_tool_calls: self.supports(\"tools\"),\n        \
-             }\n    \
-             }\n\
-             }\n",
-        ),
-        (
-            "tests/regression.rs",
-            "use loom_eval_b6::RawModel;\n\n\
-             fn raw(parameters: &[&str]) -> RawModel {\n    \
-             serde_json::from_value(serde_json::json!({\n        \
-             \"id\": \"vendor/model\",\n        \
-             \"context_length\": 200_000,\n        \
-             \"supported_parameters\": parameters,\n    \
-             }))\n    \
-             .expect(\"fixture model\")\n\
-             }\n\n\
-             #[test]\n\
-             fn tools_without_parallel_stay_serial() {\n    \
-             let caps = raw(&[\"tools\"]).capabilities();\n    \
-             assert!(caps.tool_calls, \"tools is listed\");\n    \
-             assert!(\n        \
-             !caps.parallel_tool_calls,\n        \
-             \"parallel_tool_calls is not listed; claiming it can fail the turn\"\n    \
-             );\n\
-             }\n\n\
-             #[test]\n\
-             fn parallel_explicitly_listed_is_honoured() {\n    \
-             let caps = raw(&[\"tools\", \"parallel_tool_calls\"]).capabilities();\n    \
-             assert!(caps.tool_calls && caps.parallel_tool_calls);\n\
-             }\n\n\
-             #[test]\n\
-             fn neither_listed_means_no_calls() {\n    \
-             let caps = raw(&[\"temperature\"]).capabilities();\n    \
-             assert!(!caps.tool_calls && !caps.parallel_tool_calls);\n\
-             }\n",
-        ),
-    ],
-    protected: &["tests/regression.rs"],
-    expected_passed: 3,
-};
+#[derive(Deserialize)]
+struct TaskDef {
+    id: String,
+    prompt: String,
+    tools: String,
+    #[serde(default)]
+    heavy: bool,
+    #[serde(default)]
+    system_prompt_file: Option<String>,
+    workspace: String,
+    #[serde(default)]
+    gate: Option<GateDef>,
+    #[serde(default)]
+    notes: Option<String>,
+}
 
-/// B7 — the orphaned grandchild (documented debt from the first tool
-/// iteration, fixed in 2bd4928): a dropped/aborted command run killed
-/// only the direct child, so grandchildren kept running — and kept the
-/// output pipes open. The implementation reproduces the historical
-/// plain-tokio shape; the protected test is adapted from the real
-/// group-kill regression test.
-static B7_CRATE: BugfixCrate = BugfixCrate {
-    name: "loom-eval-b7",
-    files: &[
-        (
-            "Cargo.toml",
-            "[package]\nname = \"loom-eval-b7\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-             \n[workspace]\n\n[dependencies]\ntokio = { version = \"1\", features = [\"process\", \"rt\", \"macros\", \"time\"] }\n",
-        ),
-        (
-            "src/lib.rs",
-            "//! Run a command and capture its output.\n\
-             use std::process::Stdio;\n\
-             use tokio::process::Command;\n\n\
-             /// Spawns `program`, captures stdout/stderr, and awaits completion.\n\
-             pub async fn run(program: &str, args: &[String]) -> std::io::Result<std::process::Output> {\n    \
-             let child = Command::new(program)\n        \
-             .args(args)\n        \
-             .stdin(Stdio::null())\n        \
-             .stdout(Stdio::piped())\n        \
-             .stderr(Stdio::piped())\n        \
-             .kill_on_drop(true)\n        \
-             .spawn()?;\n    \
-             child.wait_with_output().await\n\
-             }\n",
-        ),
-        (
-            "tests/regression.rs",
-            "use std::time::{Duration, Instant};\n\n\
-             const MARKER: &str = \"loom-eval-b7-marker\";\n\n\
-             /// Cleans up any marker processes this test leaves behind, even\n\
-             /// when an assertion fails first.\n\
-             struct PkillOnDrop;\n\
-             impl Drop for PkillOnDrop {\n    \
-             fn drop(&mut self) {\n        \
-             let _ = std::process::Command::new(\"pkill\").args([\"-f\", MARKER]).status();\n    \
-             }\n\
-             }\n\n\
-             #[tokio::test]\n\
-             async fn aborting_the_runner_kills_the_whole_process_tree() {\n    \
-             let _guard = PkillOnDrop;\n    \
-             let _ = std::process::Command::new(\"pkill\").args([\"-f\", MARKER]).status();\n\n    \
-             let script = format!(\"while :; do sleep 0.5; done & exec sleep 3000 #{MARKER}\");\n    \
-             let args = vec![\"-c\".to_string(), script];\n    \
-             let task = tokio::spawn(async move { loom_eval_b7::run(\"sh\", &args).await });\n    \
-             assert!(alive(), \"the child tree must come up\");\n\n    \
-             task.abort();\n    \
-             let deadline = Instant::now() + Duration::from_secs(5);\n    \
-             while alive() && Instant::now() < deadline {\n        \
-             tokio::time::sleep(Duration::from_millis(100)).await;\n    \
-             }\n    \
-             assert!(!alive(), \"aborting the runner must kill grandchildren too\");\n\
-             }\n\n\
-             fn alive() -> bool {\n    \
-             std::process::Command::new(\"pgrep\")\n        \
-             .arg(\"-f\")\n        \
-             .arg(MARKER)\n        \
-             .output()\n        \
-             .map(|out| !out.stdout.is_empty())\n        \
-             .unwrap_or(false)\n\
-             }\n",
-        ),
-    ],
-    protected: &["tests/regression.rs"],
-    expected_passed: 1,
-};
+#[derive(Deserialize)]
+#[serde(tag = "kind")]
+enum GateDef {
+    #[serde(rename = "outcome")]
+    Outcome {
+        #[serde(default)]
+        exact_files: Vec<(String, String)>,
+        #[serde(default)]
+        contains: Vec<(String, String)>,
+        #[serde(default)]
+        tests_green: Option<u64>,
+    },
+    #[serde(rename = "bugfix")]
+    Bugfix {
+        #[serde(default)]
+        protected: Vec<String>,
+        fail_to_pass: Vec<String>,
+        #[serde(default)]
+        pass_to_pass: Vec<String>,
+    },
+}
+
+fn eval_tasks_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("eval-tasks")
+}
+
+/// Loads every task directory, sorted by path for deterministic order.
+/// Malformed tasks panic: this is a test harness, and a half-loaded
+/// corpus would silently shrink the suite.
+fn tasks() -> Vec<EvalTask> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(eval_tasks_dir())
+        .expect("eval-tasks directory")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    assert!(!dirs.is_empty(), "no task directories in eval-tasks");
+    let mut loaded: Vec<EvalTask> = Vec::new();
+    for dir in dirs {
+        let def: TaskDef =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("task.json")).unwrap()).unwrap();
+        let tools = match def.tools.as_str() {
+            "read-only" => ToolSet::ReadOnly,
+            "coding" => ToolSet::Coding,
+            "read-edit" => ToolSet::ReadEdit,
+            other => panic!("{}: unknown tool set `{other}`", def.id),
+        };
+        let workspace = match def.workspace.as_str() {
+            "repo" => TaskWorkspace::Repo,
+            "copy" => TaskWorkspace::Copy(dir.join("workspace")),
+            "corpus" => TaskWorkspace::Corpus,
+            other => panic!("{}: unknown workspace `{other}`", def.id),
+        };
+        let gate = def.gate.map(|gate| match gate {
+            GateDef::Outcome {
+                exact_files,
+                contains,
+                tests_green,
+            } => TaskGate::Outcome(OutcomeSpec {
+                exact_files,
+                contains,
+                tests_green,
+            }),
+            GateDef::Bugfix {
+                protected,
+                fail_to_pass,
+                pass_to_pass,
+            } => TaskGate::Bugfix(BugfixSpec {
+                protected,
+                fail_to_pass,
+                pass_to_pass,
+            }),
+        });
+        let system_prompt = def.system_prompt_file.map(|file| {
+            let text = std::fs::read_to_string(dir.join(file)).expect("system prompt file");
+            // The file ends with one newline; the prompt itself does not.
+            text.strip_suffix('\n').map(str::to_owned).unwrap_or(text)
+        });
+        loaded.push(EvalTask {
+            id: def.id,
+            prompt: def.prompt,
+            workspace,
+            tools,
+            heavy: def.heavy,
+            system_prompt,
+            gate,
+            notes: def.notes,
+        });
+    }
+    assert!(
+        loaded.windows(2).all(|pair| pair[0].id != pair[1].id),
+        "duplicate task ids under {}",
+        eval_tasks_dir().display()
+    );
+    loaded
+}
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -504,11 +319,6 @@ fn eval_dir() -> PathBuf {
     std::env::var("LOOM_EVAL_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace_root().join("target").join("eval"))
-}
-
-/// The generated fixture workspace the mutating tasks run against.
-fn fixture_root() -> PathBuf {
-    eval_dir().join("fixture")
 }
 
 fn corpus_root() -> PathBuf {
@@ -536,54 +346,32 @@ fn ensure_corpus() {
         std::fs::write(root.join(format!("doc-{i:02}.md")), body).unwrap();
     }
 }
-
-/// (Re)creates the fixture crate. Idempotent: wiped and rewritten so every
-/// run starts from identical bytes.
-fn ensure_fixture() {
-    let root = fixture_root();
-    if root.exists() {
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-    let write = |rel: &str, body: &str| {
-        let path = root.join(rel);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, body).unwrap();
-    };
-    write(
-        "Cargo.toml",
-        "[package]\nname = \"loom-eval-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-         \n[workspace]\n",
-    );
-    write("src/lib.rs", "pub mod calc;\n");
-    write(
-        "src/calc.rs",
-        "pub fn add(a: i64, b: i64) -> i64 {\n    a + b\n}\n\n#[cfg(test)]\nmod tests {\n    \
-         use super::*;\n\n    #[test]\n    fn add_works() {\n        assert_eq!(add(2, 3), 5);\n    \
-         }\n}\n",
-    );
-    write(
-        "docs-notes/alpha.md",
-        "# Alpha\n\nThe alpha subsystem handles the first half of the pipeline.\n",
-    );
-    write(
-        "docs-notes/beta.md",
-        "# Beta\n\nThe beta subsystem consumes alpha's output and reports results.\n",
-    );
+/// The per-task run root under the eval dir. Wiped and re-copied (or
+/// regenerated) before every run, so runs start from identical bytes.
+fn run_root(task_id: &str) -> PathBuf {
+    eval_dir().join(task_id)
 }
 
-/// (Re)creates a real-bug fixture crate. Idempotent: wiped and rewritten
-/// so every run starts from identical faulty bytes.
-fn ensure_bugfix(spec: &BugfixCrate) -> PathBuf {
-    let root = eval_dir().join(spec.name);
-    if root.exists() {
-        std::fs::remove_dir_all(&root).unwrap();
+/// (Re)creates a task's run workspace by copying its `workspace/` tree.
+fn ensure_copy(src: &Path, run_root: &Path) {
+    if run_root.exists() {
+        std::fs::remove_dir_all(run_root).unwrap();
     }
-    for (rel, body) in spec.files {
-        let path = root.join(rel);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, body).unwrap();
+    copy_tree(src, run_root).unwrap();
+}
+
+fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let target = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
     }
-    root
+    Ok(())
 }
 
 // --------------------------------------------------------------- census ---
@@ -888,118 +676,132 @@ fn prune_config() -> PruneConfig {
     }
 }
 
-/// Outcome gate for real-bug tasks (SWE-bench-shaped): `cargo test` must
-/// exit 0, the libtest runner must report the expected number of passing
-/// tests (so the suite ran rather than being disabled in the manifest),
-/// and the protected test files must be byte-identical to their pre-run
-/// snapshot. Live runs only — replay re-executes the recorded edits for
-/// determinism, not for grading.
-async fn grade_bugfix(
-    workspace: &Workspace,
+/// Outcome gate, live runs only. Bugfix tasks (SWE-bench-shaped):
+/// `cargo test` exits 0, every FAIL_TO_PASS test has flipped to passing,
+/// every PASS_TO_PASS test still passes, and the protected files are
+/// byte-identical to their pre-run snapshot. Outcome tasks: the
+/// workspace state satisfies the task's [`OutcomeSpec`].
+async fn grade_gate(
+    gate: Option<&TaskGate>,
     root: &Path,
     protected_before: Option<&[(PathBuf, Vec<u8>)]>,
     live: bool,
 ) -> Option<serde_json::Value> {
-    let Workspace::Bugfix(spec) = workspace else {
-        return None;
-    };
+    let gate = gate?;
     if !live {
         return None;
     }
-    let root = root.to_path_buf();
-    let spawned = tokio::task::spawn_blocking(move || run_fixture_tests(&root)).await;
-    let (code, output) = match spawned {
-        Ok(Ok(pair)) => pair,
-        Ok(Err(error)) => {
-            return Some(serde_json::json!({
-                "bug_fixed": false,
-                "error": format!("cargo test failed to run: {error}"),
-            }));
-        }
-        Err(join) => {
-            return Some(serde_json::json!({
-                "bug_fixed": false,
-                "error": format!("gate task join error: {join}"),
-            }));
-        }
+    let needs_tests = match gate {
+        TaskGate::Bugfix(_) => true,
+        TaskGate::Outcome(spec) => spec.tests_green.is_some(),
     };
-    let passed = count_tests_passed(&output);
-    let protected_unmodified = protected_before.is_some_and(|snapshot| {
-        snapshot
-            .iter()
-            .all(|(path, before)| std::fs::read(path).is_ok_and(|now| now == *before))
-    });
-    let bug_fixed = code == Some(0) && passed >= spec.expected_passed && protected_unmodified;
-    Some(serde_json::json!({
-        "bug_fixed": bug_fixed,
-        "cargo_exit": code,
-        "tests_passed": passed,
-        "tests_expected": spec.expected_passed,
-        "protected_unmodified": protected_unmodified,
-        "spec": spec.name,
-    }))
-}
-
-/// Outcome gate for fixture tasks (B2–B4): the workspace state the run
-/// leaves behind must satisfy the task's [`OutcomeSpec`]. Live runs only.
-async fn grade_outcome(
-    spec: &'static OutcomeSpec,
-    root: &Path,
-    live: bool,
-) -> Option<serde_json::Value> {
-    if !live {
-        return None;
-    }
-    let (code, output) = match spec.tests_green {
-        Some(_) => {
-            let root = root.to_path_buf();
-            match tokio::task::spawn_blocking(move || run_fixture_tests(&root)).await {
-                Ok(Ok(pair)) => pair,
-                Ok(Err(error)) => {
-                    return Some(serde_json::json!({
-                        "bug_fixed": false,
-                        "error": format!("cargo test failed to run: {error}"),
-                    }));
-                }
-                Err(join) => {
-                    return Some(serde_json::json!({
-                        "bug_fixed": false,
-                        "error": format!("gate task join error: {join}"),
-                    }));
-                }
+    let (code, output) = if needs_tests {
+        let root = root.to_path_buf();
+        match tokio::task::spawn_blocking(move || run_fixture_tests(&root)).await {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(error)) => {
+                return Some(serde_json::json!({
+                    "bug_fixed": false,
+                    "error": format!("cargo test failed to run: {error}"),
+                }));
+            }
+            Err(join) => {
+                return Some(serde_json::json!({
+                    "bug_fixed": false,
+                    "error": format!("gate task join error: {join}"),
+                }));
             }
         }
-        None => (None, String::new()),
+    } else {
+        (None, String::new())
     };
-    let mut checks = Vec::new();
-    for (rel, expected) in spec.exact_files {
-        // One optional trailing newline is tolerated (see OutcomeSpec).
-        let ok = std::fs::read(root.join(rel))
-            .is_ok_and(|body| body.strip_suffix(b"\n").unwrap_or(&body) == expected.as_bytes());
-        checks.push(serde_json::json!({"exact": rel, "ok": ok}));
+    match gate {
+        TaskGate::Bugfix(spec) => {
+            let outcomes = test_outcomes(&output);
+            let passed = |name: &str| outcomes.iter().any(|(n, ok)| n == name && *ok);
+            let fail_to_pass: Vec<_> = spec
+                .fail_to_pass
+                .iter()
+                .map(|name| serde_json::json!({"name": name, "passed": passed(name)}))
+                .collect();
+            let pass_to_pass: Vec<_> = spec
+                .pass_to_pass
+                .iter()
+                .map(|name| serde_json::json!({"name": name, "passed": passed(name)}))
+                .collect();
+            let protected_unmodified = protected_before.is_some_and(|snapshot| {
+                snapshot
+                    .iter()
+                    .all(|(path, before)| std::fs::read(path).is_ok_and(|now| now == *before))
+            });
+            let bug_fixed = code == Some(0)
+                && fail_to_pass
+                    .iter()
+                    .all(|r| r["passed"].as_bool().unwrap_or(false))
+                && pass_to_pass
+                    .iter()
+                    .all(|r| r["passed"].as_bool().unwrap_or(false))
+                && protected_unmodified;
+            Some(serde_json::json!({
+                "bug_fixed": bug_fixed,
+                "cargo_exit": code,
+                "fail_to_pass": fail_to_pass,
+                "pass_to_pass": pass_to_pass,
+                "tests_passed": outcomes.iter().filter(|(_, ok)| *ok).count(),
+                "protected_unmodified": protected_unmodified,
+            }))
+        }
+        TaskGate::Outcome(spec) => {
+            let mut checks = Vec::new();
+            for (rel, expected) in &spec.exact_files {
+                // One optional trailing newline is tolerated (see OutcomeSpec).
+                let ok = std::fs::read(root.join(rel)).is_ok_and(|body| {
+                    body.strip_suffix(b"\n").unwrap_or(&body) == expected.as_bytes()
+                });
+                checks.push(serde_json::json!({"exact": rel, "ok": ok}));
+            }
+            for (rel, needle) in &spec.contains {
+                let ok = std::fs::read_to_string(root.join(rel)).is_ok_and(|body| {
+                    body.to_ascii_lowercase()
+                        .contains(&needle.to_ascii_lowercase())
+                });
+                checks.push(serde_json::json!({"contains": rel, "needle": needle, "ok": ok}));
+            }
+            if let Some(expected) = spec.tests_green {
+                let passed = count_tests_passed(&output);
+                checks.push(serde_json::json!({
+                    "tests_green": true,
+                    "ok": code == Some(0) && passed >= expected,
+                }));
+            }
+            let bug_fixed = checks
+                .iter()
+                .all(|check| check["ok"].as_bool().unwrap_or(false));
+            Some(serde_json::json!({
+                "bug_fixed": bug_fixed,
+                "checks": checks,
+                "cargo_exit": code,
+            }))
+        }
     }
-    for (rel, needle) in spec.contains {
-        let ok = std::fs::read_to_string(root.join(rel)).is_ok_and(|body| {
-            body.to_ascii_lowercase()
-                .contains(&needle.to_ascii_lowercase())
-        });
-        checks.push(serde_json::json!({"contains": rel, "needle": needle, "ok": ok}));
-    }
-    if let Some(expected) = spec.tests_green {
-        let passed = count_tests_passed(&output);
-        checks.push(serde_json::json!({
-            "tests_green": true,
-            "ok": code == Some(0) && passed >= expected,
-        }));
-    }
-    let bug_fixed = checks
-        .iter()
-        .all(|check| check["ok"].as_bool().unwrap_or(false));
-    Some(serde_json::json!({
-        "bug_fixed": bug_fixed,
-        "checks": checks,
-        "cargo_exit": code,
-    }))
+}
+
+/// Per-test outcomes from libtest output: `(name, passed)` for every
+/// `test NAME ... ok` / `... FAILED` / `... ignored` line. Ignored counts
+/// as not passed — a suite that ignores its regressions has not run
+/// them. Summary lines (`test result: ok. …`) do not match the
+/// `<name> ... <status>` shape and are skipped.
+fn test_outcomes(output: &str) -> Vec<(String, bool)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let rest = line.strip_prefix("test ")?;
+            let (name, status) = rest.rsplit_once(" ... ")?;
+            let passed = status == "ok";
+            matches!(status, "ok" | "FAILED" | "ignored").then(|| (name.to_owned(), passed))
+        })
+        .collect()
 }
 
 /// `cargo test` inside a fixture, bounded by a wall deadline. Returns the
@@ -1060,22 +862,22 @@ async fn run_once(
     exchanges: Option<Arc<Mutex<Vec<Exchange>>>>,
 ) -> (serde_json::Value, Vec<Exchange>, Session) {
     let root = match &task.workspace {
-        Workspace::Repo => workspace_root(),
-        Workspace::Fixture => {
-            ensure_fixture();
-            fixture_root()
+        TaskWorkspace::Repo => workspace_root(),
+        TaskWorkspace::Copy(src) => {
+            let root = run_root(&task.id);
+            ensure_copy(src, &root);
+            root
         }
-        Workspace::Corpus => {
+        TaskWorkspace::Corpus => {
             ensure_corpus();
             corpus_root()
         }
-        Workspace::Bugfix(spec) => ensure_bugfix(spec),
     };
-    // Bugfix tasks snapshot their protected files after the fixture is
+    // Bugfix tasks snapshot their protected files after the workspace is
     // (re)generated and before the agent runs, so the gate can prove the
     // tests were graded, not rewritten.
-    let protected_before: Option<Vec<(PathBuf, Vec<u8>)>> = match &task.workspace {
-        Workspace::Bugfix(spec) => Some(
+    let protected_before: Option<Vec<(PathBuf, Vec<u8>)>> = match &task.gate {
+        Some(TaskGate::Bugfix(spec)) => Some(
             spec.protected
                 .iter()
                 .map(|rel| {
@@ -1110,7 +912,7 @@ async fn run_once(
     };
     let system_prompt = task
         .system_prompt
-        .map(str::to_owned)
+        .clone()
         .unwrap_or_else(loom_core::engine::default_system_prompt);
     let agent = Agent::new(
         provider,
@@ -1130,7 +932,7 @@ async fn run_once(
 
     let started = Instant::now();
     let outcome = agent
-        .run_task(&mut session, task.prompt, &sink, &cancellation)
+        .run_task(&mut session, task.prompt.clone(), &sink, &cancellation)
         .await;
     let observed_ms = started.elapsed().as_millis() as u64;
     let tally = *tally_state.lock().unwrap();
@@ -1248,21 +1050,14 @@ async fn run_once(
         }),
     };
     // Outcome grading for gated tasks; live runs only.
-    let gate = match grade_bugfix(
-        &task.workspace,
+    if let Some(gate) = grade_gate(
+        task.gate.as_ref(),
         &root,
         protected_before.as_deref(),
         exchanges.is_some(),
     )
     .await
     {
-        Some(gate) => Some(gate),
-        None => match task.outcome {
-            Some(spec) => grade_outcome(spec, &root, exchanges.is_some()).await,
-            None => None,
-        },
-    };
-    if let Some(gate) = gate {
         report
             .as_object_mut()
             .unwrap()
@@ -1293,9 +1088,11 @@ async fn eval_live() {
         .ok()
         .map(|raw| raw.split(',').map(|id| id.trim().to_owned()).collect());
 
-    for task in TASKS {
+    let all_tasks = tasks();
+    let mut suite: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
+    for task in &all_tasks {
         if let Some(only) = &only
-            && !only.iter().any(|id| id == task.id)
+            && !only.iter().any(|id| id.as_str() == task.id)
         {
             continue;
         }
@@ -1349,6 +1146,7 @@ async fn eval_live() {
             },
             "runs": reports,
             "aggregates": aggregates_from(&reports),
+            "notes": task.notes,
         });
         let path = dir.join(format!("report-{}-{model}.json", task.id));
         std::fs::write(&path, serde_json::to_string_pretty(&report).unwrap()).unwrap();
@@ -1370,7 +1168,60 @@ async fn eval_live() {
             "{}: at least one run failed the bug-fix gate",
             task.id
         );
+        suite.push((task.id.clone(), reports));
     }
+
+    // Suite headline: the pass rate over every gated run of the session —
+    // the number the suite exists to move. Lab tasks (B1/B5) carry no
+    // gate and do not enter the rate.
+    let mut per_task = serde_json::Map::new();
+    let mut gated_runs = 0usize;
+    let mut gated_solved = 0usize;
+    for (id, reports) in &suite {
+        let gated: Vec<&serde_json::Value> = reports
+            .iter()
+            .filter(|r| r.get("gate").is_some_and(|g| !g.is_null()))
+            .collect();
+        let entry = if gated.is_empty() {
+            serde_json::json!({"kind": "lab", "runs": reports.len()})
+        } else {
+            let solved = gated
+                .iter()
+                .filter(|r| r["gate"]["bug_fixed"].as_bool().unwrap_or(false))
+                .count();
+            gated_runs += gated.len();
+            gated_solved += solved;
+            serde_json::json!({
+                "kind": "field",
+                "runs": gated.len(),
+                "solved": solved,
+                "rate": solved as f64 / gated.len() as f64,
+            })
+        };
+        per_task.insert(id.clone(), entry);
+    }
+    let headline = serde_json::json!({
+        "model": model,
+        "tasks": per_task,
+        "gated_runs": gated_runs,
+        "gated_solved": gated_solved,
+        "pass_rate": if gated_runs == 0 {
+            serde_json::json!(null)
+        } else {
+            serde_json::json!(gated_solved as f64 / gated_runs as f64)
+        },
+    });
+    let headline_path = dir.join(format!("report-suite-{model}.json"));
+    std::fs::write(
+        &headline_path,
+        serde_json::to_string_pretty(&headline).unwrap(),
+    )
+    .unwrap();
+    eprintln!(
+        "suite pass rate: {gated_solved}/{gated_runs} gated runs ({}) — wrote {}",
+        headline["pass_rate"],
+        headline_path.display()
+    );
 }
 
 /// mean/median/min/max over the per-run reports (successful runs only for
@@ -1425,33 +1276,57 @@ fn aggregates_from(reports: &[serde_json::Value]) -> serde_json::Value {
 
 // ------------------------------------------------- replay equivalence ----
 
-/// The real-bug fixtures must fail their own gates as seeded — the bug is
-/// present and the tests expose it. A seed that already passes measures
-/// nothing (SWE-bench validates the FAIL_TO_PASS pre-state the same way).
-/// B6 is additionally proven fixable in place: applying the one-line real
-/// fix turns the gate green with the expected test count.
+/// The bugfix seeds must fail their own gates as seeded — the bug is
+/// present, the FAIL_TO_PASS tests fail, and the PASS_TO_PASS tests
+/// pass (SWE-bench validates the pre-state the same way). B6 is
+/// additionally proven fixable in place: applying the one-line real fix
+/// flips every declared test to passing.
 #[test]
 fn bugfix_seeds_fail_their_gates() {
-    for spec in [&B6_CRATE, &B7_CRATE] {
-        let root = ensure_bugfix(spec);
+    for task in tasks() {
+        let Some(TaskGate::Bugfix(spec)) = task.gate.as_ref() else {
+            continue;
+        };
+        let TaskWorkspace::Copy(src) = &task.workspace else {
+            panic!("{}: bugfix tasks must use a copy workspace", task.id);
+        };
+        let root = run_root(&task.id);
+        ensure_copy(src, &root);
         let (code, output) = run_fixture_tests(&root).expect("cargo test");
         assert_ne!(
             code,
             Some(0),
             "{}: seeded fixture must fail `cargo test`",
-            spec.name
+            task.id
         );
-        assert!(
-            output.contains("test result:"),
-            "{}: the seeded tests must run and report",
-            spec.name
-        );
+        let outcomes = test_outcomes(&output);
+        let passed = |name: &str| outcomes.iter().any(|(n, ok)| n == name && *ok);
+        let failed = |name: &str| outcomes.iter().any(|(n, ok)| n == name && !*ok);
+        for name in &spec.fail_to_pass {
+            assert!(
+                failed(name),
+                "{}: FAIL_TO_PASS `{name}` must fail on the seed (outcomes: {outcomes:?})",
+                task.id
+            );
+        }
+        for name in &spec.pass_to_pass {
+            assert!(
+                passed(name),
+                "{}: PASS_TO_PASS `{name}` must pass on the seed",
+                task.id
+            );
+        }
     }
 
-    // The B6 pre-state is one line wrong; the real fix must flip the
-    // gate. This also exercises `count_tests_passed` against real
+    // The B6 pre-state is one line wrong; the real fix must flip every
+    // declared test. This also exercises `test_outcomes` against real
     // libtest output.
-    let root = ensure_bugfix(&B6_CRATE);
+    let b6 = tasks().into_iter().find(|t| t.id == "B6").unwrap();
+    let TaskWorkspace::Copy(src) = &b6.workspace else {
+        panic!("B6 must use a copy workspace");
+    };
+    let root = run_root("B6");
+    ensure_copy(src, &root);
     let lib = root.join("src/lib.rs");
     let body = std::fs::read_to_string(&lib).unwrap();
     let fixed = body.replacen(
@@ -1462,37 +1337,56 @@ fn bugfix_seeds_fail_their_gates() {
     std::fs::write(&lib, fixed).unwrap();
     let (code, output) = run_fixture_tests(&root).expect("cargo test");
     assert_eq!(code, Some(0), "the real B6 fix must turn the gate green");
-    assert_eq!(
-        count_tests_passed(&output),
-        B6_CRATE.expected_passed,
-        "the fixed suite must report its expected passing count"
-    );
-}
-
-/// The fixture outcome gates must reject an untouched fixture: a fresh
-/// workspace satisfies none of B2/B3/B4 (no greeting, no `sub`, no
-/// summaries), so a run that only claims success cannot pass. B3's
-/// tests-green check is additionally proven satisfiable — the seeded
-/// suite passes with the expected count, so the check discriminates on
-/// the code change, not on a broken baseline.
-#[tokio::test]
-async fn outcome_gates_reject_an_untouched_fixture() {
-    ensure_fixture();
-    let root = fixture_root();
-    for spec in [&B2_OUTCOME, &B3_OUTCOME, &B4_OUTCOME] {
-        let gate = grade_outcome(spec, &root, true)
-            .await
-            .expect("fixture tasks are gated");
-        assert_eq!(
-            gate["bug_fixed"], false,
-            "an untouched fixture must fail every outcome gate: {gate}"
+    let outcomes = test_outcomes(&output);
+    let Some(TaskGate::Bugfix(spec)) = b6.gate.as_ref() else {
+        panic!("B6 must be a bugfix task");
+    };
+    for name in spec.fail_to_pass.iter().chain(&spec.pass_to_pass) {
+        assert!(
+            outcomes.iter().any(|(n, ok)| n == name && *ok),
+            "the fixed suite must report `{name}` passing"
         );
     }
-    // The B3 codebase check discriminates, not the suite: the seeded
-    // fixture is already green at the expected count.
-    let (code, output) = run_fixture_tests(&root).expect("cargo test");
-    assert_eq!(code, Some(0));
-    assert_eq!(count_tests_passed(&output), 1);
+}
+
+/// The outcome gates must reject an untouched workspace: a fresh copy
+/// satisfies none of B2/B3/B4 (no greeting, no `sub`, no summaries), so
+/// a run that only claims success cannot pass. B3's tests-green check
+/// is additionally proven satisfiable — the seeded suite passes at the
+/// declared count, so the check discriminates on the code change, not
+/// on a broken baseline.
+#[tokio::test]
+async fn outcome_gates_reject_an_untouched_workspace() {
+    let mut saw_b3 = false;
+    for task in tasks() {
+        let Some(gate @ TaskGate::Outcome(spec)) = task.gate.as_ref() else {
+            continue;
+        };
+        let TaskWorkspace::Copy(src) = &task.workspace else {
+            panic!("{}: outcome tasks must use a copy workspace", task.id);
+        };
+        let root = run_root(&task.id);
+        ensure_copy(src, &root);
+        let graded = grade_gate(Some(gate), &root, None, true)
+            .await
+            .expect("outcome tasks are gated");
+        assert_eq!(
+            graded["bug_fixed"], false,
+            "{}: an untouched workspace must fail its gate: {graded}",
+            task.id
+        );
+        if task.id == "B3" {
+            saw_b3 = true;
+            let (code, output) = run_fixture_tests(&root).expect("cargo test");
+            assert_eq!(code, Some(0), "the seeded B3 suite must be green");
+            assert_eq!(
+                count_tests_passed(&output),
+                spec.tests_green.unwrap_or(0),
+                "the seeded B3 suite must pass at the declared count"
+            );
+        }
+    }
+    assert!(saw_b3, "the B3 task must exist");
 }
 
 /// The invariant under test (V3, Invariant 10): replaying recorded
@@ -1569,13 +1463,14 @@ async fn eval_replay_recordings() {
         );
         return;
     }
+    let all_tasks = tasks();
     for file in files {
         let task_id = file
             .file_stem()
             .and_then(|s| s.to_str())
             .and_then(|s| s.split('-').next())
             .unwrap_or("B1");
-        let Some(task) = TASKS.iter().find(|t| t.id == task_id) else {
+        let Some(task) = all_tasks.iter().find(|t| t.id == task_id) else {
             eprintln!("{}: no pinned task `{task_id}` — skipped", file.display());
             continue;
         };
@@ -1632,8 +1527,8 @@ async fn eval_replay_synthetic() {
         })
         .collect();
 
-    let task = TASKS.iter().find(|t| t.id == "B1").unwrap();
-    assert_replay_equivalence(task, model, &exchanges).await;
+    let task = tasks().into_iter().find(|t| t.id == "B1").unwrap();
+    assert_replay_equivalence(&task, model, &exchanges).await;
 
     // Determinism of the measurement itself: the same scripted run must
     // compile byte-identical requests every time. This pins the property the
@@ -1645,8 +1540,8 @@ async fn eval_replay_synthetic() {
     // repository, so repo drift legitimately changes tool-result bytes
     // between record and replay — assistant-turn equality above already
     // covers that path.
-    let first = replay_capturing(task, model, &exchanges).await;
-    let second = replay_capturing(task, model, &exchanges).await;
+    let first = replay_capturing(&task, model, &exchanges).await;
+    let second = replay_capturing(&task, model, &exchanges).await;
     assert_eq!(
         serde_json::to_string(&first).unwrap(),
         serde_json::to_string(&second).unwrap(),

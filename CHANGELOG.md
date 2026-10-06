@@ -34,6 +34,33 @@ token counts (~±8 %), without putting a tokenizer in the kernel:
   (`o200k_base`), wired in `Engine::open`; the eval and benchmark
   harnesses use the same estimator for parity.
 
+## 2026-10-07 — Task-directory harness with FAIL_TO_PASS gates
+
+Phase 3 of the suite rigor work: tasks leave the source file and become
+data, and the bugfix gates adopt the SWE-bench vocabulary.
+
+- **Tasks as directories** under `crates/loom-cli/tests/eval-tasks/<ID>/`:
+  a `task.json` (prompt, tools, workspace kind, gate, `heavy`, optional
+  notes), an optional `system-prompt.txt`, and an optional `workspace/`
+  tree copied verbatim into a fresh run root (`target/eval/<ID>/`) per
+  run. Adding a task is now a directory, not a harness edit; the loader
+  sorts, parses, and rejects duplicate ids and bugfix gates without
+  FAIL_TO_PASS tests.
+- **FAIL_TO_PASS / PASS_TO_PASS by test name**: the bugfix gate parses
+  libtest's per-test outcomes instead of counting. FAIL_TO_PASS must be
+  failing in the seed and passing after the run; PASS_TO_PASS must stay
+  green; protected files are still byte-compared against a pre-run
+  snapshot. Outcome gates (B2–B4) are unchanged in spirit — exact bytes,
+  substrings, green suite — now declared in the same `task.json`.
+- **Suite pass-rate headline**: every live run writes
+  `report-suite-<model>.json` — per-task {kind, runs, solved, rate} plus
+  the overall gated pass rate — so regressions have one number to move.
+- Seed invariants updated: the offline test now proves each bugfix seed
+  fails its own declared FAIL_TO_PASS set (and passes its PASS_TO_PASS
+  set), and that B6's one-line real fix flips every declared name green.
+  Existing records stay replay-valid — task ids and seed bytes are
+  unchanged.
+
 ## 2026-10-07 — Outcome gates for the fixture tasks (B2–B4)
 
 Rigor follow-up to the real-bug gates: every field task is now graded by

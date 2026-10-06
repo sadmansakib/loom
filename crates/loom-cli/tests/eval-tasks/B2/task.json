@@ -1,0 +1,11 @@
+{
+  "id": "B2",
+  "prompt": "Create the file eval-notes/greeting.txt containing exactly the text 'hello eval', then read it back and verify its content.",
+  "tools": "coding",
+  "heavy": false,
+  "workspace": "copy",
+  "gate": {
+    "kind": "outcome",
+    "exact_files": [["eval-notes/greeting.txt", "hello eval"]]
+  }
+}
