@@ -141,20 +141,43 @@ pub async fn execute_call(
     // reads are unchanged (ADR-018, V14); a hit is re-bounded exactly as a
     // fresh call would be. `cacheable` is `None` for anything the cache
     // must not serve (mutating tools, wildcards, write-declaring reads).
+    // The signature walk is file I/O + SHA-256, so it runs on a blocking
+    // thread, and the cache lock is taken only for the in-memory map
+    // operations (ADR-018: hashing never runs on an async worker or under
+    // the lock).
     let cacheable = cacheable_reads(tool, &call.arguments);
-    if let (Some(reads), Some(cache)) = (&cacheable, ctx.cache.as_ref())
-        && let Ok(mut cache) = cache.lock()
-        && let Some(output) = cache.lookup(&ctx.workspace_root, &call.name, &call.arguments, reads)
-    {
-        let (content, truncated, effects, artifact) = bound(output, ctx);
-        return finish(
-            call,
-            ToolStatus::Success,
-            content,
-            truncated,
-            effects,
-            artifact,
-        );
+    if let (Some(reads), Some(cache)) = (&cacheable, ctx.cache.as_ref()) {
+        // Cheap existence probe first: a key never stored skips the
+        // signature walk entirely (the common first-read case).
+        let has_entry = cache
+            .lock()
+            .map(|cache| cache.has_entry(&call.name, &call.arguments))
+            .unwrap_or(false);
+        if has_entry {
+            let root = ctx.workspace_root.clone();
+            let reads = reads.clone();
+            let current = tokio::task::spawn_blocking(move || {
+                crate::tool_cache::compute_signature(&root, &reads)
+            })
+            .await
+            .ok()
+            .flatten();
+            let hit = cache
+                .lock()
+                .ok()
+                .and_then(|mut cache| cache.lookup(&call.name, &call.arguments, current));
+            if let Some(output) = hit {
+                let (content, truncated, effects, artifact) = bound(output, ctx);
+                return finish(
+                    call,
+                    ToolStatus::Success,
+                    content,
+                    truncated,
+                    effects,
+                    artifact,
+                );
+            }
+        }
     }
 
     let mut timed = std::pin::pin!(timeout(
@@ -168,17 +191,20 @@ pub async fn execute_call(
         Either::Right((Ok(Ok(output)), _)) => {
             // Cache read-only, side-effect-free results before bounding, so
             // a later hit is re-bounded exactly like a fresh call (ADR-018,
-            // V14). `store` itself refuses outputs with effects.
-            if let (Some(reads), Some(cache)) = (&cacheable, ctx.cache.as_ref())
-                && let Ok(mut cache) = cache.lock()
-            {
-                cache.store(
-                    &ctx.workspace_root,
-                    &call.name,
-                    &call.arguments,
-                    reads,
-                    &output,
-                );
+            // V14). `store` itself refuses outputs with effects, and the
+            // signature is computed on a blocking thread, outside the lock.
+            if let (Some(reads), Some(cache)) = (&cacheable, ctx.cache.as_ref()) {
+                let root = ctx.workspace_root.clone();
+                let reads = reads.clone();
+                let signature = tokio::task::spawn_blocking(move || {
+                    crate::tool_cache::compute_signature(&root, &reads)
+                })
+                .await
+                .ok()
+                .flatten();
+                if let Ok(mut cache) = cache.lock() {
+                    cache.store(&call.name, &call.arguments, signature, &output);
+                }
             }
             let (content, truncated, effects, artifact) = bound(output, ctx);
             finish(

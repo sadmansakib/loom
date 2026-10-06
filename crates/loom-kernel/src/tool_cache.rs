@@ -14,6 +14,14 @@
 //! anything, so the cache is conservatively emptied). Only read-only,
 //! side-effect-free calls are ever stored; `run_command` is never cached.
 //!
+//! Locking discipline (ADR-018): the signature walk ([`compute_signature`])
+//! does file I/O and SHA-256 hashing, so it is **separate** from the map
+//! operations. The caller (the tool engine) computes signatures on a
+//! blocking thread and hands the result to [`ToolCache::lookup`] /
+//! [`ToolCache::store`], which only touch the in-memory map — so hashing
+//! never runs on an async worker and never runs while the cache mutex is
+//! held (concurrent read-only calls hash in parallel).
+//!
 //! Shared through [`ToolContext::cache`](crate::tool::ToolContext::cache).
 
 use std::collections::hash_map::HashMap;
@@ -30,18 +38,61 @@ use crate::tool::{ToolEffects, ToolOutput, paths_overlap};
 /// One file's identity when a result was cached. `hash` is `None` for a
 /// path that did not exist then; `size`/`modified` are then unused.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Signature {
+pub(crate) struct FileSignature {
     relative: String,
     size: u64,
     modified: Option<SystemTime>,
     hash: Option<[u8; 32]>,
 }
 
+/// Computes the signature of every path in `reads`, or `None` when any
+/// path is a directory or cannot be inspected — such a call is not
+/// cacheable. A missing path is a valid signature (cached as absent, so a
+/// later creation is a miss).
+///
+/// Blocking (metadata + full-file reads for the content hashes); callers
+/// run it on a blocking thread, never inside the cache lock.
+pub(crate) fn compute_signature(workspace: &Path, reads: &[String]) -> Option<Vec<FileSignature>> {
+    let mut signature = Vec::with_capacity(reads.len());
+    for relative in reads {
+        let full = workspace.join(relative);
+        match fs::metadata(&full) {
+            Ok(meta) if meta.is_file() => {
+                signature.push(FileSignature {
+                    relative: relative.clone(),
+                    size: meta.len(),
+                    modified: meta.modified().ok(),
+                    hash: Some(hash_file(&full).ok()?),
+                });
+            }
+            Ok(_) => return None,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                signature.push(FileSignature {
+                    relative: relative.clone(),
+                    size: 0,
+                    modified: None,
+                    hash: None,
+                });
+            }
+            Err(_) => return None,
+        }
+    }
+    Some(signature)
+}
+
+/// Content hash of a file's bytes.
+fn hash_file(path: &Path) -> io::Result<[u8; 32]> {
+    let bytes = fs::read(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(hasher.finalize().into())
+}
+
 /// A cached call: the signature it was stored under and the raw output
 /// (before bounding, so a hit is re-bounded exactly like a fresh call).
 #[derive(Debug, Clone)]
 struct Entry {
-    signature: Vec<Signature>,
+    signature: Vec<FileSignature>,
     output: ToolOutput,
 }
 
@@ -89,24 +140,32 @@ impl ToolCache {
         self.entries.is_empty()
     }
 
-    /// Returns the cached output for `(tool, args)` if `reads` still
-    /// resolve to the same signature. A mismatch drops the entry.
+    /// Whether `(tool, args)` has an entry, without counting a lookup.
     ///
-    /// `reads` is the tool's declared workspace-relative read set; it must
-    /// be the same set passed to [`ToolCache::store`].
+    /// A cheap pre-probe: lets the caller skip the (blocking) signature
+    /// walk entirely for keys that were never stored.
+    #[must_use]
+    pub fn has_entry(&self, tool: &str, args: &Value) -> bool {
+        self.entries
+            .contains_key(&(tool.to_owned(), args.to_string()))
+    }
+
+    /// Returns the cached output for `(tool, args)` when `current` — the
+    /// caller-computed [`compute_signature`] of the call's read set —
+    /// matches the stored signature. A mismatch drops the entry.
+    ///
+    /// Map access only: no file I/O, safe to call under the cache lock.
     pub fn lookup(
         &mut self,
-        workspace: &Path,
         tool: &str,
         args: &Value,
-        reads: &[String],
+        current: Option<Vec<FileSignature>>,
     ) -> Option<ToolOutput> {
         let key = (tool.to_owned(), args.to_string());
         if !self.entries.contains_key(&key) {
             self.misses += 1;
             return None;
         }
-        let current = signature_for(workspace, reads);
         let hit = match (&current, self.entries.get(&key)) {
             (Some(current), Some(entry)) => *current == entry.signature,
             _ => false,
@@ -120,22 +179,24 @@ impl ToolCache {
         None
     }
 
-    /// Stores `output` for `(tool, args)` under the current signature of
-    /// `reads`. Does nothing when the output had side effects (only
-    /// read-only, effect-free results are cacheable) or when any read path
-    /// is not a plain file (a directory has no stable content hash).
+    /// Stores `output` for `(tool, args)` under `signature` — the
+    /// caller-computed [`compute_signature`] of the call's read set.
+    /// Does nothing when the output had side effects (only read-only,
+    /// effect-free results are cacheable) or when the signature is
+    /// `None` (some read path is not a plain file).
+    ///
+    /// Map access only: no file I/O, safe to call under the cache lock.
     pub fn store(
         &mut self,
-        workspace: &Path,
         tool: &str,
         args: &Value,
-        reads: &[String],
+        signature: Option<Vec<FileSignature>>,
         output: &ToolOutput,
     ) {
         if !output.effects.is_empty() {
             return;
         }
-        let Some(signature) = signature_for(workspace, reads) else {
+        let Some(signature) = signature else {
             return;
         };
         self.entries.insert(
@@ -173,46 +234,6 @@ impl ToolCache {
     }
 }
 
-/// Computes the signature of every path in `reads`, or `None` when any
-/// path is a directory or cannot be inspected — such a call is not
-/// cacheable. A missing path is a valid signature (cached as absent, so a
-/// later creation is a miss).
-fn signature_for(workspace: &Path, reads: &[String]) -> Option<Vec<Signature>> {
-    let mut signature = Vec::with_capacity(reads.len());
-    for relative in reads {
-        let full = workspace.join(relative);
-        match fs::metadata(&full) {
-            Ok(meta) if meta.is_file() => {
-                signature.push(Signature {
-                    relative: relative.clone(),
-                    size: meta.len(),
-                    modified: meta.modified().ok(),
-                    hash: Some(hash_file(&full).ok()?),
-                });
-            }
-            Ok(_) => return None,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                signature.push(Signature {
-                    relative: relative.clone(),
-                    size: 0,
-                    modified: None,
-                    hash: None,
-                });
-            }
-            Err(_) => return None,
-        }
-    }
-    Some(signature)
-}
-
-/// Content hash of a file's bytes.
-fn hash_file(path: &Path) -> io::Result<[u8; 32]> {
-    let bytes = fs::read(path)?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    Ok(hasher.finalize().into())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +257,12 @@ mod tests {
         ToolOutput::new(body)
     }
 
+    /// `store`/`lookup` pairs as the tool engine issues them: signature
+    /// computed first, then handed to the map operations.
+    fn sig(dir: &Path, reads: &[String]) -> Option<Vec<FileSignature>> {
+        compute_signature(dir, reads)
+    }
+
     #[test]
     fn stores_and_serves_an_unchanged_read() {
         let dir = workspace();
@@ -244,8 +271,8 @@ mod tests {
         let reads = vec!["src/a.rs".to_owned()];
 
         let mut cache = ToolCache::new();
-        cache.store(&dir, "read_file", &args, &reads, &output("fn a() {}"));
-        let hit = cache.lookup(&dir, "read_file", &args, &reads);
+        cache.store("read_file", &args, sig(&dir, &reads), &output("fn a() {}"));
+        let hit = cache.lookup("read_file", &args, sig(&dir, &reads));
         assert_eq!(hit.map(|out| out.content), Some("fn a() {}".to_owned()));
         assert_eq!(cache.hits(), 1);
         assert_eq!(cache.misses(), 0);
@@ -259,10 +286,14 @@ mod tests {
         let reads = vec!["src/a.rs".to_owned()];
 
         let mut cache = ToolCache::new();
-        cache.store(&dir, "read_file", &args, &reads, &output("fn a() {}"));
+        cache.store("read_file", &args, sig(&dir, &reads), &output("fn a() {}"));
         // Same size, same mtime resolution risk: the content hash decides.
         write(&dir, "src/a.rs", "fn b() {}");
-        assert!(cache.lookup(&dir, "read_file", &args, &reads).is_none());
+        assert!(
+            cache
+                .lookup("read_file", &args, sig(&dir, &reads))
+                .is_none()
+        );
         assert!(cache.is_empty());
     }
 
@@ -273,10 +304,18 @@ mod tests {
         let reads = vec!["src/new.rs".to_owned()];
 
         let mut cache = ToolCache::new();
-        cache.store(&dir, "read_file", &args, &reads, &output("not found"));
-        assert!(cache.lookup(&dir, "read_file", &args, &reads).is_some());
+        cache.store("read_file", &args, sig(&dir, &reads), &output("not found"));
+        assert!(
+            cache
+                .lookup("read_file", &args, sig(&dir, &reads))
+                .is_some()
+        );
         write(&dir, "src/new.rs", "fn new() {}");
-        assert!(cache.lookup(&dir, "read_file", &args, &reads).is_none());
+        assert!(
+            cache
+                .lookup("read_file", &args, sig(&dir, &reads))
+                .is_none()
+        );
     }
 
     #[test]
@@ -287,9 +326,9 @@ mod tests {
         let reads = vec!["src".to_owned()];
 
         let mut cache = ToolCache::new();
-        cache.store(&dir, "list_dir", &args, &reads, &output("a.rs"));
+        cache.store("list_dir", &args, sig(&dir, &reads), &output("a.rs"));
         assert!(cache.is_empty());
-        assert!(cache.lookup(&dir, "list_dir", &args, &reads).is_none());
+        assert!(cache.lookup("list_dir", &args, sig(&dir, &reads)).is_none());
     }
 
     #[test]
@@ -302,7 +341,7 @@ mod tests {
         let mut cache = ToolCache::new();
         let side_effecting =
             output("fn a() {}").with_effects(ToolEffects::none().with_file_written("src/a.rs"));
-        cache.store(&dir, "read_file", &args, &reads, &side_effecting);
+        cache.store("read_file", &args, sig(&dir, &reads), &side_effecting);
         assert!(cache.is_empty());
     }
 
@@ -317,14 +356,22 @@ mod tests {
         let reads_b = vec!["src/b.rs".to_owned()];
 
         let mut cache = ToolCache::new();
-        cache.store(&dir, "read_file", &args_a, &reads_a, &output("a"));
-        cache.store(&dir, "read_file", &args_b, &reads_b, &output("b"));
+        cache.store("read_file", &args_a, sig(&dir, &reads_a), &output("a"));
+        cache.store("read_file", &args_b, sig(&dir, &reads_b), &output("b"));
         assert_eq!(cache.len(), 2);
 
         cache.invalidate_effects(&ToolEffects::none().with_file_written("src/a.rs"));
         assert_eq!(cache.len(), 1);
-        assert!(cache.lookup(&dir, "read_file", &args_a, &reads_a).is_none());
-        assert!(cache.lookup(&dir, "read_file", &args_b, &reads_b).is_some());
+        assert!(
+            cache
+                .lookup("read_file", &args_a, sig(&dir, &reads_a))
+                .is_none()
+        );
+        assert!(
+            cache
+                .lookup("read_file", &args_b, sig(&dir, &reads_b))
+                .is_some()
+        );
     }
 
     #[test]
@@ -338,8 +385,8 @@ mod tests {
         let reads_b = vec!["src/b.rs".to_owned()];
 
         let mut cache = ToolCache::new();
-        cache.store(&dir, "read_file", &args_a, &reads_a, &output("a"));
-        cache.store(&dir, "read_file", &args_b, &reads_b, &output("b"));
+        cache.store("read_file", &args_a, sig(&dir, &reads_a), &output("a"));
+        cache.store("read_file", &args_b, sig(&dir, &reads_b), &output("b"));
 
         let command = crate::tool::CommandEffect::new("cargo", vec!["test".to_owned()], Some(0));
         cache.invalidate_effects(&ToolEffects::none().with_command(command));
