@@ -1602,3 +1602,69 @@ async fn a_committed_task_is_mirrored_in_the_store() {
     assert_eq!(stored.tasks[0].turns, 2);
     assert_eq!(store.session_ids().unwrap(), vec![session.id]);
 }
+
+#[tokio::test]
+async fn a_persisted_session_resumes_from_the_store() {
+    // A frontend can drop its in-memory handle and resume: load the session
+    // from the store and keep running tasks against it. The second run must
+    // see the first run's transcript and task record.
+    let store = Arc::new(TestStore {
+        inner: MemorySessionStore::new(),
+        fail_turn: AtomicBool::new(false),
+    });
+    let id = SessionId::new();
+    let mut session = Session::new(id);
+    let token = CancellationToken::new();
+
+    let first = agent(
+        FakeProvider::new(
+            capabilities(),
+            vec![completed(
+                assistant("one", StopReason::EndTurn, Vec::new()),
+                usage(10, 2, None),
+            )],
+        ),
+        ToolRegistry::new(),
+        10,
+    )
+    .with_store(Box::new(StoreHandle::new(&store)));
+    let (sink, _receiver) = ChannelEventSink::new();
+    first
+        .run_task(&mut session, "first task", &sink, &token)
+        .await
+        .unwrap();
+
+    // Resume from the durable form, not the handle the first run used.
+    let mut resumed = store.load(&id).unwrap().unwrap();
+    assert_eq!(resumed.transcript, session.transcript);
+
+    let second = agent(
+        FakeProvider::new(
+            capabilities(),
+            vec![completed(
+                assistant("two", StopReason::EndTurn, Vec::new()),
+                usage(12, 3, None),
+            )],
+        ),
+        ToolRegistry::new(),
+        10,
+    )
+    .with_store(Box::new(StoreHandle::new(&store)));
+    let (sink, _receiver) = ChannelEventSink::new();
+    second
+        .run_task(&mut resumed, "second task", &sink, &token)
+        .await
+        .unwrap();
+
+    // Both tasks are recorded and the transcript continues in place.
+    assert_eq!(resumed.transcript.len(), 4);
+    assert!(matches!(&resumed.transcript[2], Item::User { text } if text == "second task"));
+    assert_eq!(resumed.tasks.len(), 2);
+    assert_eq!(resumed.tasks[0].turns, 1);
+    assert_eq!(resumed.tasks[1].turns, 1);
+
+    let stored = store.load(&id).unwrap().unwrap();
+    assert_eq!(stored.transcript, resumed.transcript);
+    assert_eq!(stored.tasks, resumed.tasks);
+    assert_eq!(store.session_ids().unwrap(), vec![id]);
+}

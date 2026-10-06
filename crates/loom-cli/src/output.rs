@@ -10,10 +10,10 @@
 //! the summary reports tokens and wall time, not dollars.
 
 use std::io::{IsTerminal, Write};
-use std::path::Path;
 
 use loom_core::kernel::agent::{TaskError, TaskSummary};
 use loom_core::kernel::event::{EventEnvelope, EventKind};
+use loom_core::kernel::id::SessionId;
 
 /// Renders the event stream to a terminal or to NDJSON.
 pub struct Renderer {
@@ -140,16 +140,12 @@ impl Renderer {
 }
 
 /// Prints the efficiency summary for a completed task.
-pub fn print_summary(
-    summary: &TaskSummary,
-    end_reason: &str,
-    session_path: Option<&Path>,
-    json: bool,
-) {
+pub fn print_summary(summary: &TaskSummary, end_reason: &str, session_id: &SessionId, json: bool) {
     if json {
         let line = serde_json::json!({
             "type": "summary",
             "task_id": summary.task_id.to_string(),
+            "session_id": session_id.to_string(),
             "end_reason": end_reason,
             "turns": summary.turns,
             "model_requests": summary.model_requests,
@@ -160,7 +156,6 @@ pub fn print_summary(
             "failed_tool_calls": summary.failed_tool_calls,
             "wall_time_ms": summary.wall_time.as_millis() as u64,
             "events_dropped": summary.events_dropped,
-            "session_path": session_path.map(|path| path.display().to_string()),
         });
         if let Ok(text) = serde_json::to_string(&line) {
             let _ = writeln!(std::io::stdout().lock(), "{text}");
@@ -195,9 +190,7 @@ pub fn print_summary(
         summary.wall_time.as_secs_f64(),
         summary.events_dropped
     );
-    if let Some(path) = session_path {
-        let _ = writeln!(err, "  session {}", path.display());
-    }
+    let _ = writeln!(err, "  session {}", session_id);
 }
 
 /// Reports a terminal task error to stderr. A no-op in NDJSON mode, where the

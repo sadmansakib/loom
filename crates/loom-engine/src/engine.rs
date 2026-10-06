@@ -1,4 +1,4 @@
-//! The driving API: open an engine, run one task, persist the session.
+//! The driving API: open an engine, run one task, persist sessions.
 //!
 //! [`Engine::open`] resolves credentials, builds the concrete provider, and
 //! assembles the built-in tools into one [`Agent`]; the frontend then calls
@@ -14,8 +14,10 @@ use loom_kernel::event::EventSink;
 use loom_kernel::id::SessionId;
 use loom_kernel::model::ModelProvider;
 use loom_kernel::session::Session;
+use loom_kernel::store::StoreError;
 use loom_kernel::tool::ToolRegistry;
 use loom_providers::{DeepSeekConfig, DeepSeekProvider, ReasoningEffort};
+use loom_store::SqliteStore;
 use loom_tools::{
     EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool, WriteFileTool,
 };
@@ -46,8 +48,11 @@ pub struct EngineConfig {
     pub system_prompt: Option<String>,
     /// Maximum number of model turns for one task.
     pub max_turns: u32,
-    /// Whether sessions are written to the per-user sessions directory.
-    pub save_sessions: bool,
+    /// Whether the session is persisted to the state database (ADR-008).
+    ///
+    /// When false the run is entirely in memory: a frontend that wants
+    /// durability for the session must opt in. `--no-save` clears it.
+    pub persist: bool,
 }
 
 /// An opened engine: a composed [`Agent`] plus the session policy.
@@ -56,7 +61,6 @@ pub struct EngineConfig {
 /// provider, the credential, or the tool registry again.
 pub struct Engine {
     agent: Agent,
-    save_sessions: bool,
 }
 
 impl Engine {
@@ -126,7 +130,7 @@ impl Engine {
 
         let registry = build_registry()?;
         let system_prompt = config.system_prompt.unwrap_or_else(default_system_prompt);
-        let agent = Agent::new(
+        let mut agent = Agent::new(
             Box::new(provider),
             Box::new(DefaultContextCompiler),
             registry,
@@ -135,18 +139,23 @@ impl Engine {
         )
         .with_max_turns(config.max_turns);
 
-        Ok(Self {
-            agent,
-            save_sessions: config.save_sessions,
-        })
+        // Durable sessions (ADR-008): the same `loom.db` the account store
+        // uses. `--no-save` leaves the run in memory only.
+        if config.persist {
+            let store = SqliteStore::open(paths::db_path()).map_err(EngineError::Session)?;
+            agent = agent.with_store(Box::new(store));
+        }
+
+        Ok(Self { agent })
     }
 
     /// Creates a fresh session handle for one run.
     ///
     /// The engine owns session *durability*; the frontend owns session
-    /// *identity and rendering*. Today the caller keeps the value and passes
-    /// it back to [`Engine::run_task`]; the handle-based API (engine-held
-    /// sessions, follow-ups, a command channel) lands with persistence.
+    /// *identity and rendering*. When the engine was opened with persistence,
+    /// the id can later be handed to [`Engine::load_session`] to resume. A
+    /// frontend that keeps the value can also pass it straight back to
+    /// [`Engine::run_task`] for follow-up tasks in the same session.
     #[must_use]
     pub fn new_session(&self) -> Session {
         Session::new(SessionId::new())
@@ -170,29 +179,26 @@ impl Engine {
             .await
     }
 
-    /// Writes the session as a single JSON file, unless saving is disabled.
+    /// Loads a persisted session so a frontend can resume it.
     ///
-    /// Returns the path written, or `None` when the config disabled saving.
+    /// Returns `Ok(None)` when persistence is disabled or the session is
+    /// unknown. The store is the durable form of the transcript (ADR-008);
+    /// `run_task` continues from whatever it returns.
     ///
-    /// Blocking: this creates the sessions directory and writes the file
-    /// synchronously, so a frontend that runs an event loop should call it off
-    /// its render thread (or accept the stall at its persistence point).
-    pub fn save_session(&self, session: &Session) -> Result<Option<PathBuf>, EngineError> {
-        if !self.save_sessions {
-            return Ok(None);
+    /// Blocking: reads SQLite synchronously, so an event-loop frontend should
+    /// call it off its render thread.
+    pub fn load_session(&self, id: &SessionId) -> Result<Option<Session>, EngineError> {
+        match self.agent.load_session(id) {
+            Ok(session) => Ok(session),
+            Err(error) => Err(EngineError::Session(error)),
         }
-        let dir = paths::sessions_dir();
-        std::fs::create_dir_all(&dir).map_err(|source| EngineError::SessionDir {
-            path: dir.clone(),
-            source,
-        })?;
-        let path = dir.join(format!("{}.json", session.id));
-        let bytes = serde_json::to_vec_pretty(session).map_err(EngineError::SerializeSession)?;
-        std::fs::write(&path, bytes).map_err(|source| EngineError::SessionWrite {
-            path: path.clone(),
-            source,
-        })?;
-        Ok(Some(path))
+    }
+
+    /// Lists the ids of every persisted session, oldest creation order.
+    ///
+    /// Blocking (SQLite); same call-off-thread guidance as [`Self::load_session`].
+    pub fn session_ids(&self) -> Result<Vec<SessionId>, EngineError> {
+        self.agent.session_ids().map_err(EngineError::Session)
     }
 }
 
@@ -288,25 +294,7 @@ pub enum EngineError {
         /// The registration failure.
         message: String,
     },
-    /// The sessions directory could not be created.
-    #[error("creating the session directory `{path}`")]
-    SessionDir {
-        /// Directory that could not be created.
-        path: PathBuf,
-        /// The underlying I/O failure.
-        #[source]
-        source: std::io::Error,
-    },
-    /// The session could not be serialized.
-    #[error("serialising the session: {0}")]
-    SerializeSession(#[source] serde_json::Error),
-    /// The session file could not be written.
-    #[error("writing the session to `{path}`")]
-    SessionWrite {
-        /// File that could not be written.
-        path: PathBuf,
-        /// The underlying I/O failure.
-        #[source]
-        source: std::io::Error,
-    },
+    /// The session store could not be opened, read, or written.
+    #[error("session store: {0}")]
+    Session(#[source] StoreError),
 }

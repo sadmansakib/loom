@@ -24,13 +24,10 @@ pub fn data_dir() -> PathBuf {
 }
 
 /// Path to the SQLite state database, honouring the `LOOM_DB` override.
+///
+/// Holds both account metadata and durable session transcripts (ADR-008).
 pub fn db_path() -> PathBuf {
     std::env::var_os("LOOM_DB")
         .map(PathBuf::from)
         .unwrap_or_else(|| data_dir().join("loom.db"))
-}
-
-/// Directory for saved session JSON files.
-pub fn sessions_dir() -> PathBuf {
-    data_dir().join("sessions")
 }

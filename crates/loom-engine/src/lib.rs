@@ -5,13 +5,14 @@
 //! presentation:
 //!
 //! - **Configuration** ([`EngineConfig`]) — provider, model, workspace,
-//!   reasoning effort, turn ceiling, and whether sessions are saved.
+//!   reasoning effort, turn ceiling, and whether sessions persist.
 //! - **Credential resolution** ([`auth`]) — the SQLite account store, the OS
 //!   keychain backend, and ADR-009 resolution order.
-//! - **Composition** ([`Engine::open`]) — one concrete provider and the
-//!   built-in tool registry, assembled through the `loom-kernel` traits.
+//! - **Composition** ([`Engine::open`]) — one concrete provider, the built-in
+//!   tool registry, and the durable session store, assembled through the
+//!   `loom-kernel` traits.
 //! - **Session lifecycle and durability** ([`Engine::new_session`],
-//!   [`Engine::save_session`]).
+//!   [`Engine::load_session`]) — transcripts persist in `loom.db` (ADR-008).
 //! - **The driving API** ([`Engine::run_task`]) — one task in, events out
 //!   through an in-process [`loom_kernel::event::EventSink`], a terminal
 //!   result returned as data.

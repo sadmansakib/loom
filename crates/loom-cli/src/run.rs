@@ -31,7 +31,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         workspace: args.workspace,
         system_prompt: args.system_prompt,
         max_turns: args.max_turns,
-        save_sessions: !args.no_save,
+        persist: !args.no_save,
     })?;
 
     let mut session = engine.new_session();
@@ -67,10 +67,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     signal.abort();
     let _ = consumer.join();
 
-    let session_path = engine.save_session(&session)?;
     match outcome {
         Ok(summary) => {
-            output::print_summary(&summary, "completed", session_path.as_deref(), args.json);
+            output::print_summary(&summary, "completed", &session.id, args.json);
             runtime.shutdown_timeout(Duration::from_secs(5));
             Ok(ExitCode::SUCCESS)
         }

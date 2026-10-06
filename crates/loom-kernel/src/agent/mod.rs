@@ -24,7 +24,7 @@ use crate::context::{
     ContextInput,
 };
 use crate::event::{EventKind, EventSink};
-use crate::id::TaskId;
+use crate::id::{SessionId, TaskId};
 use crate::model::{
     ModelError, ModelErrorKind, ModelEvent, ModelProvider, ModelRequest, ModelResponse, StopReason,
     Usage,
@@ -458,6 +458,26 @@ impl Agent {
     #[must_use]
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    /// Loads a persisted session from the attached store, if any.
+    ///
+    /// Returns `Ok(None)` when no store is attached or the session is unknown,
+    /// so a frontend can treat "no persistence" and "not found" alike when
+    /// deciding whether to start fresh.
+    pub fn load_session(&self, id: &SessionId) -> Result<Option<Session>, StoreError> {
+        match &self.store {
+            Some(store) => store.load(id),
+            None => Ok(None),
+        }
+    }
+
+    /// Lists persisted session ids (creation order), empty without a store.
+    pub fn session_ids(&self) -> Result<Vec<SessionId>, StoreError> {
+        match &self.store {
+            Some(store) => store.session_ids(),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Runs one task against `session`, appending its input and committing

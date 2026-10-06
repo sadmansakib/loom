@@ -1378,6 +1378,7 @@ dependencies = [
  "keyring",
  "loom-kernel",
  "loom-providers",
+ "loom-store",
  "loom-tools",
  "rusqlite",
  "serde",

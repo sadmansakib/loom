@@ -78,7 +78,7 @@ pub struct RunArgs {
     #[arg(long)]
     pub system_prompt: Option<String>,
 
-    /// Do not write the session JSON file at the end of the run.
+    /// Do not persist the session to the state database (`--no-save`).
     #[arg(long)]
     pub no_save: bool,
 }
