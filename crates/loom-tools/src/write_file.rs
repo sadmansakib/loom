@@ -29,7 +29,8 @@ struct WriteInput {
     path: String,
     /// File content to write.
     content: String,
-    /// Optional cargo run after the write: check or test.
+    /// Cargo run after the write: `check` or `test`. Omitted runs
+    /// `check` automatically for Rust sources (`.rs`, `Cargo.toml`).
     #[serde(default)]
     verify: Option<crate::verify::Scope>,
 }
@@ -69,7 +70,7 @@ impl Tool for WriteFileTool {
             let display = input.path;
             let path = resolve_within(&ctx.workspace_root, &display)?;
             let relative = workspace_relative(&ctx.workspace_root, &path);
-            let scope = input.verify;
+            let scope = input.verify.or_else(|| crate::fusion::auto_scope(&display));
             let bytes = input.content.into_bytes();
             let written = bytes.len();
             let moved_path = path.clone();
@@ -283,5 +284,33 @@ mod tests {
             output.content
         );
         assert!(!output.truncated);
+    }
+
+    #[tokio::test]
+    async fn rust_writes_verify_by_default() {
+        // No `verify` argument: a Rust source gets the fused check
+        // anyway, so the model never needs a hand-run turn for proof.
+        let (_guard, root) = crate_root();
+        let output = WriteFileTool
+            .call(
+                json!({
+                    "path": "src/lib.rs",
+                    "content": "pub fn three() -> u32 { 3 }\n"
+                }),
+                &crate_ctx(&root),
+            )
+            .await
+            .expect("ok");
+        assert!(
+            output.content.contains("--- verify ---"),
+            "{}",
+            output.content
+        );
+        assert!(
+            output.content.contains("exit status: 0"),
+            "{}",
+            output.content
+        );
+        assert_eq!(output.effects.commands_run.len(), 1);
     }
 }

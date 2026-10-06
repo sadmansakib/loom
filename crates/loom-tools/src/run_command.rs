@@ -9,12 +9,9 @@
 //! (timeout or cancellation), so a runaway command cannot outlive the
 //! turn.
 //!
-//! A timeout or cancellation kills the direct child (`kill_on_drop`) but not
-//! processes it spawned: tearing down the whole process group needs an
-//! `unsafe` `libc::killpg`, and this crate is `unsafe_code = "forbid"`. A
-//! timeout during `cargo build` can therefore leave `rustc` children running
-//! until they finish. Process-group teardown belongs with the sandbox/policy
-//! iteration (roadmap §5.3).
+//! A timeout or cancellation kills the child's whole process group
+//! (process-wrap + a best-effort `killpg` drop guard), so grandchildren
+//! like `rustc` cannot outlive the turn or hold the output pipes open.
 //!
 //! Execution policy proper (resource limits, broader allow-lists,
 //! sandboxing) is a later iteration's seam; this is the minimal safe
