@@ -12,7 +12,8 @@
 //!   tool registry, and the durable session store, assembled through the
 //!   `loom-kernel` traits.
 //! - **Session lifecycle and durability** ([`Engine::new_session`],
-//!   [`Engine::load_session`]) — transcripts persist in `loom.db` (ADR-008).
+//!   [`Engine::load_session`]) — transcripts persist in the frontend-chosen
+//!   database (ADR-008).
 //! - **The driving API** ([`Engine::run_task`]) — one task in, events out
 //!   through an in-process [`loom_kernel::event::EventSink`], a terminal
 //!   result returned as data.
@@ -28,7 +29,6 @@
 
 pub mod auth;
 pub mod engine;
-pub mod paths;
 pub mod repo;
 
 pub use engine::{Engine, EngineConfig, EngineError};

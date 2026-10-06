@@ -28,12 +28,14 @@ use loom_tools::{
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::{self, KeychainBackend, SqliteAuthStore};
-use crate::paths;
 
 /// Everything a frontend must decide before [`Engine::open`].
 ///
 /// `workspace` is canonicalized by the engine; the rest maps one-to-one to the
 /// `loom run` flags. `system_prompt` defaults to Loom's built-in instruction.
+///
+/// The database location is the frontend's decision: the engine never
+/// consults the environment for it.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Provider adapter to use. Iteration 1 ships `deepseek`.
@@ -52,6 +54,12 @@ pub struct EngineConfig {
     pub system_prompt: Option<String>,
     /// Maximum number of model turns for one task.
     pub max_turns: u32,
+    /// Path to the durable-state database (`loom.db`) the frontend selected.
+    ///
+    /// Used for credential accounts and, when `persist` is set, sessions and
+    /// artifacts. The engine applies no default: a frontend that wants the
+    /// conventional location resolves it before building this config.
+    pub db_path: PathBuf,
     /// Whether the session is persisted to the state database (ADR-008).
     ///
     /// When false the run is entirely in memory: a frontend that wants
@@ -92,7 +100,7 @@ impl Engine {
 
         // Credential resolution: --account → active saved account → env
         // (§18.3). The secret never leaves a `SecretString` wrapper.
-        let store = SqliteAuthStore::open(&paths::db_path()).map_err(EngineError::Store)?;
+        let store = SqliteAuthStore::open(&config.db_path).map_err(EngineError::Store)?;
         let secrets = KeychainBackend::default();
         let credential = auth::resolve(
             &store,
@@ -151,12 +159,14 @@ impl Engine {
         .with_facts_source(Box::new(facts));
 
         // Durable sessions and artifact bodies (ADR-008, ADR-012): the same
-        // `loom.db` the account store uses. `--no-save` leaves the run in
-        // memory only, so nothing spills and `artifact_read` has no store.
+        // database the frontend chose for accounts. `--no-save` leaves the
+        // run in memory only, so nothing spills and `artifact_read` has no
+        // store.
         if config.persist {
-            let store = SqliteStore::open(paths::db_path()).map_err(EngineError::Session)?;
+            let store = SqliteStore::open(config.db_path.clone()).map_err(EngineError::Session)?;
             agent = agent.with_store(Box::new(store));
-            let artifacts = SqliteStore::open(paths::db_path()).map_err(EngineError::Session)?;
+            let artifacts =
+                SqliteStore::open(config.db_path.clone()).map_err(EngineError::Session)?;
             agent = agent.with_artifacts(Some(Arc::new(artifacts)));
         }
 

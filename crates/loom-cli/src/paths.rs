@@ -1,7 +1,9 @@
-//! `XDG`-style paths for the CLI's durable state.
+//! Durable-state locations for the `loom` binary.
 //!
-//! `loom.db` (account metadata, later sessions) lives under the data
-//! directory, never inside the workspace: the workspace is walked by the
+//! Deciding where `loom.db` lives is a frontend responsibility: the engine
+//! accepts an explicit path and never consults the environment. This module
+//! is the CLI's policy — accounts, sessions, and artifacts share one SQLite
+//! file, kept outside the workspace because the workspace is walked by the
 //! `search` tool and may be committed (ADR-008).
 
 use std::path::PathBuf;

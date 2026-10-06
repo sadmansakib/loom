@@ -12,6 +12,7 @@ use tracing_subscriber::EnvFilter;
 mod args;
 mod auth_command;
 mod output;
+mod paths;
 mod run;
 
 use args::{Cli, Command};

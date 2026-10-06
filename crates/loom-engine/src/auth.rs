@@ -718,12 +718,12 @@ pub fn last_four(secret: &str) -> Option<String> {
     Some(chars[chars.len() - 4..].iter().collect())
 }
 
-/// Opens the account store at the resolved `loom.db` path (paths::db_path).
+/// Opens the account store at the database path the frontend selected.
 ///
 /// Frontends call this instead of knowing the on-disk layout; `loom auth`
 /// and `Engine::open` share it.
-pub fn open_store() -> Result<SqliteAuthStore, AuthError> {
-    SqliteAuthStore::open(&crate::paths::db_path())
+pub fn open_store(db_path: &std::path::Path) -> Result<SqliteAuthStore, AuthError> {
+    SqliteAuthStore::open(db_path)
 }
 
 /// The default credential surface a frontend drives (`loom auth ...`).
@@ -737,10 +737,10 @@ pub struct Auth {
 }
 
 impl Auth {
-    /// Opens the default store (`loom.db`) and keychain backend.
-    pub fn open() -> Result<Self, AuthError> {
+    /// Opens the frontend-selected store and the keychain backend.
+    pub fn open(db_path: &std::path::Path) -> Result<Self, AuthError> {
         Ok(Self {
-            store: open_store()?,
+            store: open_store(db_path)?,
             secrets: KeychainBackend::default(),
         })
     }

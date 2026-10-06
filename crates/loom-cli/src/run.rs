@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::args::RunArgs;
 use crate::output::{self, Renderer};
+use crate::paths;
 
 /// Runs one task end to end and returns the process exit code.
 ///
@@ -31,6 +32,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         workspace: args.workspace,
         system_prompt: args.system_prompt,
         max_turns: args.max_turns,
+        db_path: paths::db_path(),
         persist: !args.no_save,
     })?;
 
