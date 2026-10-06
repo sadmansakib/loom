@@ -3,6 +3,51 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-06 — OpenRouter provider (free and paid models)
+
+Second adapter, one shared wire. Loom now talks to OpenRouter alongside
+DeepSeek; free and paid models travel the same path — pricing is data
+(zero vs non-zero), never a branch. Commits `727783d`–`82e01a9`.
+
+- **Cost reporting** (`727783d`): `Usage` gains `cost_usd: Option<f64>`,
+  set when a provider reports actual spend (OpenRouter does, DeepSeek
+  does not); `Add` merges it (Some+Some = sum). `ModelEvent::Completed`
+  stays the sole usage authority; `EVENT_SCHEMA_VERSION` bumps to 2.
+- **Shared wire driver** (`26bcf0b`): the OpenAI-compatible plumbing is
+  extracted behind a `WireEndpoint` trait — `http` (timeouts, bounded
+  error bodies, `Retry-After`), `openai_wire` (request shape, chunk
+  accumulation, mid-stream error objects), `wire_stream` (SSE state
+  machine). An adapter now owns only configuration and error
+  classification, so streaming behaviour cannot drift between providers.
+- **OpenRouter adapter** (`26bcf0b`): capabilities, pricing, and
+  `parallel_tool_calls` resolve from the `GET /models` catalog
+  (`supported_parameters`; unlisted = serialize calls, the safe
+  direction). HTTP 402 classifies as permanent `QuotaExhausted` (exhausted
+  credits block even free models), 429 as retryable `RateLimited`.
+  Catalog reads are bounded at 16 MiB and UTF-8-validated under the idle
+  timeout.
+- **Provider factory** (`10d26ac`): `EngineConfig.provider` selects the
+  adapter; the engine hands catalog-driven adapters a
+  `ProviderCatalog` enum (data, not a provider-named field). It enforces
+  the 64 K pruning floor (`ModelWindowTooSmall`) and fails loudly with
+  `UnknownProvider`/`CatalogMissing` rather than falling back.
+- **Frontend-owned catalog** (`387a075`): the CLI fetches and caches the
+  catalog beside `loom.db` (`openrouter-models.json`, 24 h TTL); a fresh
+  cache skips the network, and a fetch failure falls back to a stale
+  cache so a transient outage cannot block a run.
+- **Review pass** (`62ea5a6`): fixed a wrong `parallel_tool_calls`
+  claim (every tool-capable model got parallel), bounded the catalog
+  download, neutralized `EngineConfig`'s catalog field, and collapsed
+  duplicate provider-name constants and clocks.
+- **Auth consts** (`82e01a9`): `loom-engine` names providers via the
+  shared constants (`DEFAULT_PROVIDER = DEEPSEEK_PROVIDER_NAME`) — one
+  definition site per name.
+- Docs (`fba8c7a`): architecture §9/§10 and the roadmap rewritten around
+  the two adapters, the factory, and the frontend-owned catalog.
+- `cargo test --workspace` 466 passed / 0 failed / 13 ignored (live
+  free-model tests `#[ignore]`d behind `OPENROUTER_API_KEY`, mirroring
+  `DEEPSEEK_API_KEY`); clippy and fmt clean.
+
 ## 2026-10-06 — Context pruning: episodic delta-reclaim gate (cache safety)
 
 Follow-up hardening to step 2L. Pruning must be genuinely episodic — one
