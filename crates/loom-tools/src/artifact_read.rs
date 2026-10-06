@@ -32,7 +32,7 @@ struct ArtifactReadInput {
     #[serde(default)]
     #[schemars(range(min = 1))]
     offset: Option<usize>,
-    /// Maximum lines to return (default 300).
+    /// Maximum lines to return (default: the whole body, up to the output budget).
     #[serde(default)]
     #[schemars(range(min = 1))]
     limit: Option<usize>,

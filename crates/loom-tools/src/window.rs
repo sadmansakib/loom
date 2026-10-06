@@ -11,7 +11,14 @@ use std::path::Path;
 use crate::budget::{self, READ_FILE_HEAD_BYTES};
 
 /// Lines returned when the caller does not pass `limit`.
-pub(crate) const DEFAULT_LIMIT: usize = 300;
+///
+/// Deliberately large: the real bound is the byte budget
+/// ([`READ_FILE_HEAD_BYTES`]), so a default read returns an ordinary source
+/// file in one call instead of forcing the model to page it. Paging costs a
+/// full model turn per page (each replaying the whole transcript); on B1 that
+/// measured ~2× the input tokens of a whole-file read, which is why the line
+/// default is not the knob that bounds a read.
+pub(crate) const DEFAULT_LIMIT: usize = 2000;
 
 /// Bytes scanned to count the total lines. Larger inputs are reported as
 /// "at least N lines" and can still be windowed with `offset`.

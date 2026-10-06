@@ -33,13 +33,16 @@ const MAX_FILE_BYTES: u64 = 1024 * 1024;
 /// engine's 64 KiB output bound ever sees it.
 const MAX_MATCH_LINE_BYTES: usize = 256;
 /// Above this many matches, results are summarized per file (count plus
-/// a short preview) instead of listing every matching line — the tool
-/// result is the dominant input-token cost (ADR-014, V8). Twenty lines
-/// is small enough to present plainly, large enough that a real search
-/// over a repository crosses it.
-const SUMMARY_THRESHOLD: usize = 20;
+/// a preview) instead of listing every matching line — the tool result is
+/// the dominant input-token cost (ADR-014, V8).
+///
+/// Kept high: the default `max_results` cap already bounds a raw listing
+/// (200 matches at ≤256 bytes each). Summarizing sooner hides hits, which
+/// pushed the model into extra refine/re-search turns on B1 — the summary
+/// should only replace a listing too large to present, not a routine one.
+const SUMMARY_THRESHOLD: usize = 100;
 /// How many matching lines to show per file in the summarized form.
-const PER_FILE_PREVIEW: usize = 3;
+const PER_FILE_PREVIEW: usize = 5;
 
 /// One matching line, before rendering.
 struct Match {
@@ -505,14 +508,20 @@ mod tests {
     async fn many_matches_are_summarized_per_file() {
         let (guard, root) = temp_root();
         let hits = |n: usize| "hit\n".repeat(n);
-        std::fs::write(guard.path().join("a.txt"), hits(30)).expect("write");
+        std::fs::write(guard.path().join("a.txt"), hits(130)).expect("write");
         std::fs::write(guard.path().join("b.txt"), hits(25)).expect("write");
         let output = search(&root, json!({"pattern": "hit"})).await.expect("ok");
         let content = &output.content;
-        assert!(content.starts_with("55 matches in 2 files\n"), "{content}");
-        assert!(content.contains("a.txt (30 matches)\n  1: hit\n  2: hit\n  3: hit\n"));
-        assert!(content.contains("b.txt (25 matches)\n  1: hit\n  2: hit\n  3: hit\n"));
-        assert!(content.contains("... [49 more matches; refine the pattern or pass path"));
+        assert!(content.starts_with("155 matches in 2 files\n"), "{content}");
+        assert!(content.contains(
+            "a.txt (130 matches)\n  1: hit\n  2: hit\n  3: hit\n  \
+             4: hit\n  5: hit\n"
+        ));
+        assert!(content.contains(
+            "b.txt (25 matches)\n  1: hit\n  2: hit\n  3: hit\n  \
+             4: hit\n  5: hit\n"
+        ));
+        assert!(content.contains("... [145 more matches; refine the pattern or pass path"));
         assert!(output.truncated);
     }
 
@@ -521,13 +530,20 @@ mod tests {
         let (guard, root) = temp_root();
         std::fs::write(guard.path().join("a.txt"), "hit\n".repeat(40)).expect("write");
         std::fs::write(guard.path().join("b.txt"), "hit\n".repeat(40)).expect("write");
+        // Under the summary threshold the hits are listed raw, with the cap
+        // marker naming what the cap dropped.
         let output = search(&root, json!({"pattern": "hit", "max_results": 25}))
             .await
             .expect("ok");
         assert!(
+            output.content.starts_with("a.txt:1: hit\n"),
+            "{}",
+            output.content
+        );
+        assert!(
             output
                 .content
-                .starts_with("25 matches in 1 file (stopped at the 25-match cap)\n"),
+                .contains("... [stopped at the 25-match cap; refine the pattern"),
             "{}",
             output.content
         );

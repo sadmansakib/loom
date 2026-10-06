@@ -30,7 +30,7 @@ struct ReadInput {
     #[serde(default)]
     #[schemars(range(min = 1))]
     offset: Option<usize>,
-    /// Maximum lines to return (default 300).
+    /// Maximum lines to return (default: the whole file, up to the output budget).
     #[serde(default)]
     #[schemars(range(min = 1))]
     limit: Option<usize>,
@@ -42,9 +42,10 @@ impl Tool for ReadFileTool {
         SPEC.get_or_init(|| ToolSpec {
             name: "read_file".to_owned(),
             description: "Reads one text file from the workspace as numbered lines \
-                          with a total-lines header. Read the smallest relevant range: \
-                          pass `offset` (first line, 1-based) and `limit` (line count, \
-                          default 300). Large ranges are cut with an explicit marker."
+                          with a total-lines header. The whole file is returned by \
+                          default; pass `offset` (first line, 1-based) and `limit` \
+                          (line count) to read a smaller range. Large ranges are cut \
+                          with an explicit marker."
                 .to_owned(),
             parameters: crate::schema::parameters::<ReadInput>(),
         })
@@ -176,17 +177,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_limit_bounds_a_long_file() {
+    async fn the_default_read_returns_a_long_file_whole() {
         let (guard, root) = temp_root();
         let body: String = (1..=1000).map(|n| format!("line {n}\n")).collect();
         std::fs::write(guard.path().join("f.txt"), body).expect("write");
         let output = read(&root, json!({"path": "f.txt"})).await.expect("ok");
-        assert!(output.truncated);
+        // The byte budget, not the line default, bounds an ordinary read.
+        assert!(!output.truncated, "{}", output.content);
         assert!(output.content.starts_with("f.txt: 1000 lines\n1\tline 1\n"));
+        assert!(output.content.ends_with("1000\tline 1000\n"));
+    }
+
+    #[tokio::test]
+    async fn an_explicit_limit_still_windows() {
+        let (guard, root) = temp_root();
+        let body: String = (1..=10).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(guard.path().join("f.txt"), body).expect("write");
+        let output = read(&root, json!({"path": "f.txt", "limit": 4}))
+            .await
+            .expect("ok");
+        assert!(output.truncated);
         assert!(
             output
                 .content
-                .contains("[700 more lines; read with offset=301]")
+                .contains("[6 more lines; read with offset=5]")
         );
     }
 

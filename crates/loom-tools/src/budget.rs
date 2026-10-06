@@ -9,9 +9,13 @@
 //! partial result as if it were whole (ADR-014); each helper here leaves an
 //! `... [N bytes omitted] ...` marker in the text and reports whether it cut.
 
-/// Bytes kept from the head of a `read_file` result, before windowing
-/// (ADR-014, V7).
-pub(crate) const READ_FILE_HEAD_BYTES: usize = 32 * 1024;
+/// Bytes kept from the head of a `read_file` result (ADR-014, V7).
+///
+/// Sized so an ordinary source file (plus its line-number prefixes) comes
+/// back whole in a single call: the repository's largest source file is
+/// ~47 KiB, so 56 KiB covers it while staying under the engine's 64 KiB
+/// backstop. A smaller cap forces paging, and each page costs a model turn.
+pub(crate) const READ_FILE_HEAD_BYTES: usize = 56 * 1024;
 
 /// Bytes kept from the head of a `run_command` result (banner, early output).
 pub(crate) const COMMAND_HEAD_BYTES: usize = 16 * 1024;
