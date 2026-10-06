@@ -11,6 +11,7 @@ use tracing_subscriber::EnvFilter;
 
 mod args;
 mod auth_command;
+mod catalog;
 mod output;
 mod paths;
 mod run;

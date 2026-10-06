@@ -9,7 +9,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::Context;
+use loom_core::engine::auth::Auth;
 use loom_core::kernel::event::ChannelEventSink;
+use loom_core::providers::{OpenRouterCatalog, OpenRouterProvider};
 use loom_core::{Engine, EngineConfig};
 use tokio_util::sync::CancellationToken;
 
@@ -23,6 +25,21 @@ use crate::paths;
 /// (`130` for cancellation, `1` otherwise); only setup failures propagate as
 /// `Err`.
 pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
+    // The runtime exists before the engine opens: fetching the OpenRouter
+    // catalog is asynchronous and must complete before `Engine::open`, which
+    // resolves capabilities from it.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building the tokio runtime")?;
+
+    let db_path = paths::db_path();
+    let openrouter_catalog = if args.provider == OpenRouterProvider::PROVIDER_NAME {
+        Some(load_openrouter_catalog(&runtime, &args, &db_path)?)
+    } else {
+        None
+    };
+
     let engine = Engine::open(EngineConfig {
         provider: args.provider,
         model: args.model,
@@ -32,8 +49,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         workspace: args.workspace,
         system_prompt: args.system_prompt,
         max_turns: args.max_turns,
-        db_path: paths::db_path(),
+        db_path,
         persist: !args.no_save,
+        openrouter_catalog,
     })?;
 
     let mut session = engine.new_session();
@@ -50,12 +68,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         renderer.finish();
     });
 
-    // An explicit runtime with a bounded shutdown (§6.6): the provider's
-    // timeouts need the time driver, and Ctrl-C must cancel the task token.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("building the tokio runtime")?;
+    // Ctrl-C cancels the task token; the provider's timeouts need the time
+    // driver the runtime already enables.
     let cancellation = CancellationToken::new();
     let signal_token = cancellation.clone();
     let signal = runtime.spawn(async move {
@@ -85,4 +99,25 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             })
         }
     }
+}
+
+/// Obtains the OpenRouter catalog before the engine opens.
+///
+/// The engine resolves capabilities from the catalog, so a missing one is a
+/// setup failure, not a runtime one. Credential resolution goes through the
+/// engine's account store, so `--account`, saved accounts, and the
+/// environment behave exactly as they will for the provider itself.
+fn load_openrouter_catalog(
+    runtime: &tokio::runtime::Runtime,
+    args: &RunArgs,
+    db_path: &std::path::Path,
+) -> anyhow::Result<OpenRouterCatalog> {
+    let auth = Auth::open(db_path).context("opening the account store")?;
+    runtime.block_on(crate::catalog::load(
+        &auth,
+        &args.provider,
+        args.account.as_deref(),
+        args.base_url.as_deref(),
+        db_path,
+    ))
 }
