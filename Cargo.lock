@@ -1350,20 +1350,35 @@ dependencies = [
  "anyhow",
  "clap",
  "futures",
- "keyring",
+ "loom-engine",
  "loom-kernel",
  "loom-providers",
  "loom-tools",
  "rpassword",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "loom-engine"
+version = "0.1.0"
+dependencies = [
+ "keyring",
+ "loom-kernel",
+ "loom-providers",
+ "loom-tools",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
- "tokio",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 

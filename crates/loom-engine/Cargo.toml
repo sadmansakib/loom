@@ -1,0 +1,27 @@
+[package]
+name = "loom-engine"
+description = "Loom composition root and control plane: configuration, credential resolution, provider/tool composition, session lifecycle, and the driving API frontends share."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+loom-kernel = { workspace = true }
+loom-providers = { workspace = true }
+loom-tools = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+# Account metadata store + OS-keychain secret backend (ADR-009, §18.3).
+rusqlite = { workspace = true }
+keyring = { workspace = true }
+uuid = { workspace = true }
+# CancellationToken crosses the driving API (§6.6).
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

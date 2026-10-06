@@ -7,10 +7,10 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+use loom_engine::ReasoningEffort;
 use loom_kernel::agent::DEFAULT_MAX_TURNS;
-use loom_providers::ReasoningEffort;
 
-use crate::auth::Method;
+use loom_engine::auth::Method;
 
 /// `loom`: a minimal, deterministic coding agent.
 #[derive(Debug, Parser)]

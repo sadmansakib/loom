@@ -1,33 +1,20 @@
-//! `loom run`: credential resolution, composition, and one task.
+//! `loom run`: one task driven through the engine.
 //!
-//! This is the composition root (architecture §2): it is the only place that
-//! knows about a concrete provider, the concrete tools, the credential seams,
-//! and the runtime. Everything below it is wired through the `loom-kernel`
-//! traits. Credentials are resolved *before* the provider is built, and the
-//! secret never leaves [`loom_providers::SecretString`] wrappers (§18.3).
+//! This is the CLI adapter, not the composition root: the engine (ADR-021)
+//! owns credentials, the provider, the tools, and session durability; this
+//! module builds the process around it — tokio runtime, Ctrl-C cancellation,
+//! the stdout/stderr consumer thread, and the exit code.
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::{Context, bail};
-use loom_kernel::agent::Agent;
-use loom_kernel::context::{AgentConfig, DefaultContextCompiler};
+use anyhow::Context;
+use loom_engine::{Engine, EngineConfig};
 use loom_kernel::event::ChannelEventSink;
-use loom_kernel::id::SessionId;
-use loom_kernel::model::ModelProvider;
-use loom_kernel::session::Session;
-use loom_kernel::tool::ToolRegistry;
-use loom_providers::{DeepSeekConfig, DeepSeekProvider};
-use loom_tools::{
-    EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool, WriteFileTool,
-};
 use tokio_util::sync::CancellationToken;
 
 use crate::args::RunArgs;
-use crate::auth::{self, KeychainBackend, SqliteAuthStore};
 use crate::output::{self, Renderer};
-use crate::paths;
 
 /// Runs one task end to end and returns the process exit code.
 ///
@@ -35,95 +22,19 @@ use crate::paths;
 /// (`130` for cancellation, `1` otherwise); only setup failures propagate as
 /// `Err`.
 pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
-    if args.provider != "deepseek" {
-        bail!(
-            "unknown provider `{}`: iteration 1 ships `deepseek`",
-            args.provider
-        );
-    }
-
-    let workspace = std::fs::canonicalize(&args.workspace).with_context(|| {
-        format!(
-            "workspace `{}` does not exist or is not readable",
-            args.workspace.display()
-        )
+    let engine = Engine::open(EngineConfig {
+        provider: args.provider,
+        model: args.model,
+        base_url: args.base_url,
+        reasoning_effort: args.reasoning_effort,
+        account: args.account,
+        workspace: args.workspace,
+        system_prompt: args.system_prompt,
+        max_turns: args.max_turns,
+        save_sessions: !args.no_save,
     })?;
 
-    // Credential resolution: --account → active saved account → env (§18.3).
-    let store = SqliteAuthStore::open(&paths::db_path()).context("opening the account store")?;
-    let secrets = KeychainBackend::default();
-    let credential = auth::resolve(
-        &store,
-        &secrets,
-        &args.provider,
-        args.account.as_deref(),
-        |name| std::env::var(name).ok(),
-    )?;
-    tracing::debug!(
-        source = credential.source.as_str(),
-        account = credential
-            .account
-            .as_ref()
-            .map(|account| account.label.as_str())
-            .unwrap_or("-"),
-        "credential resolved"
-    );
-
-    // Provider construction and loud capability validation (§6.4).
-    let mut config = DeepSeekConfig::new(credential.secret.expose().to_owned())
-        .with_reasoning_effort(args.reasoning_effort);
-    if let Some(base_url) = &args.base_url {
-        config = config.with_base_url(base_url.clone());
-    }
-    let provider = DeepSeekProvider::new(config).context("building the DeepSeek provider")?;
-    let capabilities = provider.capabilities(&args.model).ok_or_else(|| {
-        anyhow::anyhow!(
-            "model `{}` is unknown to provider `{}`: check --model",
-            args.model,
-            args.provider
-        )
-    })?;
-    if !capabilities.reasoning {
-        bail!(
-            "model `{}` does not support reasoning, but a reasoning effort is always sent; \
-             choose a reasoning model",
-            args.model
-        );
-    }
-
-    // Built-in tools (§9). Registration order is the exposure order: the
-    // read-only tools first, so the prompt prefix stays stable.
-    let mut registry = ToolRegistry::new();
-    registry
-        .register(Box::new(ReadFileTool))
-        .context("registering read_file")?;
-    registry
-        .register(Box::new(ListDirTool))
-        .context("registering list_dir")?;
-    registry
-        .register(Box::new(SearchTool))
-        .context("registering search")?;
-    registry
-        .register(Box::new(WriteFileTool))
-        .context("registering write_file")?;
-    registry
-        .register(Box::new(EditFileTool))
-        .context("registering edit_file")?;
-    registry
-        .register(Box::new(RunCommandTool::new()))
-        .context("registering run_command")?;
-
-    let system_prompt = args.system_prompt.unwrap_or_else(default_system_prompt);
-    let agent = Agent::new(
-        Box::new(provider),
-        Box::new(DefaultContextCompiler),
-        registry,
-        AgentConfig::new(workspace, system_prompt),
-        args.model.clone(),
-    )
-    .with_max_turns(args.max_turns);
-
-    let mut session = Session::new(SessionId::new());
+    let mut session = engine.new_session();
     let input = args.task.join(" ");
 
     // The consumer owns stdout/stderr; the sink only numbers and sends (§11).
@@ -151,12 +62,12 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         }
     });
 
-    let outcome = runtime.block_on(agent.run_task(&mut session, input, &sink, &cancellation));
+    let outcome = runtime.block_on(engine.run_task(&mut session, input, &sink, &cancellation));
     drop(sink);
     signal.abort();
     let _ = consumer.join();
 
-    let session_path = save_session(&session, args.no_save)?;
+    let session_path = engine.save_session(&session)?;
     match outcome {
         Ok(summary) => {
             output::print_summary(&summary, "completed", session_path.as_deref(), args.json);
@@ -173,30 +84,4 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             })
         }
     }
-}
-
-/// Writes the session as a single JSON file, unless saving is disabled.
-fn save_session(session: &Session, no_save: bool) -> anyhow::Result<Option<PathBuf>> {
-    if no_save {
-        return Ok(None);
-    }
-    let dir = paths::sessions_dir();
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating the session directory `{}`", dir.display()))?;
-    let path = dir.join(format!("{}.json", session.id));
-    let bytes = serde_json::to_vec_pretty(session).context("serialising the session")?;
-    std::fs::write(&path, bytes)
-        .with_context(|| format!("writing the session to `{}`", path.display()))?;
-    Ok(Some(path))
-}
-
-/// The built-in instruction; overridable with `--system-prompt`.
-fn default_system_prompt() -> String {
-    String::from(
-        "You are Loom, a coding agent working inside one workspace. Use the provided \
-         tools to inspect and change the workspace: list and search before reading, \
-         read before editing, write or edit files to make changes, and run allow-listed \
-         commands (cargo) to verify. Prefer the smallest change that works. When you \
-         answer, be concise and name the workspace-relative paths you relied on.",
-    )
 }
