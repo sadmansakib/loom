@@ -114,7 +114,7 @@ pub struct ContextInput<'a> {
     /// Agent configuration: workspace root (for relative tool arguments)
     /// plus any future knobs the compiler reads.
     pub config: &'a AgentConfig,
-    /// Repository facts captured once for this task (2E, ADR-022), or an
+    /// Repository facts captured once for this task (2E, ADR-015), or an
     /// empty value when no source is attached. Rendered as a stable system
     /// message right after the system prompt; empty facts add no message.
     pub facts: &'a KnownFacts,
@@ -164,7 +164,7 @@ impl AgentConfig {
 pub struct ContextCensus {
     /// The static system prompt (§8.1.1).
     pub system_prompt: u32,
-    /// The repository facts block, when one was projected (2E, ADR-022).
+    /// The repository facts block, when one was projected (2E, ADR-015).
     /// Counted apart from the system prompt it follows.
     pub repo_facts: u32,
     /// Task and user items in the projection.

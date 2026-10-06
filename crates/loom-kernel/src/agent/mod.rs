@@ -472,7 +472,7 @@ impl Agent {
         self
     }
 
-    /// Attaches a repository-facts source (2E, ADR-022).
+    /// Attaches a repository-facts source (2E, ADR-015).
     ///
     /// The source is scanned **once per task**, at task start, and the
     /// resulting [`KnownFacts`](crate::context::KnownFacts) is projected as a
@@ -654,7 +654,7 @@ impl Agent {
             self.reserved_output_tokens,
         )?;
 
-        // Repository facts for this task (2E, ADR-022): captured exactly once,
+        // Repository facts for this task (2E, ADR-015): captured exactly once,
         // before the first compile, so the projected block is byte-stable for
         // the whole task (§8.1.1) and "what changed" never costs a model turn.
         let facts = self.facts.scan();

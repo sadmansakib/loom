@@ -132,7 +132,7 @@ impl Engine {
 
         let registry = build_registry()?;
         let system_prompt = config.system_prompt.unwrap_or_else(default_system_prompt);
-        // Stage-1 repository facts (2E, ADR-022): the composition root owns the
+        // Stage-1 repository facts (2E, ADR-015): the composition root owns the
         // I/O; the loop scans once per task through this source.
         let facts = crate::repo::FsFactsSource::new(workspace.clone());
         let mut agent = Agent::new(

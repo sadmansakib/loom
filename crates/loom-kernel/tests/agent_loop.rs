@@ -331,7 +331,7 @@ fn usage(input: u64, output: u64, cached: Option<u64>) -> Usage {
 
 #[tokio::test]
 async fn repository_facts_are_projected_as_a_stable_system_block() {
-    // 2E (ADR-022): the facts block is a deterministic second system message,
+    // 2E (ADR-015): the facts block is a deterministic second system message,
     // identical in every turn of the task, so "what changed?" is answered
     // without a model turn and the cached prefix is never churned.
     let provider = FakeProvider::new(

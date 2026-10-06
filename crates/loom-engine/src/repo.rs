@@ -1,4 +1,4 @@
-//! Stage-1 repository intelligence (Iteration 2 step 2E; ADR-022).
+//! Stage-1 repository intelligence (Iteration 2 step 2E; ADR-015).
 //!
 //! [`scan`] produces a bounded, deterministic [`KnownFacts`] snapshot of a
 //! workspace: repository structure (languages, build systems, source and test

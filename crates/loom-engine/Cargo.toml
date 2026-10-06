@@ -10,7 +10,7 @@ loom-kernel = { workspace = true }
 loom-store = { workspace = true }
 loom-providers = { workspace = true }
 loom-tools = { workspace = true }
-# Gitignore-aware walk for the stage-1 repository scan (2E, ADR-022).
+# Gitignore-aware walk for the stage-1 repository scan (2E, ADR-015).
 ignore = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
