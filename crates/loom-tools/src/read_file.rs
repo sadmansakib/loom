@@ -7,8 +7,9 @@
 
 use futures::future::BoxFuture;
 use loom_kernel::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
+use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -28,16 +29,19 @@ const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Debug, Default)]
 pub struct ReadFileTool;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 struct ReadInput {
     /// File path, relative to the workspace root.
     path: String,
     /// First line to return, 1-based (default 1).
     #[serde(default)]
+    #[schemars(range(min = 1))]
     offset: Option<usize>,
     /// Maximum lines to return (default 300).
     #[serde(default)]
+    #[schemars(range(min = 1))]
     limit: Option<usize>,
 }
 
@@ -61,27 +65,7 @@ impl Tool for ReadFileTool {
                           pass `offset` (first line, 1-based) and `limit` (line count, \
                           default 300). Large ranges are cut with an explicit marker."
                 .to_owned(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path, relative to the workspace root."
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "First line to return, 1-based (default 1)."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Maximum lines to return (default 300)."
-                    }
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            }),
+            parameters: crate::schema::parameters::<ReadInput>(),
         })
     }
 
@@ -215,6 +199,7 @@ fn read_window(path: &Path, offset: usize, limit: usize) -> std::io::Result<Opti
 mod tests {
     use super::*;
     use loom_kernel::tool::Tool;
+    use serde_json::json;
     use std::path::PathBuf;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
@@ -368,5 +353,10 @@ mod tests {
         // Same branch a FIFO hits: metadata says "not a regular file"
         // before any blocking open.
         assert!(matches!(err, ToolError::Execution(msg) if msg.contains("not a regular file")));
+    }
+
+    #[test]
+    fn the_schema_and_the_parser_agree() {
+        crate::schema::agreement::check::<ReadInput>(json!({"path": "src/lib.rs"}));
     }
 }

@@ -11,8 +11,9 @@ use futures::future::BoxFuture;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use loom_kernel::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
 use regex::Regex;
+use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -56,8 +57,9 @@ struct Match {
 #[derive(Debug, Default)]
 pub struct SearchTool;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 struct SearchInput {
     /// Regular expression (Rust syntax).
     pattern: String,
@@ -66,6 +68,7 @@ struct SearchInput {
     path: Option<String>,
     /// Cap on reported matching lines; defaults to 200, minimum 1.
     #[serde(default)]
+    #[schemars(range(min = 1))]
     max_results: Option<usize>,
 }
 
@@ -80,27 +83,7 @@ impl Tool for SearchTool {
                           workspace-relative paths. Large result sets are summarized \
                           per file with a short preview and a hint to narrow the search."
                 .to_owned(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Rust regular expression to match per line."
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Directory or file to search; defaults to the \
-                                        whole workspace."
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Maximum matching lines to report (default 200)."
-                    }
-                },
-                "required": ["pattern"],
-                "additionalProperties": false
-            }),
+            parameters: crate::schema::parameters::<SearchInput>(),
         })
     }
 
@@ -420,6 +403,7 @@ fn read_capped_text(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use loom_kernel::tool::Tool;
+    use serde_json::json;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -771,5 +755,10 @@ mod tests {
             output.content.len(),
             "big-line.txt:1: ".len() + MAX_MATCH_LINE_BYTES + '…'.len_utf8()
         );
+    }
+
+    #[test]
+    fn the_schema_and_the_parser_agree() {
+        crate::schema::agreement::check::<SearchInput>(json!({"pattern": "fn main"}));
     }
 }

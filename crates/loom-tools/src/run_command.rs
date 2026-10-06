@@ -28,8 +28,9 @@ use loom_kernel::agent::tools::MAX_TOOL_OUTPUT_BYTES;
 use loom_kernel::tool::{
     CommandEffect, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec,
 };
+use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::io::AsyncReadExt;
 
 use crate::budget;
@@ -80,10 +81,13 @@ impl RunCommandTool {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 struct RunInput {
+    /// Executable name (no path). Allowed: cargo.
     program: String,
+    /// Arguments passed to the program, one array entry each.
     #[serde(default)]
     args: Vec<String>,
 }
@@ -98,22 +102,7 @@ impl Tool for RunCommandTool {
                           pass the program and each argument separately. Iteration 1 allows \
                           `cargo` (e.g. build, test, fmt, clippy)."
                 .to_owned(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "program": {
-                        "type": "string",
-                        "description": "Executable name (no path). Allowed: cargo."
-                    },
-                    "args": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Arguments passed to the program, one array entry each."
-                    }
-                },
-                "required": ["program"],
-                "additionalProperties": false
-            }),
+            parameters: crate::schema::parameters::<RunInput>(),
         })
     }
 
@@ -256,6 +245,7 @@ fn status_line(status: std::process::ExitStatus) -> String {
 mod tests {
     use super::*;
     use loom_kernel::tool::Tool;
+    use serde_json::json;
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::process::{ExitStatus, Output};
@@ -432,5 +422,10 @@ mod tests {
                 Some(2)
             )]
         );
+    }
+
+    #[test]
+    fn the_schema_and_the_parser_agree() {
+        crate::schema::agreement::check::<RunInput>(json!({"program": "cargo"}));
     }
 }

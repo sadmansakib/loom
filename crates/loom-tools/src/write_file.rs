@@ -6,8 +6,9 @@
 
 use futures::future::BoxFuture;
 use loom_kernel::tool::{Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec};
+use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -18,10 +19,13 @@ use crate::confinement::{resolve_within, workspace_relative};
 #[derive(Debug, Default)]
 pub struct WriteFileTool;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 struct WriteInput {
+    /// File path, relative to the workspace root.
     path: String,
+    /// The complete file content to write.
     content: String,
 }
 
@@ -35,21 +39,7 @@ impl Tool for WriteFileTool {
                           read it first when it already exists; use edit_file for a \
                           targeted change."
                 .to_owned(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path, relative to the workspace root."
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "The complete file content to write."
-                    }
-                },
-                "required": ["path", "content"],
-                "additionalProperties": false
-            }),
+            parameters: crate::schema::parameters::<WriteInput>(),
         })
     }
 
@@ -97,6 +87,7 @@ fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use loom_kernel::tool::Tool;
+    use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
@@ -175,6 +166,11 @@ mod tests {
             .await
             .expect_err("escape");
         assert!(matches!(err, ToolError::InvalidInput(msg) if msg.contains("escapes")));
+    }
+
+    #[test]
+    fn the_schema_and_the_parser_agree() {
+        crate::schema::agreement::check::<WriteInput>(json!({"path": "note.txt", "content": ""}));
     }
 
     #[tokio::test]

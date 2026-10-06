@@ -13,6 +13,7 @@ mod edit_file;
 mod list_dir;
 mod read_file;
 mod run_command;
+mod schema;
 mod search;
 mod text;
 mod write_file;

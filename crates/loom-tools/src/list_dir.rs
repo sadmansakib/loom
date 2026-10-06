@@ -2,8 +2,9 @@
 
 use futures::future::BoxFuture;
 use loom_kernel::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
+use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::sync::OnceLock;
 
 use crate::confinement::resolve_within;
@@ -13,9 +14,11 @@ use crate::confinement::resolve_within;
 #[derive(Debug, Default)]
 pub struct ListDirTool;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 struct ListInput {
+    /// Directory path, relative to the workspace root.
     path: String,
 }
 
@@ -27,17 +30,7 @@ impl Tool for ListDirTool {
             description: "Lists one directory level (non-recursive). Entries are \
                           sorted; directories carry a trailing `/`."
                 .to_owned(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Directory path, relative to the workspace root."
-                    }
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            }),
+            parameters: crate::schema::parameters::<ListInput>(),
         })
     }
 
@@ -114,6 +107,7 @@ fn list_entries(path: &std::path::Path) -> Result<ListOutcome, String> {
 mod tests {
     use super::*;
     use loom_kernel::tool::Tool;
+    use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
@@ -172,5 +166,10 @@ mod tests {
             .await
             .expect_err("escape");
         assert!(matches!(err, ToolError::InvalidInput(msg) if msg.contains("escapes")));
+    }
+
+    #[test]
+    fn the_schema_and_the_parser_agree() {
+        crate::schema::agreement::check::<ListInput>(json!({"path": "src"}));
     }
 }

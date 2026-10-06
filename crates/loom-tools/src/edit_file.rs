@@ -6,8 +6,9 @@
 
 use futures::future::BoxFuture;
 use loom_kernel::tool::{Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec};
+use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -23,11 +24,15 @@ const MAX_EDIT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 #[derive(Debug, Default)]
 pub struct EditFileTool;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 struct EditInput {
+    /// File path, relative to the workspace root.
     path: String,
+    /// Exact text to replace; must occur exactly once.
     old_string: String,
+    /// Replacement text.
     new_string: String,
 }
 
@@ -40,25 +45,7 @@ impl Tool for EditFileTool {
                           must appear exactly once — include enough surrounding text to \
                           make it unique. Use write_file to create a file."
                 .to_owned(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path, relative to the workspace root."
-                    },
-                    "old_string": {
-                        "type": "string",
-                        "description": "Exact text to replace; must occur exactly once."
-                    },
-                    "new_string": {
-                        "type": "string",
-                        "description": "Replacement text."
-                    }
-                },
-                "required": ["path", "old_string", "new_string"],
-                "additionalProperties": false
-            }),
+            parameters: crate::schema::parameters::<EditInput>(),
         })
     }
 
@@ -135,6 +122,7 @@ fn apply_edit(path: &Path, old: &str, new: &str) -> Result<String, ToolError> {
 mod tests {
     use super::*;
     use loom_kernel::tool::Tool;
+    use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
@@ -264,5 +252,12 @@ mod tests {
         .await
         .expect_err("utf8");
         assert!(matches!(err, ToolError::Execution(msg) if msg.contains("UTF-8")));
+    }
+
+    #[test]
+    fn the_schema_and_the_parser_agree() {
+        crate::schema::agreement::check::<EditInput>(
+            json!({"path": "f.rs", "old_string": "a", "new_string": "b"}),
+        );
     }
 }

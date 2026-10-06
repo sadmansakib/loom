@@ -10,6 +10,8 @@ loom-kernel = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# generated tool input schemas (ADR-005 addendum 1, V19)
+schemars = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 # gitignore-aware directory walk (search) and line matching
