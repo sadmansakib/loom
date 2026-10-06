@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use loom_kernel::agent::{Agent, TaskError, TaskSummary};
-use loom_kernel::context::{AgentConfig, DefaultContextCompiler};
+use loom_kernel::context::{
+    AgentConfig, DefaultContextCompiler, PruneConfig, PruningContextCompiler,
+};
 use loom_kernel::event::EventSink;
 use loom_kernel::id::SessionId;
 use loom_kernel::model::ModelProvider;
@@ -137,7 +139,10 @@ impl Engine {
         let facts = crate::repo::FsFactsSource::new(workspace.clone());
         let mut agent = Agent::new(
             Box::new(provider),
-            Box::new(DefaultContextCompiler),
+            Box::new(PruningContextCompiler::new(
+                Box::new(DefaultContextCompiler),
+                PruneConfig::default(),
+            )),
             registry,
             AgentConfig::new(workspace, system_prompt),
             config.model,

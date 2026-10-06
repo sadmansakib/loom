@@ -22,14 +22,24 @@
 
 mod default;
 mod facts;
+mod pruning;
 
 pub use default::DefaultContextCompiler;
 pub use facts::{FactsSource, GitState, KnownFacts, NoFacts, StaticFacts};
+pub use pruning::{PruneConfig, PruningContextCompiler, StubDecision, StubReason};
 
 use crate::model::{Message, ModelCapabilities, ModelRequest};
 use crate::session::{Session, TaskRecord};
 use crate::tool::ToolRegistry;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+/// How many bytes of serialized projection one estimated token stands for.
+///
+/// Iteration 1 has no tokenizer; this is the conservative estimate the
+/// architecture mandates (§8: "≈ bytes / 3"). A real tokenizer is a
+/// compiler-internal change and never touches the trait boundary.
+pub(crate) const BYTES_PER_TOKEN: u32 = 3;
 
 /// Serializes a list of [`Message`]s into a canonical string for token
 /// estimation.
@@ -118,6 +128,10 @@ pub struct ContextInput<'a> {
     /// empty value when no source is attached. Rendered as a stable system
     /// message right after the system prompt; empty facts add no message.
     pub facts: &'a KnownFacts,
+    /// The pruning checkpoint from the previous turn, when a pruning
+    /// compiler is in use (ADR-011). Frozen decisions are re-applied so the
+    /// projection stays byte-stable between triggers.
+    pub prune_checkpoint: Option<&'a PruneCheckpoint>,
 }
 
 /// Agent configuration the context compiler reads.
@@ -183,11 +197,29 @@ pub struct ContextCensus {
     pub total: u32,
 }
 
+/// A frozen pruning decision set (ADR-011).
+///
+/// Produced by [`PruningContextCompiler`] when the absolute trigger fires,
+/// and passed back in on later turns via [`ContextInput::prune_checkpoint`].
+/// Freezing matters for caching: between triggers the projection is
+/// byte-stable, so the provider's prefix cache holds and only each *trigger*
+/// costs one miss. Recomputing decisions every turn would invalidate the
+/// cache every turn, which costs more than the pruning saves.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneCheckpoint {
+    /// Transcript length (in items) when the decisions were computed. A
+    /// later turn appends past this; the frozen decisions still apply.
+    pub upto_item: usize,
+    /// The frozen stub decisions, in strategy order.
+    pub stubs: Vec<StubDecision>,
+}
+
 /// The result of a successful [`ContextCompiler::compile`].
 ///
-/// A struct (rather than returning [`ModelRequest`] bare) so a future
-/// pruning compiler can return a checkpoint without a breaking change
-/// (ADR-011).
+/// A struct (rather than returning [`ModelRequest`] bare) so the pruning
+/// compiler can return a [`PruneCheckpoint`] for the caller to persist
+/// without a breaking change (ADR-011).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledContext {
@@ -196,6 +228,10 @@ pub struct CompiledContext {
     pub request: ModelRequest,
     /// Per-source attribution of `request`'s estimated context (ADR-016).
     pub census: ContextCensus,
+    /// The pruning checkpoint to persist for the next compile, when a
+    /// pruning compiler produced one (ADR-011). `None` for the default
+    /// compiler and for a pruning compiler that has not triggered.
+    pub prune_checkpoint: Option<PruneCheckpoint>,
 }
 
 /// Why [`ContextCompiler::compile`] failed.

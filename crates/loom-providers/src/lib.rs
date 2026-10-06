@@ -17,6 +17,6 @@ mod sse;
 
 pub use deepseek::{
     DeepSeekConfig, DeepSeekProvider, ParseReasoningEffortError, ReasoningEffort, ThinkingMode,
-    TimeoutConfig,
+    TimeoutConfig, model_capabilities,
 };
 pub use secret::SecretString;

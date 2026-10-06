@@ -19,17 +19,13 @@
 //! DeepSeek thinking-mode contract demands the complete, unmodified
 //! reasoning of every prior turn once tools are sent (ADR-006).
 
-use super::{AgentConfig, CompiledContext, ContextCensus, ContextError, ContextInput, KnownFacts};
+use super::{
+    AgentConfig, BYTES_PER_TOKEN, CompiledContext, ContextCensus, ContextError, ContextInput,
+    KnownFacts,
+};
 use crate::model::{Message, ModelCapabilities, ModelRequest};
 use crate::tool::{ToolEffects, ToolRegistry};
 use crate::transcript::{Item, ToolResult};
-
-/// How many bytes of serialized projection one estimated token stands for.
-///
-/// Iteration 1 has no tokenizer; this is the conservative estimate the
-/// architecture mandates (§8: "≈ bytes / 3"). A real tokenizer is a
-/// compiler-internal change and never touches the trait boundary.
-const BYTES_PER_TOKEN: u32 = 3;
 
 /// Full-transcript, all-tools context compiler (§8.3).
 ///
@@ -62,7 +58,11 @@ impl super::ContextCompiler for DefaultContextCompiler {
                 max_input_tokens: input.budget.max_input_tokens,
             });
         }
-        Ok(CompiledContext { request, census })
+        Ok(CompiledContext {
+            request,
+            census,
+            prune_checkpoint: None,
+        })
     }
 }
 
@@ -140,7 +140,7 @@ fn exposed_tools(
 
 /// Serialized byte length of a value, or 0 if serialization fails (it cannot
 /// for the types in this crate; the fallback keeps the census panic-free).
-fn serialized_size<T: serde::Serialize>(value: &T) -> u64 {
+pub(super) fn serialized_size<T: serde::Serialize>(value: &T) -> u64 {
     serde_json::to_string(value)
         .map(|json| json.len() as u64)
         .unwrap_or(0)
@@ -157,7 +157,7 @@ fn serialized_size<T: serde::Serialize>(value: &T) -> u64 {
 /// serialized once, ÷ `BYTES_PER_TOKEN`, plus one token per message for
 /// framing (§8). The two are computed from the same payload, so `total` is
 /// exactly the number the budget check compares.
-fn census(request: &ModelRequest, facts_bytes: u64) -> ContextCensus {
+pub(super) fn census(request: &ModelRequest, facts_bytes: u64) -> ContextCensus {
     let mut system_total = 0u64;
     let mut user_items = 0u64;
     let mut assistant_history = 0u64;
@@ -318,6 +318,7 @@ mod tests {
             model: "deepseek-flash",
             config,
             facts,
+            prune_checkpoint: None,
         }
     }
 

@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::context::{
     AgentConfig, CompiledContext, ContextBudget, ContextCensus, ContextCompiler, ContextError,
-    ContextInput, FactsSource, NoFacts,
+    ContextInput, FactsSource, NoFacts, PruneCheckpoint,
 };
 use crate::event::{EventKind, EventSink};
 use crate::id::{SessionId, TaskId};
@@ -662,6 +662,13 @@ impl Agent {
         // the whole task (§8.1.1) and "what changed" never costs a model turn.
         let facts = self.facts.scan();
 
+        // Pruning checkpoint for this task's turn loop (ADR-011): the
+        // compiler returns a frozen decision set when its trigger fires,
+        // and the loop feeds it back on later turns so the projection stays
+        // byte-stable between triggers (one cache miss per trigger). It is
+        // per-task loop state, not agent state.
+        let mut prune_checkpoint: Option<PruneCheckpoint> = None;
+
         // Loop-owned reaction to tool failures (§13): the loop, not the
         // model, decides whether a failed attempt may be repeated. An
         // identical call is refused until some tool call succeeds, so a
@@ -696,8 +703,14 @@ impl Agent {
                     model: &self.model,
                     config: &self.config,
                     facts: &facts,
+                    prune_checkpoint: prune_checkpoint.as_ref(),
                 })?
             };
+            // Carry the pruning checkpoint forward (ADR-011): it is task
+            // state, not request state, so it lives on the loop and is fed
+            // back in on the next turn. Between triggers it is unchanged,
+            // so the projection stays byte-stable for prefix caching.
+            prune_checkpoint = compiled.prune_checkpoint;
             // Partial move: `request` moves out, `census` (Copy) stays readable
             // for the `EndTurn` return.
             let request = compiled.request;

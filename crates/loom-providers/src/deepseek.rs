@@ -287,7 +287,7 @@ impl DeepSeekProvider {
 /// (research.md §4.1): the API enumerates exactly these two ids — the
 /// legacy `deepseek-v4-flash` is rejected with a 400, so it maps to
 /// `None` (loud unknown-model failure, not a silently wrong row).
-fn model_capabilities(model: &str) -> Option<ModelCapabilities> {
+pub fn model_capabilities(model: &str) -> Option<ModelCapabilities> {
     let limits = match model {
         "deepseek-flash" | "deepseek-v4-pro" => ModelCapabilities::new(1_048_576)
             .with_max_output_tokens(393_216)

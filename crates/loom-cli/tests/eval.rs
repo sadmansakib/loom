@@ -2,10 +2,13 @@
 //!
 //! Precedes all optimization work. Three pieces:
 //!
-//! 1. **Pinned task set B1–B4.** All four run live: B1 inspects the Loom
+//! 1. **Pinned task set B1–B4 (plus heavy B5).** B1 inspects the Loom
 //!    repo with the read-only tools; B2–B4 exercise the mutating tools
-//!    against a generated fixture crate under the eval dir. Prompts are
-//!    frozen.
+//!    against a generated fixture crate under the eval dir. B5 is a
+//!    read-then-edit long-context task over a generated corpus (each read
+//!    is superseded by the following edit, so pruning is safe); it is far
+//!    slower and costlier, so it runs only when named in
+//!    `LOOM_EVAL_TASKS`. Prompts are frozen.
 //! 2. **N-run protocol.** B1 showed 1.85× input-token variance on a pinned
 //!    task (thinking mode ignores temperature), so live evaluation always
 //!    runs N ≥ 5 times and reports mean/median/min/max — never a single
@@ -58,7 +61,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures::StreamExt;
 use loom_core::engine::repo::FsFactsSource;
 use loom_core::kernel::agent::Agent;
-use loom_core::kernel::context::{AgentConfig, DefaultContextCompiler};
+use loom_core::kernel::context::{
+    AgentConfig, ContextCompiler, DefaultContextCompiler, PruneConfig, PruningContextCompiler,
+};
 use loom_core::kernel::event::{EventKind, EventSink, StrictSink};
 use loom_core::kernel::id::{SessionId, TaskId};
 use loom_core::kernel::model::{
@@ -68,7 +73,7 @@ use loom_core::kernel::model::{
 use loom_core::kernel::session::Session;
 use loom_core::kernel::tool::ToolRegistry;
 use loom_core::kernel::transcript::{AssistantMessage, Item, ToolArguments, ToolCall, ToolCallId};
-use loom_core::providers::{DeepSeekConfig, DeepSeekProvider, ReasoningEffort};
+use loom_core::providers::{DeepSeekConfig, DeepSeekProvider, ReasoningEffort, model_capabilities};
 use loom_core::tools::{
     EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool, VerifyTool, WriteFileTool,
 };
@@ -84,6 +89,26 @@ enum Workspace {
     Repo,
     /// A generated throwaway crate under the eval dir (B2–B4).
     Fixture,
+    /// A generated long-context corpus of ~40 KB markdown documents
+    /// (B5); sized so a sequential read pushes the projection past the
+    /// 64 K pruning trigger.
+    Corpus,
+}
+
+/// The tools a task may call. Deliberately coarse: the point is to pin
+/// which capabilities a baseline exercised, not to configure the agent.
+#[derive(Debug, Clone, Copy)]
+enum ToolSet {
+    /// `read_file`, `list_dir`, `search` (B1's 2026-10-06 baseline).
+    ReadOnly,
+    /// Read-only set plus `write_file`, `edit_file`, `run_command`,
+    /// `verify` (B2–B4).
+    Coding,
+    /// `read_file` + `list_dir` + `edit_file` (B5). The task reads each file
+    /// and then edits it, so every read becomes stale (superseded by the
+    /// write) and pruning can drop it without the model needing to recover
+    /// the content — the pruning-appropriate long-context shape.
+    ReadEdit,
 }
 
 /// A pinned evaluation task. Prompts are frozen: changing one invalidates
@@ -92,9 +117,12 @@ struct EvalTask {
     id: &'static str,
     prompt: &'static str,
     workspace: Workspace,
-    /// B2–B4 exercise write/edit/exec and get the full tool set; B1 keeps
-    /// the read-only set so its 2026-10-06 baseline stays comparable.
-    requires_mutating_tools: bool,
+    /// Capabilities available to the task; B1 keeps the read-only set so its
+    /// 2026-10-06 baseline stays comparable.
+    tools: ToolSet,
+    /// Long-context task: skipped unless explicitly named in
+    /// `LOOM_EVAL_TASKS` (it is far slower and costlier than B1–B4).
+    heavy: bool,
     system_prompt: &'static str,
 }
 
@@ -105,7 +133,8 @@ const TASKS: &[EvalTask] = &[
                  retry and cancellation handling in the agent loop, explain \
                  how it works, and identify the relevant files.",
         workspace: Workspace::Repo,
-        requires_mutating_tools: false,
+        tools: ToolSet::ReadOnly,
+        heavy: false,
         system_prompt: READ_ONLY_SYSTEM_PROMPT,
     },
     EvalTask {
@@ -114,7 +143,8 @@ const TASKS: &[EvalTask] = &[
                  the text 'hello eval', then read it back and verify its \
                  content.",
         workspace: Workspace::Fixture,
-        requires_mutating_tools: true,
+        tools: ToolSet::Coding,
+        heavy: false,
         system_prompt: CODING_SYSTEM_PROMPT,
     },
     EvalTask {
@@ -123,7 +153,8 @@ const TASKS: &[EvalTask] = &[
                  mirroring the existing `add` function, then run the tests \
                  covering src/calc.rs and report any failures.",
         workspace: Workspace::Fixture,
-        requires_mutating_tools: true,
+        tools: ToolSet::Coding,
+        heavy: false,
         system_prompt: CODING_SYSTEM_PROMPT,
     },
     EvalTask {
@@ -132,8 +163,28 @@ const TASKS: &[EvalTask] = &[
                  one-paragraph summary of each file into \
                  docs-notes/summaries.md, in file order.",
         workspace: Workspace::Fixture,
-        requires_mutating_tools: true,
+        tools: ToolSet::Coding,
+        heavy: false,
         system_prompt: CODING_SYSTEM_PROMPT,
+    },
+    EvalTask {
+        id: "B5",
+        prompt: "There are 8 markdown files in corpus/, named doc-01.md \
+                 through doc-08.md. Process them in ascending filename \
+                 order. For each file: read it with read_file, then append a \
+                 line to it with edit_file by setting old_string to the \
+                 file's current last line and new_string to that same last \
+                 line followed by a newline and the text 'Reviewed.'. Issue \
+                 exactly one tool call per turn and stop after that single \
+                 call so the next turn continues with the next file. Do not \
+                 search or read partial ranges, do not skip any file, and do \
+                 not stop before all 8 files are processed: stopping early \
+                 fails the task. After the last file is edited, reply with a \
+                 single line DONE.",
+        workspace: Workspace::Corpus,
+        tools: ToolSet::ReadEdit,
+        heavy: true,
+        system_prompt: LONG_CONTEXT_SYSTEM_PROMPT,
     },
 ];
 
@@ -143,6 +194,16 @@ const READ_ONLY_SYSTEM_PROMPT: &str = "You are Loom, a minimal coding agent work
      Use the provided tools to inspect the workspace: list directories and search \
      before reading large files, and prefer reading the smallest relevant range. \
      When you answer, be concise and name the workspace-relative paths you relied on.";
+
+/// B5's prompt: the opposite of the read-only default. A long-context task
+/// must read whole files without searching, so the model cannot satisfy it
+/// with a few small ranges and never exercises the pruning trigger.
+const LONG_CONTEXT_SYSTEM_PROMPT: &str = "You are Loom, a minimal coding agent working inside one workspace. \
+     This task requires reading whole files and then editing them, one after another. \
+     Use read_file to read whole files and edit_file to change them; do not search, \
+     sample, or read partial ranges. Keep going until every requested file has been \
+     processed, then answer exactly as instructed. When you answer, be concise and name \
+     the workspace-relative paths you relied on.";
 
 /// Prompt for tasks that may modify the workspace; identical to `loom-cli`'s.
 const CODING_SYSTEM_PROMPT: &str = "You are Loom, a coding agent working inside one workspace. Use the provided \
@@ -169,6 +230,32 @@ fn eval_dir() -> PathBuf {
 /// The generated fixture workspace the mutating tasks run against.
 fn fixture_root() -> PathBuf {
     eval_dir().join("fixture")
+}
+
+fn corpus_root() -> PathBuf {
+    eval_dir().join("corpus")
+}
+
+/// (Re)creates the long-context corpus (B5): eight markdown documents,
+/// each ~40 KB, so a sequential read crosses the 64 K-token pruning
+/// trigger around the fifth document. Deterministic bytes, wiped and
+/// rewritten each run.
+fn ensure_corpus() {
+    let root = corpus_root();
+    if root.exists() {
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    std::fs::create_dir_all(&root).unwrap();
+    for i in 1..=8 {
+        let mut body = format!("# Doc {i:02} — subsystem {i:02}\n\n");
+        for line in 0..700 {
+            let value = (i * 101 + line) % 997;
+            body.push_str(&format!(
+                "Line {line:04}: subsystem {i:02} records metric {value} and forwards it.\n"
+            ));
+        }
+        std::fs::write(root.join(format!("doc-{i:02}.md")), body).unwrap();
+    }
 }
 
 /// (Re)creates the fixture crate. Idempotent: wiped and rewritten so every
@@ -324,14 +411,12 @@ impl ModelProvider for ReplayProvider {
     }
 
     fn capabilities(&self, model: &str) -> Option<ModelCapabilities> {
-        (model == self.model).then(|| {
-            // Matches what the DeepSeek capability table reports for
-            // flash / v4-pro closely enough for compilation and replay.
-            ModelCapabilities::new(128_000)
-                .with_tool_calls(true)
-                .with_parallel_tool_calls(true)
-                .with_reasoning(true)
-        })
+        // Mirror the live DeepSeek table so offline replay compiles
+        // recordings produced against the real window (deepseek-flash is
+        // 1M tokens, not the 128K this replay double used to assume).
+        (model == self.model)
+            .then(|| model_capabilities(model))
+            .flatten()
     }
 
     fn stream<'a>(&'a self, request: &'a ModelRequest) -> ModelStream<'a> {
@@ -478,10 +563,14 @@ fn registry(task: &EvalTask) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ReadFileTool)).unwrap();
     registry.register(Box::new(ListDirTool)).unwrap();
-    registry.register(Box::new(SearchTool)).unwrap();
-    if task.requires_mutating_tools {
-        registry.register(Box::new(WriteFileTool)).unwrap();
+    if !matches!(task.tools, ToolSet::ReadEdit) {
+        registry.register(Box::new(SearchTool)).unwrap();
+    }
+    if matches!(task.tools, ToolSet::Coding | ToolSet::ReadEdit) {
         registry.register(Box::new(EditFileTool)).unwrap();
+    }
+    if matches!(task.tools, ToolSet::Coding) {
+        registry.register(Box::new(WriteFileTool)).unwrap();
         registry.register(Box::new(RunCommandTool::new())).unwrap();
         registry.register(Box::new(VerifyTool::new())).unwrap();
     }
@@ -506,10 +595,28 @@ async fn run_once(
             ensure_fixture();
             fixture_root()
         }
+        Workspace::Corpus => {
+            ensure_corpus();
+            corpus_root()
+        }
+    };
+    // 2L/ADR-011: pruning is OFF by default so baseline numbers stay
+    // comparable; set LOOM_EVAL_PRUNE=1 (or on/true) for the pruning arm.
+    let pruning = std::env::var("LOOM_EVAL_PRUNE").is_ok_and(|value| {
+        let value = value.to_ascii_lowercase();
+        value != "0" && value != "off" && value != "false"
+    });
+    let compiler: Box<dyn ContextCompiler> = if pruning {
+        Box::new(PruningContextCompiler::new(
+            Box::new(DefaultContextCompiler),
+            PruneConfig::default(),
+        ))
+    } else {
+        Box::new(DefaultContextCompiler)
     };
     let agent = Agent::new(
         provider,
-        Box::new(DefaultContextCompiler),
+        compiler,
         registry(task),
         AgentConfig::new(root.clone(), task.system_prompt),
         model.to_owned(),
@@ -658,6 +765,11 @@ async fn eval_live() {
         if let Some(only) = &only
             && !only.iter().any(|id| id == task.id)
         {
+            continue;
+        }
+        // Heavy (long-context) tasks run only when explicitly named: the
+        // default suite stays at B1–B4 to bound time and cost.
+        if task.heavy && only.is_none() {
             continue;
         }
         let mut reports = Vec::new();
