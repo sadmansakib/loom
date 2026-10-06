@@ -34,6 +34,28 @@ token counts (~±8 %), without putting a tokenizer in the kernel:
   (`o200k_base`), wired in `Engine::open`; the eval and benchmark
   harnesses use the same estimator for parity.
 
+## 2026-10-07 — Corpus growth: B8 and B9 from shipped fixes
+
+First corpus-expansion round on the task-directory harness: two more
+real-bug tasks mined from Loom's own fix history, each seeding the
+parent-commit fault and gating on the fix commit's behavior.
+
+- **B8 — quoted git paths** (af0f2fb): git's C-escaped porcelain output
+  (tabs, quotes, non-ASCII) entered facts mangled because only the
+  surrounding quotes were stripped. F2P: `quoted_paths_are_decoded`,
+  `quoted_rename_decodes_the_destination`; P2P: `plain_paths_pass_through`,
+  `rename_takes_the_destination`.
+- **B9 — stream head+tail cap** (6a3a3b1): the output cap kept only the
+  head, losing compiler errors and panics beyond the first window. F2P:
+  `oversized_stream_keeps_head_tail_and_marker`,
+  `the_tail_line_of_a_long_listing_survives`; P2P:
+  `small_stream_passes_through_whole`.
+- Both proven the SWE-bench way offline: seeds fail exactly their F2P
+  set, pass their P2P set, and the real fixes flip every declared name
+  green. Live spot-run (deepseek-flash): 10/10 gated runs, pass rate 1.0.
+- Suite now 9 tasks (B1–B9); `bugfix_seeds_fail_their_gates` picks the
+  new directories up automatically — no harness edits.
+
 ## 2026-10-07 — Task-directory harness with FAIL_TO_PASS gates
 
 Phase 3 of the suite rigor work: tasks leave the source file and become

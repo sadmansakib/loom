@@ -1,0 +1,20 @@
+{
+  "id": "B8",
+  "prompt": "The test suite of this crate fails. Find the fault in the implementation, fix it, and make `cargo test` pass. The tests are the specification: do not modify anything under tests/.",
+  "tools": "coding",
+  "heavy": false,
+  "workspace": "copy",
+  "notes": "Reproduces af0f2fb: git-quoted paths (C escapes) entered facts mangled because only the surrounding quotes were stripped.",
+  "gate": {
+    "kind": "bugfix",
+    "protected": ["tests/regression.rs"],
+    "fail_to_pass": [
+      "quoted_paths_are_decoded",
+      "quoted_rename_decodes_the_destination"
+    ],
+    "pass_to_pass": [
+      "plain_paths_pass_through",
+      "rename_takes_the_destination"
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+[package]
+name = "loom-eval-b9"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+tokio = { version = "1.53.1", features = ["rt", "macros", "io-util"] }
