@@ -577,6 +577,23 @@ fn registry(task: &EvalTask) -> ToolRegistry {
     registry
 }
 
+/// 2L measurement hook: force an absolute pruning trigger so a benchmark can
+/// exercise the window-relative compiler below the model's window. Unset
+/// keeps the production default (80 % of the window, 64 K floor).
+fn prune_config() -> PruneConfig {
+    match std::env::var("LOOM_EVAL_PRUNE_TRIGGER_TOKENS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+    {
+        Some(floor_tokens) => PruneConfig {
+            trigger_percent: 0,
+            floor_tokens,
+            ..PruneConfig::default()
+        },
+        None => PruneConfig::default(),
+    }
+}
+
 /// Runs one task against a provider and returns the 1H-schema report plus
 /// the recorded exchanges and the finished session. `provider_label` names
 /// the concrete backend the run used, so billed-token figures in the report
@@ -609,7 +626,7 @@ async fn run_once(
     let compiler: Box<dyn ContextCompiler> = if pruning {
         Box::new(PruningContextCompiler::new(
             Box::new(DefaultContextCompiler),
-            PruneConfig::default(),
+            prune_config(),
         ))
     } else {
         Box::new(DefaultContextCompiler)

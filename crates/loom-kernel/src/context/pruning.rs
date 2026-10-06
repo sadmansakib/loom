@@ -38,12 +38,15 @@ use crate::transcript::{Item, ToolCallId, ToolResult, ToolStatus};
 use super::default::{census, serialized_size};
 use super::{CompiledContext, ContextCompiler, ContextError, ContextInput, PruneCheckpoint};
 
-/// Pruning thresholds; the defaults are ADR-011's hypotheses, to be
-/// revisited against the 2L long-context benchmark.
+/// Pruning thresholds; the defaults are ADR-011's hypotheses, tuned by the
+/// 2L long-context benchmark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PruneConfig {
-    /// Estimated input tokens above which a recompute is triggered.
-    pub trigger_tokens: u32,
+    /// Trigger when the estimated input exceeds this percent of the model's
+    /// input budget (its context window less the reserved output).
+    pub trigger_percent: u32,
+    /// …but never below this many estimated tokens.
+    pub floor_tokens: u32,
     /// A prune only proceeds when at least this many tokens are
     /// reclaimable; below it the churn is not worth a cache miss.
     pub min_reclaim_tokens: u32,
@@ -56,10 +59,25 @@ pub struct PruneConfig {
     pub stale_error_turns: usize,
 }
 
+impl PruneConfig {
+    /// The absolute trigger for a given input budget: `trigger_percent` of
+    /// the budget, floored at `floor_tokens`.
+    ///
+    /// Window-relative by default so that pruning stays dormant for a large
+    /// context window (a 1M-token model never prunes a 64K transcript) and
+    /// a flat 64K threshold cannot make it fire on every turn of a
+    /// prefix-cached session, where each checkpoint is a cache miss.
+    #[must_use]
+    pub fn trigger_tokens(&self, max_input_tokens: u32) -> u32 {
+        (max_input_tokens.saturating_mul(self.trigger_percent) / 100).max(self.floor_tokens)
+    }
+}
+
 impl Default for PruneConfig {
     fn default() -> Self {
         Self {
-            trigger_tokens: 64_000,
+            trigger_percent: 80,
+            floor_tokens: 64_000,
             min_reclaim_tokens: 20_000,
             protected_tail_tokens: 20_000,
             protected_tail_turns: 3,
@@ -112,7 +130,9 @@ pub struct StubDecision {
 }
 
 /// A [`ContextCompiler`] that prunes projected tool results once the
-/// estimated input crosses `config.trigger_tokens`.
+/// estimated input crosses the window-relative trigger
+/// ([`PruneConfig::trigger_tokens`]): `trigger_percent` of the model's input
+/// budget, floored at `floor_tokens`.
 pub struct PruningContextCompiler {
     inner: Box<dyn ContextCompiler>,
     config: PruneConfig,
@@ -159,8 +179,10 @@ impl ContextCompiler for PruningContextCompiler {
             compiled.census = census(&compiled.request, facts_bytes);
         }
 
-        // Absolute trigger: recompute decisions over the whole transcript.
-        if compiled.census.total > self.config.trigger_tokens {
+        // Window-relative trigger: recompute decisions over the whole
+        // transcript once the estimate nears the model's input budget.
+        let trigger = self.config.trigger_tokens(budget.max_input_tokens);
+        if compiled.census.total > trigger {
             let (decisions, reclaim) = decide(session, tools, self.config);
             if reclaim >= u64::from(self.config.min_reclaim_tokens) {
                 apply_stubs(&mut compiled.request, &decisions);
@@ -648,6 +670,17 @@ mod tests {
         PruningContextCompiler::new(Box::new(DefaultContextCompiler), config)
     }
 
+    /// A config that fires at the old flat threshold, so the strategy tests
+    /// keep their shape regardless of the window-relative default (the 400 K
+    /// test budget would otherwise push the default trigger to 320 K).
+    fn firing() -> PruneConfig {
+        PruneConfig {
+            trigger_percent: 0,
+            floor_tokens: 64_000,
+            ..PruneConfig::default()
+        }
+    }
+
     fn big(prefix: &str, kb: usize) -> String {
         prefix.to_owned() + &"x".repeat(kb * 1024)
     }
@@ -663,7 +696,7 @@ mod tests {
             assistant_text("done"),
         ];
         let session = session_with(items);
-        let compiled = compiler(PruneConfig::default())
+        let compiled = compiler(firing())
             .compile(input(&session, None))
             .expect("compiles");
         assert!(compiled.prune_checkpoint.is_none());
@@ -690,7 +723,7 @@ mod tests {
         items.push(result("new", &big("dup", 25)));
         items.push(assistant_text("done"));
         let session = session_with(items);
-        let compiled = compiler(PruneConfig::default())
+        let compiled = compiler(firing())
             .compile(input(&session, None))
             .expect("compiles");
         let checkpoint = compiled.prune_checkpoint.expect("triggered");
@@ -732,7 +765,7 @@ mod tests {
         items.push(written_result("wt", "src/a.rs"));
         items.push(assistant_text("done"));
         let session = session_with(items);
-        let compiled = compiler(PruneConfig::default())
+        let compiled = compiler(firing())
             .compile(input(&session, None))
             .expect("compiles");
         let checkpoint = compiled.prune_checkpoint.expect("triggered");
@@ -772,7 +805,7 @@ mod tests {
         }
         items.push(assistant_text("done"));
         let session = session_with(items);
-        let compiled = compiler(PruneConfig::default())
+        let compiled = compiler(firing())
             .compile(input(&session, None))
             .expect("compiles");
         let checkpoint = compiled.prune_checkpoint.expect("triggered");
@@ -812,7 +845,7 @@ mod tests {
         items.push(result("recent", &big("recent", 70)));
         items.push(assistant_text("done"));
         let session = session_with(items);
-        let compiled = compiler(PruneConfig::default())
+        let compiled = compiler(firing())
             .compile(input(&session, None))
             .expect("compiles");
         let checkpoint = compiled.prune_checkpoint.expect("triggered");
@@ -839,7 +872,8 @@ mod tests {
         // A trigger low enough to fire but a reclaim floor the small
         // transcript cannot meet.
         let config = PruneConfig {
-            trigger_tokens: 10,
+            trigger_percent: 0,
+            floor_tokens: 10,
             min_reclaim_tokens: 20_000,
             ..PruneConfig::default()
         };
@@ -863,7 +897,7 @@ mod tests {
         }
         items.push(assistant_text("done"));
         let session = session_with(items.clone());
-        let first = compiler(PruneConfig::default())
+        let first = compiler(firing())
             .compile(input(&session, None))
             .expect("compiles");
         let checkpoint = first.prune_checkpoint.clone().expect("triggered");
@@ -873,7 +907,7 @@ mod tests {
         items.push(result("late", &big("late", 5)));
         items.push(assistant_text("done again"));
         let grown = session_with(items);
-        let second = compiler(PruneConfig::default())
+        let second = compiler(firing())
             .compile(input(&grown, Some(&checkpoint)))
             .expect("compiles");
         // Every frozen stub is still applied verbatim.
@@ -911,7 +945,7 @@ mod tests {
         }
         items.push(assistant_text("done"));
         let session = session_with(items);
-        let compiled = compiler(PruneConfig::default())
+        let compiled = compiler(firing())
             .compile(input(&session, None))
             .expect("compiles");
         let checkpoint = compiled.prune_checkpoint.expect("triggered");
@@ -930,6 +964,23 @@ mod tests {
             !checkpoint.stubs.iter().any(|stub| stub.call_id == "r9"),
             "the newest read is inside the protected tail"
         );
+    }
+
+    #[test]
+    fn trigger_is_window_relative_with_a_floor() {
+        let config = PruneConfig::default();
+        // 80 % of a 1M-token window is far above the 64K floor, so pruning
+        // stays dormant for ordinary transcripts on a large model.
+        assert_eq!(config.trigger_tokens(1_048_576), 838_860);
+        // A small budget falls back to the floor rather than a fraction.
+        assert_eq!(config.trigger_tokens(64_000), 64_000);
+        let scaled = PruneConfig {
+            trigger_percent: 25,
+            floor_tokens: 1_000,
+            ..PruneConfig::default()
+        };
+        assert_eq!(scaled.trigger_tokens(8_000), 2_000);
+        assert_eq!(scaled.trigger_tokens(1_000), 1_000);
     }
 
     fn messages_contain(request: &crate::model::ModelRequest, needle: &str) -> bool {
