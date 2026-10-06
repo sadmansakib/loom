@@ -31,6 +31,24 @@ const MAX_FILE_BYTES: u64 = 1024 * 1024;
 /// [`MAX_FILE_BYTES`] per match — 200 matches ≈ 200 MiB — before the
 /// engine's 64 KiB output bound ever sees it.
 const MAX_MATCH_LINE_BYTES: usize = 256;
+/// Above this many matches, results are summarized per file (count plus
+/// a short preview) instead of listing every matching line — the tool
+/// result is the dominant input-token cost (ADR-014, V8). Twenty lines
+/// is small enough to present plainly, large enough that a real search
+/// over a repository crosses it.
+const SUMMARY_THRESHOLD: usize = 20;
+/// How many matching lines to show per file in the summarized form.
+const PER_FILE_PREVIEW: usize = 3;
+
+/// One matching line, before rendering.
+struct Match {
+    /// Workspace-relative path.
+    rel: String,
+    /// 1-based line number.
+    line: usize,
+    /// The matched line (already length-capped).
+    text: String,
+}
 
 /// Regex line search over the workspace tree: `.gitignore`-aware,
 /// hidden files skipped, binary files skipped, cancellation checked
@@ -59,7 +77,8 @@ impl Tool for SearchTool {
             description: "Searches file contents with a regular expression across the \
                           workspace (gitignored and hidden files are skipped; binary \
                           files are skipped). Returns `path:line: text` entries with \
-                          workspace-relative paths."
+                          workspace-relative paths. Large result sets are summarized \
+                          per file with a short preview and a hint to narrow the search."
                 .to_owned(),
             parameters: json!({
                 "type": "object",
@@ -137,8 +156,9 @@ impl Tool for SearchTool {
             .map_err(|err| ToolError::Execution(format!("search task failed: {err}")))?;
 
             match entries {
-                Ok((lines, truncated)) => {
-                    let mut output = ToolOutput::new(lines.join("\n"));
+                Ok((matches, truncated)) => {
+                    let (content, truncated) = render(&matches, truncated, max_results);
+                    let mut output = ToolOutput::new(content);
                     if truncated {
                         output = output.with_truncated();
                     }
@@ -163,7 +183,7 @@ fn search_tree(
     max_results: usize,
     rel_base: &Path,
     cancellation: &CancellationToken,
-) -> Result<(Vec<String>, bool), String> {
+) -> Result<(Vec<Match>, bool), String> {
     // Ancestor ignore files, shallowest (workspace root) first, so the
     // nearest file wins like git. Only ignore files INSIDE the workspace
     // participate; global ignores and parent lookups above the root
@@ -228,7 +248,7 @@ fn search_tree(
     }
     let walker = builder.build();
 
-    let mut hits: Vec<String> = Vec::new();
+    let mut hits: Vec<Match> = Vec::new();
     let mut truncated = false;
     for entry in walker {
         if cancellation.is_cancelled() {
@@ -252,17 +272,80 @@ fn search_tree(
                         truncated = true;
                         return Ok((hits, truncated));
                     }
-                    hits.push(format!(
-                        "{}:{}: {}",
-                        rel.display(),
-                        index + 1,
-                        capped_line(line)
-                    ));
+                    hits.push(Match {
+                        rel: rel.display().to_string(),
+                        line: index + 1,
+                        text: capped_line(line),
+                    });
                 }
             }
         }
     }
     Ok((hits, truncated))
+}
+
+/// Renders matches: `path:line: text` lines when the set is small, or a
+/// per-file summary (count plus a short preview each) above
+/// [`SUMMARY_THRESHOLD`]. A search stopped at `max_results` carries an
+/// explicit marker rather than silently dropping the remainder (V9).
+fn render(matches: &[Match], truncated: bool, max_results: usize) -> (String, bool) {
+    if matches.is_empty() {
+        return (String::new(), false);
+    }
+    if matches.len() <= SUMMARY_THRESHOLD {
+        let mut text = matches
+            .iter()
+            .map(|m| format!("{}:{}: {}", m.rel, m.line, m.text))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if truncated {
+            text.push('\n');
+            text.push_str(&cap_hint(max_results));
+        }
+        return (text, truncated);
+    }
+    // Over the threshold: one block per file, in first-seen (walk) order,
+    // so the file that matched first is the one the model reads first.
+    let mut files: Vec<(&str, Vec<&Match>)> = Vec::new();
+    for found in matches {
+        match files.iter_mut().find(|(name, _)| *name == found.rel) {
+            Some((_, group)) => group.push(found),
+            None => files.push((found.rel.as_str(), vec![found])),
+        }
+    }
+    let mut lines = vec![format!(
+        "{} matches in {} {}{}",
+        matches.len(),
+        files.len(),
+        if files.len() == 1 { "file" } else { "files" },
+        if truncated {
+            format!(" (stopped at the {max_results}-match cap)")
+        } else {
+            String::new()
+        }
+    )];
+    let mut shown = 0usize;
+    for (name, group) in &files {
+        lines.push(format!("{name} ({} matches)", group.len()));
+        for found in group.iter().take(PER_FILE_PREVIEW) {
+            lines.push(format!("  {}: {}", found.line, found.text));
+            shown += 1;
+        }
+    }
+    let hidden = matches.len() - shown;
+    if hidden > 0 {
+        lines.push(format!(
+            "... [{hidden} more matches; refine the pattern or pass path to narrow the search]"
+        ));
+    }
+    (lines.join("\n"), hidden > 0 || truncated)
+}
+
+/// The marker appended when a search stops at its `max_results` cap.
+fn cap_hint(max_results: usize) -> String {
+    format!(
+        "... [stopped at the {max_results}-match cap; refine the pattern or pass path to narrow the search]"
+    )
 }
 
 /// Truncates a matched line to [`MAX_MATCH_LINE_BYTES`] on a UTF-8
@@ -426,7 +509,44 @@ mod tests {
         let output = search(&root, json!({"pattern": "hit", "max_results": 2}))
             .await
             .expect("ok");
-        assert_eq!(output.content, "many.txt:1: hit\nmany.txt:2: hit");
+        assert_eq!(
+            output.content,
+            "many.txt:1: hit\nmany.txt:2: hit\n\
+             ... [stopped at the 2-match cap; refine the pattern or pass path to narrow the search]"
+        );
+        assert!(output.truncated);
+    }
+
+    #[tokio::test]
+    async fn many_matches_are_summarized_per_file() {
+        let (guard, root) = temp_root();
+        let hits = |n: usize| "hit\n".repeat(n);
+        std::fs::write(guard.path().join("a.txt"), hits(30)).expect("write");
+        std::fs::write(guard.path().join("b.txt"), hits(25)).expect("write");
+        let output = search(&root, json!({"pattern": "hit"})).await.expect("ok");
+        let content = &output.content;
+        assert!(content.starts_with("55 matches in 2 files\n"), "{content}");
+        assert!(content.contains("a.txt (30 matches)\n  1: hit\n  2: hit\n  3: hit\n"));
+        assert!(content.contains("b.txt (25 matches)\n  1: hit\n  2: hit\n  3: hit\n"));
+        assert!(content.contains("... [49 more matches; refine the pattern or pass path"));
+        assert!(output.truncated);
+    }
+
+    #[tokio::test]
+    async fn a_capped_search_says_it_stopped_early() {
+        let (guard, root) = temp_root();
+        std::fs::write(guard.path().join("a.txt"), "hit\n".repeat(40)).expect("write");
+        std::fs::write(guard.path().join("b.txt"), "hit\n".repeat(40)).expect("write");
+        let output = search(&root, json!({"pattern": "hit", "max_results": 25}))
+            .await
+            .expect("ok");
+        assert!(
+            output
+                .content
+                .starts_with("25 matches in 1 file (stopped at the 25-match cap)\n"),
+            "{}",
+            output.content
+        );
         assert!(output.truncated);
     }
 
