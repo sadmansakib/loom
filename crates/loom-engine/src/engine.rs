@@ -132,6 +132,9 @@ impl Engine {
 
         let registry = build_registry()?;
         let system_prompt = config.system_prompt.unwrap_or_else(default_system_prompt);
+        // Stage-1 repository facts (2E, ADR-022): the composition root owns the
+        // I/O; the loop scans once per task through this source.
+        let facts = crate::repo::FsFactsSource::new(workspace.clone());
         let mut agent = Agent::new(
             Box::new(provider),
             Box::new(DefaultContextCompiler),
@@ -139,7 +142,8 @@ impl Engine {
             AgentConfig::new(workspace, system_prompt),
             config.model,
         )
-        .with_max_turns(config.max_turns);
+        .with_max_turns(config.max_turns)
+        .with_facts_source(Box::new(facts));
 
         // Durable sessions and artifact bodies (ADR-008, ADR-012): the same
         // `loom.db` the account store uses. `--no-save` leaves the run in

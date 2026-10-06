@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use loom_core::engine::repo::FsFactsSource;
 use loom_core::kernel::agent::Agent;
 use loom_core::kernel::context::{AgentConfig, DefaultContextCompiler};
 use loom_core::kernel::event::{EventKind, EventSink};
@@ -143,9 +144,10 @@ async fn b1_read_only_repository_inspection() {
         Box::new(provider),
         Box::new(DefaultContextCompiler),
         registry,
-        AgentConfig::new(workspace, system_prompt),
+        AgentConfig::new(workspace.clone(), system_prompt),
         model.clone(),
-    );
+    )
+    .with_facts_source(Box::new(FsFactsSource::new(workspace)));
 
     let mut session = Session::new(SessionId::new());
     let sink = CountingSink(Mutex::new(Tally::default()));

@@ -56,6 +56,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
+use loom_core::engine::repo::FsFactsSource;
 use loom_core::kernel::agent::Agent;
 use loom_core::kernel::context::{AgentConfig, DefaultContextCompiler};
 use loom_core::kernel::event::{EventKind, EventSink, StrictSink};
@@ -509,9 +510,10 @@ async fn run_once(
         provider,
         Box::new(DefaultContextCompiler),
         registry(task),
-        AgentConfig::new(root, task.system_prompt),
+        AgentConfig::new(root.clone(), task.system_prompt),
         model.to_owned(),
-    );
+    )
+    .with_facts_source(Box::new(FsFactsSource::new(root)));
     let mut session = Session::new(SessionId::new());
     let cancellation = CancellationToken::new();
     // V21: strict evaluation sink — a run that loses events fails rather than
@@ -602,6 +604,7 @@ async fn run_once(
                 "cost_usd": cost_usd(model, hit, miss, summary.output_tokens, multiplier),
                 "compiler_census": {
                     "system_prompt": summary.last_context_census.system_prompt,
+                    "repo_facts": summary.last_context_census.repo_facts,
                     "user_items": summary.last_context_census.user_items,
                     "assistant_history": summary.last_context_census.assistant_history,
                     "reasoning_replay": summary.last_context_census.reasoning_replay,

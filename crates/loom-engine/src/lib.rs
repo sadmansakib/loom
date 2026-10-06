@@ -29,6 +29,7 @@
 pub mod auth;
 pub mod engine;
 pub mod paths;
+pub mod repo;
 
 pub use engine::{Engine, EngineConfig, EngineError};
 // The provider/effort types a frontend must name to build an `EngineConfig`;
