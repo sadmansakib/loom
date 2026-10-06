@@ -53,7 +53,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -84,7 +84,7 @@ use tokio_util::sync::CancellationToken;
 // ---------------------------------------------------------------- tasks ---
 
 /// Which workspace a task runs against.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum Workspace {
     /// The Loom repository itself (read-only inspection, B1).
     Repo,
@@ -94,6 +94,30 @@ enum Workspace {
     /// (B5); sized so a sequential read pushes the projection past the
     /// 64 K pruning trigger.
     Corpus,
+    /// A crate seeded with a **real shipped bug** from Loom's history
+    /// (B6–B7): the failing regression test ships alongside the faulty
+    /// implementation, and the run is graded by a post-task gate —
+    /// `cargo test` green with the protected test files untouched.
+    Bugfix(&'static BugfixCrate),
+}
+
+/// Spec for a [`Workspace::Bugfix`] task: a self-contained crate whose
+/// `src/` reproduces a real past fault verbatim (trimmed of workspace
+/// machinery), with the real regression tests that exposed it placed in
+/// protected files the agent may not touch. The gate after the run is
+/// SWE-bench-shaped: the tests that failed before must pass after, and
+/// the tests must not have been modified.
+struct BugfixCrate {
+    /// Crate (and directory) name under the eval dir.
+    name: &'static str,
+    /// `(path, contents)` written on setup; wiped and rewritten per run.
+    files: &'static [(&'static str, &'static str)],
+    /// Files the agent must not modify; the gate compares their bytes.
+    protected: &'static [&'static str],
+    /// Tests the protected suite must report passing after the fix. Guards
+    /// against gaming the manifest: disabling a test target would still
+    /// print `test result: ok`, just with too few tests run.
+    expected_passed: u64,
 }
 
 /// The tools a task may call. Deliberately coarse: the point is to pin
@@ -191,6 +215,34 @@ const TASKS: &[EvalTask] = &[
         heavy: true,
         system_prompt: Some(LONG_CONTEXT_SYSTEM_PROMPT),
     },
+    EvalTask {
+        id: "B6",
+        prompt: "The test suite of this crate fails. Find the fault in the \
+                 implementation, fix it, and make `cargo test` pass. The \
+                 tests are the specification: do not modify anything under \
+                 tests/.",
+        workspace: Workspace::Bugfix(&B6_CRATE),
+        tools: ToolSet::Coding,
+        heavy: false,
+        system_prompt: None,
+    },
+    EvalTask {
+        id: "B7",
+        prompt: "The test suite of this crate fails, and it leaks processes. \
+                 Find the fault in the implementation, fix it, and make \
+                 `cargo test` pass. The tests are the specification: do not \
+                 modify anything under tests/.",
+        workspace: Workspace::Bugfix(&B7_CRATE),
+        tools: ToolSet::Coding,
+        // Heavy, and honestly hard: in measurement (2026-10-06,
+        // deepseek-flash, N=2) the model understood the fault and
+        // attempted real fixes but exhausted its turns iterating
+        // compile-test cycles through full fixture rebuilds — 33–47
+        // exchanges, 12–40 minutes, both runs unsolved. Kept as an
+        // opt-in difficulty probe, not a default-suite task.
+        heavy: true,
+        system_prompt: None,
+    },
 ];
 
 /// B1's original read-only prompt, kept byte-identical to the 2026-10-06
@@ -209,6 +261,169 @@ const LONG_CONTEXT_SYSTEM_PROMPT: &str = "You are Loom, a minimal coding agent w
      sample, or read partial ranges. Keep going until every requested file has been \
      processed, then answer exactly as instructed. When you answer, be concise and name \
      the workspace-relative paths you relied on.";
+
+// ------------------------------------------------------------ real bugs ---
+//
+// Field tasks: real faults that shipped in this repository, reproduced
+// as self-contained crates with the regression tests that exposed them.
+// They run with the engine-default system prompt (what users get) and
+// are graded by outcome — see `gate` in `run_once`.
+
+/// B6 — the "capability lie" (shipped in 26bcf0b, fixed in 62ea5a6):
+/// `parallel_tool_calls` was claimed for every tool-capable catalog
+/// model, so a tools-capable model that rejects parallel calls would
+/// fail the turn with a permanent InvalidRequest. The implementation
+/// below reproduces the fault; the protected tests are adapted from the
+/// real fix's regression assertions.
+static B6_CRATE: BugfixCrate = BugfixCrate {
+    name: "loom-eval-b6",
+    files: &[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"loom-eval-b6\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
+             \n[workspace]\n\n[dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\n\
+             \n[dev-dependencies]\nserde_json = \"1\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "//! Capabilities resolved from a provider model catalog.\n\
+             use serde::Deserialize;\n\n\
+             /// One raw catalog entry, as served by the provider.\n\
+             #[derive(Debug, Clone, Deserialize)]\n\
+             pub struct RawModel {\n    \
+             pub id: String,\n    \
+             pub context_length: u64,\n    \
+             #[serde(default)]\n    \
+             pub supported_parameters: Vec<String>,\n\
+             }\n\n\
+             /// What the agent loop needs to know before it schedules calls.\n\
+             #[derive(Debug, Clone, PartialEq)]\n\
+             pub struct Capabilities {\n    \
+             pub max_context_tokens: u64,\n    \
+             pub tool_calls: bool,\n    \
+             pub parallel_tool_calls: bool,\n\
+             }\n\n\
+             impl RawModel {\n    \
+             fn supports(&self, parameter: &str) -> bool {\n        \
+             self.supported_parameters.iter().any(|listed| listed == parameter)\n    \
+             }\n\n    \
+             /// Capabilities for this model.\n    \
+             pub fn capabilities(&self) -> Capabilities {\n        \
+             Capabilities {\n            \
+             max_context_tokens: self.context_length,\n            \
+             tool_calls: self.supports(\"tools\"),\n            \
+             parallel_tool_calls: self.supports(\"tools\"),\n        \
+             }\n    \
+             }\n\
+             }\n",
+        ),
+        (
+            "tests/regression.rs",
+            "use loom_eval_b6::RawModel;\n\n\
+             fn raw(parameters: &[&str]) -> RawModel {\n    \
+             serde_json::from_value(serde_json::json!({\n        \
+             \"id\": \"vendor/model\",\n        \
+             \"context_length\": 200_000,\n        \
+             \"supported_parameters\": parameters,\n    \
+             }))\n    \
+             .expect(\"fixture model\")\n\
+             }\n\n\
+             #[test]\n\
+             fn tools_without_parallel_stay_serial() {\n    \
+             let caps = raw(&[\"tools\"]).capabilities();\n    \
+             assert!(caps.tool_calls, \"tools is listed\");\n    \
+             assert!(\n        \
+             !caps.parallel_tool_calls,\n        \
+             \"parallel_tool_calls is not listed; claiming it can fail the turn\"\n    \
+             );\n\
+             }\n\n\
+             #[test]\n\
+             fn parallel_explicitly_listed_is_honoured() {\n    \
+             let caps = raw(&[\"tools\", \"parallel_tool_calls\"]).capabilities();\n    \
+             assert!(caps.tool_calls && caps.parallel_tool_calls);\n\
+             }\n\n\
+             #[test]\n\
+             fn neither_listed_means_no_calls() {\n    \
+             let caps = raw(&[\"temperature\"]).capabilities();\n    \
+             assert!(!caps.tool_calls && !caps.parallel_tool_calls);\n\
+             }\n",
+        ),
+    ],
+    protected: &["tests/regression.rs"],
+    expected_passed: 3,
+};
+
+/// B7 — the orphaned grandchild (documented debt from the first tool
+/// iteration, fixed in 2bd4928): a dropped/aborted command run killed
+/// only the direct child, so grandchildren kept running — and kept the
+/// output pipes open. The implementation reproduces the historical
+/// plain-tokio shape; the protected test is adapted from the real
+/// group-kill regression test.
+static B7_CRATE: BugfixCrate = BugfixCrate {
+    name: "loom-eval-b7",
+    files: &[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"loom-eval-b7\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
+             \n[workspace]\n\n[dependencies]\ntokio = { version = \"1\", features = [\"process\", \"rt\", \"macros\", \"time\"] }\n",
+        ),
+        (
+            "src/lib.rs",
+            "//! Run a command and capture its output.\n\
+             use std::process::Stdio;\n\
+             use tokio::process::Command;\n\n\
+             /// Spawns `program`, captures stdout/stderr, and awaits completion.\n\
+             pub async fn run(program: &str, args: &[String]) -> std::io::Result<std::process::Output> {\n    \
+             let child = Command::new(program)\n        \
+             .args(args)\n        \
+             .stdin(Stdio::null())\n        \
+             .stdout(Stdio::piped())\n        \
+             .stderr(Stdio::piped())\n        \
+             .kill_on_drop(true)\n        \
+             .spawn()?;\n    \
+             child.wait_with_output().await\n\
+             }\n",
+        ),
+        (
+            "tests/regression.rs",
+            "use std::time::{Duration, Instant};\n\n\
+             const MARKER: &str = \"loom-eval-b7-marker\";\n\n\
+             /// Cleans up any marker processes this test leaves behind, even\n\
+             /// when an assertion fails first.\n\
+             struct PkillOnDrop;\n\
+             impl Drop for PkillOnDrop {\n    \
+             fn drop(&mut self) {\n        \
+             let _ = std::process::Command::new(\"pkill\").args([\"-f\", MARKER]).status();\n    \
+             }\n\
+             }\n\n\
+             #[tokio::test]\n\
+             async fn aborting_the_runner_kills_the_whole_process_tree() {\n    \
+             let _guard = PkillOnDrop;\n    \
+             let _ = std::process::Command::new(\"pkill\").args([\"-f\", MARKER]).status();\n\n    \
+             let script = format!(\"while :; do sleep 0.5; done & exec sleep 3000 #{MARKER}\");\n    \
+             let args = vec![\"-c\".to_string(), script];\n    \
+             let task = tokio::spawn(async move { loom_eval_b7::run(\"sh\", &args).await });\n    \
+             assert!(alive(), \"the child tree must come up\");\n\n    \
+             task.abort();\n    \
+             let deadline = Instant::now() + Duration::from_secs(5);\n    \
+             while alive() && Instant::now() < deadline {\n        \
+             tokio::time::sleep(Duration::from_millis(100)).await;\n    \
+             }\n    \
+             assert!(!alive(), \"aborting the runner must kill grandchildren too\");\n\
+             }\n\n\
+             fn alive() -> bool {\n    \
+             std::process::Command::new(\"pgrep\")\n        \
+             .arg(\"-f\")\n        \
+             .arg(MARKER)\n        \
+             .output()\n        \
+             .map(|out| !out.stdout.is_empty())\n        \
+             .unwrap_or(false)\n\
+             }\n",
+        ),
+    ],
+    protected: &["tests/regression.rs"],
+    expected_passed: 1,
+};
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -288,6 +503,21 @@ fn ensure_fixture() {
         "docs-notes/beta.md",
         "# Beta\n\nThe beta subsystem consumes alpha's output and reports results.\n",
     );
+}
+
+/// (Re)creates a real-bug fixture crate. Idempotent: wiped and rewritten
+/// so every run starts from identical faulty bytes.
+fn ensure_bugfix(spec: &BugfixCrate) -> PathBuf {
+    let root = eval_dir().join(spec.name);
+    if root.exists() {
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    for (rel, body) in spec.files {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+    }
+    root
 }
 
 // --------------------------------------------------------------- census ---
@@ -592,6 +822,103 @@ fn prune_config() -> PruneConfig {
     }
 }
 
+/// Outcome gate for real-bug tasks (SWE-bench-shaped): `cargo test` must
+/// exit 0, the libtest runner must report the expected number of passing
+/// tests (so the suite ran rather than being disabled in the manifest),
+/// and the protected test files must be byte-identical to their pre-run
+/// snapshot. Live runs only — replay re-executes the recorded edits for
+/// determinism, not for grading.
+async fn grade_bugfix(
+    workspace: &Workspace,
+    root: &Path,
+    protected_before: Option<&[(PathBuf, Vec<u8>)]>,
+    live: bool,
+) -> Option<serde_json::Value> {
+    let Workspace::Bugfix(spec) = workspace else {
+        return None;
+    };
+    if !live {
+        return None;
+    }
+    let root = root.to_path_buf();
+    let spawned = tokio::task::spawn_blocking(move || run_fixture_tests(&root)).await;
+    let (code, output) = match spawned {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(error)) => {
+            return Some(serde_json::json!({
+                "bug_fixed": false,
+                "error": format!("cargo test failed to run: {error}"),
+            }));
+        }
+        Err(join) => {
+            return Some(serde_json::json!({
+                "bug_fixed": false,
+                "error": format!("gate task join error: {join}"),
+            }));
+        }
+    };
+    let passed = count_tests_passed(&output);
+    let protected_unmodified = protected_before.is_some_and(|snapshot| {
+        snapshot
+            .iter()
+            .all(|(path, before)| std::fs::read(path).is_ok_and(|now| now == *before))
+    });
+    let bug_fixed = code == Some(0) && passed >= spec.expected_passed && protected_unmodified;
+    Some(serde_json::json!({
+        "bug_fixed": bug_fixed,
+        "cargo_exit": code,
+        "tests_passed": passed,
+        "tests_expected": spec.expected_passed,
+        "protected_unmodified": protected_unmodified,
+        "spec": spec.name,
+    }))
+}
+
+/// `cargo test` inside a fixture, bounded by a wall deadline. Returns the
+/// exit code (`None` on timeout) and the combined output.
+fn run_fixture_tests(root: &Path) -> std::io::Result<(Option<i32>, String)> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("cargo")
+        .args(["test", "--color", "never"])
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                let output = child.wait_with_output()?;
+                let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+                text.push_str(&String::from_utf8_lossy(&output.stderr));
+                return Ok((status.code(), text));
+            }
+            None if Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok((None, String::from("gate timeout after 300s")));
+            }
+            None => std::thread::sleep(Duration::from_millis(250)),
+        }
+    }
+}
+
+/// Sums the `N passed` counts over every successful libtest summary line.
+/// A disabled test target prints `ok. 0 passed`, so this is what catches a
+/// manifest that silences the regression suite instead of fixing the code.
+fn count_tests_passed(output: &str) -> u64 {
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let rest = line.strip_prefix("test result: ok.")?;
+            let rest = rest.trim_start();
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse::<u64>().ok()
+        })
+        .sum()
+}
+
 /// Runs one task against a provider and returns the 1H-schema report plus
 /// the recorded exchanges and the finished session. `provider_label` names
 /// the concrete backend the run used, so billed-token figures in the report
@@ -604,7 +931,7 @@ async fn run_once(
     provider: Box<dyn ModelProvider>,
     exchanges: Option<Arc<Mutex<Vec<Exchange>>>>,
 ) -> (serde_json::Value, Vec<Exchange>, Session) {
-    let root = match task.workspace {
+    let root = match &task.workspace {
         Workspace::Repo => workspace_root(),
         Workspace::Fixture => {
             ensure_fixture();
@@ -614,6 +941,23 @@ async fn run_once(
             ensure_corpus();
             corpus_root()
         }
+        Workspace::Bugfix(spec) => ensure_bugfix(spec),
+    };
+    // Bugfix tasks snapshot their protected files after the fixture is
+    // (re)generated and before the agent runs, so the gate can prove the
+    // tests were graded, not rewritten.
+    let protected_before: Option<Vec<(PathBuf, Vec<u8>)>> = match &task.workspace {
+        Workspace::Bugfix(spec) => Some(
+            spec.protected
+                .iter()
+                .map(|rel| {
+                    let path = root.join(rel);
+                    let bytes = std::fs::read(&path).unwrap_or_default();
+                    (path, bytes)
+                })
+                .collect(),
+        ),
+        _ => None,
     };
     // 2L/ADR-011: pruning is OFF by default so baseline numbers stay
     // comparable; set LOOM_EVAL_PRUNE=1 (or on/true) for the pruning arm.
@@ -647,7 +991,7 @@ async fn run_once(
         AgentConfig::new(root.clone(), system_prompt),
         model.to_owned(),
     )
-    .with_facts_source(Box::new(FsFactsSource::new(root)));
+    .with_facts_source(Box::new(FsFactsSource::new(root.clone())));
     let mut session = Session::new(SessionId::new());
     let cancellation = CancellationToken::new();
     // V21: strict evaluation sink — a run that loses events fails rather than
@@ -712,7 +1056,7 @@ async fn run_once(
         })
     });
 
-    let report = match &outcome {
+    let mut report = match &outcome {
         Ok(summary) => {
             assert_eq!(
                 summary.events_dropped, 0,
@@ -775,6 +1119,20 @@ async fn run_once(
             "observed_wall_time_ms": observed_ms,
         }),
     };
+    // Outcome grading for real-bug tasks; live runs only.
+    if let Some(gate) = grade_bugfix(
+        &task.workspace,
+        &root,
+        protected_before.as_deref(),
+        exchanges.is_some(),
+    )
+    .await
+    {
+        report
+            .as_object_mut()
+            .unwrap()
+            .insert("gate".to_owned(), gate);
+    }
     (report, recorded, session)
 }
 
@@ -828,8 +1186,8 @@ async fn eval_live() {
             )
             .await;
             eprintln!(
-                "{} run {}/{}: success={}",
-                task.id, run, runs, report["success"]
+                "{} run {}/{}: success={} bug_fixed={}",
+                task.id, run, runs, report["success"], report["gate"]["bug_fixed"]
             );
             std::fs::write(
                 records_dir.join(format!("{}-{model}-{run}.jsonl", task.id)),
@@ -866,6 +1224,17 @@ async fn eval_live() {
             "{}: at least one live run failed",
             task.id
         );
+        // Real-bug tasks are graded by outcome: a run whose gate failed
+        // (tests not green, tests rewritten, or suite disabled) fails the
+        // live eval even though the transcript itself completed.
+        assert!(
+            reports
+                .iter()
+                .filter(|r| r.get("gate").is_some_and(|g| !g.is_null()))
+                .all(|r| r["gate"]["bug_fixed"].as_bool().unwrap_or(false)),
+            "{}: at least one run failed the bug-fix gate",
+            task.id
+        );
     }
 }
 
@@ -886,7 +1255,7 @@ fn aggregates_from(reports: &[serde_json::Value]) -> serde_json::Value {
             .filter_map(|r| r[key].as_f64())
             .collect()
     };
-    serde_json::json!({
+    let mut aggregates = serde_json::json!({
         "turns": aggregate(&pick("turns")),
         "input_tokens": aggregate(&pick("input_tokens")),
         "cache_hit_tokens": aggregate(&pick("cache_hit_tokens")),
@@ -895,10 +1264,75 @@ fn aggregates_from(reports: &[serde_json::Value]) -> serde_json::Value {
         "output_tokens": aggregate(&pick("output_tokens")),
         "wall_time_ms": aggregate(&pick("wall_time_ms")),
         "cost_usd": aggregate_f64(&pick_f64("cost_usd")),
-    })
+    });
+    // Pass rate for gated (real-bug) tasks: solved runs over all runs,
+    // transcript failures included — a failed run is a failed fix.
+    let gated: Vec<&serde_json::Value> = reports
+        .iter()
+        .filter(|r| r.get("gate").is_some_and(|g| !g.is_null()))
+        .collect();
+    if !gated.is_empty() {
+        let solved = gated
+            .iter()
+            .filter(|r| r["gate"]["bug_fixed"].as_bool().unwrap_or(false))
+            .count();
+        aggregates.as_object_mut().unwrap().insert(
+            "bug_fixed_rate".to_owned(),
+            serde_json::json!({
+                "solved": solved,
+                "runs": gated.len(),
+                "rate": solved as f64 / gated.len() as f64,
+            }),
+        );
+    }
+    aggregates
 }
 
 // ------------------------------------------------- replay equivalence ----
+
+/// The real-bug fixtures must fail their own gates as seeded — the bug is
+/// present and the tests expose it. A seed that already passes measures
+/// nothing (SWE-bench validates the FAIL_TO_PASS pre-state the same way).
+/// B6 is additionally proven fixable in place: applying the one-line real
+/// fix turns the gate green with the expected test count.
+#[test]
+fn bugfix_seeds_fail_their_gates() {
+    for spec in [&B6_CRATE, &B7_CRATE] {
+        let root = ensure_bugfix(spec);
+        let (code, output) = run_fixture_tests(&root).expect("cargo test");
+        assert_ne!(
+            code,
+            Some(0),
+            "{}: seeded fixture must fail `cargo test`",
+            spec.name
+        );
+        assert!(
+            output.contains("test result:"),
+            "{}: the seeded tests must run and report",
+            spec.name
+        );
+    }
+
+    // The B6 pre-state is one line wrong; the real fix must flip the
+    // gate. This also exercises `count_tests_passed` against real
+    // libtest output.
+    let root = ensure_bugfix(&B6_CRATE);
+    let lib = root.join("src/lib.rs");
+    let body = std::fs::read_to_string(&lib).unwrap();
+    let fixed = body.replacen(
+        "parallel_tool_calls: self.supports(\"tools\"),",
+        "parallel_tool_calls: self.supports(\"parallel_tool_calls\"),",
+        1,
+    );
+    std::fs::write(&lib, fixed).unwrap();
+    let (code, output) = run_fixture_tests(&root).expect("cargo test");
+    assert_eq!(code, Some(0), "the real B6 fix must turn the gate green");
+    assert_eq!(
+        count_tests_passed(&output),
+        B6_CRATE.expected_passed,
+        "the fixed suite must report its expected passing count"
+    );
+}
 
 /// The invariant under test (V3, Invariant 10): replaying recorded
 /// responses through the real agent + real tools reproduces the recorded

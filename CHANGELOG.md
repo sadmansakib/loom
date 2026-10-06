@@ -34,6 +34,34 @@ token counts (~±8 %), without putting a tokenizer in the kernel:
   (`o200k_base`), wired in `Engine::open`; the eval and benchmark
   harnesses use the same estimator for parity.
 
+## 2026-10-07 — Real-bug eval tasks with outcome gates (B6–B7)
+
+The suite's field tasks now include faults that actually shipped in this
+repository, graded by outcome instead of transcript success — the shape
+SWE-bench uses (FAIL_TO_PASS with protected tests).
+
+- **B6 — the "capability lie"** (shipped `26bcf0b`, fixed `62ea5a6`):
+  `parallel_tool_calls` claimed for every tool-capable catalog model.
+  Seeded as a self-contained crate with the real regression tests in a
+  protected file. Live (N=5, deepseek-flash): **5/5 solved**, 5.8 turns,
+  13,592 input tokens mean, 85.7 % cache hit, ≈$0.0007 per run.
+- **B7 — the orphaned grandchild** (fixed `2bd4928`): dropped command
+  runs killed only the direct child. Genuinely hard: in measurement the
+  model understood the fault and attempted real fixes but exhausted its
+  turns in compile-test cycles (33–47 exchanges, both runs unsolved).
+  Kept as an opt-in `heavy` difficulty probe, not a default-suite task.
+- **Gate machinery**: after a gated run the harness executes
+  `cargo test` in the fixture (wall-bounded), counts passing tests from
+  the libtest summaries (a disabled target prints `ok. 0 passed`, so
+  count is what catches manifest gaming), and compares the protected
+  files byte-for-byte against a pre-run snapshot. Reports carry a
+  `gate` object per run and a `bug_fixed_rate` aggregate; the live eval
+  fails if any run's gate fails. An offline invariant test proves every
+  seed fails its own gate as shipped and that B6's one-line real fix
+  flips it green with the expected count.
+- Replay: B6's records replay offline like any other task (recorded
+  edits re-execute for determinism); grading itself is live-only.
+
 ## 2026-10-06 — OpenRouter provider (free and paid models)
 
 Second adapter, one shared wire. Loom now talks to OpenRouter alongside
