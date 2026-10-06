@@ -30,7 +30,7 @@ pub struct EditFileTool;
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 struct EditInput {
-    /// File path, relative to the workspace root.
+    /// Workspace-relative file path.
     path: String,
     /// Exact text to replace; must occur exactly once.
     old_string: String,
@@ -44,8 +44,8 @@ impl Tool for EditFileTool {
         SPEC.get_or_init(|| ToolSpec {
             name: "edit_file".to_owned(),
             description: "Replaces an exact string in one workspace file. `old_string` \
-                          must appear exactly once — include enough surrounding text to \
-                          make it unique. Use write_file to create a file."
+                          must occur exactly once — include enough context to make it \
+                          unique."
                 .to_owned(),
             parameters: crate::schema::parameters::<EditInput>(),
         })

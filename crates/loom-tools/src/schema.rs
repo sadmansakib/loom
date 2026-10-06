@@ -14,6 +14,11 @@ use schemars::JsonSchema;
 /// and the hand-written schemas this replaces did not have them. The
 /// rest (properties, descriptions from doc comments, `required`,
 /// `additionalProperties`) comes straight from the struct.
+///
+/// The schema is then passed through [`compact`], which removes the
+/// `schemars` annotations that do not affect what the tool accepts. This is
+/// a pure size cut: the tool spec is the dominant fixed cost of a short
+/// task's context (`2K`), and these keys are re-sent on every request.
 pub(crate) fn parameters<T: JsonSchema>() -> serde_json::Value {
     // A `RootSchema` is always JSON-representable, so the fallback is
     // unreachable; it keeps this path panic-free under the workspace lint.
@@ -23,7 +28,150 @@ pub(crate) fn parameters<T: JsonSchema>() -> serde_json::Value {
         object.remove("$schema");
         object.remove("title");
     }
+    inline_definitions(&mut value);
+    compact(&mut value);
     value
+}
+
+/// Replaces `{"$ref": "#/definitions/<Name>"}` nodes with the definition body
+/// and drops the now-unused `definitions` table.
+///
+/// `schemars` emits a named enum (e.g. `verify`'s `Scope`) as a top-level
+/// `definitions` entry referenced by `$ref`. The model only ever sees one
+/// tool at a time, so the indirection buys nothing and costs bytes; inlining
+/// also lets [`compact`] see through the copy. A schemars `$ref` is wrapped in
+/// a single-element `allOf`, so that wrapper is collapsed too.
+fn inline_definitions(root: &mut serde_json::Value) {
+    let Some(definitions) = root
+        .get("definitions")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return;
+    };
+    let definitions = definitions.clone();
+    resolve_refs(root, &definitions);
+    if let Some(object) = root.as_object_mut() {
+        object.remove("definitions");
+    }
+}
+
+fn resolve_refs(
+    value: &mut serde_json::Value,
+    definitions: &serde_json::Map<String, serde_json::Value>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let replacement = map
+                .get("$ref")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|r| r.strip_prefix("#/definitions/"))
+                .and_then(|name| definitions.get(name))
+                .cloned();
+            if let Some(mut resolved) = replacement {
+                resolve_refs(&mut resolved, definitions);
+                *value = resolved;
+                return;
+            }
+            for child in map.values_mut() {
+                resolve_refs(child, definitions);
+            }
+            // Collapse `{"allOf": [<one schema>]}` left by a resolved `$ref`,
+            // keeping the parent's own keys (e.g. its `description`).
+            if let Some(serde_json::Value::Array(items)) = map.get("allOf")
+                && items.len() == 1
+                && let serde_json::Value::Object(inner) = items[0].clone()
+            {
+                map.remove("allOf");
+                for (key, child) in inner {
+                    map.entry(key).or_insert(child);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                resolve_refs(item, definitions);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Recursively drops schema keys the model does not need.
+///
+/// `schemars` annotates every `Option` field with `"default": null` and every
+/// `usize` with `"format": "uint"`. Neither changes what the tool accepts:
+/// `required` already names the mandatory fields and serde supplies the
+/// defaults, so both are pure repetition in every request. `format` is only
+/// dropped when it is the Rust-integer marker, so a future schema can keep a
+/// meaningful format; other keys (`description`, `type`, `minimum`, enums,
+/// `additionalProperties`) are preserved. The walk is deterministic because
+/// `serde_json` maps serialize with sorted keys (`preserve_order` off).
+///
+/// Two more rewrites happen on the way through, both meaning-preserving:
+///
+/// * `"minimum": 1.0` becomes `"minimum": 1` — `schemars` serialises integer
+///   bounds as floats, and the trailing `.0` is re-sent on every request.
+/// * A `oneOf` whose branches are each a single-value string enum (how
+///   `schemars` renders a field-less Rust `enum`) collapses to one plain
+///   `enum` list. `{"oneOf":[{"enum":["check"]},{"enum":["test"]}]}` and
+///   `"enum": ["check","test"]` accept exactly the same values; the branch
+///   descriptions duplicate the field's own description, so they go too.
+fn compact(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.remove("default");
+            if map.get("format").and_then(serde_json::Value::as_str) == Some("uint") {
+                map.remove("format");
+            }
+            if let Some(bound) = map.get("minimum").and_then(serde_json::Value::as_f64)
+                && bound.fract() == 0.0
+            {
+                map.insert("minimum".to_owned(), serde_json::Value::from(bound as i64));
+            }
+            for child in map.values_mut() {
+                compact(child);
+            }
+            collapse_singleton_enum(map);
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                compact(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Rewrites a `oneOf` of single-value string enums into one `enum` list, in
+/// place. Anything else is left untouched.
+fn collapse_singleton_enum(map: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(serde_json::Value::Array(branches)) = map.get("oneOf") else {
+        return;
+    };
+    if branches.is_empty() || map.contains_key("enum") {
+        return;
+    }
+    let mut values: Vec<serde_json::Value> = Vec::with_capacity(branches.len());
+    for branch in branches {
+        let Some(object) = branch.as_object() else {
+            return;
+        };
+        let Some(variants) = object.get("enum").and_then(serde_json::Value::as_array) else {
+            return;
+        };
+        if variants.len() != 1
+            || object.get("type") != Some(&serde_json::Value::String("string".to_owned()))
+        {
+            return;
+        }
+        values.push(variants[0].clone());
+    }
+    map.remove("oneOf");
+    map.insert("enum".to_owned(), serde_json::Value::Array(values));
+    map.insert(
+        "type".to_owned(),
+        serde_json::Value::String("string".to_owned()),
+    );
 }
 
 /// Schema↔parser agreement checks (V19).

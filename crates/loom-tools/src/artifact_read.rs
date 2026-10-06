@@ -26,13 +26,13 @@ pub struct ArtifactReadTool;
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 struct ArtifactReadInput {
-    /// Artifact id from the `[... stored as artifact <id> ...]` note.
+    /// Artifact id from a `stored as artifact <id>` note.
     id: String,
-    /// First line to return, 1-based (default 1).
+    /// First line to return, 1-based.
     #[serde(default)]
     #[schemars(range(min = 1))]
     offset: Option<usize>,
-    /// Maximum lines to return (default: the whole body, up to the output budget).
+    /// Maximum lines to return; defaults to the whole body.
     #[serde(default)]
     #[schemars(range(min = 1))]
     limit: Option<usize>,
@@ -44,10 +44,9 @@ impl Tool for ArtifactReadTool {
         SPEC.get_or_init(|| ToolSpec {
             name: "artifact_read".to_owned(),
             description: "Reads a tool result that was too large for the inline budget \
-                          and was stored as an artifact. Pass the id from the \
-                          `stored as artifact <id>` note. Returns numbered lines with a \
-                          total-lines header; page it with `offset` and `limit` exactly \
-                          like `read_file`."
+                          and was stored as an artifact. Pass the id from the `stored as \
+                          artifact <id>` note. Returns numbered lines; page with `offset` \
+                          and `limit` like `read_file`."
                 .to_owned(),
             parameters: crate::schema::parameters::<ArtifactReadInput>(),
         })

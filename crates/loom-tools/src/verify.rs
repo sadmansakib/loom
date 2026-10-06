@@ -38,9 +38,9 @@ pub struct VerifyTool;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum Scope {
-    /// Compile only (level 1): compiler diagnostics, no tests.
+    /// Compile only; no tests.
     Check,
-    /// Compile and run tests (level 2): diagnostics plus failing tests.
+    /// Compile and run tests.
     #[default]
     Test,
 }
@@ -49,8 +49,7 @@ enum Scope {
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 struct VerifyInput {
-    /// Verification scope. `check` compiles only and reports diagnostics;
-    /// `test` compiles and runs tests.
+    /// `check` compiles only; `test` compiles and runs tests.
     scope: Scope,
 }
 
@@ -77,12 +76,11 @@ impl Tool for VerifyTool {
         static SPEC: OnceLock<ToolSpec> = OnceLock::new();
         SPEC.get_or_init(|| ToolSpec {
             name: "verify".to_owned(),
-            description: "Runs a bounded cargo verification in the workspace root and returns \
-                          structured failure evidence: compiler diagnostics (level `check`) or \
-                          diagnostics plus failing-test details (level `test`). \
-                          Failures are linked to the files this task recently changed. Prefer \
-                          the smallest scope that can prove the change; escalate only after a \
-                          failure. Output is never a full log."
+            description: "Runs a bounded cargo verification and returns structured \
+                          failure evidence: compiler diagnostics (`check`) or diagnostics \
+                          plus failing tests (`test`), linked to files this task changed. \
+                          Prefer the smallest scope that can prove the change; output is \
+                          never a full log."
                 .to_owned(),
             parameters: crate::schema::parameters::<VerifyInput>(),
         })

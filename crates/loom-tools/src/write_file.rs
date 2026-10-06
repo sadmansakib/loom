@@ -25,9 +25,9 @@ pub struct WriteFileTool;
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 struct WriteInput {
-    /// File path, relative to the workspace root.
+    /// Workspace-relative file path.
     path: String,
-    /// The complete file content to write.
+    /// File content to write.
     content: String,
 }
 
@@ -36,10 +36,9 @@ impl Tool for WriteFileTool {
         static SPEC: OnceLock<ToolSpec> = OnceLock::new();
         SPEC.get_or_init(|| ToolSpec {
             name: "write_file".to_owned(),
-            description: "Creates or overwrites one text file in the workspace, creating \
-                          parent directories as needed. Overwrites the whole file, so \
-                          read it first when it already exists; use edit_file for a \
-                          targeted change."
+            description: "Creates or overwrites one text file, creating parent \
+                          directories. Overwrites the whole file, so read it first if it \
+                          exists; use edit_file for a targeted change."
                 .to_owned(),
             parameters: crate::schema::parameters::<WriteInput>(),
         })

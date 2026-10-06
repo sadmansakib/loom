@@ -18,7 +18,7 @@ pub struct ListDirTool;
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 struct ListInput {
-    /// Directory path, relative to the workspace root.
+    /// Workspace-relative directory path.
     path: String,
 }
 
@@ -27,8 +27,8 @@ impl Tool for ListDirTool {
         static SPEC: OnceLock<ToolSpec> = OnceLock::new();
         SPEC.get_or_init(|| ToolSpec {
             name: "list_dir".to_owned(),
-            description: "Lists one directory level (non-recursive). Entries are \
-                          sorted; directories carry a trailing `/`."
+            description: "Lists one directory level, non-recursive. Entries are sorted; \
+                          directories carry a trailing `/`."
                 .to_owned(),
             parameters: crate::schema::parameters::<ListInput>(),
         })

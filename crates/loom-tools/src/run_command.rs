@@ -78,9 +78,9 @@ impl RunCommandTool {
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 struct RunInput {
-    /// Executable name (no path). Allowed: cargo.
+    /// Executable name, no path; allowed: cargo.
     program: String,
-    /// Arguments passed to the program, one array entry each.
+    /// Arguments, one array entry each.
     #[serde(default)]
     args: Vec<String>,
 }
@@ -91,9 +91,8 @@ impl Tool for RunCommandTool {
         SPEC.get_or_init(|| ToolSpec {
             name: "run_command".to_owned(),
             description: "Runs an allow-listed program in the workspace root and returns \
-                          its combined stdout/stderr and exit status. No shell is involved; \
-                          pass the program and each argument separately. Iteration 1 allows \
-                          `cargo` (e.g. build, test, fmt, clippy)."
+                          its combined stdout/stderr and exit status. No shell: pass the \
+                          program and each argument separately. Allowed: `cargo`."
                 .to_owned(),
             parameters: crate::schema::parameters::<RunInput>(),
         })

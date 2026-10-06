@@ -24,13 +24,13 @@ pub struct ReadFileTool;
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 struct ReadInput {
-    /// File path, relative to the workspace root.
+    /// Workspace-relative file path.
     path: String,
-    /// First line to return, 1-based (default 1).
+    /// First line to return, 1-based.
     #[serde(default)]
     #[schemars(range(min = 1))]
     offset: Option<usize>,
-    /// Maximum lines to return (default: the whole file, up to the output budget).
+    /// Maximum lines to return; defaults to the whole file.
     #[serde(default)]
     #[schemars(range(min = 1))]
     limit: Option<usize>,
@@ -41,10 +41,9 @@ impl Tool for ReadFileTool {
         static SPEC: OnceLock<ToolSpec> = OnceLock::new();
         SPEC.get_or_init(|| ToolSpec {
             name: "read_file".to_owned(),
-            description: "Reads one text file from the workspace as numbered lines \
-                          with a total-lines header. The whole file is returned by \
-                          default; pass `offset` (first line, 1-based) and `limit` \
-                          (line count) to read a smaller range. Large ranges are cut \
+            description: "Reads one text file as numbered lines with a total-lines \
+                          header. Returns the whole file by default; pass `offset` \
+                          (1-based) and `limit` for a smaller range. Long ranges are cut \
                           with an explicit marker."
                 .to_owned(),
             parameters: crate::schema::parameters::<ReadInput>(),

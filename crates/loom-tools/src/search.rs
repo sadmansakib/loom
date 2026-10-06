@@ -66,10 +66,10 @@ pub struct SearchTool;
 struct SearchInput {
     /// Regular expression (Rust syntax).
     pattern: String,
-    /// Directory (or file) to search; defaults to the workspace root.
+    /// Directory or file to search; defaults to the workspace root.
     #[serde(default)]
     path: Option<String>,
-    /// Cap on reported matching lines; defaults to 200, minimum 1.
+    /// Cap on reported matching lines; minimum 1, default 200.
     #[serde(default)]
     #[schemars(range(min = 1))]
     max_results: Option<usize>,
@@ -80,11 +80,10 @@ impl Tool for SearchTool {
         static SPEC: OnceLock<ToolSpec> = OnceLock::new();
         SPEC.get_or_init(|| ToolSpec {
             name: "search".to_owned(),
-            description: "Searches file contents with a regular expression across the \
-                          workspace (gitignored and hidden files are skipped; binary \
-                          files are skipped). Returns `path:line: text` entries with \
-                          workspace-relative paths. Large result sets are summarized \
-                          per file with a short preview and a hint to narrow the search."
+            description: "Searches file contents by regular expression across the \
+                          workspace (gitignored, hidden, and binary files skipped). \
+                          Returns `path:line: text`; large sets are summarized per file \
+                          with a preview and a hint to narrow the search."
                 .to_owned(),
             parameters: crate::schema::parameters::<SearchInput>(),
         })

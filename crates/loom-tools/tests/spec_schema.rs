@@ -19,6 +19,7 @@ fn tools() -> Vec<(&'static str, Box<dyn Tool>)> {
         ("write_file", Box::new(loom_tools::WriteFileTool)),
         ("edit_file", Box::new(loom_tools::EditFileTool)),
         ("run_command", Box::new(loom_tools::RunCommandTool::new())),
+        ("verify", Box::new(loom_tools::VerifyTool::new())),
         ("artifact_read", Box::new(loom_tools::ArtifactReadTool)),
     ]
 }
@@ -74,6 +75,26 @@ fn every_tool_schema_is_a_closed_described_object() {
             assert!(
                 properties.contains_key(key),
                 "{name}: required `{key}` is not a declared property"
+            );
+        }
+    }
+}
+
+/// `2K`: the serialized specs carry no `schemars` noise.
+///
+/// `schema::parameters` strips the keys that repeat on every request without
+/// changing what a tool accepts (`default`, `format`, and the
+/// `definitions`/`$ref` indirection for a named enum). The byte *budget*
+/// lives in `measure_specs.rs`; here we only assert the noise is gone, so the
+/// two tests do not duplicate a number that has to be bumped in lockstep.
+#[test]
+fn tool_specs_are_compact_and_noise_free() {
+    for (name, tool) in tools() {
+        let json = serde_json::to_string(&tool.spec()).expect("spec serializes");
+        for banned in ["\"$ref\"", "\"definitions\"", "\"default\"", "\"format\""] {
+            assert!(
+                !json.contains(banned),
+                "{name}: spec still carries {banned}"
             );
         }
     }
