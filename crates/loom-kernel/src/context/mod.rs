@@ -41,6 +41,44 @@ use std::path::PathBuf;
 /// compiler-internal change and never touches the trait boundary.
 pub(crate) const BYTES_PER_TOKEN: u32 = 3;
 
+/// Estimates how many model tokens a serialized projection payload is.
+///
+/// The kernel ships only the conservative [`HeuristicEstimator`]
+/// (§8: bytes ÷ [`BYTES_PER_TOKEN`]); a frontend that links a real
+/// tokenizer injects it through the compiler constructors. The trait
+/// keeps the kernel tokenizer-free (ADR-001) while letting the engine
+/// estimate with the same family of tokenizer the provider bills.
+pub trait TokenEstimator: Send + Sync + 'static {
+    /// Estimated tokens for `text` — the exact serialized payload the
+    /// provider bills, not the logical content.
+    fn estimate(&self, text: &str) -> u32;
+}
+
+/// The kernel's default estimate: one token per [`BYTES_PER_TOKEN`]
+/// bytes of serialized payload.
+///
+/// Conservative for code-shaped JSON (real BPE runs ~3.5–4 bytes per
+/// token), so a budget decided by it errs toward refusing early rather
+/// than sending an over-window request.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HeuristicEstimator;
+
+impl TokenEstimator for HeuristicEstimator {
+    fn estimate(&self, text: &str) -> u32 {
+        u32::try_from(text.len() / BYTES_PER_TOKEN as usize).unwrap_or(u32::MAX)
+    }
+}
+
+/// Estimates the tokens of a serialized JSON value (0 if the value
+/// cannot serialize — it cannot for the kernel's types; the fallback
+/// keeps estimation panic-free like [`serialized_size`]).
+pub(crate) fn estimate_serialized<T: serde::Serialize>(
+    estimator: &dyn TokenEstimator,
+    value: &T,
+) -> u32 {
+    serde_json::to_string(value).map_or(0, |json| estimator.estimate(&json))
+}
+
 /// Serializes a list of [`Message`]s into a canonical string for token
 /// estimation.
 ///

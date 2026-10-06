@@ -142,7 +142,9 @@ async fn b1_read_only_repository_inspection() {
     );
     let agent = Agent::new(
         Box::new(provider),
-        Box::new(DefaultContextCompiler),
+        Box::new(DefaultContextCompiler::with_estimator(std::sync::Arc::new(
+            loom_core::engine::O200kEstimator,
+        ))),
         registry,
         AgentConfig::new(workspace.clone(), system_prompt),
         model.clone(),

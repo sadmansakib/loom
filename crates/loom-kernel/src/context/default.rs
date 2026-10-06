@@ -20,12 +20,13 @@
 //! reasoning of every prior turn once tools are sent (ADR-006).
 
 use super::{
-    AgentConfig, BYTES_PER_TOKEN, CompiledContext, ContextCensus, ContextError, ContextInput,
-    KnownFacts,
+    AgentConfig, CompiledContext, ContextCensus, ContextError, ContextInput, HeuristicEstimator,
+    KnownFacts, TokenEstimator, estimate_serialized,
 };
 use crate::model::{Message, ModelCapabilities, ModelRequest};
 use crate::tool::{ToolEffects, ToolRegistry};
 use crate::transcript::{Item, ToolResult};
+use std::sync::Arc;
 
 /// Full-transcript, all-tools context compiler (§8.3).
 ///
@@ -34,12 +35,34 @@ use crate::transcript::{Item, ToolResult};
 /// order; tool definitions appear once per request in deterministic
 /// registration order; and the estimated token count is checked against
 /// the budget so a known-overflow request is never sent.
-#[derive(Debug, Default)]
-pub struct DefaultContextCompiler;
+///
+/// Token estimates come from the injected [`TokenEstimator`]; the default
+/// is the kernel's conservative bytes ÷ 3 heuristic.
+pub struct DefaultContextCompiler {
+    estimator: Arc<dyn TokenEstimator>,
+}
+
+impl Default for DefaultContextCompiler {
+    fn default() -> Self {
+        Self {
+            estimator: Arc::new(HeuristicEstimator),
+        }
+    }
+}
+
+impl DefaultContextCompiler {
+    /// Uses `estimator` for every token estimate (census totals and the
+    /// budget check that consumes them).
+    #[must_use]
+    pub fn with_estimator(estimator: Arc<dyn TokenEstimator>) -> Self {
+        Self { estimator }
+    }
+}
 
 impl super::ContextCompiler for DefaultContextCompiler {
     fn compile(&self, input: ContextInput<'_>) -> Result<CompiledContext, ContextError> {
-        let (messages, facts_bytes) = project_messages(input.session, input.config, input.facts);
+        let (messages, facts_tokens) =
+            project_messages(input.session, input.config, input.facts, &*self.estimator);
         let tools = exposed_tools(input.tools, input.capabilities);
         let request = ModelRequest {
             model: input.model.to_owned(),
@@ -51,7 +74,7 @@ impl super::ContextCompiler for DefaultContextCompiler {
                 .map(|tokens| tokens.min(input.budget.reserved_output_tokens)),
             temperature: None,
         };
-        let census = census(&request, facts_bytes);
+        let census = census(&request, facts_tokens, &*self.estimator);
         if census.total > input.budget.max_input_tokens {
             return Err(ContextError::BudgetExceeded {
                 estimated: census.total,
@@ -73,22 +96,23 @@ impl super::ContextCompiler for DefaultContextCompiler {
 /// order except `ContentFilter` assistant turns, which stay in the transcript
 /// but are never replayed.
 ///
-/// Returns the messages and the serialized byte length of the facts message
+/// Returns the messages and the estimated tokens of the facts message
 /// (0 when absent), so the census can attribute it apart from the system
 /// prompt without re-parsing the projection.
 fn project_messages(
     session: &crate::session::Session,
     config: &AgentConfig,
     facts: &KnownFacts,
-) -> (Vec<Message>, u64) {
+    estimator: &dyn TokenEstimator,
+) -> (Vec<Message>, u32) {
     let mut messages = vec![Message::System {
         text: config.system_prompt.clone(),
     }];
     let facts_text = facts.render();
-    let mut facts_bytes = 0u64;
+    let mut facts_tokens = 0u32;
     if !facts_text.is_empty() {
         let message = Message::System { text: facts_text };
-        facts_bytes = serialized_size(&message);
+        facts_tokens = estimate_serialized(estimator, &message);
         messages.push(message);
     }
     for item in &session.transcript {
@@ -118,7 +142,7 @@ fn project_messages(
             messages.push(message);
         }
     }
-    (messages, facts_bytes)
+    (messages, facts_tokens)
 }
 
 /// The tools exposed to the model (§8.2): all registered tools, in
@@ -148,58 +172,78 @@ pub(super) fn serialized_size<T: serde::Serialize>(value: &T) -> u64 {
 
 /// Attributes the request's estimated context to its sources (ADR-016, V18).
 ///
-/// `facts_bytes` is the serialized byte length of the repository facts
+/// `facts_tokens` is the estimated tokens of the repository facts
 /// message, subtracted from the system-prompt attribution so the two system
 /// messages in the prefix never double-count.
 ///
-/// Per-source figures are serialized bytes ÷ [`BYTES_PER_TOKEN`]; `total` is
-/// the authoritative estimate: the whole message list plus tool list,
-/// serialized once, ÷ `BYTES_PER_TOKEN`, plus one token per message for
-/// framing (§8). The two are computed from the same payload, so `total` is
-/// exactly the number the budget check compares.
-pub(super) fn census(request: &ModelRequest, facts_bytes: u64) -> ContextCensus {
-    let mut system_total = 0u64;
-    let mut user_items = 0u64;
-    let mut assistant_history = 0u64;
-    let mut reasoning_replay = 0u64;
-    let mut tool_results = 0u64;
+/// Per-source figures are the estimator's tokens over each serialized
+/// message (or tool spec); `total` is the authoritative estimate: the
+/// whole message list plus tool list, serialized once and estimated,
+/// plus one token per message for framing (§8). The two are computed
+/// from the same payload, so `total` is exactly the number the budget
+/// check compares.
+pub(super) fn census(
+    request: &ModelRequest,
+    facts_tokens: u32,
+    estimator: &dyn TokenEstimator,
+) -> ContextCensus {
+    let mut system_total = 0u32;
+    let mut user_items = 0u32;
+    let mut assistant_history = 0u32;
+    let mut reasoning_replay = 0u32;
+    let mut tool_results = 0u32;
     for message in &request.messages {
         match message {
-            Message::System { .. } => system_total += serialized_size(message),
-            Message::User { .. } => user_items += serialized_size(message),
+            Message::System { .. } => {
+                system_total = system_total.saturating_add(estimate_serialized(estimator, message));
+            }
+            Message::User { .. } => {
+                user_items = user_items.saturating_add(estimate_serialized(estimator, message));
+            }
             Message::Assistant(assistant) => {
                 // Reasoning is attributed on its own; the rest of the
                 // assistant message (text and tool-call arguments) stays in
                 // `assistant_history`, so the two never double-count.
-                let reasoning = assistant.reasoning.as_ref().map_or(0, serialized_size);
-                reasoning_replay += reasoning;
-                assistant_history += serialized_size(message).saturating_sub(reasoning);
+                let reasoning = assistant
+                    .reasoning
+                    .as_ref()
+                    .map_or(0, |trace| estimate_serialized(estimator, trace));
+                reasoning_replay = reasoning_replay.saturating_add(reasoning);
+                assistant_history = assistant_history.saturating_add(
+                    estimate_serialized(estimator, message).saturating_sub(reasoning),
+                );
             }
-            Message::ToolResult(_) => tool_results += serialized_size(message),
+            Message::ToolResult(_) => {
+                tool_results = tool_results.saturating_add(estimate_serialized(estimator, message));
+            }
         }
     }
-    let tool_specs: u64 = request.tools.iter().map(serialized_size).sum();
+    let tool_specs: u32 = request
+        .tools
+        .iter()
+        .map(|spec| estimate_serialized(estimator, spec))
+        .fold(0u32, u32::saturating_add);
 
     let messages = super::messages_serialized(&request.messages);
     let tools = serde_json::to_string(&request.tools);
     debug_assert!(tools.is_ok(), "tool-spec serialization must not fail");
-    let payload = messages.len() as u64 + tools.unwrap_or_default().len() as u64;
-    // saturating to avoid u32 overflow on absurd inputs; a compiler that
-    // reports `u32::MAX` estimated tokens will simply exceed any budget.
-    let total = ((payload / u64::from(BYTES_PER_TOKEN)).min(u64::from(u32::MAX)) as u32)
-        .saturating_add(request.messages.len() as u32);
+    // Saturating on each half: a compiler that reports `u32::MAX`
+    // estimated tokens will simply exceed any budget.
+    let total = estimator
+        .estimate(&messages)
+        .saturating_add(estimator.estimate(&tools.unwrap_or_default()))
+        .saturating_add(u32::try_from(request.messages.len()).unwrap_or(u32::MAX));
 
-    let tokens = |bytes: u64| (bytes / u64::from(BYTES_PER_TOKEN)).min(u64::from(u32::MAX)) as u32;
     ContextCensus {
         // Everything in a `System` message that is not the facts block is the
         // system prompt; the two are the only system messages projected.
-        system_prompt: tokens(system_total.saturating_sub(facts_bytes)),
-        repo_facts: tokens(facts_bytes),
-        user_items: tokens(user_items),
-        assistant_history: tokens(assistant_history),
-        reasoning_replay: tokens(reasoning_replay),
-        tool_results: tokens(tool_results),
-        tool_specs: tokens(tool_specs),
+        system_prompt: system_total.saturating_sub(facts_tokens),
+        repo_facts: facts_tokens,
+        user_items,
+        assistant_history,
+        reasoning_replay,
+        tool_results,
+        tool_specs,
         total,
     }
 }
@@ -327,7 +371,7 @@ mod tests {
         tools: &ToolRegistry,
         budget: ContextBudget,
     ) -> Result<CompiledContext, ContextError> {
-        DefaultContextCompiler.compile(input(
+        DefaultContextCompiler::default().compile(input(
             session,
             tools,
             &task_record(),
@@ -478,7 +522,7 @@ mod tests {
     #[test]
     fn no_tools_when_model_lacks_tool_calls() {
         let caps = ModelCapabilities::new(100_000); // tool_calls: false
-        let compiled = DefaultContextCompiler
+        let compiled = DefaultContextCompiler::default()
             .compile(input(
                 &session(),
                 &registry(),
@@ -624,7 +668,7 @@ mod tests {
     #[test]
     fn max_tokens_reservation_wins_when_smaller() {
         let caps = capabilities().with_max_output_tokens(8_192); // reserved 4096
-        let compiled = DefaultContextCompiler
+        let compiled = DefaultContextCompiler::default()
             .compile(input(
                 &session(),
                 &registry(),
@@ -644,7 +688,7 @@ mod tests {
     #[test]
     fn max_tokens_model_limit_wins_when_smaller() {
         let caps = capabilities().with_max_output_tokens(1_000); // reserved 4096
-        let compiled = DefaultContextCompiler
+        let compiled = DefaultContextCompiler::default()
             .compile(input(
                 &session(),
                 &registry(),
@@ -666,7 +710,7 @@ mod tests {
         let caps = ModelCapabilities::new(100_000)
             .with_tool_calls(true)
             .with_reasoning(true);
-        let compiled = DefaultContextCompiler
+        let compiled = DefaultContextCompiler::default()
             .compile(input(
                 &session(),
                 &registry(),
@@ -708,7 +752,7 @@ mod tests {
         let mut s = session();
         s.push_item(Item::User { text: TASK.into() }).unwrap();
         let f = facts();
-        let compiled = DefaultContextCompiler
+        let compiled = DefaultContextCompiler::default()
             .compile_with_facts(&s, &f)
             .expect("within budget");
         let messages = &compiled.request.messages;
@@ -732,7 +776,7 @@ mod tests {
     #[test]
     fn facts_are_attributed_apart_from_the_system_prompt() {
         let f = facts();
-        let with = DefaultContextCompiler
+        let with = DefaultContextCompiler::default()
             .compile_with_facts(&session(), &f)
             .expect("within budget");
         let without = compile(&session(), &registry(), budget()).expect("within budget");
@@ -749,13 +793,13 @@ mod tests {
         let mut s = session();
         s.push_item(Item::User { text: TASK.into() }).unwrap();
         let f = facts();
-        let first = DefaultContextCompiler
+        let first = DefaultContextCompiler::default()
             .compile_with_facts(&s, &f)
             .expect("within budget");
         let mut msg = assistant("working", StopReason::ToolCalls);
         msg.tool_calls = vec![call("c1", "read_file")];
         s.append_turn(msg, vec![result_for("c1")]).unwrap();
-        let second = DefaultContextCompiler
+        let second = DefaultContextCompiler::default()
             .compile_with_facts(&s, &f)
             .expect("within budget");
         assert_eq!(first.request.messages[0], second.request.messages[0]);

@@ -3,6 +3,20 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-06 — Real token estimation (o200k) for census and pruning
+
+Context accounting moves from bytes/3 (±30 % error) to real BPE
+token counts (~±8 %), without putting a tokenizer in the kernel:
+
+- `loom-kernel` defines a pure `TokenEstimator` trait plus
+  `HeuristicEstimator` (the old bytes/3 behavior, the default);
+  `DefaultContextCompiler` and `PruningContextCompiler` take an injected
+  estimator, and the census and all prune-trigger/reclaim math are now
+  in tokens.
+- `loom-engine` ships `O200kEstimator` over `tiktoken-rs`
+  (`o200k_base`), wired in `Engine::open`; the eval and benchmark
+  harnesses use the same estimator for parity.
+
 ## 2026-10-06 — OpenRouter provider (free and paid models)
 
 Second adapter, one shared wire. Loom now talks to OpenRouter alongside

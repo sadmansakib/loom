@@ -29,10 +29,12 @@
 
 pub mod auth;
 pub mod engine;
+mod estimate;
 mod provider;
 pub mod repo;
 
 pub use engine::{Engine, EngineConfig, EngineError, default_system_prompt};
+pub use estimate::O200kEstimator;
 // The provider/effort types a frontend must name to build an `EngineConfig`;
 // re-exported so a frontend never depends on the provider crate directly.
 pub use loom_providers::{ProviderCatalog, ReasoningEffort};

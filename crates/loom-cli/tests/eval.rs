@@ -63,6 +63,7 @@ use loom_core::engine::repo::FsFactsSource;
 use loom_core::kernel::agent::Agent;
 use loom_core::kernel::context::{
     AgentConfig, ContextCompiler, DefaultContextCompiler, PruneConfig, PruningContextCompiler,
+    TokenEstimator,
 };
 use loom_core::kernel::event::{EventKind, EventSink, StrictSink};
 use loom_core::kernel::id::{SessionId, TaskId};
@@ -620,13 +621,20 @@ async fn run_once(
         let value = value.to_ascii_lowercase();
         value != "0" && value != "off" && value != "false"
     });
+    // Parity with `Engine::open`: the eval counts tokens with the same
+    // o200k estimator the engine injects, never the byte heuristic.
+    let estimator: std::sync::Arc<dyn TokenEstimator> =
+        std::sync::Arc::new(loom_core::engine::O200kEstimator);
     let compiler: Box<dyn ContextCompiler> = if pruning {
-        Box::new(PruningContextCompiler::new(
-            Box::new(DefaultContextCompiler),
-            prune_config(),
-        ))
+        Box::new(
+            PruningContextCompiler::new(
+                Box::new(DefaultContextCompiler::with_estimator(estimator.clone())),
+                prune_config(),
+            )
+            .with_estimator(estimator),
+        )
     } else {
-        Box::new(DefaultContextCompiler)
+        Box::new(DefaultContextCompiler::with_estimator(estimator))
     };
     let system_prompt = task
         .system_prompt

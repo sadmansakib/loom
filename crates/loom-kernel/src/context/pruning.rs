@@ -29,6 +29,7 @@
 //! defaults (64 K trigger vs ≥ 64 K windows) assume.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -38,7 +39,10 @@ use crate::tool::{PathAccess, ToolRegistry, paths_overlap};
 use crate::transcript::{Item, ToolCallId, ToolResult, ToolStatus};
 
 use super::default::{census, serialized_size};
-use super::{CompiledContext, ContextCompiler, ContextError, ContextInput, PruneCheckpoint};
+use super::{
+    CompiledContext, ContextCompiler, ContextError, ContextInput, HeuristicEstimator,
+    PruneCheckpoint, TokenEstimator, estimate_serialized,
+};
 
 /// Pruning thresholds; the defaults are ADR-011's hypotheses, tuned by the
 /// 2L long-context benchmark.
@@ -138,15 +142,30 @@ pub struct StubDecision {
 pub struct PruningContextCompiler {
     inner: Box<dyn ContextCompiler>,
     config: PruneConfig,
+    estimator: Arc<dyn TokenEstimator>,
 }
 
 impl PruningContextCompiler {
     /// Wraps `inner` (the shipped
     /// [`DefaultContextCompiler`](super::DefaultContextCompiler)) with the
-    /// given thresholds.
+    /// given thresholds, estimating with the kernel's conservative
+    /// bytes ÷ 3 heuristic.
     #[must_use]
     pub fn new(inner: Box<dyn ContextCompiler>, config: PruneConfig) -> Self {
-        Self { inner, config }
+        Self {
+            inner,
+            config,
+            estimator: Arc::new(HeuristicEstimator),
+        }
+    }
+
+    /// Uses `estimator` for the reclaim and protected-tail math, so the
+    /// wrapper decides in the same token space as the census that feeds
+    /// it. Inject the same estimator the inner compiler uses.
+    #[must_use]
+    pub fn with_estimator(mut self, estimator: Arc<dyn TokenEstimator>) -> Self {
+        self.estimator = estimator;
+        self
     }
 }
 
@@ -164,10 +183,10 @@ impl ContextCompiler for PruningContextCompiler {
 
         // `census` needs the facts-message size the inner projection used;
         // recompute it the same way `project_messages` does.
-        let facts_bytes = if facts_text.is_empty() {
+        let facts_tokens = if facts_text.is_empty() {
             0
         } else {
-            serialized_size(&Message::System { text: facts_text })
+            estimate_serialized(&*self.estimator, &Message::System { text: facts_text })
         };
 
         // Apply the frozen decisions first: between triggers the projection
@@ -178,7 +197,7 @@ impl ContextCompiler for PruningContextCompiler {
             .filter(|stubs| !stubs.is_empty())
         {
             apply_stubs(&mut compiled.request, &frozen);
-            compiled.census = census(&compiled.request, facts_bytes);
+            compiled.census = census(&compiled.request, facts_tokens, &*self.estimator);
         }
 
         // Window-relative trigger: recompute decisions over the whole
@@ -192,13 +211,13 @@ impl ContextCompiler for PruningContextCompiler {
         // messages) on every turn.
         let trigger = self.config.trigger_tokens(budget.max_input_tokens);
         if compiled.census.total > trigger {
-            let (decisions, reclaim) = decide(session, tools, self.config);
-            let already = checkpoint
-                .as_ref()
-                .map_or(0, |frozen| frozen_reclaim(session, &frozen.stubs));
+            let (decisions, reclaim) = decide(session, tools, self.config, &*self.estimator);
+            let already = checkpoint.as_ref().map_or(0, |frozen| {
+                frozen_reclaim(session, &frozen.stubs, &*self.estimator)
+            });
             if reclaim >= already.saturating_add(u64::from(self.config.min_reclaim_tokens)) {
                 apply_stubs(&mut compiled.request, &decisions);
-                compiled.census = census(&compiled.request, facts_bytes);
+                compiled.census = census(&compiled.request, facts_tokens, &*self.estimator);
                 checkpoint = Some(PruneCheckpoint {
                     upto_item: session.transcript.len(),
                     stubs: decisions,
@@ -241,12 +260,16 @@ fn apply_stubs(request: &mut crate::model::ModelRequest, stubs: &[StubDecision])
 /// Tokens the already-frozen stubs reclaim from the *current* transcript, so
 /// `compile` can gate a fresh checkpoint on the reclaim that is genuinely new
 /// (ADR-011: pruning is episodic — one cache miss per checkpoint).
-fn frozen_reclaim(session: &Session, stubs: &[StubDecision]) -> u64 {
+fn frozen_reclaim(
+    session: &Session,
+    stubs: &[StubDecision],
+    estimator: &dyn TokenEstimator,
+) -> u64 {
     let by_call: HashMap<&str, StubReason> = stubs
         .iter()
         .map(|stub| (stub.call_id.as_str(), stub.reason))
         .collect();
-    let mut reclaim_bytes = 0u64;
+    let mut reclaim = 0u64;
     for item in &session.transcript {
         let Item::ToolResult(result) = item else {
             continue;
@@ -254,13 +277,16 @@ fn frozen_reclaim(session: &Session, stubs: &[StubDecision]) -> u64 {
         let Some(reason) = by_call.get(result.call_id.as_str()) else {
             continue;
         };
-        reclaim_bytes += serialized_size(item).saturating_sub(stub_bytes(
-            &result.call_id,
-            &result.status,
-            *reason,
-        ));
+        reclaim += u64::from(
+            estimate_serialized(estimator, item).saturating_sub(stub_tokens(
+                &result.call_id,
+                &result.status,
+                *reason,
+                estimator,
+            )),
+        );
     }
-    reclaim_bytes / u64::from(super::BYTES_PER_TOKEN)
+    reclaim
 }
 
 /// Facts gathered from the transcript for the decision pass.
@@ -269,7 +295,10 @@ struct ResultFacts {
     turn: usize,
     call_id: ToolCallId,
     status: ToolStatus,
+    /// Serialized byte size — ordering only (the age-out sort).
     bytes: u64,
+    /// Estimated tokens of the serialized item — the reclaim math.
+    tokens: u32,
     /// Tool name + canonical arguments, when the call is known and
     /// read-only; `None` otherwise (unknown or mutating — never a dedupe,
     /// supersede or age-out candidate).
@@ -283,6 +312,7 @@ fn decide(
     session: &Session,
     registry: &ToolRegistry,
     config: PruneConfig,
+    estimator: &dyn TokenEstimator,
 ) -> (Vec<StubDecision>, u64) {
     let transcript: &[Item] = &session.transcript;
 
@@ -333,6 +363,7 @@ fn decide(
                     call_id: result.call_id.clone(),
                     status: result.status,
                     bytes: serialized_size(item),
+                    tokens: estimate_serialized(estimator, item),
                     read_call,
                 });
             }
@@ -351,8 +382,8 @@ fn decide(
     let mut trailing = 0u64;
     let mut token_cut = transcript.len();
     for (index, item) in transcript.iter().enumerate().rev() {
-        trailing += serialized_size(item);
-        if trailing >= u64::from(config.protected_tail_tokens) * u64::from(super::BYTES_PER_TOKEN) {
+        trailing += u64::from(estimate_serialized(estimator, item));
+        if trailing >= u64::from(config.protected_tail_tokens) {
             token_cut = index;
             break;
         }
@@ -362,19 +393,22 @@ fn decide(
     let total_turns = assistant_at.len();
     let mut stubbed: Vec<StubDecision> = Vec::new();
     let mut stubbed_ids: HashSet<&str> = HashSet::new();
-    let mut reclaim_bytes = 0u64;
+    let mut reclaim_tokens = 0u64;
 
     fn add_stub<'a>(
         facts: &'a ResultFacts,
         reason: StubReason,
         stubbed: &mut Vec<StubDecision>,
         stubbed_ids: &mut HashSet<&'a str>,
-        reclaim_bytes: &mut u64,
+        reclaim_tokens: &mut u64,
+        estimator: &dyn TokenEstimator,
     ) {
-        *reclaim_bytes +=
-            facts
-                .bytes
-                .saturating_sub(stub_bytes(&facts.call_id, &facts.status, reason));
+        *reclaim_tokens += u64::from(facts.tokens.saturating_sub(stub_tokens(
+            &facts.call_id,
+            &facts.status,
+            reason,
+            estimator,
+        )));
         stubbed_ids.insert(facts.call_id.as_str());
         stubbed.push(StubDecision {
             call_id: facts.call_id.as_str().to_owned(),
@@ -412,7 +446,8 @@ fn decide(
                 StubReason::DuplicateRead,
                 &mut stubbed,
                 &mut stubbed_ids,
-                &mut reclaim_bytes,
+                &mut reclaim_tokens,
+                estimator,
             );
         }
     }
@@ -437,7 +472,8 @@ fn decide(
                 StubReason::SupersededRead,
                 &mut stubbed,
                 &mut stubbed_ids,
-                &mut reclaim_bytes,
+                &mut reclaim_tokens,
+                estimator,
             );
         }
     }
@@ -455,7 +491,8 @@ fn decide(
                 StubReason::StaleError,
                 &mut stubbed,
                 &mut stubbed_ids,
-                &mut reclaim_bytes,
+                &mut reclaim_tokens,
+                estimator,
             );
         }
     }
@@ -482,15 +519,21 @@ fn decide(
             StubReason::AgedOut,
             &mut stubbed,
             &mut stubbed_ids,
-            &mut reclaim_bytes,
+            &mut reclaim_tokens,
+            estimator,
         );
     }
 
-    (stubbed, reclaim_bytes / u64::from(super::BYTES_PER_TOKEN))
+    (stubbed, reclaim_tokens)
 }
 
-/// Serialized size of the stub that would replace this result.
-fn stub_bytes(call_id: &ToolCallId, status: &ToolStatus, reason: StubReason) -> u64 {
+/// Estimated tokens of the stub that would replace this result.
+fn stub_tokens(
+    call_id: &ToolCallId,
+    status: &ToolStatus,
+    reason: StubReason,
+    estimator: &dyn TokenEstimator,
+) -> u32 {
     let probe = Item::ToolResult(ToolResult {
         call_id: call_id.clone(),
         status: *status,
@@ -499,7 +542,7 @@ fn stub_bytes(call_id: &ToolCallId, status: &ToolStatus, reason: StubReason) -> 
         effects: crate::tool::ToolEffects::none(),
         artifact: None,
     });
-    serialized_size(&probe)
+    estimate_serialized(estimator, &probe)
 }
 
 /// The declared read paths of a call, when the tool is registered,
@@ -715,7 +758,7 @@ mod tests {
 
     fn compiler(config: PruneConfig) -> PruningContextCompiler {
         shared();
-        PruningContextCompiler::new(Box::new(DefaultContextCompiler), config)
+        PruningContextCompiler::new(Box::new(DefaultContextCompiler::default()), config)
     }
 
     /// A config that fires at the old flat threshold, so the strategy tests

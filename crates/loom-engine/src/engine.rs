@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::estimate::O200kEstimator;
 use loom_kernel::agent::{Agent, TaskError, TaskSummary};
 use loom_kernel::context::{
     AgentConfig, DefaultContextCompiler, PruneConfig, PruningContextCompiler,
@@ -152,12 +153,18 @@ impl Engine {
         // Stage-1 repository facts (2E, ADR-015): the composition root owns the
         // I/O; the loop scans once per task through this source.
         let facts = crate::repo::FsFactsSource::new(workspace.clone());
+        // Token estimates use a real tokenizer (o200k) — the same estimator
+        // feeds the census, the budget check, and the pruning math.
+        let estimator: Arc<dyn loom_kernel::context::TokenEstimator> = Arc::new(O200kEstimator);
         let mut agent = Agent::new(
             handle.provider,
-            Box::new(PruningContextCompiler::new(
-                Box::new(DefaultContextCompiler),
-                PruneConfig::default(),
-            )),
+            Box::new(
+                PruningContextCompiler::new(
+                    Box::new(DefaultContextCompiler::with_estimator(estimator.clone())),
+                    PruneConfig::default(),
+                )
+                .with_estimator(estimator),
+            ),
             registry,
             AgentConfig::new(workspace, system_prompt),
             config.model,

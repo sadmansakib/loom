@@ -18,6 +18,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Account metadata store + OS-keychain secret backend (ADR-009, §18.3).
 rusqlite = { workspace = true }
+# o200k tokenizer for the engine's token estimates (kernel stays pure)
+tiktoken-rs = { workspace = true }
 keyring = { workspace = true }
 uuid = { workspace = true }
 # CancellationToken crosses the driving API (§6.6).

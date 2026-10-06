@@ -305,7 +305,7 @@ fn agent_with_retry(
 ) -> Agent {
     Agent::new(
         Box::new(provider),
-        Box::new(DefaultContextCompiler),
+        Box::new(DefaultContextCompiler::default()),
         registry,
         AgentConfig::new(PathBuf::from("."), "you are a test agent"),
         "fake-model",
@@ -367,7 +367,7 @@ async fn repository_facts_are_projected_as_a_stable_system_block() {
     );
     let agent = Agent::new(
         Box::new(provider),
-        Box::new(DefaultContextCompiler),
+        Box::new(DefaultContextCompiler::default()),
         registry_with("echo"),
         AgentConfig::new(PathBuf::from("."), "you are a test agent"),
         "fake-model",
