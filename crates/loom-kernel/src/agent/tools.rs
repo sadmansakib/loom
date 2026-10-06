@@ -399,6 +399,7 @@ fn lock_slot(slot: &Mutex<Option<ToolResult>>) -> MutexGuard<'_, Option<ToolResu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::ArtifactStore;
     use crate::tool::{CommandEffect, Tool, ToolEffects, ToolOutput, ToolSpec};
     use crate::transcript::{ToolArguments, ToolCallId};
     use futures::future::BoxFuture;
@@ -1044,5 +1045,43 @@ mod tests {
         let batch = ToolBatch::new(&registry, &exposure);
         let results = batch.execute(&[], &ctx).await;
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn oversized_output_spills_to_an_artifact() {
+        let content = "x".repeat(MAX_TOOL_OUTPUT_BYTES + 1024);
+        let tool = MockTool::text("big", &content);
+        let store = Arc::new(crate::store::MemoryArtifactStore::new());
+        let token = CancellationToken::new();
+        let ctx = test_ctx(Duration::from_secs(10), &token).with_artifacts(Some(store.clone()));
+        let registry = registry(vec![tool]);
+        let exposure = ToolExposure::from_names(["big"]);
+
+        let result = execute_call(
+            &registry,
+            &exposure,
+            &make_call("big"),
+            &ctx,
+            &AtomicBool::new(false),
+        )
+        .await;
+
+        assert!(result.truncated, "spilled output must be marked truncated");
+        assert!(
+            result.content.len() <= MAX_TOOL_OUTPUT_BYTES,
+            "inline content must stay within the budget"
+        );
+        assert!(
+            result
+                .content
+                .ends_with("bytes); read it with artifact_read]"),
+            "content must point at the artifact: {}",
+            result.content
+        );
+        let reference = result.artifact.expect("output should spill to an artifact");
+        assert_eq!(reference.kind, ARTIFACT_KIND);
+        assert_eq!(reference.bytes, content.len() as u64);
+        let fetched = store.get(&reference.id).expect("get").expect("stored");
+        assert_eq!(fetched.body, content.into_bytes());
     }
 }
