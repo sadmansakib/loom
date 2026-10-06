@@ -3,6 +3,25 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-06 — Context pruning: episodic delta-reclaim gate (cache safety)
+
+Follow-up hardening to step 2L. Pruning must be genuinely episodic — one
+cache miss per checkpoint, never per turn (ADR-011). `PruningContextCompiler`
+previously re-ran `decide()` and adopted a fresh checkpoint on *every* turn
+the estimate stayed above the trigger, even when a frozen checkpoint already
+existed, rewriting earlier projected messages and busting the prefix cache
+each turn.
+
+- `crates/loom-kernel/src/context/pruning.rs`: a new checkpoint is adopted
+  only when its reclaim exceeds, by at least `min_reclaim_tokens`, what the
+  frozen stubs already reclaim (new `frozen_reclaim(session, stubs)` helper).
+  A checkpoint that already covers the transcript is carried verbatim, so a
+  session parked above the trigger stays byte-stable.
+- New test `frozen_checkpoint_is_not_recomputed_while_parked_above_trigger`
+  (fails before the change, passes after).
+- `cargo test --workspace` 420 passed / 0 failed / 10 ignored; clippy and fmt
+  clean.
+
 ## 2026-10-06 — Context pruning: window-relative trigger (step 2L retune)
 
 The 2L long-context benchmark (task B5: read→edit over 8 corpus files)

@@ -181,10 +181,20 @@ impl ContextCompiler for PruningContextCompiler {
 
         // Window-relative trigger: recompute decisions over the whole
         // transcript once the estimate nears the model's input budget.
+        //
+        // ADR-011: pruning is episodic — one cache miss per checkpoint, never
+        // per turn. A checkpoint that already covers the transcript is only
+        // superseded when the new pass reclaims a meaningful amount *beyond*
+        // what the frozen stubs already reclaim; otherwise a session parked
+        // above the trigger would re-decide (and rewrite earlier projected
+        // messages) on every turn.
         let trigger = self.config.trigger_tokens(budget.max_input_tokens);
         if compiled.census.total > trigger {
             let (decisions, reclaim) = decide(session, tools, self.config);
-            if reclaim >= u64::from(self.config.min_reclaim_tokens) {
+            let already = checkpoint
+                .as_ref()
+                .map_or(0, |frozen| frozen_reclaim(session, &frozen.stubs));
+            if reclaim >= already.saturating_add(u64::from(self.config.min_reclaim_tokens)) {
                 apply_stubs(&mut compiled.request, &decisions);
                 compiled.census = census(&compiled.request, facts_bytes);
                 checkpoint = Some(PruneCheckpoint {
@@ -224,6 +234,30 @@ fn apply_stubs(request: &mut crate::model::ModelRequest, stubs: &[StubDecision])
         result.content = reason.stub_text().to_owned();
         result.truncated = false;
     }
+}
+
+/// Tokens the already-frozen stubs reclaim from the *current* transcript, so
+/// `compile` can gate a fresh checkpoint on the reclaim that is genuinely new
+/// (ADR-011: pruning is episodic — one cache miss per checkpoint).
+fn frozen_reclaim(session: &Session, stubs: &[StubDecision]) -> u64 {
+    let mut reclaim_bytes = 0u64;
+    for item in &session.transcript {
+        let Item::ToolResult(result) = item else {
+            continue;
+        };
+        let Some(stub) = stubs
+            .iter()
+            .find(|stub| stub.call_id == result.call_id.as_str())
+        else {
+            continue;
+        };
+        reclaim_bytes += serialized_size(item).saturating_sub(stub_bytes(
+            &result.call_id,
+            &result.status,
+            stub.reason,
+        ));
+    }
+    reclaim_bytes / u64::from(super::BYTES_PER_TOKEN)
 }
 
 /// Facts gathered from the transcript for the decision pass.
@@ -981,6 +1015,61 @@ mod tests {
         };
         assert_eq!(scaled.trigger_tokens(8_000), 2_000);
         assert_eq!(scaled.trigger_tokens(1_000), 1_000);
+    }
+
+    #[test]
+    fn frozen_checkpoint_is_not_recomputed_while_parked_above_trigger() {
+        // Once a checkpoint is adopted, turns that add no meaningful new
+        // reclaim must not rewrite it: re-deciding would rewrite earlier
+        // projected messages and cost a cache miss every turn (ADR-011
+        // forbids per-turn pruning).
+        let mut items = vec![Item::User {
+            text: "go".to_owned(),
+        }];
+        for n in 0..6 {
+            items.push(assistant_calls(
+                "reading",
+                vec![read_call(&format!("r{n}"), &format!("src/f{n}.rs"))],
+            ));
+            items.push(result(&format!("r{n}"), &big("read", 30)));
+        }
+        // A recent large read that the protected tail keeps, so the pruned
+        // projection stays above the (deliberately low) trigger.
+        items.push(assistant_calls(
+            "read recent",
+            vec![read_call("recent", "src/new.rs")],
+        ));
+        items.push(result("recent", &big("recent", 70)));
+        items.push(assistant_text("done"));
+        let config = PruneConfig {
+            trigger_percent: 0,
+            floor_tokens: 2_000,
+            min_reclaim_tokens: 5_000,
+            ..PruneConfig::default()
+        };
+        let session = session_with(items.clone());
+        let first = compiler(config)
+            .compile(input(&session, None))
+            .expect("compiles");
+        let checkpoint = first.prune_checkpoint.clone().expect("triggered");
+        assert!(
+            first.census.total > config.trigger_tokens(budget().max_input_tokens),
+            "the pruned projection is still above the trigger"
+        );
+
+        // A further user turn adds no newly reclaimable content.
+        items.push(Item::User {
+            text: "still working".to_owned(),
+        });
+        let grown = session_with(items);
+        let second = compiler(config)
+            .compile(input(&grown, Some(&checkpoint)))
+            .expect("compiles");
+        assert_eq!(
+            second.prune_checkpoint.as_ref(),
+            Some(&checkpoint),
+            "the frozen checkpoint must be carried verbatim, not recomputed"
+        );
     }
 
     fn messages_contain(request: &crate::model::ModelRequest, needle: &str) -> bool {
