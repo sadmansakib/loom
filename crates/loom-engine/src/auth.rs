@@ -28,7 +28,7 @@ use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use loom_providers::SecretString;
+use loom_providers::{DEEPSEEK_PROVIDER_NAME, OPENROUTER_PROVIDER_NAME, SecretString};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 pub const KEYRING_SERVICE: &str = "loom";
 
 /// The default provider for Iteration 1.
-pub const DEFAULT_PROVIDER: &str = "deepseek";
+pub const DEFAULT_PROVIDER: &str = DEEPSEEK_PROVIDER_NAME;
 
 /// Ordered environment-variable fallback names for a provider (ADR-009).
 ///
@@ -44,8 +44,8 @@ pub const DEFAULT_PROVIDER: &str = "deepseek";
 /// resolves only from saved accounts.
 pub fn provider_env_names(provider: &str) -> &'static [&'static str] {
     match provider {
-        "deepseek" => &["DEEPSEEK_API_KEY"],
-        "openrouter" => &["OPENROUTER_API_KEY"],
+        DEEPSEEK_PROVIDER_NAME => &["DEEPSEEK_API_KEY"],
+        OPENROUTER_PROVIDER_NAME => &["OPENROUTER_API_KEY"],
         _ => &[],
     }
 }
