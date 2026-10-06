@@ -14,11 +14,11 @@
 //! point these at the GLM Coding Plan endpoint.
 
 use futures::StreamExt;
-use loom_core::model::{
+use loom_kernel::model::{
     Message, ModelError, ModelEvent, ModelProvider, ModelRequest, ModelResponse, StopReason,
 };
-use loom_core::tool::ToolSpec;
-use loom_core::transcript::{ToolCallId, ToolResult, ToolStatus};
+use loom_kernel::tool::ToolSpec;
+use loom_kernel::transcript::{ToolCallId, ToolResult, ToolStatus};
 use loom_providers::{DeepSeekConfig, DeepSeekProvider, ReasoningEffort, ThinkingMode};
 use serde_json::json;
 

@@ -10,7 +10,7 @@ name = "loom"
 path = "src/main.rs"
 
 [dependencies]
-loom-core = { workspace = true }
+loom-kernel = { workspace = true }
 loom-providers = { workspace = true }
 loom-tools = { workspace = true }
 anyhow = { workspace = true }

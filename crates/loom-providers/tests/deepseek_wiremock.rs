@@ -13,11 +13,11 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use loom_core::model::{
+use loom_kernel::model::{
     Message, ModelError, ModelErrorKind, ModelEvent, ModelProvider, ModelRequest, StopReason,
 };
-use loom_core::tool::ToolSpec;
-use loom_core::transcript::{
+use loom_kernel::tool::ToolSpec;
+use loom_kernel::transcript::{
     AssistantMessage, ReasoningTrace, ToolArguments, ToolCall, ToolCallId, ToolResult, ToolStatus,
 };
 use loom_providers::{DeepSeekConfig, DeepSeekProvider, TimeoutConfig};
@@ -84,14 +84,16 @@ async fn mount_sse(server: &MockServer, body: String) {
 }
 
 /// Drains a provider stream to a Vec.
-async fn collect(stream: loom_core::model::ModelStream<'_>) -> Vec<Result<ModelEvent, ModelError>> {
+async fn collect(
+    stream: loom_kernel::model::ModelStream<'_>,
+) -> Vec<Result<ModelEvent, ModelError>> {
     stream.collect().await
 }
 
 /// The stream must have ended with `Completed`; returns the response.
 fn expect_completed(
     events: Vec<Result<ModelEvent, ModelError>>,
-) -> loom_core::model::ModelResponse {
+) -> loom_kernel::model::ModelResponse {
     match events.into_iter().last() {
         Some(Ok(ModelEvent::Completed(response))) => response,
         other => panic!("expected stream to end with Completed, got {other:?}"),

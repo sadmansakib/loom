@@ -9,7 +9,7 @@
 
 use futures::future::BoxFuture;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use loom_core::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
+use loom_kernel::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -333,7 +333,7 @@ fn read_capped_text(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loom_core::tool::Tool;
+    use loom_kernel::tool::Tool;
     use std::path::PathBuf;
     use std::time::Duration;
 

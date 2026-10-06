@@ -22,17 +22,17 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use futures::stream;
-use loom_core::agent::{Agent, RetryPolicy, TaskError};
-use loom_core::context::{AgentConfig, DefaultContextCompiler};
-use loom_core::event::{ChannelEventSink, EventEnvelope, EventKind};
-use loom_core::id::SessionId;
-use loom_core::model::{
+use loom_kernel::agent::{Agent, RetryPolicy, TaskError};
+use loom_kernel::context::{AgentConfig, DefaultContextCompiler};
+use loom_kernel::event::{ChannelEventSink, EventEnvelope, EventKind};
+use loom_kernel::id::SessionId;
+use loom_kernel::model::{
     Message, ModelCapabilities, ModelError, ModelErrorKind, ModelEvent, ModelProvider,
     ModelRequest, ModelResponse, ModelStream, StopReason, Usage,
 };
-use loom_core::session::{Session, TaskStatus};
-use loom_core::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolSpec};
-use loom_core::transcript::{
+use loom_kernel::session::{Session, TaskStatus};
+use loom_kernel::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolSpec};
+use loom_kernel::transcript::{
     AssistantMessage, Item, ToolArguments, ToolCall, ToolCallId, ToolFailure, ToolStatus,
 };
 use serde_json::{Value, json};

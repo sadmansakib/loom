@@ -5,7 +5,7 @@
 //! tools, so an escape is an execution-invariant violation, not policy.
 
 use futures::future::BoxFuture;
-use loom_core::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
+use loom_kernel::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -94,7 +94,7 @@ fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loom_core::tool::Tool;
+    use loom_kernel::tool::Tool;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;

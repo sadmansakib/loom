@@ -9,7 +9,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use loom_core::tool::ToolError;
+use loom_kernel::tool::ToolError;
 
 /// Resolves `user` against `root`, rejecting anything that escapes
 /// the workspace.

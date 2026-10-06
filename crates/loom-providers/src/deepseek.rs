@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use loom_core::model::{
+use loom_kernel::model::{
     ModelCapabilities, ModelError, ModelErrorKind, ModelEvent, ModelProvider, ModelRequest,
     ModelResponse, ModelStream,
 };

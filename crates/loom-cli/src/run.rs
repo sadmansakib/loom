@@ -2,7 +2,7 @@
 //!
 //! This is the composition root (architecture §2): it is the only place that
 //! knows about a concrete provider, the concrete tools, the credential seams,
-//! and the runtime. Everything below it is wired through the `loom-core`
+//! and the runtime. Everything below it is wired through the `loom-kernel`
 //! traits. Credentials are resolved *before* the provider is built, and the
 //! secret never leaves [`loom_providers::SecretString`] wrappers (§18.3).
 
@@ -11,13 +11,13 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use loom_core::agent::Agent;
-use loom_core::context::{AgentConfig, DefaultContextCompiler};
-use loom_core::event::ChannelEventSink;
-use loom_core::id::SessionId;
-use loom_core::model::ModelProvider;
-use loom_core::session::Session;
-use loom_core::tool::ToolRegistry;
+use loom_kernel::agent::Agent;
+use loom_kernel::context::{AgentConfig, DefaultContextCompiler};
+use loom_kernel::event::ChannelEventSink;
+use loom_kernel::id::SessionId;
+use loom_kernel::model::ModelProvider;
+use loom_kernel::session::Session;
+use loom_kernel::tool::ToolRegistry;
 use loom_providers::{DeepSeekConfig, DeepSeekProvider};
 use loom_tools::{
     EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool, WriteFileTool,

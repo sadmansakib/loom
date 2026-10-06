@@ -9,7 +9,7 @@
 //!
 //! The loop is a deterministic controller; the model is the reasoning
 //! component. It contains no provider-specific branches beyond the
-//! capability and response semantics defined by `loom-core`, and it never
+//! capability and response semantics defined by `loom-kernel`, and it never
 //! imports a concrete provider or tool (ADR-001): both arrive as
 //! trait objects and a registry.
 

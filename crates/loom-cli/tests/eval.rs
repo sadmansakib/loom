@@ -50,17 +50,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
-use loom_core::agent::Agent;
-use loom_core::context::{AgentConfig, DefaultContextCompiler};
-use loom_core::event::{EventKind, EventSink};
-use loom_core::id::{SessionId, TaskId};
-use loom_core::model::{
+use loom_kernel::agent::Agent;
+use loom_kernel::context::{AgentConfig, DefaultContextCompiler};
+use loom_kernel::event::{EventKind, EventSink};
+use loom_kernel::id::{SessionId, TaskId};
+use loom_kernel::model::{
     Message, ModelCapabilities, ModelEvent, ModelProvider, ModelRequest, ModelResponse,
     ModelStream, StopReason, Usage,
 };
-use loom_core::session::Session;
-use loom_core::tool::ToolRegistry;
-use loom_core::transcript::{AssistantMessage, Item, ToolArguments, ToolCall, ToolCallId};
+use loom_kernel::session::Session;
+use loom_kernel::tool::ToolRegistry;
+use loom_kernel::transcript::{AssistantMessage, Item, ToolArguments, ToolCall, ToolCallId};
 use loom_providers::{DeepSeekConfig, DeepSeekProvider, ReasoningEffort};
 use loom_tools::{
     EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool, WriteFileTool,

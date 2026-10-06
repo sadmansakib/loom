@@ -1,17 +1,17 @@
-//! Cross-crate contract tests for `loom-core`'s provider seams.
+//! Cross-crate contract tests for `loom-kernel`'s provider seams.
 //!
-//! These tests exist in `loom-providers` — not `loom-core` — on purpose:
+//! These tests exist in `loom-providers` — not `loom-kernel` — on purpose:
 //! they prove that a *different crate* can implement `ModelProvider` and
 //! build the values it needs. `#[non_exhaustive]` types that only
-//! `loom-core`'s own tests construct would hide construction gaps until
+//! `loom-kernel`'s own tests construct would hide construction gaps until
 //! the real DeepSeek adapter hits them.
 
-use loom_core::model::{
+use loom_kernel::model::{
     Message, ModelCapabilities, ModelError, ModelErrorKind, ModelEvent, ModelProvider,
     ModelRequest, ModelResponse, ModelStream, StopReason, Usage,
 };
-use loom_core::tool::ToolSpec;
-use loom_core::transcript::AssistantMessage;
+use loom_kernel::tool::ToolSpec;
+use loom_kernel::transcript::AssistantMessage;
 
 struct TestProvider;
 

@@ -1,8 +1,8 @@
 //! The `read_file` tool: bounded, workspace-confined text reads.
 
 use futures::future::BoxFuture;
-use loom_core::agent::tools::MAX_TOOL_OUTPUT_BYTES;
-use loom_core::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
+use loom_kernel::agent::tools::MAX_TOOL_OUTPUT_BYTES;
+use loom_kernel::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::Read;
@@ -105,7 +105,7 @@ fn read_capped(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loom_core::tool::Tool;
+    use loom_kernel::tool::Tool;
     use std::path::PathBuf;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;

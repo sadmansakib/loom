@@ -11,10 +11,10 @@
 
 use std::collections::BTreeMap;
 
-use loom_core::model::{
+use loom_kernel::model::{
     Message, ModelError, ModelErrorKind, ModelEvent, ModelRequest, ModelResponse, StopReason, Usage,
 };
-use loom_core::transcript::{
+use loom_kernel::transcript::{
     AssistantMessage, ReasoningTrace, ToolArguments, ToolCall, ToolCallId, ToolResult,
 };
 use serde::Deserialize;
@@ -531,8 +531,8 @@ fn assemble_call(partial: &PartialToolCall, id_prefix: &str) -> Result<ToolCall,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loom_core::model::ModelCapabilities;
-    use loom_core::tool::ToolSpec;
+    use loom_kernel::model::ModelCapabilities;
+    use loom_kernel::tool::ToolSpec;
 
     fn no_in_stream(_: &str) -> Option<ModelErrorKind> {
         None
@@ -615,7 +615,7 @@ mod tests {
                     }),
                     Message::ToolResult(ToolResult {
                         call_id: ToolCallId::try_from("call_1".to_owned()).unwrap(),
-                        status: loom_core::transcript::ToolStatus::Success,
+                        status: loom_kernel::transcript::ToolStatus::Success,
                         content: "file body".into(),
                         truncated: false,
                     }),

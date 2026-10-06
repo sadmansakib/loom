@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-loom-core = { workspace = true }
+loom-kernel = { workspace = true }
 bytes = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }

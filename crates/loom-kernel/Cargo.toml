@@ -1,5 +1,5 @@
 [package]
-name = "loom-core"
+name = "loom-kernel"
 description = "Loom domain model and orchestration: sessions, transcript, model/tool abstractions, context compiler, agent loop."
 version.workspace = true
 edition.workspace = true

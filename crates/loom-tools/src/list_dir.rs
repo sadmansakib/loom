@@ -1,7 +1,7 @@
 //! The `list_dir` tool: sorted, one-level directory listings.
 
 use futures::future::BoxFuture;
-use loom_core::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
+use loom_kernel::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::OnceLock;
@@ -116,7 +116,7 @@ fn list_entries(path: &std::path::Path) -> Result<ListOutcome, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loom_core::tool::Tool;
+    use loom_kernel::tool::Tool;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
