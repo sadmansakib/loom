@@ -34,6 +34,33 @@ token counts (~±8 %), without putting a tokenizer in the kernel:
   (`o200k_base`), wired in `Engine::open`; the eval and benchmark
   harnesses use the same estimator for parity.
 
+## 2026-10-07 — Corpus growth: B12 and B13 from shipped fixes
+
+Round 3 of mining Loom's fix history for bugfix tasks; the suite now
+spans 13 tasks (B1–B13).
+
+- **B12 — effect-based wave scheduling** (59b9989): the scheduler
+  serialized every batch containing a mutation instead of deriving waves
+  from declared read/write effects. F2P: disjoint writes run
+  concurrently, a write and a disjoint read run concurrently, an
+  unrelated call rejoins the first wave. P2P: same-path ordering,
+  read-only single wave, ancestor-aware overlap, wildcard access, model
+  order within waves.
+- **B13 — tool-spec compaction** (2c6dfee): serialized schemas carried
+  schemars indirection and annotations into every request. F2P:
+  `$ref` inlining with the definitions table dropped, `default` and
+  `format: "uint"` stripped, integral minimums lose the float tail,
+  singleton `oneOf` branches collapse to a plain enum. P2P: root
+  `$schema`/`title` drop, descriptions/required/types survive,
+  meaningful formats, non-integral bounds, multi-value `oneOf`, plain
+  enums.
+- Both proven SWE-bench style offline (seeds fail exactly their F2P
+  set, pass their P2P set; real fixes flip everything green — 9/9 and
+  10/10) and live: 10/10 gated runs at pass rate 1.0 (deepseek-flash).
+- Task prompts now carry the "tests are the complete and only
+  specification; expect no hidden tests" guard for all new tasks (the
+  B10 lesson).
+
 ## 2026-10-07 — Corpus growth: B10 and B11 from shipped fixes
 
 Second expansion round: two more real-bug tasks from Loom's fix history.

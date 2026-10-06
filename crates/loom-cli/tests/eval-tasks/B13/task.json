@@ -1,0 +1,26 @@
+{
+  "id": "B13",
+  "prompt": "The test suite of this crate fails. Find the fault in the implementation, fix it, and make `cargo test` pass. The tests under tests/ are the complete and only specification of correct behavior: do not modify anything under tests/, and expect no hidden tests beyond them.",
+  "tools": "coding",
+  "heavy": false,
+  "workspace": "copy",
+  "gate": {
+    "kind": "bugfix",
+    "protected": ["tests/regression.rs"],
+    "fail_to_pass": [
+      "definitions_are_inlined_and_the_table_dropped",
+      "redundant_annotations_are_stripped",
+      "integral_minimums_lose_the_float_tail",
+      "singleton_oneof_branches_collapse"
+    ],
+    "pass_to_pass": [
+      "root_schema_and_title_are_dropped",
+      "descriptions_required_and_types_survive",
+      "meaningful_formats_survive",
+      "non_integral_bounds_survive",
+      "oneof_with_multi_value_branches_survives",
+      "a_plain_enum_survives"
+    ]
+  },
+  "notes": "Reproduces 2c6dfee: serialized tool schemas carried schemars indirection and annotations (refs, defaults, uint formats, float-tailed minimums, singleton oneOf branches) that re-entered every request unchanged."
+}
