@@ -24,6 +24,21 @@ pub(crate) fn omitted(count: u64) -> String {
     format!("... [{count} bytes omitted]")
 }
 
+/// Keeps the first `cap` bytes of `text` (never splitting a character) and
+/// appends an explicit marker naming what was dropped. Returns the text and
+/// whether it was cut.
+pub(crate) fn head_only(text: &str, cap: usize) -> (String, bool) {
+    if text.len() <= cap {
+        return (text.to_owned(), false);
+    }
+    let end = floor_char_boundary(text, cap);
+    let mut shaped = String::with_capacity(end + 48);
+    shaped.push_str(&text[..end]);
+    shaped.push('\n');
+    shaped.push_str(&omitted((text.len() - end) as u64));
+    (shaped, true)
+}
+
 /// Keeps the first `head_cap` and the last `tail_cap` bytes of `text` (never
 /// splitting a character) around an explicit omission marker. Returns the text
 /// and whether it was cut.
@@ -85,6 +100,16 @@ mod tests {
     }
 
     #[test]
+    fn head_only_keeps_the_head_and_marks_the_rest() {
+        let (shaped, cut) = head_only("abcdefghij", 4);
+        assert!(cut);
+        assert_eq!(shaped, format!("abcd\n{}", omitted(6)));
+        let (shaped, cut) = head_only("hello", 32);
+        assert_eq!(shaped, "hello");
+        assert!(!cut);
+    }
+
+    #[test]
     fn cuts_never_split_a_multibyte_character() {
         // Each character is 3 bytes; a cap of 4 lands mid-character.
         let text = "✀✀✀".to_owned();
@@ -92,5 +117,8 @@ mod tests {
         assert!(cut);
         assert!(shaped.starts_with('✀'));
         assert!(shaped.ends_with('✀'));
+        let (shaped, cut) = head_only(&text, 4);
+        assert!(cut);
+        assert_eq!(shaped, format!("✀\n{}", omitted(6)));
     }
 }
