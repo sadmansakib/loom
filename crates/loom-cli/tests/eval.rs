@@ -16,11 +16,16 @@
 //!    transcript's assistant items to equal the recordings verbatim — the
 //!    V3 / Invariant-10 replayability claim, tested without a network.
 //!
-//! Also: a **context census** per turn — estimated tokens by source
-//! (system / user / assistant / tool_result / tool specs, bytes ÷ 3, the
-//! same heuristic the I1 compiler uses). The compiler now reports its own
-//! authoritative per-source census (ADR-016, carried on `TaskSummary`); the
-//! harness records both the request-side attribution and the compiler's.
+//! Also: a **context census** per turn, reported as **exact serialized bytes
+//! by source** (system / user / assistant / tool_result / tool specs) plus the
+//! bytes÷3 token estimate (`est_tokens`). Bytes are the provider-agnostic,
+//! deterministic measurement; the ÷3 figure is the budget heuristic the I1
+//! compiler enforces against (architecture §8). Per-run `input_tokens` /
+//! `output_tokens` / `cost_usd` are what the provider *billed* — inherently
+//! per-model, so the report labels `model`, `provider`, and `price_window`.
+//! The compiler also reports its own authoritative per-source census (ADR-016,
+//! carried on `TaskSummary`); the harness records both the request-side
+//! attribution and the compiler's.
 //!
 //! Running:
 //!
@@ -201,8 +206,11 @@ fn ensure_fixture() {
 
 // --------------------------------------------------------------- census ---
 
-/// Estimated token attribution for one request (bytes ÷ 3, the compiler's
-/// I1 heuristic — direction, not billing-grade precision).
+/// Per-source attribution for one request, in **exact serialized bytes**
+/// (`serde_json` canonical form — no provider, tokenizer, or network
+/// involved, so the figure is deterministic and provider-agnostic).
+/// `est_tokens` divides by 3 only for comparison with the compiler's budget
+/// heuristic (architecture §8).
 #[derive(Debug, Default, Serialize)]
 struct Census {
     system: u64,
@@ -479,10 +487,14 @@ fn registry(task: &EvalTask) -> ToolRegistry {
 }
 
 /// Runs one task against a provider and returns the 1H-schema report plus
-/// the recorded exchanges and the finished session.
+/// the recorded exchanges and the finished session. `provider_label` names
+/// the concrete backend the run used, so billed-token figures in the report
+/// are attributable ("deepseek", "replay", …) and never read as
+/// provider-agnostic.
 async fn run_once(
     task: &EvalTask,
     model: &str,
+    provider_label: &str,
     provider: Box<dyn ModelProvider>,
     exchanges: Option<Arc<Mutex<Vec<Exchange>>>>,
 ) -> (serde_json::Value, Vec<Exchange>, Session) {
@@ -527,17 +539,19 @@ async fn run_once(
         .as_ref()
         .map(|x| x.lock().unwrap().clone())
         .unwrap_or_default();
-    // Census over the recorded requests (live runs only).
+    // Census over the recorded requests (live runs only). Reported as exact
+    // bytes — the provider-agnostic measurement — plus the ÷3 estimate the
+    // context budget itself enforces.
     let census_turns: Vec<serde_json::Value> = recorded
         .iter()
         .map(|e| {
             let c = census(&e.request);
             serde_json::json!({
-                "system": c.system / 3,
-                "user": c.user / 3,
-                "assistant": c.assistant / 3,
-                "tool_result": c.tool_result / 3,
-                "tool_specs": c.tool_specs / 3,
+                "system_bytes": c.system,
+                "user_bytes": c.user,
+                "assistant_bytes": c.assistant,
+                "tool_result_bytes": c.tool_result,
+                "tool_specs_bytes": c.tool_specs,
                 "est_tokens": c.est_tokens(),
             })
         })
@@ -545,13 +559,13 @@ async fn run_once(
     let final_census = recorded.last().map(|e| census(&e.request));
     let census_totals = final_census.map(|c| {
         serde_json::json!({
-            "system": c.system / 3,
-            "user": c.user / 3,
-            "assistant": c.assistant / 3,
-            "tool_result": c.tool_result / 3,
-            "tool_specs": c.tool_specs / 3,
+            "system_bytes": c.system,
+            "user_bytes": c.user,
+            "assistant_bytes": c.assistant,
+            "tool_result_bytes": c.tool_result,
+            "tool_specs_bytes": c.tool_specs,
             "est_tokens": c.est_tokens(),
-            "note": "final-turn attribution, bytes/3 estimate",
+            "note": "final-turn attribution; bytes are exact, est_tokens = bytes/3 budget heuristic",
         })
     });
 
@@ -568,6 +582,7 @@ async fn run_once(
             serde_json::json!({
                 "task": task.id,
                 "model": model,
+                "provider": provider_label,
                 "success": true,
                 "turns": summary.turns,
                 "model_requests": summary.model_requests,
@@ -593,7 +608,7 @@ async fn run_once(
                     "tool_results": summary.last_context_census.tool_results,
                     "tool_specs": summary.last_context_census.tool_specs,
                     "total": summary.last_context_census.total,
-                    "note": "compiler-side attribution, ADR-016",
+                    "note": "compiler-side attribution, ADR-016; ÷3 estimated tokens (budget-facing)",
                 },
                 "census_final_turn": census_totals,
                 "census_per_turn": census_turns,
@@ -602,6 +617,7 @@ async fn run_once(
         Err(error) => serde_json::json!({
             "task": task.id,
             "model": model,
+            "provider": provider_label,
             "success": false,
             "end_reason": error.end_reason(),
             "error": error.to_string(),
@@ -646,9 +662,16 @@ async fn eval_live() {
                 DeepSeekConfig::new(api_key.clone()).with_reasoning_effort(ReasoningEffort::High),
             )
             .unwrap();
+            let provider_label = deepseek.name().to_owned();
             let (provider, exchanges) = RecordingProvider::new(deepseek);
-            let (report, recorded, _session) =
-                run_once(task, &model, Box::new(provider), Some(exchanges)).await;
+            let (report, recorded, _session) = run_once(
+                task,
+                &model,
+                &provider_label,
+                Box::new(provider),
+                Some(exchanges),
+            )
+            .await;
             eprintln!(
                 "{} run {}/{}: success={}",
                 task.id, run, runs, report["success"]
@@ -670,6 +693,12 @@ async fn eval_live() {
             "harness": "eval 2A",
             "task": task.id,
             "model": model,
+            "provider": "deepseek",
+            "units": {
+                "census": "exact serialized bytes (provider-agnostic, deterministic)",
+                "est_tokens": "bytes/3 budget heuristic",
+                "tokens/cost": "provider-billed, per-model evidence only",
+            },
             "runs": reports,
             "aggregates": aggregates_from(&reports),
         });
@@ -720,7 +749,8 @@ fn aggregates_from(reports: &[serde_json::Value]) -> serde_json::Value {
 /// assistant turns verbatim in the transcript.
 async fn assert_replay_equivalence(task: &EvalTask, model: &str, exchanges: &[Exchange]) {
     let replay = ReplayProvider::new(model, exchanges);
-    let (report, _recorded, session) = run_once(task, model, Box::new(replay), None).await;
+    let (report, _recorded, session) =
+        run_once(task, model, "replay", Box::new(replay), None).await;
     assert!(
         report["success"].as_bool().unwrap(),
         "replay of {} failed: {report}",
@@ -750,6 +780,16 @@ async fn assert_replay_equivalence(task: &EvalTask, model: &str, exchanges: &[Ex
             task.id
         );
     }
+}
+
+/// Runs one offline replay with request capture, so tests can inspect what
+/// the compiler produced on a deterministic path (no network, no clock).
+async fn replay_capturing(task: &EvalTask, model: &str, exchanges: &[Exchange]) -> Vec<Exchange> {
+    let replay = ReplayProvider::new(model, exchanges);
+    let (provider, captured) = RecordingProvider::new(replay);
+    let (_report, recorded, _session) =
+        run_once(task, model, "replay", Box::new(provider), Some(captured)).await;
+    recorded
 }
 
 /// Replays every recording on disk. Self-skips when no recordings exist
@@ -843,6 +883,28 @@ async fn eval_replay_synthetic() {
 
     let task = TASKS.iter().find(|t| t.id == "B1").unwrap();
     assert_replay_equivalence(task, model, &exchanges).await;
+
+    // Determinism of the measurement itself: the same scripted run must
+    // compile byte-identical requests every time. This pins the property the
+    // byte census relies on — request bytes are a pure function of
+    // (task, tools, transcript), with no clock, provider, or map-ordering
+    // nondeterminism (serde_json's sorted-key maps are part of the contract;
+    // enabling `preserve_order` would fail here first). Live-recorded
+    // requests are deliberately NOT compared against these: B1 reads this
+    // repository, so repo drift legitimately changes tool-result bytes
+    // between record and replay — assistant-turn equality above already
+    // covers that path.
+    let first = replay_capturing(task, model, &exchanges).await;
+    let second = replay_capturing(task, model, &exchanges).await;
+    assert_eq!(
+        serde_json::to_string(&first).unwrap(),
+        serde_json::to_string(&second).unwrap(),
+        "replayed runs must compile byte-identical requests"
+    );
+    assert!(
+        first.iter().all(|e| !e.request.messages.is_empty()),
+        "capture must include the compiler-produced requests"
+    );
 
     // The scripted tool call must have executed against the real workspace.
     // (assert_replay_equivalence already proved turn equality; this checks
