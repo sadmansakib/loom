@@ -33,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::artifact::ArtifactRef;
 use crate::store::ArtifactStore;
+use crate::tool_cache::ToolCache;
 
 /// The model-facing definition of one tool (its name, what it does, and
 /// the arguments it accepts).
@@ -95,6 +96,25 @@ impl PathTouch {
             access: PathAccess::Write,
         }
     }
+}
+
+/// Whether two workspace-relative paths overlap: identical, or one is an
+/// ancestor directory of the other (segment-wise). A read of `src` and a
+/// write to `src/a.rs` contend; `src/a.rs` and `src/b.rs` do not. `.` (the
+/// workspace root) is an ancestor of everything. Shared by scheduling
+/// (V13) and result caching (V14).
+pub(crate) fn paths_overlap(a: &str, b: &str) -> bool {
+    a == b || is_ancestor(a, b) || is_ancestor(b, a)
+}
+
+/// Whether `dir` is a strict ancestor directory of `path`.
+pub(crate) fn is_ancestor(dir: &str, path: &str) -> bool {
+    let dir = dir.trim_end_matches('/');
+    if dir.is_empty() || dir == "." {
+        return !path.is_empty() && path != ".";
+    }
+    path.strip_prefix(dir)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// The execution seam for one tool.
@@ -187,6 +207,11 @@ pub struct ToolContext {
     /// batch (same-batch change→failure linkage); the loop seeds it from
     /// committed results and the tool engine appends as calls finish.
     pub recent_changes: Arc<Mutex<Vec<String>>>,
+    /// Shared result cache for read-only calls (2G, ADR-018, V14). `None`
+    /// disables caching. A hit is verified by content hash before reuse,
+    /// and the engine invalidates entries when any recorded effect touches
+    /// their paths — so a stale result is never served.
+    pub cache: Option<Arc<Mutex<ToolCache>>>,
 }
 
 /// Cap on [`ToolContext::recent_changes`]: the most recent mutations are
@@ -210,6 +235,7 @@ impl std::fmt::Debug for ToolContext {
             .field("timeout", &self.timeout)
             .field("artifacts", &self.artifacts.is_some())
             .field("recent_changes", &recent_changes)
+            .field("cache", &self.cache.is_some())
             .finish()
     }
 }
@@ -231,6 +257,7 @@ impl ToolContext {
             timeout,
             artifacts: None,
             recent_changes: Arc::new(Mutex::new(Vec::new())),
+            cache: None,
         }
     }
 
@@ -247,6 +274,14 @@ impl ToolContext {
     #[must_use]
     pub fn with_recent_changes(mut self, recent_changes: Vec<String>) -> Self {
         self.recent_changes = Arc::new(Mutex::new(recent_changes));
+        self
+    }
+
+    /// Attaches the shared result cache read-only calls may be served from
+    /// (builder style, 2G/ADR-018). `None` disables caching.
+    #[must_use]
+    pub fn with_cache(mut self, cache: Option<Arc<Mutex<ToolCache>>>) -> Self {
+        self.cache = cache;
         self
     }
 

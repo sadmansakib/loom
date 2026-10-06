@@ -27,7 +27,8 @@ use tokio::time::timeout;
 
 use crate::artifact::ArtifactRef;
 use crate::tool::{
-    PathAccess, PathTouch, ToolContext, ToolEffects, ToolError, ToolOutput, ToolRegistry,
+    PathAccess, PathTouch, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolRegistry,
+    paths_overlap,
 };
 use crate::transcript::{ToolCall, ToolFailure, ToolResult, ToolStatus};
 
@@ -136,6 +137,26 @@ pub async fn execute_call(
     }
     started.store(true, Ordering::Release);
 
+    // Serve a repeated read-only call from the cache when the files it
+    // reads are unchanged (ADR-018, V14); a hit is re-bounded exactly as a
+    // fresh call would be. `cacheable` is `None` for anything the cache
+    // must not serve (mutating tools, wildcards, write-declaring reads).
+    let cacheable = cacheable_reads(tool, &call.arguments);
+    if let (Some(reads), Some(cache)) = (&cacheable, ctx.cache.as_ref())
+        && let Ok(mut cache) = cache.lock()
+        && let Some(output) = cache.lookup(&ctx.workspace_root, &call.name, &call.arguments, reads)
+    {
+        let (content, truncated, effects, artifact) = bound(output, ctx);
+        return finish(
+            call,
+            ToolStatus::Success,
+            content,
+            truncated,
+            effects,
+            artifact,
+        );
+    }
+
     let mut timed = std::pin::pin!(timeout(
         ctx.timeout,
         tool.call(call.arguments.clone().into(), ctx)
@@ -145,6 +166,20 @@ pub async fn execute_call(
         // Cancelled mid-flight: the tool future is dropped here.
         Either::Left(((), _timed)) => cancelled_result(call, true),
         Either::Right((Ok(Ok(output)), _)) => {
+            // Cache read-only, side-effect-free results before bounding, so
+            // a later hit is re-bounded exactly like a fresh call (ADR-018,
+            // V14). `store` itself refuses outputs with effects.
+            if let (Some(reads), Some(cache)) = (&cacheable, ctx.cache.as_ref())
+                && let Ok(mut cache) = cache.lock()
+            {
+                cache.store(
+                    &ctx.workspace_root,
+                    &call.name,
+                    &call.arguments,
+                    reads,
+                    &output,
+                );
+            }
             let (content, truncated, effects, artifact) = bound(output, ctx);
             finish(
                 call,
@@ -375,6 +410,14 @@ impl<'a> ToolBatch<'a> {
                     // (same-batch linkage, 2F). Conflict-free waves record
                     // no conflicting effects.
                     ctx.note_effects(&result.effects);
+                    // Drop cached reads that this call invalidated: a file
+                    // mutation clears entries whose paths overlap it, and a
+                    // `run_command` clears the whole cache (ADR-018, V14).
+                    if let Some(cache) = ctx.cache.as_ref()
+                        && let Ok(mut cache) = cache.lock()
+                    {
+                        cache.invalidate_effects(&result.effects);
+                    }
                     lock_slot(slot).replace(result);
                 }
             }))
@@ -405,6 +448,25 @@ impl<'a> ToolBatch<'a> {
             )
             .collect()
     }
+}
+
+/// The workspace paths a call reads, when the call is safely cacheable
+/// (ADR-018, V14): a read-only tool that declares exactly its read paths.
+/// `None` for a mutating tool, a wildcard tool (`touched_paths == None`),
+/// or any tool declaring a write — none of which the cache may serve.
+fn cacheable_reads(tool: &dyn Tool, arguments: &serde_json::Value) -> Option<Vec<String>> {
+    if !tool.is_read_only() {
+        return None;
+    }
+    let touches = tool.touched_paths(arguments)?;
+    let mut reads = Vec::with_capacity(touches.len());
+    for touch in touches {
+        if touch.access != PathAccess::Read {
+            return None;
+        }
+        reads.push(touch.path);
+    }
+    Some(reads)
 }
 
 /// The paths one call will touch, split into read/write sets for the
@@ -504,24 +566,6 @@ fn writes_overlap(writer: &Access, other: &Access) -> bool {
             .iter()
             .any(|w| touched.iter().any(|t| paths_overlap(w, t))),
     }
-}
-
-/// Whether two workspace-relative paths overlap: identical, or one is an
-/// ancestor directory of the other (segment-wise). A read of `src` and a
-/// write to `src/a.rs` contend; `src/a.rs` and `src/b.rs` do not. `.` (the
-/// workspace root) is an ancestor of everything.
-fn paths_overlap(a: &str, b: &str) -> bool {
-    a == b || is_ancestor(a, b) || is_ancestor(b, a)
-}
-
-/// Whether `dir` is a strict ancestor directory of `path`.
-fn is_ancestor(dir: &str, path: &str) -> bool {
-    let dir = dir.trim_end_matches('/');
-    if dir.is_empty() || dir == "." {
-        return !path.is_empty() && path != ".";
-    }
-    path.strip_prefix(dir)
-        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Assigns each call to a wave: the longest path over conflict edges. Two
@@ -773,6 +817,84 @@ mod tests {
         .await;
         assert_eq!(result.status, ToolStatus::Success);
         assert_eq!(result.effects, effects);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_read_is_served_from_cache_until_a_write_invalidates() {
+        let dir = std::env::temp_dir().join(format!("loom-tools-cache-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(dir.join("src")).expect("workspace");
+        std::fs::write(dir.join("src/a.rs"), "fn a() {}").expect("file");
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let tool = MockTool {
+            spec: spec("read_file"),
+            read_only: true,
+            action: Action::Track {
+                reads: vec!["src/a.rs".to_owned()],
+                writes: Vec::new(),
+                declared: true,
+                active: Arc::new(AtomicUsize::new(0)),
+                max_seen: Arc::new(AtomicUsize::new(0)),
+                log: log.clone(),
+                label: "read".to_owned(),
+                ms: 0,
+            },
+        };
+        let registry = registry(vec![tool]);
+        let exposure = ToolExposure::from_names(["read_file"]);
+        let token = CancellationToken::new();
+        let cache = Arc::new(Mutex::new(crate::tool_cache::ToolCache::new()));
+        let ctx = ToolContext::new(dir.clone(), token.clone(), Duration::from_secs(5))
+            .with_cache(Some(cache.clone()));
+        let started = AtomicBool::new(false);
+
+        let first = execute_call(
+            &registry,
+            &exposure,
+            &make_call("read_file"),
+            &ctx,
+            &started,
+        )
+        .await;
+        let second = execute_call(
+            &registry,
+            &exposure,
+            &make_call("read_file"),
+            &ctx,
+            &started,
+        )
+        .await;
+        assert_eq!(first.status, ToolStatus::Success);
+        assert_eq!(second.status, ToolStatus::Success);
+        assert_eq!(second.content, first.content);
+        assert_eq!(
+            log.lock().expect("log").len(),
+            1,
+            "the second identical read must be served from the cache"
+        );
+        assert_eq!(cache.lock().expect("cache").hits(), 1);
+
+        cache
+            .lock()
+            .expect("cache")
+            .invalidate_effects(&ToolEffects::none().with_file_written("src/a.rs"));
+        let third = execute_call(
+            &registry,
+            &exposure,
+            &make_call("read_file"),
+            &ctx,
+            &started,
+        )
+        .await;
+        assert_eq!(third.status, ToolStatus::Success);
+        assert_eq!(
+            log.lock().expect("log").len(),
+            2,
+            "a recorded write to the read path invalidates the entry"
+        );
+        assert_eq!(third.content, first.content);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

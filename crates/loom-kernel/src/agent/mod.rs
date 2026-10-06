@@ -14,7 +14,7 @@
 //! trait objects and a registry.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
@@ -33,6 +33,7 @@ use crate::model::{
 use crate::session::{PlannedTurn, Session, TaskRecord, TerminalTaskStatus};
 use crate::store::{ArtifactStore, SessionStore, StoreError};
 use crate::tool::{ToolContext, ToolRegistry};
+use crate::tool_cache::ToolCache;
 use crate::transcript::{AssistantMessage, Item, ToolCall, ToolFailure, ToolResult, ToolStatus};
 
 pub mod retry;
@@ -370,6 +371,7 @@ pub struct Agent {
     store: Option<Box<dyn SessionStore>>,
     artifacts: Option<Arc<dyn ArtifactStore>>,
     facts: Box<dyn FactsSource>,
+    cache: Arc<Mutex<ToolCache>>,
 }
 
 impl Agent {
@@ -399,6 +401,7 @@ impl Agent {
             store: None,
             artifacts: None,
             facts: Box::new(NoFacts),
+            cache: Arc::new(Mutex::new(ToolCache::new())),
         }
     }
 
@@ -961,7 +964,8 @@ impl Agent {
             self.tool_timeout,
         )
         .with_artifacts(self.artifacts.clone())
-        .with_recent_changes(recent_changes.to_vec());
+        .with_recent_changes(recent_changes.to_vec())
+        .with_cache(Some(self.cache.clone()));
         let batch = ToolBatch::new(&self.registry, &exposure)
             .with_max_concurrency(self.max_tool_concurrency);
         let ran = batch.execute(&runnable, &context).await;

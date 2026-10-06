@@ -15,4 +15,5 @@ pub mod model;
 pub mod session;
 pub mod store;
 pub mod tool;
+pub mod tool_cache;
 pub mod transcript;
