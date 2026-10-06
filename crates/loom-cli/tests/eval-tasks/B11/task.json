@@ -1,0 +1,21 @@
+{
+  "id": "B11",
+  "prompt": "The test suite of this crate fails. Find the fault in the implementation, fix it, and make `cargo test` pass. The tests are the specification: do not modify anything under tests/.",
+  "tools": "coding",
+  "heavy": false,
+  "workspace": "copy",
+  "notes": "Reproduces 43290a5: a session parked above the trigger re-decided every turn, rewriting the checkpoint and busting the prefix cache.",
+  "gate": {
+    "kind": "bugfix",
+    "protected": ["tests/regression.rs"],
+    "fail_to_pass": [
+      "stationary_context_carries_the_checkpoint",
+      "repeated_decisions_are_stable"
+    ],
+    "pass_to_pass": [
+      "below_the_trigger_keeps_everything",
+      "first_crossing_adopts_a_checkpoint",
+      "reclaim_subtracts_stub_costs"
+    ]
+  }
+}

@@ -34,6 +34,27 @@ token counts (~±8 %), without putting a tokenizer in the kernel:
   (`o200k_base`), wired in `Engine::open`; the eval and benchmark
   harnesses use the same estimator for parity.
 
+## 2026-10-07 — Corpus growth: B10 and B11 from shipped fixes
+
+Second expansion round: two more real-bug tasks from Loom's fix history.
+
+- **B10 — forced pagination** (dff6bd7): the read line-window
+  truncated files that fit the byte budget, forcing multi-turn
+  pagination of ordinary files. F2P:
+  `default_read_returns_small_files_whole`,
+  `oversized_default_read_fills_the_budget_not_the_line_window`; P2P:
+  `explicit_limit_is_honoured`, `offset_is_honoured`,
+  `empty_file_returns_empty_whole`.
+- **B11 — pruning checkpoint churn** (43290a5): a session parked above
+  the trigger re-decided every turn, rewriting the checkpoint and
+  busting the prefix cache. F2P:
+  `stationary_context_carries_the_checkpoint`,
+  `repeated_decisions_are_stable`; P2P: `below_the_trigger_keeps_everything`,
+  `first_crossing_adopts_a_checkpoint`, `reclaim_subtracts_stub_costs`.
+- Same proofs as B8/B9: seeds fail exactly their F2P set, pass their
+  P2P set, real fixes flip every declared name green; offline suite
+  picks the directories up with no harness edits. Suite now 11 tasks.
+
 ## 2026-10-07 — Corpus growth: B8 and B9 from shipped fixes
 
 First corpus-expansion round on the task-directory harness: two more

@@ -1,0 +1,21 @@
+{
+  "id": "B10",
+  "prompt": "The test suite of this crate fails. Find the fault in the implementation, fix it, and make `cargo test` pass. The tests under tests/ are the complete and only specification of correct behavior: do not modify anything under tests/, and expect no hidden tests beyond them.",
+  "tools": "coding",
+  "heavy": false,
+  "workspace": "copy",
+  "notes": "Reproduces dff6bd7: the line window truncated reads that fit the byte budget, forcing multi-turn pagination of ordinary files.",
+  "gate": {
+    "kind": "bugfix",
+    "protected": ["tests/regression.rs"],
+    "fail_to_pass": [
+      "default_read_returns_small_files_whole",
+      "oversized_default_read_fills_the_budget_not_the_line_window"
+    ],
+    "pass_to_pass": [
+      "explicit_limit_is_honoured",
+      "offset_is_honoured",
+      "empty_file_returns_empty_whole"
+    ]
+  }
+}
