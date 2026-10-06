@@ -3,17 +3,20 @@
 //! Extracted from `run_command` so `verify` runs commands through exactly the
 //! same bounded, deadlock-free path: stdin closed, both pipes drained
 //! concurrently, each stream keeping a bounded head plus tail (errors live at
-//! the tail; a marker names what was dropped), and the child killed if the
-//! future is dropped. Bytes past the kept windows are still read and
-//! discarded, so the child never blocks writing to a full pipe. A non-zero
-//! exit status is **not** an error here — the caller decides what a failing
-//! status means, so the model can always see the failure.
+//! the tail; a marker names what was dropped), and the whole **process
+//! group** killed if the future is dropped, so a command that spawned
+//! children cannot leave orphans holding the pipes. Bytes past the kept
+//! windows are still read and discarded, so the child never blocks writing
+//! to a full pipe. A non-zero exit status is **not** an error here — the
+//! caller decides what a failing status means, so the model can always see
+//! the failure.
 
 use std::collections::VecDeque;
 use std::process::Stdio;
 
 use loom_kernel::agent::tools::MAX_TOOL_OUTPUT_BYTES;
 use loom_kernel::tool::{ToolContext, ToolError};
+use process_wrap::tokio::{CommandWrap, ProcessGroup};
 use tokio::io::AsyncReadExt;
 
 /// Leading bytes kept per stream.
@@ -23,31 +26,69 @@ const STREAM_HEAD_BYTES: usize = MAX_TOOL_OUTPUT_BYTES;
 /// command's diagnosis usually lands.
 const STREAM_TAIL_BYTES: usize = MAX_TOOL_OUTPUT_BYTES;
 
+/// Kills the whole process group when dropped while still armed.
+///
+/// process-wrap's tokio `KillOnDrop` shim only sets tokio's own
+/// kill-on-drop flag, which signals the direct child pid — grandchildren
+/// survive it. The child is spawned as its own group leader
+/// ([`ProcessGroup::leader`]), so one best-effort `killpg` reaps the
+/// tree on the cancellation path. Disarmed on normal completion: a
+/// reaped pgid could be reused by an unrelated process.
+struct GroupKillOnDrop {
+    pgid: i32,
+    armed: bool,
+}
+
+impl Drop for GroupKillOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            // Best effort: cancellation must not wait on the doomed tree.
+            let pgid = nix::unistd::Pid::from_raw(self.pgid);
+            let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+        }
+    }
+}
+
 /// Runs `program` with `args` in the workspace root, capturing bounded stdout
 /// and stderr plus the exit status.
 ///
 /// Mirrors the `run_command` execution contract: bare program name, no shell,
 /// workspace-root working directory, cancellation by dropping the future.
+/// The child leads its own process group and the group is killed on drop,
+/// so a timeout or cancel reaps grandchildren too — with tokio's plain
+/// `kill_on_drop` only the direct child died (documented debt, now closed).
 pub(crate) async fn run_bounded(
     program: &str,
     args: &[String],
     ctx: &ToolContext,
 ) -> Result<std::process::Output, ToolError> {
-    let mut child = tokio::process::Command::new(program)
-        .args(args)
-        .current_dir(&ctx.workspace_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| ToolError::Execution(format!("cannot run \"{program}\": {error}")))?;
+    let mut child = CommandWrap::with_new(program, |command| {
+        command
+            .args(args)
+            .current_dir(&ctx.workspace_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    })
+    .wrap(ProcessGroup::leader())
+    .spawn()
+    .map_err(|error| ToolError::Execution(format!("cannot run \"{program}\": {error}")))?;
+    let mut guard = match child.id() {
+        Some(pid) => GroupKillOnDrop {
+            pgid: i32::try_from(pid).unwrap_or(-1),
+            armed: true,
+        },
+        None => GroupKillOnDrop {
+            pgid: -1,
+            armed: false,
+        },
+    };
     let stdout = child
-        .stdout
+        .stdout()
         .take()
         .ok_or_else(|| ToolError::Execution(String::from("cannot capture stdout pipe")))?;
     let stderr = child
-        .stderr
+        .stderr()
         .take()
         .ok_or_else(|| ToolError::Execution(String::from("cannot capture stderr pipe")))?;
     let (stdout, stderr) = futures::join!(read_capped(stdout), read_capped(stderr));
@@ -59,6 +100,7 @@ pub(crate) async fn run_bounded(
         .wait()
         .await
         .map_err(|error| ToolError::Execution(format!("cannot run \"{program}\": {error}")))?;
+    guard.armed = false;
     Ok(std::process::Output {
         status,
         stdout,
@@ -165,5 +207,65 @@ mod tests {
         producer.await.unwrap();
         let payload = vec![b'x'; STREAM_HEAD_BYTES - 1];
         assert_eq!(kept, payload);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_future_kills_the_whole_process_group() {
+        use loom_kernel::tool::ToolContext;
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        // A unique marker so pgrep cannot collide with anything else on the
+        // machine. The `&` subshell stays a `sh` whose argv embeds the
+        // marker (an `exec` would drop it), and the parent `exec`s a sleep
+        // so both hold the stdout pipe open — the read side only ends when
+        // the whole group is killed.
+        const MARKER: &str = "loom-grp-9873";
+        // Leftovers from an earlier failed run of this very test would
+        // satisfy the liveness probe and mask the behaviour under test.
+        let _ = std::process::Command::new("pkill")
+            .arg("-f")
+            .arg(MARKER)
+            .output();
+        let root = std::env::temp_dir().join("loom-exec-grp-test");
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = ToolContext::new(root, CancellationToken::new(), Duration::from_secs(120));
+        let script = format!("while :; do sleep 0.5; done & exec sleep 3000 # {MARKER}");
+        let args = vec!["-c".to_owned(), script];
+
+        // Cancelling the task drops the future mid-run — the same
+        // cancellation path a timeout or Ctrl-C takes in production.
+        let task = tokio::spawn(async move { run_bounded("sh", &args, &ctx).await });
+        let alive = || {
+            std::process::Command::new("pgrep")
+                .arg("-f")
+                .arg(MARKER)
+                .output()
+                .map(|out| out.status.success() && !out.stdout.is_empty())
+                .unwrap_or(false)
+        };
+        // Hold the future briefly so the group is up, then drop it: the
+        // group must die, orphans included.
+        let mut up = false;
+        for _ in 0..50 {
+            if alive() {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(up, "test setup: the process group never came up");
+
+        task.abort();
+
+        let mut dead = false;
+        for _ in 0..50 {
+            if !alive() {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(dead, "dropping the future must kill grandchildren too");
     }
 }

@@ -3,6 +3,23 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-06 — Process-group kill for tool commands
+
+`run_command`'s timeout killed only the direct child; a grandchild
+spawned by a shell kept running and could hold the output pipes open
+(documented debt since the tool review). Fixed with `process-wrap`:
+
+- `exec::run_bounded` spawns commands as process-group leaders
+  (`ProcessGroup::leader()`), so one signal reaps the whole tree.
+- The stock `KillOnDrop` wrapper only sets tokio's flag — SIGKILL to the
+  direct pid, which orphans grandchildren — so a small owned guard kills
+  the group (`killpg`) when the future is dropped (timeout, Ctrl-C,
+  abort) and disarms itself after a successful wait, before the pgid can
+  be recycled.
+- Test: a marker process tree survives until the running future is
+  aborted, then dies (stale marker processes are pre-killed so earlier
+  failed runs cannot mask the probe).
+
 ## 2026-10-06 — Real token estimation (o200k) for census and pruning
 
 Context accounting moves from bytes/3 (±30 % error) to real BPE
