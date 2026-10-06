@@ -123,7 +123,11 @@ struct EvalTask {
     /// Long-context task: skipped unless explicitly named in
     /// `LOOM_EVAL_TASKS` (it is far slower and costlier than B1–B4).
     heavy: bool,
-    system_prompt: &'static str,
+    /// System prompt: `None` runs with the engine default — coding tasks
+    /// must measure the prompt users actually get, so parity cannot drift.
+    /// Read-only (B1) and long-context (B5) keep task-specific prompts
+    /// deliberately: they pin baselines and force whole-file reading.
+    system_prompt: Option<&'static str>,
 }
 
 const TASKS: &[EvalTask] = &[
@@ -135,7 +139,7 @@ const TASKS: &[EvalTask] = &[
         workspace: Workspace::Repo,
         tools: ToolSet::ReadOnly,
         heavy: false,
-        system_prompt: READ_ONLY_SYSTEM_PROMPT,
+        system_prompt: Some(READ_ONLY_SYSTEM_PROMPT),
     },
     EvalTask {
         id: "B2",
@@ -145,7 +149,7 @@ const TASKS: &[EvalTask] = &[
         workspace: Workspace::Fixture,
         tools: ToolSet::Coding,
         heavy: false,
-        system_prompt: CODING_SYSTEM_PROMPT,
+        system_prompt: None,
     },
     EvalTask {
         id: "B3",
@@ -155,7 +159,7 @@ const TASKS: &[EvalTask] = &[
         workspace: Workspace::Fixture,
         tools: ToolSet::Coding,
         heavy: false,
-        system_prompt: CODING_SYSTEM_PROMPT,
+        system_prompt: None,
     },
     EvalTask {
         id: "B4",
@@ -165,7 +169,7 @@ const TASKS: &[EvalTask] = &[
         workspace: Workspace::Fixture,
         tools: ToolSet::Coding,
         heavy: false,
-        system_prompt: CODING_SYSTEM_PROMPT,
+        system_prompt: None,
     },
     EvalTask {
         id: "B5",
@@ -184,7 +188,7 @@ const TASKS: &[EvalTask] = &[
         workspace: Workspace::Corpus,
         tools: ToolSet::ReadEdit,
         heavy: true,
-        system_prompt: LONG_CONTEXT_SYSTEM_PROMPT,
+        system_prompt: Some(LONG_CONTEXT_SYSTEM_PROMPT),
     },
 ];
 
@@ -204,13 +208,6 @@ const LONG_CONTEXT_SYSTEM_PROMPT: &str = "You are Loom, a minimal coding agent w
      sample, or read partial ranges. Keep going until every requested file has been \
      processed, then answer exactly as instructed. When you answer, be concise and name \
      the workspace-relative paths you relied on.";
-
-/// Prompt for tasks that may modify the workspace; identical to `loom-cli`'s.
-const CODING_SYSTEM_PROMPT: &str = "You are Loom, a coding agent working inside one workspace. Use the provided \
-     tools to inspect and change the workspace: list and search before reading, \
-     read before editing, write or edit files to make changes, and run allow-listed \
-     commands (cargo) to verify. Prefer the smallest change that works. When you \
-     answer, be concise and name the workspace-relative paths you relied on.";
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -631,11 +628,15 @@ async fn run_once(
     } else {
         Box::new(DefaultContextCompiler)
     };
+    let system_prompt = task
+        .system_prompt
+        .map(str::to_owned)
+        .unwrap_or_else(loom_core::engine::default_system_prompt);
     let agent = Agent::new(
         provider,
         compiler,
         registry(task),
-        AgentConfig::new(root.clone(), task.system_prompt),
+        AgentConfig::new(root.clone(), system_prompt),
         model.to_owned(),
     )
     .with_facts_source(Box::new(FsFactsSource::new(root)));

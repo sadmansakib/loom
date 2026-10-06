@@ -48,6 +48,34 @@ DeepSeek; free and paid models travel the same path — pricing is data
   free-model tests `#[ignore]`d behind `OPENROUTER_API_KEY`, mirroring
   `DEEPSEEK_API_KEY`); clippy and fmt clean.
 
+## 2026-10-06 — Action fusion and a measured context mandate
+
+Two token-efficiency changes, both measured on the eval harness (N=5,
+deepseek-flash) before being kept.
+
+- **Fused verification** (`011fd5a`): `write_file` and `edit_file` accept
+  an optional `verify` argument (`"check"`/`"test"`) that runs cargo in
+  the same call, so a change is proved in the turn that made it instead
+  of a separate verify round-trip. The fused output carries the same
+  structured failure evidence as the `verify` tool; effects record both
+  the file write and the command. Tool-spec guards relaxed to 4,820 B
+  total (still ~10 % under the pre-compaction size).
+- **Context mandate, trimmed by measurement**: the default system prompt
+  teaches exactly two rules — batch independent read-only calls in one
+  turn (they run in parallel; never mix a mutation into the batch), and
+  set `verify` on writes that touch compilable code. The first draft
+  (~885 B) was measured at +31 % input on B2 and cut to ~310 B, which
+  held B2 flat and improved B3 by 26 % (16.0 K → 11.9 K input, 6.6 → 5.4
+  turns). The eval harness now sources B2–B4 prompts from the engine
+  default instead of a frozen copy, so measured and shipped prompts
+  cannot drift apart again.
+- Verdict kept honest: fusion adoption on deepseek-flash is low (1 of 25
+  mutating calls; B3 still prefers one raw `run_command` cargo call),
+  and B2's +33 % vs its pre-fusion baseline is the fixed cost of the
+  mandate plus two larger specs (~0.9 KB/turn) on a three-turn task.
+  B1's unchanged path moved −11 % across the same cycles, putting the
+  N=5 noise floor around ±10 %.
+
 ## 2026-10-06 — Context pruning: episodic delta-reclaim gate (cache safety)
 
 Follow-up hardening to step 2L. Pruning must be genuinely episodic — one
