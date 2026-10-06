@@ -40,11 +40,12 @@ pub const DEFAULT_PROVIDER: &str = "deepseek";
 
 /// Ordered environment-variable fallback names for a provider (ADR-009).
 ///
-/// Adapter-declared in spirit; Iteration 1 has exactly one provider. An
-/// unknown provider has no fallback and resolves only from saved accounts.
+/// Adapter-declared in spirit; an unknown provider has no fallback and
+/// resolves only from saved accounts.
 pub fn provider_env_names(provider: &str) -> &'static [&'static str] {
     match provider {
         "deepseek" => &["DEEPSEEK_API_KEY"],
+        "openrouter" => &["OPENROUTER_API_KEY"],
         _ => &[],
     }
 }
@@ -763,6 +764,23 @@ impl Auth {
     /// Removes an account and its secret (see [`remove_account`]).
     pub fn remove(&self, provider: &str, target: &str) -> Result<RemovedAccount, AuthError> {
         remove_account(&self.store, &self.secrets, provider, target)
+    }
+
+    /// Resolves the credential for `provider` (ADR-009 order: explicit
+    /// `requested` account, then the active account, then the provider's
+    /// environment variables).
+    ///
+    /// A frontend that must act before opening the engine — fetching an
+    /// OpenRouter catalog, say — uses this so credential resolution has
+    /// exactly one implementation.
+    pub fn resolve(
+        &self,
+        provider: &str,
+        requested: Option<&str>,
+    ) -> Result<ResolvedCredential, AuthError> {
+        resolve(&self.store, &self.secrets, provider, requested, |name| {
+            std::env::var(name).ok()
+        })
     }
 }
 

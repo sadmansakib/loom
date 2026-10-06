@@ -15,11 +15,10 @@ use loom_kernel::context::{
 };
 use loom_kernel::event::EventSink;
 use loom_kernel::id::SessionId;
-use loom_kernel::model::ModelProvider;
 use loom_kernel::session::Session;
 use loom_kernel::store::StoreError;
 use loom_kernel::tool::ToolRegistry;
-use loom_providers::{DeepSeekConfig, DeepSeekProvider, ReasoningEffort};
+use loom_providers::{OpenRouterCatalog, ReasoningEffort};
 use loom_store::SqliteStore;
 use loom_tools::{
     ArtifactReadTool, EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool,
@@ -65,6 +64,34 @@ pub struct EngineConfig {
     /// When false the run is entirely in memory: a frontend that wants
     /// durability for the session must opt in. `--no-save` clears it.
     pub persist: bool,
+    /// Model catalog snapshot for catalog-driven providers (OpenRouter).
+    ///
+    /// The frontend fetches and caches the snapshot (see
+    /// [`loom_providers::fetch_catalog`]) and passes it here, so the
+    /// engine stays synchronous and never performs network discovery of
+    /// its own. Adapters without a catalog ignore it; adapters that need
+    /// one reject the run when it is absent.
+    pub openrouter_catalog: Option<OpenRouterCatalog>,
+}
+
+/// A minimal [`EngineConfig`] for tests that need one without a real
+/// workspace or database.
+#[cfg(test)]
+pub(crate) fn test_config() -> EngineConfig {
+    let base = std::env::temp_dir().join("loom-engine-test-config");
+    EngineConfig {
+        provider: "deepseek".to_owned(),
+        model: "deepseek-flash".to_owned(),
+        base_url: None,
+        reasoning_effort: ReasoningEffort::default(),
+        account: None,
+        workspace: base.join("workspace"),
+        system_prompt: None,
+        max_turns: 1,
+        db_path: base.join("loom.db"),
+        persist: false,
+        openrouter_catalog: None,
+    }
 }
 
 /// An opened engine: a composed [`Agent`] plus the session policy.
@@ -88,10 +115,6 @@ impl Engine {
     /// credential command) — so a frontend that runs an event loop should call
     /// it off its render thread.
     pub fn open(config: EngineConfig) -> Result<Self, EngineError> {
-        if config.provider != "deepseek" {
-            return Err(EngineError::UnknownProvider(config.provider));
-        }
-
         let workspace =
             std::fs::canonicalize(&config.workspace).map_err(|source| EngineError::Workspace {
                 path: config.workspace.clone(),
@@ -119,26 +142,9 @@ impl Engine {
             "credential resolved"
         );
 
-        // Provider construction and loud capability validation (§6.4).
-        let mut provider_config = DeepSeekConfig::new(credential.secret.expose().to_owned())
-            .with_reasoning_effort(config.reasoning_effort);
-        if let Some(base_url) = &config.base_url {
-            provider_config = provider_config.with_base_url(base_url.clone());
-        }
-        let provider = DeepSeekProvider::new(provider_config)
-            .map_err(|error| EngineError::Provider(Box::new(error)))?;
-        let capabilities =
-            provider
-                .capabilities(&config.model)
-                .ok_or_else(|| EngineError::UnknownModel {
-                    provider: config.provider.clone(),
-                    model: config.model.clone(),
-                })?;
-        if !capabilities.reasoning {
-            return Err(EngineError::ModelWithoutReasoning {
-                model: config.model.clone(),
-            });
-        }
+        // Provider construction and loud capability validation: all
+        // adapter-specific knowledge lives in `provider`.
+        let handle = crate::provider::build(&config, credential.secret.expose())?;
 
         let registry = build_registry()?;
         let system_prompt = config.system_prompt.unwrap_or_else(default_system_prompt);
@@ -146,7 +152,7 @@ impl Engine {
         // I/O; the loop scans once per task through this source.
         let facts = crate::repo::FsFactsSource::new(workspace.clone());
         let mut agent = Agent::new(
-            Box::new(provider),
+            handle.provider,
             Box::new(PruningContextCompiler::new(
                 Box::new(DefaultContextCompiler),
                 PruneConfig::default(),
@@ -273,8 +279,14 @@ fn default_system_prompt() -> String {
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     /// The requested provider has no adapter in this build.
-    #[error("unknown provider `{0}`: iteration 1 ships `deepseek`")]
+    #[error("unknown provider `{0}`: no adapter is registered for it")]
     UnknownProvider(String),
+    /// A catalog-driven provider was selected without a catalog.
+    #[error("provider `{provider}` needs a model catalog, but none was loaded")]
+    CatalogMissing {
+        /// The provider that requires the catalog.
+        provider: String,
+    },
     /// The workspace does not exist or cannot be resolved.
     #[error("workspace `{path}` does not exist or is not readable")]
     Workspace {
@@ -295,7 +307,7 @@ pub enum EngineError {
     /// Boxed rather than naming `reqwest::Error` so the facade does not leak
     /// the HTTP client's type; the cause is still reachable via
     /// [`std::error::Error::source`].
-    #[error("building the DeepSeek provider: {0}")]
+    #[error("building the provider: {0}")]
     Provider(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// The model is not in the provider's capability table.
     #[error("model `{model}` is unknown to provider `{provider}`: check --model")]
@@ -304,6 +316,17 @@ pub enum EngineError {
         provider: String,
         /// Model that was not found.
         model: String,
+    },
+    /// The model's context window is below the pruning floor.
+    #[error(
+        "model `{model}` has a {tokens}-token context window, below the minimum Loom needs to \
+         recover context"
+    )]
+    ModelWindowTooSmall {
+        /// The offending model.
+        model: String,
+        /// Its advertised context window.
+        tokens: u32,
     },
     /// The model must support reasoning: an effort is always sent.
     #[error(
