@@ -66,6 +66,11 @@ impl Engine {
     /// Setup failures are returned here, before any task runs, so a frontend
     /// can report them once (bad provider, missing credential, unknown model)
     /// rather than per task.
+    ///
+    /// This performs blocking I/O — workspace canonicalization, the SQLite
+    /// account store, and the OS keychain (and, for `auth login`, the
+    /// credential command) — so a frontend that runs an event loop should call
+    /// it off its render thread.
     pub fn open(config: EngineConfig) -> Result<Self, EngineError> {
         if config.provider != "deepseek" {
             return Err(EngineError::UnknownProvider(config.provider));
@@ -105,7 +110,7 @@ impl Engine {
             provider_config = provider_config.with_base_url(base_url.clone());
         }
         let provider = DeepSeekProvider::new(provider_config)
-            .map_err(|error| EngineError::Provider(error.to_string()))?;
+            .map_err(|error| EngineError::Provider(Box::new(error)))?;
         let capabilities =
             provider
                 .capabilities(&config.model)
@@ -178,8 +183,7 @@ impl Engine {
             source,
         })?;
         let path = dir.join(format!("{}.json", session.id));
-        let bytes = serde_json::to_vec_pretty(session)
-            .map_err(|error| EngineError::SerializeSession(error.to_string()))?;
+        let bytes = serde_json::to_vec_pretty(session).map_err(EngineError::SerializeSession)?;
         std::fs::write(&path, bytes).map_err(|source| EngineError::SessionWrite {
             path: path.clone(),
             source,
@@ -249,8 +253,12 @@ pub enum EngineError {
     #[error(transparent)]
     Auth(#[from] auth::AuthError),
     /// The provider client could not be constructed.
+    ///
+    /// Boxed rather than naming `reqwest::Error` so the facade does not leak
+    /// the HTTP client's type; the cause is still reachable via
+    /// [`std::error::Error::source`].
     #[error("building the DeepSeek provider: {0}")]
-    Provider(String),
+    Provider(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// The model is not in the provider's capability table.
     #[error("model `{model}` is unknown to provider `{provider}`: check --model")]
     UnknownModel {
@@ -287,7 +295,7 @@ pub enum EngineError {
     },
     /// The session could not be serialized.
     #[error("serialising the session: {0}")]
-    SerializeSession(String),
+    SerializeSession(#[source] serde_json::Error),
     /// The session file could not be written.
     #[error("writing the session to `{path}`")]
     SessionWrite {

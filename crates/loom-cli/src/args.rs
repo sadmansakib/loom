@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use loom_core::engine::ReasoningEffort;
+use loom_core::ReasoningEffort;
 use loom_core::kernel::agent::DEFAULT_MAX_TURNS;
 
 use loom_core::engine::auth::Method;

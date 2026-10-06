@@ -9,8 +9,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::Context;
-use loom_core::engine::{Engine, EngineConfig};
 use loom_core::kernel::event::ChannelEventSink;
+use loom_core::{Engine, EngineConfig};
 use tokio_util::sync::CancellationToken;
 
 use crate::args::RunArgs;

@@ -23,5 +23,7 @@ pub use loom_providers as providers;
 pub use loom_tools as tools;
 
 // The driving API, surfaced at the facade root so the common path is
-// `loom_core::Engine`.
+// `loom_core::Engine`. Driving-API types are imported from the root, not
+// through the `engine` alias; module-scoped APIs stay behind the aliases
+// (`loom_core::kernel::…`, `loom_core::engine::auth::…`).
 pub use loom_engine::{Engine, EngineConfig, EngineError, ReasoningEffort};
