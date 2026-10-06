@@ -9,7 +9,8 @@
 
 use loom_kernel::model::{ModelCapabilities, ModelProvider};
 use loom_providers::{
-    DeepSeekConfig, DeepSeekProvider, OpenRouterCatalog, OpenRouterConfig, OpenRouterProvider,
+    DEEPSEEK_PROVIDER_NAME, DeepSeekConfig, DeepSeekProvider, OPENROUTER_PROVIDER_NAME,
+    OpenRouterConfig, OpenRouterProvider, ProviderCatalog,
 };
 
 use crate::engine::{EngineConfig, EngineError};
@@ -47,8 +48,8 @@ impl std::fmt::Debug for ProviderHandle {
 /// immediately, so it never travels further in the clear.
 pub(crate) fn build(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, EngineError> {
     match config.provider.as_str() {
-        DeepSeekProvider::PROVIDER_NAME => build_deepseek(config, api_key),
-        OpenRouterProvider::PROVIDER_NAME => build_openrouter(config, api_key),
+        DEEPSEEK_PROVIDER_NAME => build_deepseek(config, api_key),
+        OPENROUTER_PROVIDER_NAME => build_openrouter(config, api_key),
         other => Err(EngineError::UnknownProvider(other.to_owned())),
     }
 }
@@ -90,13 +91,14 @@ fn build_deepseek(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle
 /// the plain OpenAI wire and does not send provider-specific reasoning
 /// fields.
 fn build_openrouter(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, EngineError> {
-    let catalog: OpenRouterCatalog =
-        config
-            .openrouter_catalog
-            .clone()
-            .ok_or_else(|| EngineError::CatalogMissing {
+    let catalog = match &config.catalog {
+        Some(ProviderCatalog::OpenRouter(catalog)) => catalog.clone(),
+        _ => {
+            return Err(EngineError::CatalogMissing {
                 provider: config.provider.clone(),
-            })?;
+            });
+        }
+    };
     let mut provider_config = OpenRouterConfig::new(api_key);
     if let Some(base_url) = &config.base_url {
         provider_config = provider_config.with_base_url(base_url.clone());
@@ -151,7 +153,7 @@ mod tests {
     fn openrouter_without_catalog_fails_loudly() {
         let mut config = crate::engine::test_config();
         config.provider = "openrouter".to_owned();
-        config.openrouter_catalog = None;
+        config.catalog = None;
         let error = build(&config, "key").expect_err("must reject");
         assert!(matches!(error, EngineError::CatalogMissing { .. }));
     }
@@ -161,7 +163,7 @@ mod tests {
         let mut config = crate::engine::test_config();
         config.provider = "openrouter".to_owned();
         config.model = "vendor/model:free".to_owned();
-        config.openrouter_catalog = Some(
+        config.catalog = Some(ProviderCatalog::OpenRouter(
             loom_providers::parse_catalog(
                 r#"{"data":[{"id":"vendor/model:free","context_length":200000,
                     "pricing":{"prompt":"0","completion":"0"},
@@ -169,7 +171,7 @@ mod tests {
                 1,
             )
             .expect("fixture"),
-        );
+        ));
         let handle = build(&config, "key").expect("builds");
         assert_eq!(handle.capabilities.max_context_tokens, 200_000);
         assert!(handle.capabilities.tool_calls);
@@ -180,13 +182,13 @@ mod tests {
         let mut config = crate::engine::test_config();
         config.provider = "openrouter".to_owned();
         config.model = "vendor/missing".to_owned();
-        config.openrouter_catalog = Some(
+        config.catalog = Some(ProviderCatalog::OpenRouter(
             loom_providers::parse_catalog(
                 r#"{"data":[{"id":"other","context_length":100000}]}"#,
                 1,
             )
             .expect("fixture"),
-        );
+        ));
         let error = build(&config, "key").expect_err("must reject");
         assert!(matches!(error, EngineError::UnknownModel { .. }));
     }
@@ -196,13 +198,13 @@ mod tests {
         let mut config = crate::engine::test_config();
         config.provider = "openrouter".to_owned();
         config.model = "vendor/tiny".to_owned();
-        config.openrouter_catalog = Some(
+        config.catalog = Some(ProviderCatalog::OpenRouter(
             loom_providers::parse_catalog(
                 r#"{"data":[{"id":"vendor/tiny","context_length":8192}]}"#,
                 1,
             )
             .expect("fixture"),
-        );
+        ));
         let error = build(&config, "key").expect_err("must reject");
         assert!(matches!(
             error,

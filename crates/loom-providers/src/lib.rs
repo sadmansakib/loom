@@ -29,7 +29,7 @@ pub use http::TimeoutConfig;
 pub use openrouter::PROVIDER_NAME as OPENROUTER_PROVIDER_NAME;
 pub use openrouter::{
     CatalogError, DEFAULT_BASE_URL as OPENROUTER_DEFAULT_BASE_URL, OpenRouterCatalog,
-    OpenRouterConfig, OpenRouterModel, OpenRouterProvider, fetch_catalog, fetch_catalog_with,
-    now_epoch_secs, parse_catalog,
+    OpenRouterConfig, OpenRouterModel, OpenRouterProvider, ProviderCatalog, fetch_catalog,
+    fetch_catalog_with, now_epoch_secs, parse_catalog,
 };
 pub use secret::SecretString;

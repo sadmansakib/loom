@@ -115,6 +115,12 @@ pub struct OpenRouterModel {
     pub max_completion_tokens: Option<u32>,
     /// Whether the model accepts tool calls.
     pub tool_capable: bool,
+    /// Whether the model accepts parallel tool calls in one turn, from
+    /// `supported_parameters`. `false` when unlisted: serializing calls
+    /// is always safe, while emitting parallel calls a model rejects
+    /// would fail the turn.
+    #[serde(default)]
+    pub parallel_tool_calls: bool,
     /// Whether the model supports explicit reasoning controls.
     pub reasoning_capable: bool,
     /// USD per input token, when priced.
@@ -163,7 +169,7 @@ impl OpenRouterCatalog {
         let context = model.context_length?;
         let mut capabilities = ModelCapabilities::new(context)
             .with_tool_calls(model.tool_capable)
-            .with_parallel_tool_calls(model.tool_capable)
+            .with_parallel_tool_calls(model.parallel_tool_calls)
             .with_reasoning(model.reasoning_capable);
         if let Some(max_output) = model.max_completion_tokens {
             capabilities = capabilities.with_max_output_tokens(max_output);
@@ -182,6 +188,19 @@ impl OpenRouterCatalog {
     pub fn is_empty(&self) -> bool {
         self.models.is_empty()
     }
+}
+
+/// A provider-supplied model catalog, handed to the engine as data.
+///
+/// One variant per catalog-driven adapter: the engine's provider factory
+/// matches on the variant and never knows a provider's catalog shape, so
+/// a second catalog-driven provider extends this enum instead of growing
+/// engine configuration. Adapters that serve capabilities from a built-in
+/// table never see it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProviderCatalog {
+    /// A `GET /models` snapshot (see [`fetch_catalog`]).
+    OpenRouter(OpenRouterCatalog),
 }
 
 /// Errors from [`fetch_catalog`].
@@ -221,6 +240,11 @@ pub async fn fetch_catalog(
     fetch_catalog_with(&client, base_url, api_key, timeouts).await
 }
 
+/// Cap on the catalog response body. The live catalog is a few hundred
+/// kilobytes; a cap keeps a misbehaving endpoint from ballooning memory —
+/// the SSE path caps its reads the same way.
+const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
+
 /// [`fetch_catalog`] for callers that already own a client.
 pub async fn fetch_catalog_with(
     client: &reqwest::Client,
@@ -228,6 +252,8 @@ pub async fn fetch_catalog_with(
     api_key: &str,
     timeouts: TimeoutConfig,
 ) -> Result<OpenRouterCatalog, CatalogError> {
+    use futures::StreamExt;
+
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let send = client.get(url).bearer_auth(api_key).send();
     let response = match tokio::time::timeout(timeouts.header, send).await {
@@ -243,11 +269,27 @@ pub async fn fetch_catalog_with(
             body: body_excerpt(&body),
         });
     }
-    let read = response.text();
+    // Bounded, validated read: a catalog larger than the cap or not
+    // valid UTF-8 is a protocol failure, not a reason to buffer
+    // unbounded bytes the way `Response::text` would.
+    let read = async {
+        let mut stream = response.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(CatalogError::Request)?;
+            if buf.len() + chunk.len() > MAX_CATALOG_BYTES {
+                return Err(CatalogError::Decode(format!(
+                    "catalog body exceeded the {MAX_CATALOG_BYTES}-byte cap"
+                )));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        String::from_utf8(buf)
+            .map_err(|_| CatalogError::Decode("catalog body is not valid UTF-8".to_owned()))
+    };
     let body = match tokio::time::timeout(timeouts.idle, read).await {
         Err(_) => return Err(CatalogError::Timeout),
-        Ok(Err(error)) => return Err(CatalogError::Request(error)),
-        Ok(Ok(body)) => body,
+        Ok(result) => result?,
     };
     parse_catalog(&body, now_epoch_secs()).map_err(|error| CatalogError::Decode(error.to_string()))
 }
@@ -314,6 +356,7 @@ fn reduce_model(raw: RawModel) -> OpenRouterModel {
             .top_provider
             .and_then(|top_provider| top_provider.max_completion_tokens),
         tool_capable: supports("tools"),
+        parallel_tool_calls: supports("parallel_tool_calls"),
         reasoning_capable: supports("reasoning"),
         prompt_price: raw
             .pricing
@@ -352,9 +395,6 @@ pub struct OpenRouterProvider {
 }
 
 impl OpenRouterProvider {
-    /// The provider name used to select this adapter.
-    pub const PROVIDER_NAME: &'static str = "openrouter";
-
     /// Creates a provider bound to `catalog` with a connection-pooled
     /// HTTP client.
     ///
@@ -379,27 +419,11 @@ impl OpenRouterProvider {
 
     /// Classifies an HTTP status per the OpenRouter error model.
     ///
-    /// 402 signals exhausted credits and blocks even free models (a
-    /// permanent condition the loop must not retry); 429 is the shared
-    /// rate/`free_model_daily_requests` limit and is retryable. A 4xx
-    /// whose body names a context-length overflow is classified as
-    /// [`ModelErrorKind::ContextOverflow`] so the loop can distinguish it
-    /// from a malformed request.
+    /// Test-only alias for [`WireEndpoint::classify_status`]; the
+    /// adapter trait is the single implementation.
+    #[cfg(test)]
     fn classify_status(status: reqwest::StatusCode, body: &str) -> ModelError {
-        let mut kind = match status.as_u16() {
-            400 | 404 | 422 => ModelErrorKind::InvalidRequest,
-            401 | 403 => ModelErrorKind::Auth,
-            402 => ModelErrorKind::QuotaExhausted,
-            408 => ModelErrorKind::Transport,
-            429 => ModelErrorKind::RateLimited,
-            503 => ModelErrorKind::Overloaded,
-            _ if status.is_client_error() => ModelErrorKind::InvalidRequest,
-            _ => ModelErrorKind::Server,
-        };
-        if kind == ModelErrorKind::InvalidRequest && names_context_overflow(body) {
-            kind = ModelErrorKind::ContextOverflow;
-        }
-        ModelError::new(kind, format!("HTTP {status}: {}", body_excerpt(body)))
+        <Self as WireEndpoint>::classify_status(status, body)
     }
 }
 
@@ -469,8 +493,29 @@ impl WireEndpoint for OpenRouterProvider {
         }
     }
 
+    /// Classifies an HTTP status per the OpenRouter error model.
+    ///
+    /// 402 signals exhausted credits and blocks even free models (a
+    /// permanent condition the loop must not retry); 429 is the shared
+    /// rate/`free_model_daily_requests` limit and is retryable. A 4xx
+    /// whose body names a context-length overflow is classified as
+    /// [`ModelErrorKind::ContextOverflow`] so the loop can distinguish it
+    /// from a malformed request.
     fn classify_status(status: reqwest::StatusCode, body: &str) -> ModelError {
-        OpenRouterProvider::classify_status(status, body)
+        let mut kind = match status.as_u16() {
+            400 | 404 | 422 => ModelErrorKind::InvalidRequest,
+            401 | 403 => ModelErrorKind::Auth,
+            402 => ModelErrorKind::QuotaExhausted,
+            408 => ModelErrorKind::Transport,
+            429 => ModelErrorKind::RateLimited,
+            503 => ModelErrorKind::Overloaded,
+            _ if status.is_client_error() => ModelErrorKind::InvalidRequest,
+            _ => ModelErrorKind::Server,
+        };
+        if kind == ModelErrorKind::InvalidRequest && names_context_overflow(body) {
+            kind = ModelErrorKind::ContextOverflow;
+        }
+        ModelError::new(kind, format!("HTTP {status}: {}", body_excerpt(body)))
     }
 }
 
@@ -499,7 +544,7 @@ mod tests {
                 "context_length": 200000,
                 "top_provider": { "max_completion_tokens": 8192 },
                 "pricing": { "prompt": "0", "completion": "0" },
-                "supported_parameters": ["tools", "reasoning", "temperature"]
+                "supported_parameters": ["tools", "parallel_tool_calls", "reasoning", "temperature"]
             },
             {
                 "id": "vendor/paid-model",
@@ -532,7 +577,7 @@ mod tests {
         assert_eq!(free.prompt_price, Some(0.0));
         assert_eq!(free.completion_price, Some(0.0));
         assert_eq!(free.is_free(), Some(true));
-        assert!(free.tool_capable && free.reasoning_capable);
+        assert!(free.tool_capable && free.parallel_tool_calls && free.reasoning_capable);
 
         let paid = catalog.model("vendor/paid-model").expect("paid model");
         assert_eq!(paid.context_length, Some(1_048_576));
@@ -540,7 +585,8 @@ mod tests {
         assert_eq!(paid.prompt_price, Some(0.000003));
         assert_eq!(paid.completion_price, Some(0.000015));
         assert_eq!(paid.is_free(), Some(false));
-        assert!(paid.tool_capable && !paid.reasoning_capable);
+        // `tools` listed without `parallel_tool_calls`: calls serialize.
+        assert!(paid.tool_capable && !paid.parallel_tool_calls && !paid.reasoning_capable);
     }
 
     #[test]
@@ -564,7 +610,7 @@ mod tests {
 
         let paid = catalog.capabilities("vendor/paid-model").expect("caps");
         assert_eq!(paid.max_context_tokens, 1_048_576);
-        assert!(paid.tool_calls && !paid.reasoning);
+        assert!(paid.tool_calls && !paid.parallel_tool_calls && !paid.reasoning);
     }
 
     #[test]

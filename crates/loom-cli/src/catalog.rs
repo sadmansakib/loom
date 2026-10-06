@@ -7,7 +7,7 @@
 //! a transient outage cannot block a run that already has a usable catalog.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::Context;
 use loom_core::engine::auth::Auth;
@@ -41,7 +41,7 @@ pub async fn load(
     let cached = read_cache(&path);
 
     if let Some(cached) = &cached
-        && is_fresh(cached, now_epoch_secs())
+        && is_fresh(cached, providers::now_epoch_secs())
     {
         return Ok(cached.clone());
     }
@@ -102,13 +102,6 @@ fn write_cache(path: &Path, catalog: &OpenRouterCatalog) -> anyhow::Result<()> {
     }
     let body = serde_json::to_vec(catalog).context("serializing the OpenRouter catalog")?;
     std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))
-}
-
-/// Unix seconds now; `0` if the clock is before the epoch.
-fn now_epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 #[cfg(test)]

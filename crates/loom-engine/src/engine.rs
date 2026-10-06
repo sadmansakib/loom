@@ -18,7 +18,7 @@ use loom_kernel::id::SessionId;
 use loom_kernel::session::Session;
 use loom_kernel::store::StoreError;
 use loom_kernel::tool::ToolRegistry;
-use loom_providers::{OpenRouterCatalog, ReasoningEffort};
+use loom_providers::{ProviderCatalog, ReasoningEffort};
 use loom_store::SqliteStore;
 use loom_tools::{
     ArtifactReadTool, EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool,
@@ -64,14 +64,15 @@ pub struct EngineConfig {
     /// When false the run is entirely in memory: a frontend that wants
     /// durability for the session must opt in. `--no-save` clears it.
     pub persist: bool,
-    /// Model catalog snapshot for catalog-driven providers (OpenRouter).
+    /// Model catalog for catalog-driven adapters, handed in as data.
     ///
     /// The frontend fetches and caches the snapshot (see
-    /// [`loom_providers::fetch_catalog`]) and passes it here, so the
-    /// engine stays synchronous and never performs network discovery of
-    /// its own. Adapters without a catalog ignore it; adapters that need
-    /// one reject the run when it is absent.
-    pub openrouter_catalog: Option<OpenRouterCatalog>,
+    /// [`loom_providers::fetch_catalog`]) and passes the matching
+    /// [`ProviderCatalog`] variant here, so the engine stays synchronous
+    /// and never performs network discovery of its own. Adapters that
+    /// resolve capabilities from a built-in table ignore it; adapters
+    /// that need one reject the run when it is absent.
+    pub catalog: Option<ProviderCatalog>,
 }
 
 /// A minimal [`EngineConfig`] for tests that need one without a real
@@ -90,7 +91,7 @@ pub(crate) fn test_config() -> EngineConfig {
         max_turns: 1,
         db_path: base.join("loom.db"),
         persist: false,
-        openrouter_catalog: None,
+        catalog: None,
     }
 }
 

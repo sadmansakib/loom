@@ -393,7 +393,7 @@ Two adapters ship, over one shared wire implementation:
   model catalog (`GET /models`). Free and paid models travel the same
   path: pricing is data (zero for free, non-zero for paid), never a
   branch. The catalog is fetched and cached by the *frontend* and handed
-  to the engine as `EngineConfig::openrouter_catalog`, so the engine
+  to the engine as `EngineConfig::catalog`, so the engine
   stays synchronous and offline-capable. Attribution headers are
   optional configuration.
 

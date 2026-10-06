@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::Context;
 use loom_core::engine::auth::Auth;
 use loom_core::kernel::event::ChannelEventSink;
-use loom_core::providers::{OpenRouterCatalog, OpenRouterProvider};
+use loom_core::providers::{OPENROUTER_PROVIDER_NAME, ProviderCatalog};
 use loom_core::{Engine, EngineConfig};
 use tokio_util::sync::CancellationToken;
 
@@ -34,8 +34,10 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         .context("building the tokio runtime")?;
 
     let db_path = paths::db_path();
-    let openrouter_catalog = if args.provider == OpenRouterProvider::PROVIDER_NAME {
-        Some(load_openrouter_catalog(&runtime, &args, &db_path)?)
+    let catalog = if args.provider == OPENROUTER_PROVIDER_NAME {
+        Some(ProviderCatalog::OpenRouter(load_openrouter_catalog(
+            &runtime, &args, &db_path,
+        )?))
     } else {
         None
     };
@@ -51,7 +53,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         max_turns: args.max_turns,
         db_path,
         persist: !args.no_save,
-        openrouter_catalog,
+        catalog,
     })?;
 
     let mut session = engine.new_session();
@@ -111,7 +113,7 @@ fn load_openrouter_catalog(
     runtime: &tokio::runtime::Runtime,
     args: &RunArgs,
     db_path: &std::path::Path,
-) -> anyhow::Result<OpenRouterCatalog> {
+) -> anyhow::Result<loom_core::providers::OpenRouterCatalog> {
     let auth = Auth::open(db_path).context("opening the account store")?;
     runtime.block_on(crate::catalog::load(
         &auth,

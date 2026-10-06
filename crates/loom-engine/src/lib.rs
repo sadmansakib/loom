@@ -35,4 +35,4 @@ pub mod repo;
 pub use engine::{Engine, EngineConfig, EngineError};
 // The provider/effort types a frontend must name to build an `EngineConfig`;
 // re-exported so a frontend never depends on the provider crate directly.
-pub use loom_providers::{OpenRouterCatalog, ReasoningEffort};
+pub use loom_providers::{ProviderCatalog, ReasoningEffort};

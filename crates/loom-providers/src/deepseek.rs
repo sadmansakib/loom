@@ -194,9 +194,6 @@ pub struct DeepSeekProvider {
 }
 
 impl DeepSeekProvider {
-    /// The provider name used to select this adapter.
-    pub const PROVIDER_NAME: &'static str = "deepseek";
-
     /// Creates a provider with a connection-pooled HTTP client.
     ///
     /// Fails only when the TLS backend cannot be initialized (e.g.
