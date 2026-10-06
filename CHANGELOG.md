@@ -3,6 +3,32 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-06 — Context pruning: window-relative trigger (step 2L retune)
+
+The 2L long-context benchmark (task B5: read→edit over 8 corpus files)
+showed the ADR-011 flat 64 K trigger bounds context but costs ~25 % more
+under prefix caching: each checkpoint re-bills the live window at
+cache-miss price. The trigger is now **window-relative** — `max(80 % of
+the model's input window, 64 K)` — so automatic pruning stays dormant on a
+large window and only bounds context as a task approaches the wall (commit
+`6c225d9`).
+
+- `PruneConfig` (`crates/loom-kernel/src/context/pruning.rs`):
+  `trigger_tokens` → `trigger_percent` (80) + `floor_tokens` (64 K), with a
+  `trigger_tokens(max_input_tokens)` helper; the strategy tests pin the old
+  flat threshold via a `firing()` config, and a new test covers the
+  threshold math.
+- Eval harness: `LOOM_EVAL_PRUNE_TRIGGER_TOKENS` forces an absolute trigger
+  for measurement.
+- B5 N=5 per arm (deepseek-flash, off-peak): no-prune vs flat 64 K — final
+  context 127.6 K → 35.7 K (−72 %), input −47.6 %, turns equal (18.6),
+  0 failed calls, but cost +24.6 %; the window-relative default arm is
+  identical to no-prune (pruning never fires at a 1 M window), and the
+  forced-64 K arm reproduces the flat result. Record
+  `docs/benchmarks/2L-2026-10-06.md`.
+- `cargo test --workspace` 419 passed / 0 failed / 10 ignored; clippy and
+  fmt clean.
+
 ## 2026-10-06 — Context pruning (ADR-011, step 2L)
 
 `PruningContextCompiler` bounds a long task's projection without mutating
