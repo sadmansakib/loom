@@ -173,6 +173,10 @@ impl Engine {
     /// Writes the session as a single JSON file, unless saving is disabled.
     ///
     /// Returns the path written, or `None` when the config disabled saving.
+    ///
+    /// Blocking: this creates the sessions directory and writes the file
+    /// synchronously, so a frontend that runs an event loop should call it off
+    /// its render thread (or accept the stall at its persistence point).
     pub fn save_session(&self, session: &Session) -> Result<Option<PathBuf>, EngineError> {
         if !self.save_sessions {
             return Ok(None);
