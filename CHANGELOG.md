@@ -3,6 +3,37 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-06 — Context pruning (ADR-011, step 2L)
+
+`PruningContextCompiler` bounds a long task's projection without mutating
+the transcript; measured on a new long-context task (B5) it cuts the final
+context ~72 % but **costs more** under prefix caching. Record
+`docs/benchmarks/2L-2026-10-06.md`.
+
+- New `crates/loom-kernel/src/context/pruning.rs` wraps
+  `DefaultContextCompiler` and applies four deterministic zero-model-call
+  strategies in fixed order — dedupe identical read-only calls, supersede
+  reads of later-modified paths, drop stale errors, age out unprotected
+  read-only results — each replaced by a stub that keeps `call_id`.
+  Protected: the tail (≥ 20 K tokens and ≥ last 3 turns), user items,
+  assistant text, reasoning, the first user item. It fires only past
+  64 K estimated input and ≥ 20 K reclaimable; decisions are frozen in an
+  episodic `PruneCheckpoint` returned in `CompiledContext` and passed back
+  via `ContextInput`, so the projection is byte-stable between checkpoints.
+- Wired on by default in `loom-engine`; `LOOM_EVAL_PRUNE` toggles it in the
+  eval harness. New heavy task **B5** (read → edit over 8 corpus files,
+  `ToolSet::ReadEdit`, `LONG_CONTEXT_SYSTEM_PROMPT`); offline replay now
+  mirrors the live DeepSeek capability table (the stale 128 K window it
+  assumed could not replay B5's ~127 K transcript).
+- Benchmark (N=5 per arm, deepseek-flash, off-peak): final context
+  127.6 K → **35.7 K (−72 %)**, input −47.6 %, turns 18.6 = 18.6, 0 failed
+  calls — but cost **+24.6 %** and `cache_miss` +38.7 %, because each
+  checkpoint rewrites the prefix and re-bills the live window at cache-miss
+  price. Automatic pruning is a window-safety mechanism, not a cost win;
+  default disposition pending.
+- `cargo test --workspace` 418 passed / 0 failed / 10 ignored; clippy and
+  fmt clean.
+
 ## 2026-10-06 — Tool-spec compaction (step 2K)
 
 The serialized tool specs are the dominant fixed cost of a short task's
