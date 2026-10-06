@@ -7,6 +7,7 @@
 //! engine's sequential mode (§10). `.gitignore` participates only as a
 //! *discovery* filter in [`SearchTool`] — never as authorization (§9.2).
 
+mod budget;
 mod confinement;
 mod edit_file;
 mod list_dir;

@@ -1,7 +1,6 @@
 //! The `read_file` tool: bounded, workspace-confined text reads.
 
 use futures::future::BoxFuture;
-use loom_kernel::agent::tools::MAX_TOOL_OUTPUT_BYTES;
 use loom_kernel::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -9,11 +8,12 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
 
+use crate::budget::{self, READ_FILE_HEAD_BYTES};
 use crate::confinement::resolve_within;
 
-/// Reads one file's UTF-8 text, confined to the workspace root and
-/// capped at [`MAX_TOOL_OUTPUT_BYTES`] (the engine bounds output a
-/// second time; the cap here keeps the read itself bounded).
+/// Reads one file's UTF-8 text, confined to the workspace root and capped at
+/// [`READ_FILE_HEAD_BYTES`] with an explicit omission marker (ADR-014); the
+/// engine bounds output a second time as a backstop.
 #[derive(Debug, Default)]
 pub struct ReadFileTool;
 
@@ -29,8 +29,8 @@ impl Tool for ReadFileTool {
         SPEC.get_or_init(|| ToolSpec {
             name: "read_file".to_owned(),
             description: "Reads one text file from the workspace. Returns the file's \
-                          full content, or the first 64 KiB with `truncated: true` \
-                          when larger."
+                          content; files larger than 32 KiB are cut with an explicit \
+                          omission marker and `truncated: true`."
                 .to_owned(),
             parameters: json!({
                 "type": "object",
@@ -60,23 +60,36 @@ impl Tool for ReadFileTool {
                 .map_err(|err| ToolError::InvalidInput(format!("invalid arguments: {err}")))?;
             let path = resolve_within(&ctx.workspace_root, &input.path)?;
             let display = input.path;
-            let bytes = tokio::task::spawn_blocking(move || read_capped(&path))
-                .await
-                .map_err(|err| ToolError::Execution(format!("read task failed: {err}")))?
-                .map_err(|err| ToolError::Execution(format!("cannot read \"{display}\": {err}")))?;
+            let bytes =
+                tokio::task::spawn_blocking(move || read_capped(&path, READ_FILE_HEAD_BYTES))
+                    .await
+                    .map_err(|err| ToolError::Execution(format!("read task failed: {err}")))?
+                    .map_err(|err| {
+                        ToolError::Execution(format!("cannot read \"{display}\": {err}"))
+                    })?;
             // A miss is an answer, not a fault: the caller asked for the
             // file, and "there is no such file" is the honest result (§13).
-            let Some(bytes) = bytes else {
+            let Some((bytes, total)) = bytes else {
                 return Ok(ToolOutput::new(format!(
                     "file \"{display}\" does not exist"
                 )));
             };
 
-            let truncated = bytes.len() > MAX_TOOL_OUTPUT_BYTES;
+            let truncated = total > READ_FILE_HEAD_BYTES as u64;
             let content =
-                crate::text::decode_capped(bytes, MAX_TOOL_OUTPUT_BYTES).ok_or_else(|| {
+                crate::text::decode_capped(bytes, READ_FILE_HEAD_BYTES).ok_or_else(|| {
                     ToolError::Execution(format!("cannot read \"{display}\": not valid UTF-8"))
                 })?;
+            let content = if truncated {
+                // Omitted counts are explicit (ADR-014): the model must not
+                // reason over a partial file as if it were whole.
+                format!(
+                    "{content}\n{}",
+                    budget::omitted(total - content.len() as u64)
+                )
+            } else {
+                content
+            };
             let mut output = ToolOutput::new(content);
             if truncated {
                 output = output.with_truncated();
@@ -86,11 +99,12 @@ impl Tool for ReadFileTool {
     }
 }
 
-/// Reads at most `MAX + 1` bytes (the extra byte only signals
-/// truncation). Metadata is checked first so a FIFO or socket with no
-/// writer cannot pin a blocking-pool thread indefinitely. A missing path
-/// yields `Ok(None)`: "there is no such file" is an answer, not a fault.
-fn read_capped(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+/// Reads at most `cap + 1` bytes, returning them with the file's true size (the
+/// extra byte only signals truncation; the size gives the exact omitted count).
+/// Metadata is checked first so a FIFO or socket with no writer cannot pin a
+/// blocking-pool thread indefinitely. A missing path yields `Ok(None)`: "there
+/// is no such file" is an answer, not a fault.
+fn read_capped(path: &Path, cap: usize) -> std::io::Result<Option<(Vec<u8>, u64)>> {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -101,9 +115,8 @@ fn read_capped(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
     }
     let file = std::fs::File::open(path)?;
     let mut bytes = Vec::new();
-    file.take((MAX_TOOL_OUTPUT_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)?;
-    Ok(Some(bytes))
+    file.take((cap + 1) as u64).read_to_end(&mut bytes)?;
+    Ok(Some((bytes, metadata.len())))
 }
 
 #[cfg(test)]
@@ -167,13 +180,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_file_truncates() {
+    async fn oversized_file_truncates_with_an_explicit_marker() {
         let (guard, root) = temp_root();
         // 3-byte chars so the cut lands mid-char and must back off.
         std::fs::write(guard.path().join("big"), "✀".repeat(22_000)).expect("write");
         let output = read(&root, json!({"path": "big"})).await.expect("ok");
         assert!(output.truncated);
-        assert_eq!(output.content.len(), MAX_TOOL_OUTPUT_BYTES - 1);
+        assert!(output.content.starts_with('✀'));
+        let marker = output.content.find("\n... [").expect("omission marker");
+        assert!(marker <= READ_FILE_HEAD_BYTES);
+        assert!(
+            output
+                .content
+                .contains(&format!("[{} bytes omitted]", 66_000 - marker)),
+            "exact omitted count: {}",
+            &output.content[marker..]
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_ascii_file_reports_the_exact_omitted_count() {
+        let (guard, root) = temp_root();
+        std::fs::write(guard.path().join("big"), "a".repeat(40_000)).expect("write");
+        let output = read(&root, json!({"path": "big"})).await.expect("ok");
+        assert!(output.truncated);
+        assert_eq!(
+            output.content,
+            format!("{}\n... [7232 bytes omitted]", "a".repeat(32_768))
+        );
     }
 
     #[tokio::test]

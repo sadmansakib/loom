@@ -32,13 +32,15 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 
+use crate::budget;
+
 /// Programs Iteration 1 will execute. Anything else is rejected as
 /// invalid input before a process is created.
 const DEFAULT_ALLOWED: &[&str] = &["cargo"];
 
 /// Per-stream byte budget buffered before the remainder is discarded, so a
-/// chatty program cannot exhaust memory. `render` still enforces the
-/// combined [`MAX_TOOL_OUTPUT_BYTES`] cap on the model-visible text.
+/// chatty program cannot exhaust memory. `render` still enforces the combined
+/// head+tail budget (ADR-014) on the model-visible text.
 const STREAM_BUFFER_BYTES: usize = MAX_TOOL_OUTPUT_BYTES;
 
 /// Runs an allow-listed program in the workspace root and returns its
@@ -226,16 +228,18 @@ fn render(program: &str, args: &[String], output: &std::process::Output) -> Tool
         text.push_str("\n--- stderr ---\n");
         text.push_str(&String::from_utf8_lossy(&output.stderr));
     }
-    let rendered = if text.len() <= MAX_TOOL_OUTPUT_BYTES {
-        ToolOutput::new(text)
-    } else {
-        let mut cut = MAX_TOOL_OUTPUT_BYTES;
-        while !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        text.truncate(cut);
-        text.push_str("\n...[output truncated]");
+    // Errors live at the tail, so keep both ends (ADR-014). The status line and
+    // early output survive at the head; the last lines of stderr survive at the
+    // tail; the explicit marker names what was dropped.
+    let (text, cut) = budget::head_tail(
+        &text,
+        budget::COMMAND_HEAD_BYTES,
+        budget::COMMAND_TAIL_BYTES,
+    );
+    let rendered = if cut {
         ToolOutput::new(text).with_truncated()
+    } else {
+        ToolOutput::new(text)
     };
     rendered.with_effects(effects)
 }
@@ -365,9 +369,13 @@ mod tests {
         .await
         .expect("ok");
         assert!(output.truncated, "large output should be flagged truncated");
-        assert!(output.content.ends_with("...[output truncated]"));
         assert!(
-            output.content.len() <= MAX_TOOL_OUTPUT_BYTES + 64,
+            output.content.contains("bytes omitted"),
+            "the cut must be explicit: {}",
+            &output.content[..output.content.len().min(200)]
+        );
+        assert!(
+            output.content.len() <= budget::COMMAND_HEAD_BYTES + budget::COMMAND_TAIL_BYTES + 64,
             "content length {} exceeded the bound",
             output.content.len()
         );
@@ -379,17 +387,28 @@ mod tests {
     }
 
     #[test]
-    fn render_truncates_large_output() {
-        let big = vec![b'x'; MAX_TOOL_OUTPUT_BYTES + 32];
+    fn render_truncates_large_output_keeping_both_ends() {
+        let mut stdout = vec![b'x'; MAX_TOOL_OUTPUT_BYTES + 32];
+        stdout.extend_from_slice(b"\nLAST LINE: failure at the tail");
         let output = Output {
             status: ExitStatus::from_raw(0),
-            stdout: big,
+            stdout,
             stderr: Vec::new(),
         };
         let rendered = render("echo", &[], &output);
         assert!(rendered.truncated);
-        assert!(rendered.content.ends_with("...[output truncated]"));
-        assert!(rendered.content.len() <= MAX_TOOL_OUTPUT_BYTES + 32);
+        assert!(
+            rendered.content.contains("bytes omitted"),
+            "the cut must be explicit"
+        );
+        assert!(
+            rendered.content.ends_with("LAST LINE: failure at the tail"),
+            "the tail must survive: {}",
+            &rendered.content[rendered.content.len().saturating_sub(120)..]
+        );
+        assert!(
+            rendered.content.len() <= budget::COMMAND_HEAD_BYTES + budget::COMMAND_TAIL_BYTES + 64
+        );
     }
 
     #[test]
