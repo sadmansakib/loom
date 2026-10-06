@@ -1,0 +1,20 @@
+[package]
+name = "loom-store"
+description = "Durable state substrate: the SQLite implementations of the kernel's session and artifact stores."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+loom-kernel = { workspace = true }
+# `bundled` ships SQLite with FTS5/JSON1 so behaviour does not depend on the
+# system library (ADR-008).
+rusqlite = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

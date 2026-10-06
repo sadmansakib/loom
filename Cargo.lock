@@ -1421,6 +1421,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-store"
+version = "0.1.0"
+dependencies = [
+ "loom-kernel",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "loom-tools"
 version = "0.1.0"
 dependencies = [

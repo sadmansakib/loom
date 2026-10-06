@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/loom-kernel",
+    "crates/loom-store",
     "crates/loom-providers",
     "crates/loom-tools",
     "crates/loom-engine",
@@ -19,6 +20,7 @@ rust-version = "1.88"
 [workspace.dependencies]
 # internal crates
 loom-kernel = { path = "crates/loom-kernel" }
+loom-store = { path = "crates/loom-store" }
 loom-providers = { path = "crates/loom-providers" }
 loom-tools = { path = "crates/loom-tools" }
 loom-engine = { path = "crates/loom-engine" }
