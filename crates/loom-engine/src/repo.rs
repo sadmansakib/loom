@@ -228,7 +228,10 @@ fn run_git(root: &Path, args: &[&str]) -> Option<String> {
 /// Extracts changed paths from `git status --porcelain` output.
 ///
 /// Handles the rename form (`R  old -> new`), taking the destination, and
-/// sorts/dedupes for determinism.
+/// sorts/dedupes for determinism. Paths that git quotes (they contain `"`,
+/// `\`, or control bytes — `core.quotepath=false` only stops *non-ASCII*
+/// being quoted) are C-unquoted, so quoted and unquoted spellings of the
+/// same path land on one entry.
 fn parse_porcelain(output: &str) -> Vec<String> {
     let mut paths: Vec<String> = output
         .lines()
@@ -236,13 +239,58 @@ fn parse_porcelain(output: &str) -> Vec<String> {
             // `XY <path>`: the status is two fixed columns then a space.
             let rest = line.get(3..)?;
             let path = rest.rsplit(" -> ").next().unwrap_or(rest);
-            let path = path.trim().trim_matches('"');
-            (!path.is_empty()).then(|| path.to_owned())
+            let path = unquote_git_path(path.trim());
+            (!path.is_empty()).then_some(path)
         })
         .collect();
     paths.sort();
     paths.dedup();
     paths
+}
+
+/// Decodes one git-quoted path: `"…"` with C escapes (`\t`, `\n`, `\r`,
+/// `\"`, `\\`, `\NNN` octal naming raw bytes). Unquoted input passes through
+/// unchanged. Octal escapes are bytes, not code points, so the result is
+/// re-decoded as UTF-8; invalid sequences (from raw non-UTF-8 paths)
+/// degrade via lossy conversion rather than a wrong path.
+fn unquote_git_path(path: &str) -> String {
+    let Some(inner) = path.strip_prefix('"').and_then(|p| p.strip_suffix('"')) else {
+        return path.to_owned();
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    let mut buf = [0_u8; 4];
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push(b'\n'),
+            Some('t') => out.push(b'\t'),
+            Some('r') => out.push(b'\r'),
+            Some('a') => out.push(0x07),
+            Some('b') => out.push(0x08),
+            Some('f') => out.push(0x0c),
+            Some('v') => out.push(0x0b),
+            Some('"') => out.push(b'"'),
+            Some('\\') => out.push(b'\\'),
+            Some(first @ '0'..='7') => {
+                // Exactly three octal digits name one raw byte.
+                let mut value = first.to_digit(8).unwrap_or(0);
+                for _ in 0..2 {
+                    match chars.next().and_then(|d| d.to_digit(8)) {
+                        Some(digit) => value = value * 8 + digit,
+                        None => break,
+                    }
+                }
+                out.push(value as u8);
+            }
+            Some(other) => out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes()),
+            None => out.push(b'\\'),
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -331,6 +379,27 @@ mod tests {
             parse_porcelain(out),
             vec!["a.txt".to_owned(), "b.txt".to_owned(), "new.txt".to_owned()]
         );
+    }
+
+    #[test]
+    fn porcelain_unquotes_escaped_paths() {
+        // git quotes paths containing `"`, `\`, or control bytes even with
+        // core.quotepath=false; octal escapes appear for raw bytes.
+        let out = "?? \"a\\tb.txt\"\n M \"quote\\\"d.txt\"\n?? \"caf\\303\\251.txt\"\n";
+        assert_eq!(
+            parse_porcelain(out),
+            vec![
+                "a\tb.txt".to_owned(),
+                "café.txt".to_owned(),
+                "quote\"d.txt".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn porcelain_unquotes_rename_destination() {
+        let out = "R  \"old\\tname.txt\" -> \"new\\tname.txt\"\n";
+        assert_eq!(parse_porcelain(out), vec!["new\tname.txt".to_owned()]);
     }
 
     #[test]
