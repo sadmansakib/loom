@@ -1,6 +1,6 @@
 [package]
 name = "loom-tools"
-description = "Built-in deterministic tools for Loom: read_file, list_dir, search."
+description = "Built-in deterministic tools for Loom: read_file, list_dir, search, write_file, edit_file, run_command."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,8 +15,9 @@ tracing = { workspace = true }
 # gitignore-aware directory walk (search) and line matching
 ignore = { workspace = true }
 regex = { workspace = true }
-# spawn_blocking wraps the blocking std::fs work (architecture.md §12)
-tokio = { workspace = true, features = ["rt"] }
+# spawn_blocking wraps the blocking std::fs work; `process` backs
+# run_command (architecture.md §9/§12)
+tokio = { workspace = true, features = ["rt", "process"] }
 # CancellationToken in the search walk (per-file cancellation check)
 tokio-util = { workspace = true }
 

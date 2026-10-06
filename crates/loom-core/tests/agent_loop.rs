@@ -33,7 +33,7 @@ use loom_core::model::{
 use loom_core::session::{Session, TaskStatus};
 use loom_core::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolSpec};
 use loom_core::transcript::{
-    AssistantMessage, Item, ToolArguments, ToolCall, ToolCallId, ToolStatus,
+    AssistantMessage, Item, ToolArguments, ToolCall, ToolCallId, ToolFailure, ToolStatus,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -183,6 +183,35 @@ impl Tool for BlockingTool {
             // `Cancelled { started: true }`.
             std::future::pending::<()>().await;
             Ok(ToolOutput::new("cancelled"))
+        })
+    }
+}
+
+/// A mutating tool that always fails and counts how many times it was
+/// actually invoked — lets a test prove that a refused repeat never ran.
+struct FailingTool {
+    spec: ToolSpec,
+    invocations: Arc<Mutex<u32>>,
+}
+
+impl Tool for FailingTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    fn call<'a>(
+        &'a self,
+        _input: Value,
+        _ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
+        let invocations = Arc::clone(&self.invocations);
+        Box::pin(async move {
+            *invocations.lock().unwrap() += 1;
+            Err(ToolError::Execution("boom".to_owned()))
         })
     }
 }
@@ -944,4 +973,177 @@ async fn event_sequence_is_monotonic() {
         envelopes.last().unwrap().kind,
         EventKind::TaskCompleted
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Tool-failure policy: the loop refuses blind repetition
+// ---------------------------------------------------------------------------
+
+/// A registry with a failing tool (`boom`) and a succeeding echo, plus the
+/// failing tool's invocation counter. `boom` is mutating so batches run
+/// sequentially in call order.
+fn registry_for_repeat() -> (ToolRegistry, Arc<Mutex<u32>>) {
+    let mut registry = ToolRegistry::new();
+    let invocations = Arc::new(Mutex::new(0_u32));
+    registry
+        .register(Box::new(FailingTool {
+            spec: spec("boom"),
+            invocations: Arc::clone(&invocations),
+        }))
+        .unwrap();
+    registry
+        .register(Box::new(FakeTool {
+            spec: spec("echo"),
+            read_only: true,
+        }))
+        .unwrap();
+    (registry, invocations)
+}
+
+/// A failed call repeated unchanged in a later turn is refused by the loop
+/// with `ToolFailure::RepeatedCall` and never reaches the tool again.
+#[tokio::test]
+async fn repeated_failed_call_is_refused_and_not_rereun() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            completed(
+                assistant(
+                    "",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_1", "boom", json!({ "q": 1 }))],
+                ),
+                usage(5, 1, None),
+            ),
+            completed(
+                assistant(
+                    "",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_2", "boom", json!({ "q": 1 }))],
+                ),
+                usage(5, 1, None),
+            ),
+            completed(
+                assistant("done", StopReason::EndTurn, Vec::new()),
+                usage(5, 1, None),
+            ),
+        ],
+    );
+    let (registry, invocations) = registry_for_repeat();
+    let mut session = Session::new(SessionId::new());
+    let (sink, _receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = agent(provider, registry, 10);
+
+    let summary = agent
+        .run_task(&mut session, "run it twice", &sink, &token)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.successful_tool_calls, 0);
+    assert_eq!(summary.failed_tool_calls, 2);
+    // The tool ran exactly once: the second call was refused, not re-run.
+    assert_eq!(*invocations.lock().unwrap(), 1);
+
+    // user, assistant, result(boom: execution), assistant, result(boom: repeated), assistant
+    assert_eq!(session.transcript.len(), 6);
+    let Item::ToolResult(first) = &session.transcript[2] else {
+        panic!("expected the first boom result");
+    };
+    assert!(matches!(
+        &first.status,
+        ToolStatus::Error(ToolFailure::Execution)
+    ));
+    assert!(first.content.contains("error: execution failed: boom"));
+    assert!(
+        first.content.contains("Hint:"),
+        "a real failure carries a forward hint"
+    );
+
+    let Item::ToolResult(second) = &session.transcript[4] else {
+        panic!("expected the repeated boom result");
+    };
+    assert!(matches!(
+        &second.status,
+        ToolStatus::Error(ToolFailure::RepeatedCall)
+    ));
+    assert!(
+        second
+            .content
+            .contains("repeating it unchanged is not permitted")
+    );
+    assert!(
+        !second.content.contains("Hint:"),
+        "the refusal is self-describing; it does not stack another hint"
+    );
+}
+
+/// Progress re-legitimises a previously failed call: once any tool call in a
+/// later turn succeeds, the ledger clears, so an identical call is allowed to
+/// run again (and genuinely re-executes).
+#[tokio::test]
+async fn a_successful_call_clears_the_failure_ledger() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            completed(
+                assistant(
+                    "",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_1", "boom", json!({ "q": 1 }))],
+                ),
+                usage(5, 1, None),
+            ),
+            completed(
+                assistant(
+                    "",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_2", "echo", json!({ "q": "x" }))],
+                ),
+                usage(5, 1, None),
+            ),
+            completed(
+                assistant(
+                    "",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_3", "boom", json!({ "q": 1 }))],
+                ),
+                usage(5, 1, None),
+            ),
+            completed(
+                assistant("done", StopReason::EndTurn, Vec::new()),
+                usage(5, 1, None),
+            ),
+        ],
+    );
+    let (registry, invocations) = registry_for_repeat();
+    let mut session = Session::new(SessionId::new());
+    let (sink, _receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = agent(provider, registry, 10);
+
+    let summary = agent
+        .run_task(&mut session, "fail, succeed, fail again", &sink, &token)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.successful_tool_calls, 1);
+    assert_eq!(summary.failed_tool_calls, 2);
+    // boom ran twice: the echo success cleared the ledger between them.
+    assert_eq!(*invocations.lock().unwrap(), 2);
+
+    // user, a, r(boom), a, r(echo), a, r(boom), a
+    assert_eq!(session.transcript.len(), 8);
+    let Item::ToolResult(second) = &session.transcript[4] else {
+        panic!("expected the echo result");
+    };
+    assert_eq!(second.status, ToolStatus::Success);
+
+    let Item::ToolResult(third) = &session.transcript[6] else {
+        panic!("expected the second boom result");
+    };
+    assert!(
+        matches!(&third.status, ToolStatus::Error(ToolFailure::Execution)),
+        "the third call re-ran instead of being refused"
+    );
 }

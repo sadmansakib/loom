@@ -13,6 +13,7 @@
 //! imports a concrete provider or tool (ADR-001): both arrive as
 //! trait objects and a registry.
 
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
@@ -29,7 +30,7 @@ use crate::model::{
 };
 use crate::session::{Session, TaskRecord, TerminalTaskStatus};
 use crate::tool::{ToolContext, ToolRegistry};
-use crate::transcript::{AssistantMessage, Item, ToolCall, ToolResult, ToolStatus};
+use crate::transcript::{AssistantMessage, Item, ToolCall, ToolFailure, ToolResult, ToolStatus};
 
 pub mod retry;
 pub mod tools;
@@ -360,6 +361,12 @@ impl Agent {
             self.reserved_output_tokens,
         )?;
 
+        // Loop-owned reaction to tool failures (§13): the loop, not the
+        // model, decides whether a failed attempt may be repeated. An
+        // identical call is refused until some tool call succeeds, so a
+        // failure forces a change of approach instead of trial and error.
+        let mut failures = FailureLedger::default();
+
         for turn in 1..=self.max_turns {
             sink.emit(task_id, EventKind::TurnStarted { turn });
 
@@ -420,6 +427,7 @@ impl Agent {
                             sink,
                             cancellation,
                             accounting,
+                            &mut failures,
                         )
                         .await;
                     // A batch interrupted by cancellation still commits its
@@ -591,6 +599,13 @@ impl Agent {
     /// per-call events are emitted in call order (all starts before the
     /// batch, completes after), which is exact for the sequential path and
     /// an Iteration 1 approximation under read-only concurrency.
+    ///
+    /// The loop — not the model — owns the reaction to a failure (§13):
+    /// `failures` refuses an exact repeat of a call that already failed
+    /// (returning [`ToolFailure::RepeatedCall`] without invoking the tool)
+    /// until some call succeeds, and every failure the model sees carries a
+    /// deterministic next-step hint.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_batch(
         &self,
         calls: &[ToolCall],
@@ -599,6 +614,7 @@ impl Agent {
         sink: &dyn EventSink,
         cancellation: &CancellationToken,
         accounting: &mut Accounting,
+        failures: &mut FailureLedger,
     ) -> Vec<ToolResult> {
         let exposure = ToolExposure::from_names(request.tools.iter().map(|spec| spec.name.clone()));
         for call in calls {
@@ -611,6 +627,18 @@ impl Agent {
             );
         }
 
+        // Partition into calls the loop refuses (an exact repeat of a
+        // failure with no success since) and calls that may run. A refused
+        // call never reaches the tool engine, so it starts nothing.
+        let mut runnable: Vec<ToolCall> = Vec::new();
+        let mut runnable_indices: Vec<usize> = Vec::new();
+        for (index, call) in calls.iter().enumerate() {
+            if !failures.refuses(call) {
+                runnable_indices.push(index);
+                runnable.push(call.clone());
+            }
+        }
+
         let context = ToolContext::new(
             self.config.workspace_root.clone(),
             cancellation.clone(),
@@ -618,12 +646,35 @@ impl Agent {
         );
         let batch = ToolBatch::new(&self.registry, &exposure)
             .with_max_concurrency(self.max_tool_concurrency);
-        let results = batch.execute(calls, &context).await;
+        let ran = batch.execute(&runnable, &context).await;
 
-        for (call, result) in calls.iter().zip(results.iter()) {
+        // Refused calls were never handed to the engine; reconstruct every
+        // result in call order from the executed set plus refusal fillers.
+        let mut executed: HashMap<usize, ToolResult> =
+            runnable_indices.iter().copied().zip(ran).collect();
+        let mut results: Vec<ToolResult> = calls
+            .iter()
+            .enumerate()
+            .map(|(index, call)| {
+                executed
+                    .remove(&index)
+                    .unwrap_or_else(|| repeated_call_result(call))
+            })
+            .collect();
+
+        for (call, result) in calls.iter().zip(results.iter_mut()) {
             match result.status {
-                ToolStatus::Success => accounting.successful_tool_calls += 1,
-                ToolStatus::Error(_) => accounting.failed_tool_calls += 1,
+                ToolStatus::Success => {
+                    accounting.successful_tool_calls += 1;
+                    // Progress: a previously failed call is a legitimate
+                    // retry again once the workspace may have changed.
+                    failures.clear();
+                }
+                ToolStatus::Error(kind) => {
+                    accounting.failed_tool_calls += 1;
+                    failures.record(call);
+                    append_failure_hint(&mut result.content, kind);
+                }
                 // A cancelled call is neither a success nor a failure of the
                 // tool; the task outcome records the cancellation.
                 ToolStatus::Cancelled { .. } => {}
@@ -652,6 +703,82 @@ impl Agent {
             .map_err(|error| TaskError::Internal(error.to_string()))?;
         Ok(())
     }
+}
+
+/// Tracks the calls that failed during one task so the loop can refuse an
+/// exact repeat (§13). Cleared whenever any tool call succeeds, because a
+/// new success means the workspace may have changed and a previously failing
+/// call may now be legitimate (e.g. write a file, then edit it).
+#[derive(Default)]
+struct FailureLedger {
+    failed: HashSet<(String, String)>,
+}
+
+impl FailureLedger {
+    /// Whether `call` exactly repeats a recorded failure with no success since.
+    fn refuses(&self, call: &ToolCall) -> bool {
+        self.failed.contains(&ledger_key(call))
+    }
+
+    /// Records a failed call.
+    fn record(&mut self, call: &ToolCall) {
+        self.failed.insert(ledger_key(call));
+    }
+
+    /// Forgets every failure: some tool call has succeeded since.
+    fn clear(&mut self) {
+        self.failed.clear();
+    }
+}
+
+/// Identity of a call for the failure ledger: tool name plus canonical
+/// argument JSON. `Value` object keys are ordered, so equality is
+/// deterministic.
+fn ledger_key(call: &ToolCall) -> (String, String) {
+    (
+        call.name.clone(),
+        serde_json::to_string(&*call.arguments).unwrap_or_default(),
+    )
+}
+
+/// The loop's refusal result for a repeated failed call: the tool never runs,
+/// so no side effect occurs, and the model is told to change approach.
+fn repeated_call_result(call: &ToolCall) -> ToolResult {
+    ToolResult {
+        call_id: call.id.clone(),
+        status: ToolStatus::Error(ToolFailure::RepeatedCall),
+        content: format!(
+            "error: you already called \"{}\" with these exact arguments and it failed; \
+             repeating it unchanged is not permitted. Reassess before calling again: read \
+             the failure above, change the arguments, or use a different tool.",
+            call.name
+        ),
+        truncated: false,
+    }
+}
+
+/// Appends a deterministic next-step hint to a failure the model will see.
+/// The engine (`execute_call`) is untouched, so its content contract is
+/// unchanged; the loop layers guidance on top.
+fn append_failure_hint(content: &mut String, kind: ToolFailure) {
+    let hint = match kind {
+        ToolFailure::InvalidInput => {
+            "Hint: correct the arguments described above before calling again."
+        }
+        ToolFailure::Execution => {
+            "Hint: inspect the error above and change your approach; the same call will be refused."
+        }
+        ToolFailure::Timeout => {
+            "Hint: the call timed out; narrow the operation or change approach."
+        }
+        ToolFailure::UnknownTool | ToolFailure::NotExposed => {
+            "Hint: call one of the available tools listed above."
+        }
+        // The refusal result already explains itself.
+        ToolFailure::RepeatedCall => return,
+    };
+    content.push('\n');
+    content.push_str(hint);
 }
 
 /// How one model attempt ended.

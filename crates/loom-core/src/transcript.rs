@@ -373,6 +373,11 @@ pub enum ToolFailure {
     Execution,
     /// The agent stopped waiting; blocking work may still continue.
     Timeout,
+    /// The loop refused to re-run an identical call that already failed,
+    /// because no tool call has succeeded since (§13). Repeating a failed
+    /// attempt unchanged is not permitted; the model must change its
+    /// approach. The call never started, so no side effects occurred.
+    RepeatedCall,
 }
 
 #[cfg(test)]

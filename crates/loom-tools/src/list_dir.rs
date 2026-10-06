@@ -55,21 +55,50 @@ impl Tool for ListDirTool {
                 .map_err(|err| ToolError::InvalidInput(format!("invalid arguments: {err}")))?;
             let path = resolve_within(&ctx.workspace_root, &input.path)?;
             let display = input.path;
-            let entries = tokio::task::spawn_blocking(move || list_entries(&path))
+            let outcome = tokio::task::spawn_blocking(move || list_entries(&path))
                 .await
                 .map_err(|err| ToolError::Execution(format!("list task failed: {err}")))?
                 .map_err(|err| ToolError::Execution(format!("cannot list \"{display}\": {err}")))?;
-            Ok(ToolOutput {
-                content: entries.join("\n"),
-                truncated: false,
+            // A miss is an answer, not a fault: the caller asked what is
+            // there, and "nothing" is the honest result (§13).
+            Ok(match outcome {
+                ListOutcome::Entries(entries) => ToolOutput {
+                    content: entries.join("\n"),
+                    truncated: false,
+                },
+                ListOutcome::Missing => {
+                    ToolOutput::new(format!("path \"{display}\" does not exist"))
+                }
+                ListOutcome::NotADirectory => {
+                    ToolOutput::new(format!("path \"{display}\" is not a directory"))
+                }
             })
         })
     }
 }
 
+/// What a listing found: real entries, nothing at the path, or a path that is
+/// not a directory. The last two are answers the model can act on, not faults.
+enum ListOutcome {
+    Entries(Vec<String>),
+    Missing,
+    NotADirectory,
+}
+
 /// Collects and sorts one directory level; `/` for directories.
-/// Sorting is by byte value, so the result is deterministic.
-fn list_entries(path: &std::path::Path) -> Result<Vec<String>, String> {
+/// Sorting is by byte value, so the result is deterministic. A missing path
+/// or a non-directory is reported as such rather than raised as an error.
+fn list_entries(path: &std::path::Path) -> Result<ListOutcome, String> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ListOutcome::Missing);
+        }
+        Err(err) => return Err(err.to_string()),
+    };
+    if !metadata.is_dir() {
+        return Ok(ListOutcome::NotADirectory);
+    }
     let dir = std::fs::read_dir(path).map_err(|err| err.to_string())?;
     let mut entries = Vec::new();
     for entry in dir {
@@ -81,7 +110,7 @@ fn list_entries(path: &std::path::Path) -> Result<Vec<String>, String> {
         entries.push(if is_dir { format!("{name}/") } else { name });
     }
     entries.sort();
-    Ok(entries)
+    Ok(ListOutcome::Entries(entries))
 }
 
 #[cfg(test)]
@@ -123,22 +152,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_dir_is_execution_error() {
+    async fn missing_dir_is_informational() {
         let (_guard, root) = temp_root();
-        let err = list(&root, json!({"path": "nope"}))
-            .await
-            .expect_err("missing");
-        assert!(matches!(err, ToolError::Execution(msg) if msg.contains("nope")));
+        let output = list(&root, json!({"path": "nope"})).await.expect("ok");
+        assert_eq!(output.content, "path \"nope\" does not exist");
+        assert!(!output.truncated);
     }
 
     #[tokio::test]
-    async fn file_argument_is_execution_error() {
+    async fn file_argument_is_informational() {
         let (guard, root) = temp_root();
         std::fs::write(guard.path().join("f.txt"), b"x").expect("write");
-        let err = list(&root, json!({"path": "f.txt"}))
-            .await
-            .expect_err("not a dir");
-        assert!(matches!(err, ToolError::Execution(msg) if msg.contains("f.txt")));
+        let output = list(&root, json!({"path": "f.txt"})).await.expect("ok");
+        assert_eq!(output.content, "path \"f.txt\" is not a directory");
+        assert!(!output.truncated);
     }
 
     #[tokio::test]

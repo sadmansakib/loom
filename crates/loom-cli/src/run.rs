@@ -19,7 +19,9 @@ use loom_core::model::ModelProvider;
 use loom_core::session::Session;
 use loom_core::tool::ToolRegistry;
 use loom_providers::{DeepSeekConfig, DeepSeekProvider};
-use loom_tools::{ListDirTool, ReadFileTool, SearchTool};
+use loom_tools::{
+    EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool, WriteFileTool,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::args::RunArgs;
@@ -89,7 +91,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         );
     }
 
-    // Built-in read-only tools (§9). Registration order is the exposure order.
+    // Built-in tools (§9). Registration order is the exposure order: the
+    // read-only tools first, so the prompt prefix stays stable.
     let mut registry = ToolRegistry::new();
     registry
         .register(Box::new(ReadFileTool))
@@ -100,6 +103,15 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     registry
         .register(Box::new(SearchTool))
         .context("registering search")?;
+    registry
+        .register(Box::new(WriteFileTool))
+        .context("registering write_file")?;
+    registry
+        .register(Box::new(EditFileTool))
+        .context("registering edit_file")?;
+    registry
+        .register(Box::new(RunCommandTool::new()))
+        .context("registering run_command")?;
 
     let system_prompt = args.system_prompt.unwrap_or_else(default_system_prompt);
     let agent = Agent::new(
@@ -181,9 +193,10 @@ fn save_session(session: &Session, no_save: bool) -> anyhow::Result<Option<PathB
 /// The built-in instruction; overridable with `--system-prompt`.
 fn default_system_prompt() -> String {
     String::from(
-        "You are Loom, a minimal coding agent working read-only inside one workspace. \
-         Use the provided tools to inspect the workspace: list directories and search \
-         before reading large files, and prefer reading the smallest relevant range. \
-         When you answer, be concise and name the workspace-relative paths you relied on.",
+        "You are Loom, a coding agent working inside one workspace. Use the provided \
+         tools to inspect and change the workspace: list and search before reading, \
+         read before editing, write or edit files to make changes, and run allow-listed \
+         commands (cargo) to verify. Prefer the smallest change that works. When you \
+         answer, be concise and name the workspace-relative paths you relied on.",
     )
 }

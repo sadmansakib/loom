@@ -64,6 +64,13 @@ impl Tool for ReadFileTool {
                 .await
                 .map_err(|err| ToolError::Execution(format!("read task failed: {err}")))?
                 .map_err(|err| ToolError::Execution(format!("cannot read \"{display}\": {err}")))?;
+            // A miss is an answer, not a fault: the caller asked for the
+            // file, and "there is no such file" is the honest result (§13).
+            let Some(bytes) = bytes else {
+                return Ok(ToolOutput::new(format!(
+                    "file \"{display}\" does not exist"
+                )));
+            };
 
             let truncated = bytes.len() > MAX_TOOL_OUTPUT_BYTES;
             let content =
@@ -77,16 +84,22 @@ impl Tool for ReadFileTool {
 
 /// Reads at most `MAX + 1` bytes (the extra byte only signals
 /// truncation). Metadata is checked first so a FIFO or socket with no
-/// writer cannot pin a blocking-pool thread indefinitely.
-fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
-    if !std::fs::metadata(path)?.is_file() {
+/// writer cannot pin a blocking-pool thread indefinitely. A missing path
+/// yields `Ok(None)`: "there is no such file" is an answer, not a fault.
+fn read_capped(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if !metadata.is_file() {
         return Err(std::io::Error::other("not a regular file"));
     }
     let file = std::fs::File::open(path)?;
     let mut bytes = Vec::new();
     file.take((MAX_TOOL_OUTPUT_BYTES + 1) as u64)
         .read_to_end(&mut bytes)?;
-    Ok(bytes)
+    Ok(Some(bytes))
 }
 
 #[cfg(test)]
@@ -125,12 +138,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_file_is_execution_error() {
+    async fn missing_file_is_informational() {
         let (_guard, root) = temp_root();
-        let err = read(&root, json!({"path": "gone.txt"}))
-            .await
-            .expect_err("missing");
-        assert!(matches!(err, ToolError::Execution(msg) if msg.contains("gone.txt")));
+        let output = read(&root, json!({"path": "gone.txt"})).await.expect("ok");
+        assert_eq!(output.content, "file \"gone.txt\" does not exist");
+        assert!(!output.truncated);
     }
 
     #[tokio::test]

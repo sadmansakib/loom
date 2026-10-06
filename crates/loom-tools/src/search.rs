@@ -110,9 +110,11 @@ impl Tool for SearchTool {
             };
             let display = input.path.unwrap_or_else(|| ".".to_owned());
             let scope = resolve_within(&ctx.workspace_root, &display)?;
+            // A miss is an answer, not a fault: the caller asked whether
+            // anything matches there, and there is nothing to search (§13).
             if !scope.exists() {
-                return Err(ToolError::Execution(format!(
-                    "cannot search \"{display}\": path does not exist"
+                return Ok(ToolOutput::new(format!(
+                    "path \"{display}\" does not exist"
                 )));
             }
             // Reported paths are relative to the workspace root (not the
@@ -484,12 +486,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_scope_is_execution_error() {
+    async fn missing_scope_is_informational() {
         let (_guard, root) = temp_root();
-        let err = search(&root, json!({"pattern": "x", "path": "nope"}))
+        let output = search(&root, json!({"pattern": "x", "path": "nope"}))
             .await
-            .expect_err("missing scope");
-        assert!(matches!(err, ToolError::Execution(msg) if msg.contains("nope")));
+            .expect("ok");
+        assert_eq!(output.content, "path \"nope\" does not exist");
+        assert!(!output.truncated);
     }
 
     #[tokio::test]

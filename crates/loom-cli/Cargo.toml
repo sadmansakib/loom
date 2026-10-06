@@ -32,6 +32,8 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# eval harness tests only (record/replay provider taps model streams)
+futures = { workspace = true }
 
 [lints]
 workspace = true
