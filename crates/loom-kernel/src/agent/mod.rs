@@ -736,6 +736,7 @@ impl Agent {
                             cancellation,
                             accounting,
                             &mut failures,
+                            &recent_changes(session),
                         )
                         .await;
                     // A batch interrupted by cancellation still commits its
@@ -926,6 +927,7 @@ impl Agent {
         cancellation: &CancellationToken,
         accounting: &mut Accounting,
         failures: &mut FailureLedger,
+        recent_changes: &[String],
     ) -> Vec<ToolResult> {
         let exposure = ToolExposure::from_names(request.tools.iter().map(|spec| spec.name.clone()));
 
@@ -958,7 +960,8 @@ impl Agent {
             cancellation.clone(),
             self.tool_timeout,
         )
-        .with_artifacts(self.artifacts.clone());
+        .with_artifacts(self.artifacts.clone())
+        .with_recent_changes(recent_changes.to_vec());
         let batch = ToolBatch::new(&self.registry, &exposure)
             .with_max_concurrency(self.max_tool_concurrency);
         let ran = batch.execute(&runnable, &context).await;
@@ -1086,6 +1089,38 @@ fn ledger_key(call: &ToolCall) -> (String, String) {
 
 /// The loop's refusal result for a repeated failed call: the tool never runs,
 /// so no side effect occurs, and the model is told to change approach.
+/// Workspace-relative paths the task has mutated so far (2F, ADR-017).
+///
+/// Derived from the recorded [`ToolEffects`](crate::tool::ToolEffects) on
+/// each committed tool result — never diffed and never model-declared — so
+/// verification links a failure to what the loop actually changed. Deduped
+/// oldest-first and capped, most recent retained.
+fn recent_changes(session: &Session) -> Vec<String> {
+    /// Keep the evidence block small; the most recent mutations matter most.
+    const MAX: usize = 32;
+    let mut seen = std::collections::HashSet::new();
+    let mut paths = Vec::new();
+    for item in &session.transcript {
+        let Item::ToolResult(result) = item else {
+            continue;
+        };
+        for path in result
+            .effects
+            .files_written
+            .iter()
+            .chain(result.effects.files_deleted.iter())
+        {
+            if seen.insert(path.clone()) {
+                paths.push(path.clone());
+            }
+        }
+    }
+    if paths.len() > MAX {
+        paths.drain(..paths.len() - MAX);
+    }
+    paths
+}
+
 fn repeated_call_result(call: &ToolCall) -> ToolResult {
     ToolResult::new(
         call.id.clone(),

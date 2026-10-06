@@ -114,6 +114,11 @@ pub struct ToolContext {
     /// decision 3). `None` when the run has no artifacts configured, in
     /// which case results are only bounded inline.
     pub artifacts: Option<Arc<dyn ArtifactStore>>,
+    /// Recently changed workspace-relative paths, oldest first (2F,
+    /// ADR-017). Derived from the turn's recorded [`ToolEffects`], not
+    /// from a model declaration, so verification can link a failure to a
+    /// recent change without a symbol graph. Empty for read-only runs.
+    pub recent_changes: Vec<String>,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -126,6 +131,7 @@ impl std::fmt::Debug for ToolContext {
             .field("cancellation", &self.cancellation)
             .field("timeout", &self.timeout)
             .field("artifacts", &self.artifacts.is_some())
+            .field("recent_changes", &self.recent_changes.len())
             .finish()
     }
 }
@@ -146,6 +152,7 @@ impl ToolContext {
             cancellation,
             timeout,
             artifacts: None,
+            recent_changes: Vec::new(),
         }
     }
 
@@ -154,6 +161,14 @@ impl ToolContext {
     #[must_use]
     pub fn with_artifacts(mut self, artifacts: Option<Arc<dyn ArtifactStore>>) -> Self {
         self.artifacts = artifacts;
+        self
+    }
+
+    /// Supplies the recent-change list verification links failures to
+    /// (builder style, 2F). Oldest first; the derive is workspace-relative.
+    #[must_use]
+    pub fn with_recent_changes(mut self, recent_changes: Vec<String>) -> Self {
+        self.recent_changes = recent_changes;
         self
     }
 }

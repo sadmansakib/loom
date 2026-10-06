@@ -70,7 +70,7 @@ use loom_core::kernel::tool::ToolRegistry;
 use loom_core::kernel::transcript::{AssistantMessage, Item, ToolArguments, ToolCall, ToolCallId};
 use loom_core::providers::{DeepSeekConfig, DeepSeekProvider, ReasoningEffort};
 use loom_core::tools::{
-    EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool, WriteFileTool,
+    EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool, VerifyTool, WriteFileTool,
 };
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -483,6 +483,7 @@ fn registry(task: &EvalTask) -> ToolRegistry {
         registry.register(Box::new(WriteFileTool)).unwrap();
         registry.register(Box::new(EditFileTool)).unwrap();
         registry.register(Box::new(RunCommandTool::new())).unwrap();
+        registry.register(Box::new(VerifyTool::new())).unwrap();
     }
     registry
 }

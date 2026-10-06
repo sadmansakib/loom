@@ -20,29 +20,21 @@
 //! sandboxing) is a later iteration's seam; this is the minimal safe
 //! shape that lets Loom verify its own edits today.
 
-use std::process::Stdio;
 use std::sync::OnceLock;
 
 use futures::future::BoxFuture;
-use loom_kernel::agent::tools::MAX_TOOL_OUTPUT_BYTES;
 use loom_kernel::tool::{
     CommandEffect, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::io::AsyncReadExt;
 
 use crate::budget;
 
 /// Programs Iteration 1 will execute. Anything else is rejected as
 /// invalid input before a process is created.
 const DEFAULT_ALLOWED: &[&str] = &["cargo"];
-
-/// Per-stream byte budget buffered before the remainder is discarded, so a
-/// chatty program cannot exhaust memory. `render` still enforces the combined
-/// head+tail budget (ADR-014) on the model-visible text.
-const STREAM_BUFFER_BYTES: usize = MAX_TOOL_OUTPUT_BYTES;
 
 /// Runs an allow-listed program in the workspace root and returns its
 /// combined output and exit status.
@@ -131,65 +123,10 @@ impl Tool for RunCommandTool {
                     self.allowed.join(", ")
                 )));
             }
-            let mut child = tokio::process::Command::new(&input.program)
-                .args(&input.args)
-                .current_dir(&ctx.workspace_root)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .map_err(|err| {
-                    ToolError::Execution(format!("cannot run \"{}\": {err}", input.program))
-                })?;
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| ToolError::Execution(String::from("cannot capture stdout pipe")))?;
-            let stderr = child
-                .stderr
-                .take()
-                .ok_or_else(|| ToolError::Execution(String::from("cannot capture stderr pipe")))?;
-            // Read both streams concurrently to EOF. Each buffer is capped and
-            // the remainder is discarded, so the child never blocks on a full
-            // pipe and memory stays bounded regardless of output size.
-            let (stdout, stderr) = futures::join!(read_capped(stdout), read_capped(stderr));
-            let stdout =
-                stdout.map_err(|err| ToolError::Execution(format!("cannot read output: {err}")))?;
-            let stderr =
-                stderr.map_err(|err| ToolError::Execution(format!("cannot read output: {err}")))?;
-            let status = child.wait().await.map_err(|err| {
-                ToolError::Execution(format!("cannot run \"{}\": {err}", input.program))
-            })?;
-            let output = std::process::Output {
-                status,
-                stdout,
-                stderr,
-            };
+            let output = crate::exec::run_bounded(&input.program, &input.args, ctx).await?;
             Ok(render(&input.program, &input.args, &output))
         })
     }
-}
-
-/// Reads a child stream to EOF, keeping at most [`STREAM_BUFFER_BYTES`] and
-/// discarding the rest so the child cannot block writing to a full pipe.
-async fn read_capped<R>(mut reader: R) -> std::io::Result<Vec<u8>>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut kept = Vec::new();
-    let mut chunk = [0_u8; 8192];
-    loop {
-        let read = reader.read(&mut chunk).await?;
-        if read == 0 {
-            break;
-        }
-        if kept.len() < STREAM_BUFFER_BYTES {
-            let room = STREAM_BUFFER_BYTES - kept.len();
-            kept.extend_from_slice(&chunk[..room.min(read)]);
-        }
-    }
-    Ok(kept)
 }
 
 /// Renders one completed process as model-visible text, recording the
@@ -244,6 +181,7 @@ fn status_line(status: std::process::ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use loom_kernel::agent::tools::MAX_TOOL_OUTPUT_BYTES;
     use loom_kernel::tool::Tool;
     use serde_json::json;
     use std::os::unix::process::ExitStatusExt;

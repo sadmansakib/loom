@@ -21,7 +21,7 @@ use loom_providers::{DeepSeekConfig, DeepSeekProvider, ReasoningEffort};
 use loom_store::SqliteStore;
 use loom_tools::{
     ArtifactReadTool, EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool,
-    WriteFileTool,
+    VerifyTool, WriteFileTool,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -232,6 +232,7 @@ fn build_registry() -> Result<ToolRegistry, EngineError> {
     register("write_file", Box::new(WriteFileTool))?;
     register("edit_file", Box::new(EditFileTool))?;
     register("run_command", Box::new(RunCommandTool::new()))?;
+    register("verify", Box::new(VerifyTool::new()))?;
     Ok(registry)
 }
 
@@ -240,8 +241,10 @@ fn default_system_prompt() -> String {
     String::from(
         "You are Loom, a coding agent working inside one workspace. Use the provided \
          tools to inspect and change the workspace: list and search before reading, \
-         read before editing, write or edit files to make changes, and run allow-listed \
-         commands (cargo) to verify. Prefer the smallest change that works. When you \
+         read before editing, write or edit files to make changes, and verify with \
+         the `verify` tool (it reports structured failure evidence). Run \
+         allow-listed commands (cargo) directly only when you need a raw command. \
+         Prefer the smallest change that works. When you \
          answer, be concise and name the workspace-relative paths you relied on.",
     )
 }
