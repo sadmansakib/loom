@@ -89,6 +89,18 @@ pub enum TaskError {
         /// The configured turn ceiling.
         max_turns: u32,
     },
+    /// The task's [`TaskBudget`] was exhausted: a token, tool-call, or
+    /// wall-time limit was reached.
+    ///
+    /// The budget is checked at the top of each turn, so the unit of work in
+    /// flight when the ceiling was crossed (one model response, or one tool
+    /// batch) still completed and stays committed.
+    #[error("task exceeded its {limit} budget")]
+    BudgetExhausted {
+        /// Which limit was reached: `input_tokens`, `output_tokens`,
+        /// `total_tokens`, `tool_calls`, or `wall_time`.
+        limit: &'static str,
+    },
     /// The task's cancellation token fired.
     #[error("task was cancelled")]
     Cancelled,
@@ -131,6 +143,7 @@ impl TaskError {
             TaskError::Protocol(_) => "protocol",
             TaskError::Internal(_) => "internal",
             TaskError::MaxTurns { .. } => "max_turns",
+            TaskError::BudgetExhausted { .. } => "budget_exhausted",
             TaskError::Cancelled => "user_cancelled",
             TaskError::UnrecoverableStop { stop_reason } => stop_reason,
             TaskError::Persistence(_) => "persistence",
@@ -163,6 +176,163 @@ pub struct TaskSummary {
     pub wall_time: Duration,
     /// Events the sink failed to deliver (best-effort observability, §11).
     pub events_dropped: u64,
+    /// Budget headroom left when the task ended. A field is `None` when that
+    /// resource was unbounded; it is `Some(0)` when the ceiling was reached.
+    pub remaining_budget: RemainingBudget,
+}
+
+/// A task's resource envelope (§14).
+///
+/// Every ceiling is optional: `None` means the resource is unbounded, which
+/// is the default. The loop checks the envelope once per turn, before
+/// compiling the next request, so a ceiling can be exceeded by at most the
+/// unit of work in flight when it was crossed — one model response, or one
+/// tool batch. A task that completes inside that turn still succeeds.
+///
+/// The turn ceiling is separate: it stays [`Agent::with_max_turns`], because
+/// it is a loop-shape knob rather than a cost bound.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TaskBudget {
+    /// Ceiling on prompt (input) tokens summed over the task.
+    pub max_input_tokens: Option<u64>,
+    /// Ceiling on generated (output) tokens summed over the task.
+    pub max_output_tokens: Option<u64>,
+    /// Ceiling on `input + output` tokens summed over the task.
+    pub max_total_tokens: Option<u64>,
+    /// Ceiling on tool calls the loop executes. Refused repeats of a failed
+    /// call do not run and do not count.
+    pub max_tool_calls: Option<u32>,
+    /// Ceiling on the task's wall-clock duration.
+    pub max_wall_time: Option<Duration>,
+}
+
+impl TaskBudget {
+    /// An envelope with no ceilings.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the input-token ceiling.
+    #[must_use]
+    pub fn with_max_input_tokens(mut self, max_input_tokens: u64) -> Self {
+        self.max_input_tokens = Some(max_input_tokens);
+        self
+    }
+
+    /// Sets the output-token ceiling.
+    #[must_use]
+    pub fn with_max_output_tokens(mut self, max_output_tokens: u64) -> Self {
+        self.max_output_tokens = Some(max_output_tokens);
+        self
+    }
+
+    /// Sets the total-token ceiling (`input + output`).
+    #[must_use]
+    pub fn with_max_total_tokens(mut self, max_total_tokens: u64) -> Self {
+        self.max_total_tokens = Some(max_total_tokens);
+        self
+    }
+
+    /// Sets the tool-call ceiling.
+    #[must_use]
+    pub fn with_max_tool_calls(mut self, max_tool_calls: u32) -> Self {
+        self.max_tool_calls = Some(max_tool_calls);
+        self
+    }
+
+    /// Sets the wall-clock ceiling.
+    #[must_use]
+    pub fn with_max_wall_time(mut self, max_wall_time: Duration) -> Self {
+        self.max_wall_time = Some(max_wall_time);
+        self
+    }
+
+    /// The name of the first exhausted limit, if any.
+    ///
+    /// Deterministic order so the reported [`TaskError::BudgetExhausted`] is
+    /// stable when several limits are reached at once: total tokens, then
+    /// input, then output, then tool calls, then wall time.
+    fn exhausted(&self, accounting: &Accounting, elapsed: Duration) -> Option<&'static str> {
+        let limits = [
+            (
+                self.max_total_tokens,
+                accounting
+                    .usage
+                    .input_tokens
+                    .saturating_add(accounting.usage.output_tokens),
+                "total_tokens",
+            ),
+            (
+                self.max_input_tokens,
+                accounting.usage.input_tokens,
+                "input_tokens",
+            ),
+            (
+                self.max_output_tokens,
+                accounting.usage.output_tokens,
+                "output_tokens",
+            ),
+            (
+                self.max_tool_calls.map(u64::from),
+                u64::from(accounting.tool_calls()),
+                "tool_calls",
+            ),
+        ];
+        for (max, used, name) in limits {
+            if let Some(max) = max
+                && used >= max
+            {
+                return Some(name);
+            }
+        }
+        if let Some(max) = self.max_wall_time
+            && elapsed >= max
+        {
+            return Some("wall_time");
+        }
+        None
+    }
+
+    /// Headroom left after `accounting` and `elapsed`.
+    fn remaining(&self, accounting: &Accounting, elapsed: Duration) -> RemainingBudget {
+        let rem_u64 = |max: Option<u64>, used: u64| max.map(|max| max.saturating_sub(used));
+        RemainingBudget {
+            input_tokens: rem_u64(self.max_input_tokens, accounting.usage.input_tokens),
+            output_tokens: rem_u64(self.max_output_tokens, accounting.usage.output_tokens),
+            total_tokens: rem_u64(
+                self.max_total_tokens,
+                accounting
+                    .usage
+                    .input_tokens
+                    .saturating_add(accounting.usage.output_tokens),
+            ),
+            tool_calls: self
+                .max_tool_calls
+                .map(|max| max.saturating_sub(accounting.tool_calls())),
+            wall_time: self.max_wall_time.map(|max| max.saturating_sub(elapsed)),
+        }
+    }
+}
+
+/// Budget headroom when a task ended, surfaced in [`TaskSummary`].
+///
+/// Each field is `None` when the corresponding ceiling was not set, and
+/// `Some(0)` when the ceiling was reached (or passed).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RemainingBudget {
+    /// Input tokens still allowed, when bounded.
+    pub input_tokens: Option<u64>,
+    /// Output tokens still allowed, when bounded.
+    pub output_tokens: Option<u64>,
+    /// Total tokens still allowed, when bounded.
+    pub total_tokens: Option<u64>,
+    /// Tool calls still allowed, when bounded.
+    pub tool_calls: Option<u32>,
+    /// Wall time still allowed, when bounded.
+    pub wall_time: Option<Duration>,
 }
 
 /// The deterministic controller of the model–tool loop (§13).
@@ -179,6 +349,7 @@ pub struct Agent {
     model: String,
     retry: RetryPolicy,
     max_turns: u32,
+    budget: TaskBudget,
     reserved_output_tokens: u32,
     tool_timeout: Duration,
     max_tool_concurrency: usize,
@@ -204,6 +375,7 @@ impl Agent {
             model: model.into(),
             retry: RetryPolicy::default(),
             max_turns: DEFAULT_MAX_TURNS,
+            budget: TaskBudget::default(),
             reserved_output_tokens: DEFAULT_RESERVED_OUTPUT_TOKENS,
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
             max_tool_concurrency: DEFAULT_MAX_TOOL_CONCURRENCY,
@@ -228,6 +400,13 @@ impl Agent {
     #[must_use]
     pub fn with_reserved_output_tokens(mut self, reserved_output_tokens: u32) -> Self {
         self.reserved_output_tokens = reserved_output_tokens;
+        self
+    }
+
+    /// Sets the task's resource envelope (§14). Unset ceilings are unbounded.
+    #[must_use]
+    pub fn with_budget(mut self, budget: TaskBudget) -> Self {
+        self.budget = budget;
         self
     }
 
@@ -286,7 +465,14 @@ impl Agent {
         // 3. The turn loop; the epilogue below always finalizes the record.
         let mut accounting = Accounting::default();
         let outcome = self
-            .run_turns(session, task_id, sink, cancellation, &mut accounting)
+            .run_turns(
+                session,
+                task_id,
+                sink,
+                cancellation,
+                &mut accounting,
+                started,
+            )
             .await;
 
         // 4. Finalize: record the outcome, emit the terminal event, and
@@ -332,6 +518,7 @@ impl Agent {
             failed_tool_calls: accounting.failed_tool_calls,
             wall_time,
             events_dropped,
+            remaining_budget: self.budget.remaining(&accounting, wall_time),
         };
 
         outcome.map(|()| summary)
@@ -346,6 +533,7 @@ impl Agent {
         sink: &dyn EventSink,
         cancellation: &CancellationToken,
         accounting: &mut Accounting,
+        started: Instant,
     ) -> Result<(), TaskError> {
         // Capabilities are resolved once: in Iteration 1 the model is fixed
         // for the task (§6.4). An unknown model fails before the first
@@ -368,6 +556,13 @@ impl Agent {
         let mut failures = FailureLedger::default();
 
         for turn in 1..=self.max_turns {
+            // Enforce the task's resource envelope before spending anything
+            // further (§14). Checked once per turn, so the unit in flight when
+            // a ceiling was crossed still completed and stays committed.
+            if let Some(limit) = self.budget.exhausted(accounting, started.elapsed()) {
+                return Err(TaskError::BudgetExhausted { limit });
+            }
+
             sink.emit(task_id, EventKind::TurnStarted { turn });
 
             // a. Compile the model request from durable state (§8). The
@@ -831,6 +1026,13 @@ struct Accounting {
 }
 
 impl Accounting {
+    /// Tool calls the loop executed: successes plus failures. Refused
+    /// repeats of a failed call never ran, so they do not count.
+    fn tool_calls(&self) -> u32 {
+        self.successful_tool_calls
+            .saturating_add(self.failed_tool_calls)
+    }
+
     /// Mirrors the current totals into the session's task record.
     fn sync(&self, session: &mut Session, task_id: TaskId) {
         if let Some(record) = session.task_mut(task_id) {

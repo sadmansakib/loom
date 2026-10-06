@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use futures::stream;
-use loom_kernel::agent::{Agent, RetryPolicy, TaskError};
+use loom_kernel::agent::{Agent, RetryPolicy, TaskBudget, TaskError};
 use loom_kernel::context::{AgentConfig, DefaultContextCompiler};
 use loom_kernel::event::{ChannelEventSink, EventEnvelope, EventKind};
 use loom_kernel::id::SessionId;
@@ -1146,4 +1146,179 @@ async fn a_successful_call_clears_the_failure_ledger() {
         matches!(&third.status, ToolStatus::Error(ToolFailure::Execution)),
         "the third call re-ran instead of being refused"
     );
+}
+
+#[tokio::test]
+async fn total_token_budget_stops_the_task_before_the_next_request() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![completed(
+            assistant(
+                "",
+                StopReason::ToolCalls,
+                vec![tool_call("call_1", "echo", json!({}))],
+            ),
+            usage(700, 100, None),
+        )],
+    )
+    .repeat_last();
+    let mut session = Session::new(SessionId::new());
+    let (sink, _receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = agent(provider, registry_with("echo"), 10)
+        .with_budget(TaskBudget::new().with_max_total_tokens(1_000));
+
+    let error = agent
+        .run_task(&mut session, "loop", &sink, &token)
+        .await
+        .unwrap_err();
+
+    // Turn 1 reaches 800 (< 1000) and commits; turn 2 reaches 1600 and the
+    // turn-3 check refuses to spend more.
+    assert!(
+        matches!(
+            error,
+            TaskError::BudgetExhausted {
+                limit: "total_tokens"
+            }
+        ),
+        "unexpected error: {error:?}"
+    );
+    assert!(!error.is_cancelled());
+    assert_eq!(error.end_reason(), "budget_exhausted");
+
+    // user + two (assistant + result) turns committed before the stop.
+    assert_eq!(session.transcript.len(), 5);
+    let record = &session.tasks[0];
+    assert_eq!(record.status, TaskStatus::Failed);
+    assert_eq!(record.turns, 2);
+    assert_eq!(record.end_reason.as_deref(), Some("budget_exhausted"));
+}
+
+#[tokio::test]
+async fn tool_call_budget_stops_after_the_batch_that_crossed_it() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![completed(
+            assistant(
+                "",
+                StopReason::ToolCalls,
+                vec![tool_call("call_1", "echo", json!({}))],
+            ),
+            usage(5, 1, None),
+        )],
+    )
+    .repeat_last();
+    let mut session = Session::new(SessionId::new());
+    let (sink, _receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = agent(provider, registry_with("echo"), 10)
+        .with_budget(TaskBudget::new().with_max_tool_calls(1));
+
+    let error = agent
+        .run_task(&mut session, "loop", &sink, &token)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            TaskError::BudgetExhausted {
+                limit: "tool_calls"
+            }
+        ),
+        "unexpected error: {error:?}"
+    );
+    // The one allowed batch ran and committed; the next turn then stopped.
+    assert_eq!(session.transcript.len(), 3);
+    assert_eq!(session.tasks[0].turns, 1);
+}
+
+#[tokio::test]
+async fn wall_time_budget_can_stop_before_the_first_request() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![completed(
+            assistant("done", StopReason::EndTurn, Vec::new()),
+            usage(5, 1, None),
+        )],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, _receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = agent(provider, ToolRegistry::new(), 10)
+        .with_budget(TaskBudget::new().with_max_wall_time(Duration::ZERO));
+
+    let error = agent
+        .run_task(&mut session, "go", &sink, &token)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, TaskError::BudgetExhausted { limit: "wall_time" }),
+        "unexpected error: {error:?}"
+    );
+    // Only the input user item exists: no request was ever sent.
+    assert_eq!(session.transcript.len(), 1);
+    assert!(matches!(&session.transcript[0], Item::User { .. }));
+}
+
+#[tokio::test]
+async fn remaining_budget_is_surfaced_on_success() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![completed(
+            assistant("done", StopReason::EndTurn, Vec::new()),
+            usage(10, 5, None),
+        )],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, _receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = agent(provider, ToolRegistry::new(), 10).with_budget(
+        TaskBudget::new()
+            .with_max_total_tokens(100)
+            .with_max_tool_calls(3)
+            .with_max_wall_time(Duration::from_secs(3_600)),
+    );
+
+    let summary = agent
+        .run_task(&mut session, "go", &sink, &token)
+        .await
+        .unwrap();
+
+    let remaining = summary.remaining_budget;
+    assert_eq!(remaining.total_tokens, Some(85));
+    assert_eq!(remaining.tool_calls, Some(3));
+    assert_eq!(remaining.input_tokens, None);
+    assert_eq!(remaining.output_tokens, None);
+    let left = remaining.wall_time.expect("wall-time ceiling was set");
+    assert!(left <= Duration::from_secs(3_600));
+    assert!(left > Duration::from_secs(3_590));
+}
+
+#[tokio::test]
+async fn default_budget_is_unbounded_and_reports_no_ceilings() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![completed(
+            assistant("done", StopReason::EndTurn, Vec::new()),
+            usage(10, 5, None),
+        )],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, _receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = agent(provider, ToolRegistry::new(), 10);
+
+    let summary = agent
+        .run_task(&mut session, "go", &sink, &token)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.remaining_budget.input_tokens, None);
+    assert_eq!(summary.remaining_budget.output_tokens, None);
+    assert_eq!(summary.remaining_budget.total_tokens, None);
+    assert_eq!(summary.remaining_budget.tool_calls, None);
+    assert_eq!(summary.remaining_budget.wall_time, None);
 }
