@@ -1,6 +1,6 @@
 //! Execution of `loom auth ...` (ADR-009, architecture §18.3).
 //!
-//! The engine ([`loom_engine::auth`]) owns the store, the keychain backend,
+//! The engine ([`loom_core::engine::auth`]) owns the store, the keychain backend,
 //! and every account mutation; this module only reads flags, prompts for the
 //! secret, and reports the result. Printed output never contains the secret —
 //! at most its last four characters.
@@ -8,7 +8,7 @@
 use std::io::Read;
 
 use anyhow::Context;
-use loom_engine::auth::{self, Auth, DEFAULT_PROVIDER, LoginSpec, Method};
+use loom_core::engine::auth::{self, Auth, DEFAULT_PROVIDER, LoginSpec, Method};
 
 use crate::args::{AuthCommand, ListArgs, LoginArgs, RemoveArgs, UseArgs};
 

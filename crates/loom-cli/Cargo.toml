@@ -10,8 +10,7 @@ name = "loom"
 path = "src/main.rs"
 
 [dependencies]
-loom-engine = { workspace = true }
-loom-kernel = { workspace = true }
+loom-core = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
@@ -27,10 +26,6 @@ rpassword = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 serde = { workspace = true }
-# Tool registry + provider for the eval harness (record/replay provider taps
-# model streams); the binary itself wires these through `loom-engine`.
-loom-tools = { workspace = true }
-loom-providers = { workspace = true }
 # eval harness tests only (record/replay provider taps model streams)
 futures = { workspace = true }
 

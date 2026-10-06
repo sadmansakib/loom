@@ -1,0 +1,15 @@
+[package]
+name = "loom-core"
+description = "Umbrella facade: the single crate a frontend imports (kernel, engine, providers, tools)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+loom-kernel = { workspace = true }
+loom-engine = { workspace = true }
+loom-providers = { workspace = true }
+loom-tools = { workspace = true }
+
+[lints]
+workspace = true

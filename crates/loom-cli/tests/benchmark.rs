@@ -28,16 +28,16 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use loom_kernel::agent::Agent;
-use loom_kernel::context::{AgentConfig, DefaultContextCompiler};
-use loom_kernel::event::{EventKind, EventSink};
-use loom_kernel::id::{SessionId, TaskId};
-use loom_kernel::model::ModelProvider;
-use loom_kernel::session::Session;
-use loom_kernel::tool::ToolRegistry;
-use loom_kernel::transcript::{Item, ToolFailure, ToolStatus};
-use loom_providers::{DeepSeekConfig, DeepSeekProvider, ReasoningEffort};
-use loom_tools::{ListDirTool, ReadFileTool, SearchTool};
+use loom_core::kernel::agent::Agent;
+use loom_core::kernel::context::{AgentConfig, DefaultContextCompiler};
+use loom_core::kernel::event::{EventKind, EventSink};
+use loom_core::kernel::id::{SessionId, TaskId};
+use loom_core::kernel::model::ModelProvider;
+use loom_core::kernel::session::Session;
+use loom_core::kernel::tool::ToolRegistry;
+use loom_core::kernel::transcript::{Item, ToolFailure, ToolStatus};
+use loom_core::providers::{DeepSeekConfig, DeepSeekProvider, ReasoningEffort};
+use loom_core::tools::{ListDirTool, ReadFileTool, SearchTool};
 use tokio_util::sync::CancellationToken;
 
 /// A provider tally built from the event stream: retries and the
@@ -220,7 +220,7 @@ async fn b1_read_only_repository_inspection() {
 ///
 /// `input_tokens` counts the whole prompt; `cached_input_tokens` is the subset
 /// served from the provider cache, so the miss count is the difference.
-fn cache_split(summary: &loom_kernel::agent::TaskSummary) -> (u64, u64) {
+fn cache_split(summary: &loom_core::kernel::agent::TaskSummary) -> (u64, u64) {
     let hit = summary.cached_input_tokens.unwrap_or(0);
     (hit, summary.input_tokens.saturating_sub(hit))
 }

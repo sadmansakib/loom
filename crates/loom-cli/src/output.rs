@@ -12,8 +12,8 @@
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 
-use loom_kernel::agent::{TaskError, TaskSummary};
-use loom_kernel::event::{EventEnvelope, EventKind};
+use loom_core::kernel::agent::{TaskError, TaskSummary};
+use loom_core::kernel::event::{EventEnvelope, EventKind};
 
 /// Renders the event stream to a terminal or to NDJSON.
 pub struct Renderer {

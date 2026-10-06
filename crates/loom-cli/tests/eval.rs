@@ -50,19 +50,19 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
-use loom_kernel::agent::Agent;
-use loom_kernel::context::{AgentConfig, DefaultContextCompiler};
-use loom_kernel::event::{EventKind, EventSink};
-use loom_kernel::id::{SessionId, TaskId};
-use loom_kernel::model::{
+use loom_core::kernel::agent::Agent;
+use loom_core::kernel::context::{AgentConfig, DefaultContextCompiler};
+use loom_core::kernel::event::{EventKind, EventSink};
+use loom_core::kernel::id::{SessionId, TaskId};
+use loom_core::kernel::model::{
     Message, ModelCapabilities, ModelEvent, ModelProvider, ModelRequest, ModelResponse,
     ModelStream, StopReason, Usage,
 };
-use loom_kernel::session::Session;
-use loom_kernel::tool::ToolRegistry;
-use loom_kernel::transcript::{AssistantMessage, Item, ToolArguments, ToolCall, ToolCallId};
-use loom_providers::{DeepSeekConfig, DeepSeekProvider, ReasoningEffort};
-use loom_tools::{
+use loom_core::kernel::session::Session;
+use loom_core::kernel::tool::ToolRegistry;
+use loom_core::kernel::transcript::{AssistantMessage, Item, ToolArguments, ToolCall, ToolCallId};
+use loom_core::providers::{DeepSeekConfig, DeepSeekProvider, ReasoningEffort};
+use loom_core::tools::{
     EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool, WriteFileTool,
 };
 use serde::{Deserialize, Serialize};

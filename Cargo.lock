@@ -1350,10 +1350,7 @@ dependencies = [
  "anyhow",
  "clap",
  "futures",
- "loom-engine",
- "loom-kernel",
- "loom-providers",
- "loom-tools",
+ "loom-core",
  "rpassword",
  "serde",
  "serde_json",
@@ -1362,6 +1359,16 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "loom-core"
+version = "0.1.0"
+dependencies = [
+ "loom-engine",
+ "loom-kernel",
+ "loom-providers",
+ "loom-tools",
 ]
 
 [[package]]
