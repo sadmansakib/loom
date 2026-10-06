@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// Current event protocol version.
 ///
@@ -295,6 +296,55 @@ impl EventSink for ChannelEventSink {
     }
 }
 
+/// An [`EventSink`] that cancels the task when an event is lost.
+///
+/// Evaluation runs must fail on event loss rather than silently accepting a
+/// truncated trace (ADR-004 addendum, item 3). This sink wraps another sink
+/// and, whenever a call to [`emit`](EventSink::emit) increases the inner
+/// sink's drop count, triggers the supplied [`CancellationToken`]. The loop
+/// observes that token at its next cancellation checkpoint and ends the task
+/// as [`TaskError::Cancelled`](crate::agent::TaskError::Cancelled), so a lossy
+/// run is reported as a failure instead of a clean success.
+///
+/// Wrapping a sink that cannot drop — whose [`dropped`](EventSink::dropped)
+/// stays `0`, such as an in-process tally — is a transparent pass-through: the
+/// token is never triggered. The strict mode only bites when the inner sink can
+/// actually lose events.
+pub struct StrictSink<S: EventSink> {
+    inner: S,
+    cancellation: CancellationToken,
+}
+
+impl<S: EventSink> StrictSink<S> {
+    /// Wraps `inner`; `cancellation` must be the same token the task runs
+    /// under, so loss trips the cancellation the loop already observes.
+    pub fn new(inner: S, cancellation: CancellationToken) -> Self {
+        Self {
+            inner,
+            cancellation,
+        }
+    }
+
+    /// Borrows the wrapped sink (its own counters, e.g. an event tally).
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+}
+
+impl<S: EventSink> EventSink for StrictSink<S> {
+    fn emit(&self, task_id: TaskId, kind: EventKind) {
+        let before = self.inner.dropped();
+        self.inner.emit(task_id, kind);
+        if self.inner.dropped() > before {
+            self.cancellation.cancel();
+        }
+    }
+
+    fn dropped(&self) -> u64 {
+        self.inner.dropped()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,5 +530,54 @@ mod tests {
         assert_eq!(json["kind"]["attempt"], 2);
         assert_eq!(json["kind"]["delay_ms"], 4000);
         assert_eq!(json["kind"]["response_started"], true);
+    }
+
+    #[test]
+    fn strict_sink_cancels_the_task_on_the_first_drop() {
+        // The motivating consumer (ADR-004 addendum, item 3): evaluation
+        // must not silently accept a truncated trace.
+        let (inner, receiver) = ChannelEventSink::new();
+        drop(receiver); // consumer gone: the next emit drops
+        let token = CancellationToken::new();
+        let sink = StrictSink::new(inner, token.clone());
+
+        assert!(!token.is_cancelled());
+        sink.emit(TaskId::new(), EventKind::TaskStarted);
+        assert!(token.is_cancelled(), "loss must trip the task's token");
+        assert_eq!(sink.dropped(), 1);
+    }
+
+    #[test]
+    fn strict_sink_is_a_transparent_passthrough_when_nothing_is_dropped() {
+        let (inner, mut receiver) = ChannelEventSink::new();
+        let token = CancellationToken::new();
+        let sink = StrictSink::new(inner, token.clone());
+        let task = TaskId::new();
+
+        sink.emit(task, EventKind::TaskStarted);
+        sink.emit(task, EventKind::TaskCompleted);
+
+        assert!(!token.is_cancelled());
+        assert_eq!(sink.dropped(), 0);
+        assert_eq!(receiver.try_recv().unwrap().sequence, 0);
+        assert_eq!(receiver.try_recv().unwrap().sequence, 1);
+    }
+
+    #[test]
+    fn strict_sink_never_cancels_for_a_sink_that_cannot_drop() {
+        // Wrapping an in-process tally (whose `dropped()` is the default 0)
+        // must not spuriously cancel.
+        struct Null;
+        impl EventSink for Null {
+            fn emit(&self, _task_id: TaskId, _kind: EventKind) {}
+        }
+
+        let token = CancellationToken::new();
+        let sink = StrictSink::new(Null, token.clone());
+        for _ in 0..10 {
+            sink.emit(TaskId::new(), EventKind::TurnStarted { turn: 1 });
+        }
+        assert!(!token.is_cancelled());
+        assert_eq!(sink.dropped(), 0);
     }
 }

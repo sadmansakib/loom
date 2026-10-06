@@ -52,7 +52,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures::StreamExt;
 use loom_core::kernel::agent::Agent;
 use loom_core::kernel::context::{AgentConfig, DefaultContextCompiler};
-use loom_core::kernel::event::{EventKind, EventSink};
+use loom_core::kernel::event::{EventKind, EventSink, StrictSink};
 use loom_core::kernel::id::{SessionId, TaskId};
 use loom_core::kernel::model::{
     Message, ModelCapabilities, ModelEvent, ModelProvider, ModelRequest, ModelResponse,
@@ -348,14 +348,14 @@ fn read_exchanges(path: &std::path::Path) -> Vec<Exchange> {
 // ------------------------------------------------------------- metrics ---
 
 /// Event tally (same shape as benchmark.rs).
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct Tally {
     events: u64,
     retries: u32,
     retries_after_output: u32,
 }
 
-struct CountingSink(Mutex<Tally>);
+struct CountingSink(Arc<Mutex<Tally>>);
 
 impl EventSink for CountingSink {
     fn emit(&self, _task_id: TaskId, kind: EventKind) {
@@ -500,15 +500,25 @@ async fn run_once(
         model.to_owned(),
     );
     let mut session = Session::new(SessionId::new());
-    let sink = CountingSink(Mutex::new(Tally::default()));
     let cancellation = CancellationToken::new();
+    // V21: strict evaluation sink — a run that loses events fails rather than
+    // silently producing a truncated trace. The tally sink cannot drop, so
+    // this only bites if the harness ever swaps in a lossy sink.
+    let tally_state = Arc::new(Mutex::new(Tally::default()));
+    let sink = StrictSink::new(CountingSink(Arc::clone(&tally_state)), cancellation.clone());
 
     let started = Instant::now();
     let outcome = agent
         .run_task(&mut session, task.prompt, &sink, &cancellation)
         .await;
     let observed_ms = started.elapsed().as_millis() as u64;
-    let tally = sink.0.into_inner().unwrap();
+    let tally = *tally_state.lock().unwrap();
+    assert_eq!(
+        sink.dropped(),
+        0,
+        "{} ({model}): the strict evaluation sink saw dropped events",
+        task.id
+    );
 
     // Clone out of the shared mutex: the provider (still owned by the
     // agent) holds the other Arc, so try_unwrap would fail.
@@ -546,6 +556,11 @@ async fn run_once(
 
     let report = match &outcome {
         Ok(summary) => {
+            assert_eq!(
+                summary.events_dropped, 0,
+                "{} ({model}): dropped {} events; evaluation fails on loss",
+                task.id, summary.events_dropped
+            );
             let hit = summary.cached_input_tokens.unwrap_or(0);
             let miss = summary.input_tokens.saturating_sub(hit);
             let (multiplier, window) = price_multiplier(SystemTime::now());
