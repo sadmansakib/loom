@@ -36,6 +36,9 @@ struct EditInput {
     old_string: String,
     /// Replacement text.
     new_string: String,
+    /// Optional cargo run after the edit: check or test.
+    #[serde(default)]
+    verify: Option<crate::verify::Scope>,
 }
 
 impl Tool for EditFileTool {
@@ -73,15 +76,26 @@ impl Tool for EditFileTool {
             let display = input.path;
             let path = resolve_within(&ctx.workspace_root, &display)?;
             let relative = workspace_relative(&ctx.workspace_root, &path);
+            let scope = input.verify;
             let old = input.old_string;
             let new = input.new_string;
-            tokio::task::spawn_blocking(move || apply_edit(&path, &old, &new))
+            let detail = tokio::task::spawn_blocking(move || apply_edit(&path, &old, &new))
                 .await
-                .map_err(|err| ToolError::Execution(format!("edit task failed: {err}")))?
-                .map(|detail| {
-                    ToolOutput::new(format!("edited {display}: {detail}"))
-                        .with_effects(ToolEffects::none().with_file_written(relative))
-                })
+                .map_err(|err| ToolError::Execution(format!("edit task failed: {err}")))??;
+            let mut effects = ToolEffects::none().with_file_written(relative.clone());
+            let mut content = format!("edited {display}: {detail}");
+            let mut truncated = false;
+            if let Some(scope) = scope {
+                let (rendered, command) = crate::fusion::run_fused(scope, ctx, &relative).await?;
+                content = format!("{content}\n\n--- verify ---\n{}", rendered.content);
+                truncated = rendered.truncated;
+                effects = effects.with_command(command);
+            }
+            let mut output = ToolOutput::new(content).with_effects(effects);
+            if truncated {
+                output = output.with_truncated();
+            }
+            Ok(output)
         })
     }
 }
@@ -266,7 +280,56 @@ mod tests {
     #[test]
     fn the_schema_and_the_parser_agree() {
         crate::schema::agreement::check::<EditInput>(
-            json!({"path": "f.rs", "old_string": "a", "new_string": "b"}),
+            json!({"path": "f.rs", "old_string": "a", "new_string": "b", "verify": "check"}),
         );
+    }
+
+    #[tokio::test]
+    async fn fused_check_fixes_and_verifies_in_one_call() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        std::fs::create_dir(root.join("src")).expect("src");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"fusion-edit\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
+             [lib]\npath = \"src/lib.rs\"\n",
+        )
+        .expect("Cargo.toml");
+        std::fs::write(root.join("src/lib.rs"), "pub fn one() -> u32 { 1  }\n").expect("seed");
+
+        let ctx = ToolContext::new(
+            root.to_path_buf(),
+            CancellationToken::new(),
+            Duration::from_secs(120),
+        );
+        let output = EditFileTool
+            .call(
+                json!({
+                    "path": "src/lib.rs",
+                    "old_string": "{ 1  }",
+                    "new_string": "{ 1 }",
+                    "verify": "check"
+                }),
+                &ctx,
+            )
+            .await
+            .expect("ok");
+        assert!(
+            output.content.starts_with("edited src/lib.rs"),
+            "{}",
+            output.content
+        );
+        assert!(
+            output.content.contains("--- verify ---"),
+            "{}",
+            output.content
+        );
+        assert!(
+            output.content.contains("exit status: 0"),
+            "{}",
+            output.content
+        );
+        assert_eq!(output.effects.files_written, vec!["src/lib.rs".to_string()]);
+        assert_eq!(output.effects.commands_run.len(), 1);
     }
 }

@@ -29,6 +29,9 @@ struct WriteInput {
     path: String,
     /// File content to write.
     content: String,
+    /// Optional cargo run after the write: check or test.
+    #[serde(default)]
+    verify: Option<crate::verify::Scope>,
 }
 
 impl Tool for WriteFileTool {
@@ -37,8 +40,8 @@ impl Tool for WriteFileTool {
         SPEC.get_or_init(|| ToolSpec {
             name: "write_file".to_owned(),
             description: "Creates or overwrites one text file, creating parent \
-                          directories. Overwrites the whole file, so read it first if it \
-                          exists; use edit_file for a targeted change."
+                          directories. Read first if it exists; use edit_file for a \
+                          targeted change."
                 .to_owned(),
             parameters: crate::schema::parameters::<WriteInput>(),
         })
@@ -66,18 +69,30 @@ impl Tool for WriteFileTool {
             let display = input.path;
             let path = resolve_within(&ctx.workspace_root, &display)?;
             let relative = workspace_relative(&ctx.workspace_root, &path);
+            let scope = input.verify;
             let bytes = input.content.into_bytes();
             let written = bytes.len();
-            tokio::task::spawn_blocking(move || write_file(&path, &bytes))
+            let moved_path = path.clone();
+            tokio::task::spawn_blocking(move || write_file(&moved_path, &bytes))
                 .await
                 .map_err(|err| ToolError::Execution(format!("write task failed: {err}")))?
                 .map_err(|err| {
                     ToolError::Execution(format!("cannot write \"{display}\": {err}"))
                 })?;
-            Ok(
-                ToolOutput::new(format!("wrote {written} bytes to {display}"))
-                    .with_effects(ToolEffects::none().with_file_written(relative)),
-            )
+            let mut effects = ToolEffects::none().with_file_written(relative.clone());
+            let mut content = format!("wrote {written} bytes to {display}");
+            let mut truncated = false;
+            if let Some(scope) = scope {
+                let (rendered, command) = crate::fusion::run_fused(scope, ctx, &relative).await?;
+                content = format!("{content}\n\n--- verify ---\n{}", rendered.content);
+                truncated = rendered.truncated;
+                effects = effects.with_command(command);
+            }
+            let mut output = ToolOutput::new(content).with_effects(effects);
+            if truncated {
+                output = output.with_truncated();
+            }
+            Ok(output)
         })
     }
 }
@@ -178,7 +193,9 @@ mod tests {
 
     #[test]
     fn the_schema_and_the_parser_agree() {
-        crate::schema::agreement::check::<WriteInput>(json!({"path": "note.txt", "content": ""}));
+        crate::schema::agreement::check::<WriteInput>(
+            json!({"path": "note.txt", "content": "", "verify": "check"}),
+        );
     }
 
     #[tokio::test]
@@ -188,5 +205,83 @@ mod tests {
             .await
             .expect_err("missing field");
         assert!(matches!(err, ToolError::InvalidInput(msg) if msg.contains("arguments")));
+    }
+
+    /// A workspace that is a tiny cargo crate, so fused verification has
+    /// something real to compile.
+    fn crate_root() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        std::fs::create_dir(root.join("src")).expect("src");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"fusion-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
+             [lib]\npath = \"src/lib.rs\"\n",
+        )
+        .expect("Cargo.toml");
+        std::fs::write(root.join("src/lib.rs"), "pub fn one() -> u32 { 1 }\n").expect("lib.rs");
+        (dir, root)
+    }
+
+    fn crate_ctx(root: &Path) -> ToolContext {
+        ToolContext::new(
+            root.to_path_buf(),
+            CancellationToken::new(),
+            Duration::from_secs(120),
+        )
+    }
+
+    #[tokio::test]
+    async fn fused_check_reports_diagnostics_in_the_same_call() {
+        let (_guard, root) = crate_root();
+        // A syntax error: the fused check must fail while still reporting
+        // the write itself as done.
+        let output = WriteFileTool
+            .call(
+                json!({
+                    "path": "src/lib.rs",
+                    "content": "pub fn one() -> u32 { 1 ",
+                    "verify": "check"
+                }),
+                &crate_ctx(&root),
+            )
+            .await
+            .expect("ok");
+        assert!(output.content.starts_with("wrote "), "{}", output.content);
+        assert!(
+            output.content.contains("--- verify ---"),
+            "{}",
+            output.content
+        );
+        assert!(
+            output.content.contains("unclosed delimiter"),
+            "{}",
+            output.content
+        );
+        assert_eq!(output.effects.files_written, vec!["src/lib.rs".to_string()]);
+        assert_eq!(output.effects.commands_run.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fused_check_pass_reports_exit_zero() {
+        let (_guard, root) = crate_root();
+        let output = WriteFileTool
+            .call(
+                json!({
+                    "path": "src/new.rs",
+                    "content": "pub fn two() -> u32 { 2 }\n",
+                    "verify": "check"
+                }),
+                &crate_ctx(&root),
+            )
+            .await
+            .expect("ok");
+        // A file cargo never compiles still verifies green (exit 0).
+        assert!(
+            output.content.contains("exit status: 0"),
+            "{}",
+            output.content
+        );
+        assert!(!output.truncated);
     }
 }

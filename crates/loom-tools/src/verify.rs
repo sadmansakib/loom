@@ -35,10 +35,13 @@ const ALLOWED: &[&str] = &["cargo"];
 pub struct VerifyTool;
 
 /// How much verification to run.
+///
+/// Shared with the mutating tools' fused `verify` argument (action
+/// fusion), so one enum owns the vocabulary.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-enum Scope {
-    /// Compile only; no tests.
+pub(crate) enum Scope {
+    /// Compile only.
     Check,
     /// Compile and run tests.
     #[default]
@@ -55,7 +58,7 @@ struct VerifyInput {
 
 impl Scope {
     /// The `cargo` arguments this scope runs.
-    fn args(self) -> &'static [&'static str] {
+    pub(crate) fn args(self) -> &'static [&'static str] {
         match self {
             Self::Check => &["check", "--message-format=json"],
             Self::Test => &["test", "--message-format=json"],
@@ -119,7 +122,7 @@ impl Tool for VerifyTool {
 }
 
 /// Shapes one verification run into a bounded, structured [`ToolOutput`].
-fn render(
+pub(crate) fn render(
     program: &str,
     args: &[String],
     output: &std::process::Output,

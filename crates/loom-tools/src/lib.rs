@@ -13,6 +13,7 @@ mod confinement;
 mod edit_file;
 mod evidence;
 mod exec;
+mod fusion;
 mod list_dir;
 mod read_file;
 mod run_command;
