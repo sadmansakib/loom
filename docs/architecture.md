@@ -1,7 +1,7 @@
 # Loom Architecture
 
 Loom is a coding-agent runtime written in Rust. It drives a large language
-model (DeepSeek today) through a turn-based loop, gives the model a bounded,
+model through a turn-based loop, gives the model a bounded,
 confinement-enforced toolkit for reading and editing a workspace, verifies
 its own edits by running builds and tests, and persists every session to a
 local SQLite database. Everything runs locally; the only network traffic is
@@ -24,8 +24,8 @@ kernel never links a filesystem store or a CLI, the engine never prints.
 |---|---|---|
 | `loom-core` | Facade re-exporting the public surface for embedders | engine, kernel, providers, tools |
 | `loom-kernel` | The agent itself: loop, context compilation, session/transcript model, tool abstraction, tool cache, artifacts, events, budgets | providers (traits only), nothing I/O-bearing |
-| `loom-engine` | Composition root: builds a configured `Agent` from paths, auth, provider, store; repository facts scanner | kernel, store, providers |
-| `loom-providers` | Model provider implementations (OpenAI-compatible wire → DeepSeek) plus the `ModelProvider` contract's wire types | kernel model types |
+| `loom-engine` | Composition root: builds a configured `Agent` from paths, auth, a provider factory, and stores; repository facts scanner | kernel, store, providers |
+| `loom-providers` | Model provider adapters (DeepSeek, OpenRouter) over one shared OpenAI-compatible wire and SSE driver | kernel model types |
 | `loom-store` | SQLite persistence: sessions, turns, tasks, artifacts, auth accounts | kernel store traits |
 | `loom-tools` | The shipped tool suite (read/search/edit/write/list/run/verify + artifact read) | kernel tool traits |
 | `loom-cli` | Binary: argument parsing, output rendering, run/eval/auth commands | engine |
@@ -98,8 +98,10 @@ Invariants the session layer enforces (and tests):
    type; a second finish attempt cannot overwrite the recorded end reason.
 
 **Events** (`event.rs`) are the observation stream: `EventEnvelope`
-(`schema_version: 1`, per-sink monotonically increasing `sequence`,
-snake_case `type` tag). A lock spans numbering and send, so arrival order
+(`schema_version: 2`, per-sink monotonically increasing `sequence`,
+snake_case `type` tag). Version 2 adds `Usage.cost_usd`, the
+provider-reported charge; it is `serde(default)`, so version-1 payloads
+still deserialize. A lock spans numbering and send, so arrival order
 equals sequence order even with concurrent emitters. The channel sink is
 unbounded — a slow consumer queues rather than back-pressures the agent;
 only a closed receiver drops (counted, warned once). `StrictSink` wraps a
@@ -357,12 +359,23 @@ not a failure.
 ## 9. Engine and CLI
 
 `Engine::open` is the composition root: canonicalize the workspace,
-resolve credentials, validate capabilities and reasoning settings against
-the provider, build the tool registry (stable order, read-only tools
-first), wrap the context compiler with the pruning decorator, attach the
-facts source, and open the stores. It returns an `Engine` or a fully
+resolve credentials, select and validate the provider through the
+provider factory (capabilities and reasoning settings checked against the
+adapter), build the tool registry (stable order, read-only tools first),
+wrap the context compiler with the pruning decorator, attach the facts
+source, and open the stores. It returns an `Engine` or a fully
 taxonomized `EngineError` — never a partially wired agent. The engine
 never prints; it reports through typed results and the event stream.
+
+Provider selection lives in one private engine module
+(`provider.rs`), the only place that names concrete adapters. It matches
+the configured provider name against the adapters' `PROVIDER_NAME`
+constants, rejects models whose context window is below the pruning
+floor (64K tokens) as `ModelWindowTooSmall`, and fails loudly with
+`UnknownProvider` or `CatalogMissing` rather than falling back to a
+default provider or model. The engine may read the process environment
+for credentials but never consults it for the database location — that
+is the frontend's decision, passed in as `EngineConfig::db_path`.
 
 The CLI is thin: `loom run` (interactive render — text to stdout,
 reasoning to a dim stderr, NDJSON mode for machines), `loom auth`
@@ -371,14 +384,39 @@ success, non-zero failure, 130 cancelled.
 
 ## 10. Providers
 
-`loom-providers` speaks the OpenAI-compatible wire format and configures
-it for DeepSeek (base URL, reasoning fields). `ModelCapabilities` are
-explicit per model (window, output cap, tool support) — an unknown model
-fails at setup, not mid-task. Errors classify into retryable
+Two adapters ship, over one shared wire implementation:
+
+- **DeepSeek** — a built-in capability table, because its API serves no
+  capability metadata; reasoning effort and a thinking on/off switch are
+  sent explicitly on every request.
+- **OpenRouter** — capabilities and pricing resolved from the provider's
+  model catalog (`GET /models`). Free and paid models travel the same
+  path: pricing is data (zero for free, non-zero for paid), never a
+  branch. The catalog is fetched and cached by the *frontend* and handed
+  to the engine as `EngineConfig::openrouter_catalog`, so the engine
+  stays synchronous and offline-capable. Attribution headers are
+  optional configuration.
+
+The shared layer is deliberate, not incidental. `http` owns transport
+plumbing (liveness timeouts, bounded error-body reads, `Retry-After`);
+`openai_wire` owns the OpenAI-compatible request shape and chunk
+accumulation; `wire_stream` owns the SSE state machine — decoding,
+timeout enforcement, drop-to-cancel, unterminated-`[DONE]` tolerance,
+and stop-signal normalization. An adapter supplies only configuration and
+error classification through a `WireEndpoint` trait, so the delicate
+streaming behaviour cannot drift between providers. The finalize policy
+also classifies mid-stream error objects, which OpenRouter can emit.
+
+`ModelCapabilities` are explicit per model (window, output cap, tool
+support) and resolved at setup, so an unknown model fails before the
+first request, not mid-task. Errors classify into retryable
 (rate-limited, overloaded, transport, server) and permanent (auth,
-malformed request); the loop's retry policy consumes the former.
-`ModelEvent::Completed` is the sole authority for usage numbers — the
-loop never double-counts from streaming deltas.
+quota-exhausted, invalid request, context overflow, protocol); the loop's
+retry policy consumes the former. `ModelEvent::Completed` is the sole
+authority for usage numbers — the loop never double-counts from
+streaming deltas — and it carries `cost_usd` when the provider reports
+actual spend, so paid usage is visible without adapter-specific
+accounting in the loop.
 
 ## 11. Evaluation harness
 

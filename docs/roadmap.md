@@ -110,13 +110,21 @@ works; this document tracks direction.
 - **CLI.** `run` with human rendering (reasoning on stderr, NDJSON for
   machines), `auth` management, exit-code discipline (130 on cancel).
   Engine is frontend-neutral: no printing outside the CLI renderer.
-- **Provider.** OpenAI-compatible wire adapter configured for DeepSeek
-  with explicit per-model capabilities; unknown models fail at setup.
+- **Providers.** Two adapters over one shared OpenAI-compatible wire
+  and SSE streaming driver: DeepSeek (built-in capability table,
+  reasoning effort and thinking controls) and OpenRouter (capabilities
+  and pricing resolved from the provider's model catalog). Free and
+  paid models travel the same path — pricing is data, never a branch —
+  and the catalog is fetched and cached by the frontend, so the engine
+  stays synchronous. Unknown models, missing catalogs, and windows
+  below the 64K pruning floor all fail at setup, not mid-task.
+  Provider-reported cost is carried on usage for paid spend.
 - **Eval harness.** Replay-based equivalence testing (transcript and
   byte-identical request assertions), zero-dropped-event assertions,
   per-turn census and cache hit/miss reporting with aggregates, and a
   pinned benchmark task suite.
-- **Verification bar.** ~450 tests, clippy clean, fmt clean.
+- **Verification bar.** ~465 tests (plus 13 live-API tests ignored by
+  default), clippy clean, fmt clean.
 
 ---
 
@@ -156,11 +164,13 @@ requires unwinding shipped invariants.
 
 ### Mid term
 
-6. **More providers.** Only DeepSeek ships; the `ModelProvider` trait,
-   capability table, and wire adapter are provider-shaped already. Add
-   at least one more OpenAI-compatible provider and one
-   non-OpenAI-shaped one (to prove the abstraction), including
-   capability-correct pruning floors per model.
+6. **More providers.** DeepSeek and OpenRouter share one OpenAI-shaped
+   wire; the abstraction is proven only for that shape. Add a
+   non-OpenAI-shaped provider (Anthropic-style messages, or Gemini) to
+   pressure the `ModelProvider` boundary itself, including
+   capability-correct pruning floors per model. OpenRouter's catalog is
+   the model to copy for capability discovery: fetch in the frontend,
+   pass to the engine as data.
 7. **Long-term memory.** Designed (session-persistent knowledge with
    explicit add/expire semantics) but not built. The `FactsSource` seam
    and the facts block projection are the insertion point; the hard
