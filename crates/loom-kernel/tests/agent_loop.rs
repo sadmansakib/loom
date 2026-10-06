@@ -326,6 +326,7 @@ fn usage(input: u64, output: u64, cached: Option<u64>) -> Usage {
         input_tokens: input,
         output_tokens: output,
         cached_input_tokens: cached,
+        cost_usd: None,
     }
 }
 

@@ -52,7 +52,10 @@ use tokio_util::sync::CancellationToken;
 /// [`ProviderData`](crate::transcript::ProviderData)), and
 /// [`StopReason`](crate::model::StopReason); via `ModelRetry` —
 /// [`ModelErrorKind`]; plus [`ToolCallId`] and [`TaskId`].
-pub const EVENT_SCHEMA_VERSION: u16 = 1;
+///
+/// v2 adds `Usage.cost_usd` (provider-reported charge; `serde(default)`,
+/// so v1 payloads still deserialize).
+pub const EVENT_SCHEMA_VERSION: u16 = 2;
 
 /// One observed occurrence during a task, wrapped for the wire.
 ///
@@ -496,6 +499,7 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: Some(3),
+                cost_usd: None,
             },
         };
         let envelope = EventEnvelope {

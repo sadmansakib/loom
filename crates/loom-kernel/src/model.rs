@@ -19,11 +19,13 @@ use serde::{Deserialize, Serialize};
 ///
 /// Provider adapters fill this from the wire response; the agent loop sums
 /// it per task. `cached_input_tokens` is `Option` because not every
-/// provider reports cache hits.
+/// provider reports cache hits. `cost_usd` is `Option` for the same reason:
+/// only providers that price per request report it (OpenRouter returns the
+/// actual charge for both free — `0.0` — and paid models).
 ///
 /// Part of the event wire format (via `ModelCompleted`): adding a field
 /// bumps `EVENT_SCHEMA_VERSION` in `crate::event`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct Usage {
     /// Tokens in the request prompt.
     pub input_tokens: u64,
@@ -31,6 +33,12 @@ pub struct Usage {
     pub output_tokens: u64,
     /// Prompt tokens served from a provider-side cache, if reported.
     pub cached_input_tokens: Option<u64>,
+    /// The provider-reported charge for this request in US dollars, if
+    /// reported. Absent means "not reported", not "free".
+    ///
+    /// `serde(default)` keeps pre-cost persisted events deserializable.
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
 }
 
 impl std::ops::Add for Usage {
@@ -41,11 +49,18 @@ impl std::ops::Add for Usage {
     /// over `None`. Note this means a total built from a mix of
     /// providers that do and don't report cache hits shows a partial
     /// count; consumers comparing cache ratios must account for that.
+    /// `cost_usd` merges the same way (a task mixing a cost-reporting
+    /// provider with one that reports nothing shows a partial total).
     fn add(self, rhs: Usage) -> Usage {
         Usage {
             input_tokens: self.input_tokens + rhs.input_tokens,
             output_tokens: self.output_tokens + rhs.output_tokens,
             cached_input_tokens: match (self.cached_input_tokens, rhs.cached_input_tokens) {
+                (Some(a), Some(b)) => Some(a + b),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            },
+            cost_usd: match (self.cost_usd, rhs.cost_usd) {
                 (Some(a), Some(b)) => Some(a + b),
                 (Some(a), None) | (None, Some(a)) => Some(a),
                 (None, None) => None,
@@ -650,6 +665,7 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: Some(2),
+                cost_usd: None,
             },
         };
         // Stop reason is reachable through the message, where the
