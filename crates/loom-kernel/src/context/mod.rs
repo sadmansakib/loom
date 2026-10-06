@@ -141,6 +141,38 @@ impl AgentConfig {
     }
 }
 
+/// Per-source attribution of a compiled request's estimated context
+/// (ADR-016, V18).
+///
+/// Every source field is the compiler's Iteration-1 estimate — serialized
+/// bytes ÷ 3 — for one part of the projection, so the sources can be compared
+/// across turns without a tokenizer. The per-source values round down
+/// independently and therefore need not sum exactly to
+/// [`total`](ContextCensus::total); `total` is the authoritative figure the
+/// budget check compares (the whole message list plus tool list, serialized
+/// once, ÷ 3, plus one token per message for framing) and is exactly what
+/// [`ContextError::BudgetExceeded`] reports.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ContextCensus {
+    /// The static system prompt (§8.1.1).
+    pub system_prompt: u32,
+    /// Task and user items in the projection.
+    pub user_items: u32,
+    /// Replayed assistant history: text and tool-call arguments, excluding
+    /// reasoning.
+    pub assistant_history: u32,
+    /// Replayed reasoning traces (§4.2), counted apart from the assistant
+    /// text they accompany.
+    pub reasoning_replay: u32,
+    /// Tool results replayed from the transcript.
+    pub tool_results: u32,
+    /// Exposed tool definitions.
+    pub tool_specs: u32,
+    /// Authoritative total: the estimate the budget check compares.
+    pub total: u32,
+}
+
 /// The result of a successful [`ContextCompiler::compile`].
 ///
 /// A struct (rather than returning [`ModelRequest`] bare) so a future
@@ -152,6 +184,8 @@ pub struct CompiledContext {
     /// The complete model request: system prefix, projected history, and
     /// the exposed tool definitions.
     pub request: ModelRequest,
+    /// Per-source attribution of `request`'s estimated context (ADR-016).
+    pub census: ContextCensus,
 }
 
 /// Why [`ContextCompiler::compile`] failed.

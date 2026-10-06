@@ -19,7 +19,7 @@
 //! DeepSeek thinking-mode contract demands the complete, unmodified
 //! reasoning of every prior turn once tools are sent (ADR-006).
 
-use super::{AgentConfig, CompiledContext, ContextBudget, ContextError, ContextInput};
+use super::{AgentConfig, CompiledContext, ContextCensus, ContextError, ContextInput};
 use crate::model::{Message, ModelCapabilities, ModelRequest};
 use crate::tool::ToolRegistry;
 use crate::transcript::Item;
@@ -55,8 +55,14 @@ impl super::ContextCompiler for DefaultContextCompiler {
                 .map(|tokens| tokens.min(input.budget.reserved_output_tokens)),
             temperature: None,
         };
-        enforce_budget(&request, input.budget)?;
-        Ok(CompiledContext { request })
+        let census = census(&request);
+        if census.total > input.budget.max_input_tokens {
+            return Err(ContextError::BudgetExceeded {
+                estimated: census.total,
+                max_input_tokens: input.budget.max_input_tokens,
+            });
+        }
+        Ok(CompiledContext { request, census })
     }
 }
 
@@ -105,38 +111,69 @@ fn exposed_tools(
     registry.specs().cloned().collect()
 }
 
-/// The compiler's token estimate for a whole request: the serialized
-/// projection (system prefix + history) plus the tool definitions, at
-/// `BYTES_PER_TOKEN` bytes per token, plus one fixed token per message to
-/// cover per-message framing overhead (§8).
-fn estimated_tokens(request: &ModelRequest) -> u32 {
+/// Serialized byte length of a value, or 0 if serialization fails (it cannot
+/// for the types in this crate; the fallback keeps the census panic-free).
+fn serialized_size<T: serde::Serialize>(value: &T) -> u64 {
+    serde_json::to_string(value)
+        .map(|json| json.len() as u64)
+        .unwrap_or(0)
+}
+
+/// Attributes the request's estimated context to its sources (ADR-016, V18).
+///
+/// Per-source figures are serialized bytes ÷ [`BYTES_PER_TOKEN`]; `total` is
+/// the authoritative estimate: the whole message list plus tool list,
+/// serialized once, ÷ `BYTES_PER_TOKEN`, plus one token per message for
+/// framing (§8). The two are computed from the same payload, so `total` is
+/// exactly the number the budget check compares.
+fn census(request: &ModelRequest) -> ContextCensus {
+    let mut system_prompt = 0u64;
+    let mut user_items = 0u64;
+    let mut assistant_history = 0u64;
+    let mut reasoning_replay = 0u64;
+    let mut tool_results = 0u64;
+    for message in &request.messages {
+        match message {
+            Message::System { .. } => system_prompt += serialized_size(message),
+            Message::User { .. } => user_items += serialized_size(message),
+            Message::Assistant(assistant) => {
+                // Reasoning is attributed on its own; the rest of the
+                // assistant message (text and tool-call arguments) stays in
+                // `assistant_history`, so the two never double-count.
+                let reasoning = assistant.reasoning.as_ref().map_or(0, serialized_size);
+                reasoning_replay += reasoning;
+                assistant_history += serialized_size(message).saturating_sub(reasoning);
+            }
+            Message::ToolResult(_) => tool_results += serialized_size(message),
+        }
+    }
+    let tool_specs: u64 = request.tools.iter().map(serialized_size).sum();
+
     let messages = super::messages_serialized(&request.messages);
     let tools = serde_json::to_string(&request.tools);
     debug_assert!(tools.is_ok(), "tool-spec serialization must not fail");
-    let tools = tools.unwrap_or_default();
-    let bytes = messages.len() + tools.len();
+    let payload = messages.len() as u64 + tools.unwrap_or_default().len() as u64;
     // saturating to avoid u32 overflow on absurd inputs; a compiler that
     // reports `u32::MAX` estimated tokens will simply exceed any budget.
-    let payload = (bytes as u64 / u64::from(BYTES_PER_TOKEN)).min(u64::from(u32::MAX)) as u32;
-    payload.saturating_add(request.messages.len() as u32)
-}
+    let total = ((payload / u64::from(BYTES_PER_TOKEN)).min(u64::from(u32::MAX)) as u32)
+        .saturating_add(request.messages.len() as u32);
 
-/// Refuses to send a request whose estimated tokens exceed the budget (§8).
-fn enforce_budget(request: &ModelRequest, budget: ContextBudget) -> Result<(), ContextError> {
-    let estimated = estimated_tokens(request);
-    if estimated > budget.max_input_tokens {
-        return Err(ContextError::BudgetExceeded {
-            estimated,
-            max_input_tokens: budget.max_input_tokens,
-        });
+    let tokens = |bytes: u64| (bytes / u64::from(BYTES_PER_TOKEN)).min(u64::from(u32::MAX)) as u32;
+    ContextCensus {
+        system_prompt: tokens(system_prompt),
+        user_items: tokens(user_items),
+        assistant_history: tokens(assistant_history),
+        reasoning_replay: tokens(reasoning_replay),
+        tool_results: tokens(tool_results),
+        tool_specs: tokens(tool_specs),
+        total,
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::ContextCompiler;
+    use crate::context::{ContextBudget, ContextCompiler};
     use crate::id::TaskId;
     use crate::model::StopReason;
     use crate::session::{Session, TaskRecord};
@@ -421,6 +458,60 @@ mod tests {
         let compiled = compile(&session(), &registry(), budget()).expect("within budget");
         // System message only.
         assert_eq!(compiled.request.messages.len(), 1);
+    }
+
+    #[test]
+    fn census_attributes_every_source() {
+        let mut s = session();
+        s.push_item(Item::User { text: TASK.into() }).unwrap();
+        let mut msg = assistant("calling", StopReason::ToolCalls);
+        msg.reasoning = Some(ReasoningTrace {
+            text: "let me look at the file first".into(),
+            provider_data: None,
+        });
+        msg.tool_calls = vec![call("c1", "read_file")];
+        s.append_turn(msg, vec![result_for("c1")]).unwrap();
+
+        let compiled = compile(&s, &registry(), budget()).expect("within budget");
+        let census = compiled.census;
+        assert!(census.system_prompt > 0, "system prompt attributed");
+        assert!(census.user_items > 0, "user item attributed");
+        assert!(census.assistant_history > 0, "assistant text attributed");
+        assert!(census.reasoning_replay > 0, "reasoning attributed");
+        assert!(census.tool_results > 0, "tool result attributed");
+        assert!(census.tool_specs > 0, "tool specs attributed");
+        assert!(census.total > 0);
+    }
+
+    #[test]
+    fn census_is_zero_sources_for_an_empty_transcript() {
+        // No tools registered, so nothing but the system prompt is present.
+        let compiled =
+            compile(&session(), &ToolRegistry::default(), budget()).expect("within budget");
+        let census = compiled.census;
+        // System prompt is the only content; nothing else is attributed.
+        assert!(census.system_prompt > 0);
+        assert_eq!(census.user_items, 0);
+        assert_eq!(census.assistant_history, 0);
+        assert_eq!(census.reasoning_replay, 0);
+        assert_eq!(census.tool_results, 0);
+        assert_eq!(census.tool_specs, 0);
+        assert!(census.total >= census.system_prompt);
+    }
+
+    #[test]
+    fn reasoning_is_attributed_apart_from_assistant_text() {
+        let mut s = session();
+        let mut with_reasoning = assistant("answer", StopReason::EndTurn);
+        with_reasoning.reasoning = Some(ReasoningTrace {
+            text: "a long private chain of thought, replayed byte-exact".into(),
+            provider_data: None,
+        });
+        s.push_item(Item::Assistant(with_reasoning)).unwrap();
+
+        let compiled = compile(&s, &registry(), budget()).expect("within budget");
+        assert!(compiled.census.reasoning_replay > 0);
+        assert!(compiled.census.assistant_history > 0);
     }
 
     #[test]

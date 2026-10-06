@@ -1298,6 +1298,32 @@ async fn remaining_budget_is_surfaced_on_success() {
 }
 
 #[tokio::test]
+async fn summary_carries_the_final_turn_context_census() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![completed(
+            assistant("done", StopReason::EndTurn, Vec::new()),
+            usage(10, 5, None),
+        )],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, _receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = agent(provider, ToolRegistry::new(), 10);
+
+    let summary = agent
+        .run_task(&mut session, "inspect the repo", &sink, &token)
+        .await
+        .unwrap();
+
+    // ADR-016/V18: the compiler attributes the final request's context.
+    let census = summary.last_context_census;
+    assert!(census.system_prompt > 0, "system prompt attributed");
+    assert!(census.user_items > 0, "task item attributed");
+    assert!(census.total > 0, "authoritative total is reported");
+}
+
+#[tokio::test]
 async fn default_budget_is_unbounded_and_reports_no_ceilings() {
     let provider = FakeProvider::new(
         capabilities(),

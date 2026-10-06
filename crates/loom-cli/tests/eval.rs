@@ -18,8 +18,9 @@
 //!
 //! Also: a **context census** per turn — estimated tokens by source
 //! (system / user / assistant / tool_result / tool specs, bytes ÷ 3, the
-//! same heuristic the I1 compiler uses). This is the harness-side
-//! attribution B1 lacked; compiler-exact census arrives with 2A core work.
+//! same heuristic the I1 compiler uses). The compiler now reports its own
+//! authoritative per-source census (ADR-016, carried on `TaskSummary`); the
+//! harness records both the request-side attribution and the compiler's.
 //!
 //! Running:
 //!
@@ -584,6 +585,16 @@ async fn run_once(
                 "observed_wall_time_ms": observed_ms,
                 "price_window": window,
                 "cost_usd": cost_usd(model, hit, miss, summary.output_tokens, multiplier),
+                "compiler_census": {
+                    "system_prompt": summary.last_context_census.system_prompt,
+                    "user_items": summary.last_context_census.user_items,
+                    "assistant_history": summary.last_context_census.assistant_history,
+                    "reasoning_replay": summary.last_context_census.reasoning_replay,
+                    "tool_results": summary.last_context_census.tool_results,
+                    "tool_specs": summary.last_context_census.tool_specs,
+                    "total": summary.last_context_census.total,
+                    "note": "compiler-side attribution, ADR-016",
+                },
                 "census_final_turn": census_totals,
                 "census_per_turn": census_turns,
             })

@@ -20,7 +20,8 @@ use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::context::{
-    AgentConfig, CompiledContext, ContextBudget, ContextCompiler, ContextError, ContextInput,
+    AgentConfig, CompiledContext, ContextBudget, ContextCensus, ContextCompiler, ContextError,
+    ContextInput,
 };
 use crate::event::{EventKind, EventSink};
 use crate::id::TaskId;
@@ -179,6 +180,10 @@ pub struct TaskSummary {
     /// Budget headroom left when the task ended. A field is `None` when that
     /// resource was unbounded; it is `Some(0)` when the ceiling was reached.
     pub remaining_budget: RemainingBudget,
+    /// Per-source census of the final compiled request (ADR-016). Default
+    /// (all zero) if the task ended before any request was compiled (e.g.
+    /// cancelled, or over budget at turn one).
+    pub last_context_census: ContextCensus,
 }
 
 /// A task's resource envelope (§14).
@@ -480,12 +485,12 @@ impl Agent {
         //    returned so callers can read either.
         let wall_time = started.elapsed();
         let status = match &outcome {
-            Ok(()) => TerminalTaskStatus::Completed,
+            Ok(_) => TerminalTaskStatus::Completed,
             Err(error) if error.is_cancelled() => TerminalTaskStatus::Cancelled,
             Err(_) => TerminalTaskStatus::Failed,
         };
         let end_reason = match &outcome {
-            Ok(()) => "end_turn".to_owned(),
+            Ok(_) => "end_turn".to_owned(),
             Err(error) => error.end_reason().to_owned(),
         };
         if let Some(record) = session.task_mut(task_id) {
@@ -494,7 +499,7 @@ impl Agent {
             record.finish(status, now_millis(), end_reason);
         }
         match &outcome {
-            Ok(()) => sink.emit(task_id, EventKind::TaskCompleted),
+            Ok(_) => sink.emit(task_id, EventKind::TaskCompleted),
             Err(error) if error.is_cancelled() => sink.emit(task_id, EventKind::TaskCancelled),
             Err(error) => sink.emit(
                 task_id,
@@ -506,6 +511,7 @@ impl Agent {
         // Sampled after the terminal emit so a closed sink's drop of that
         // event is counted too (§11).
         let events_dropped = sink.dropped();
+        let last_context_census = outcome.as_ref().ok().copied().unwrap_or_default();
 
         let summary = TaskSummary {
             task_id,
@@ -519,13 +525,14 @@ impl Agent {
             wall_time,
             events_dropped,
             remaining_budget: self.budget.remaining(&accounting, wall_time),
+            last_context_census,
         };
 
-        outcome.map(|()| summary)
+        outcome.map(|_| summary)
     }
 
-    /// The turn loop proper (§13). Returns `Ok(())` on `EndTurn`, or the
-    /// error that ended the task.
+    /// The turn loop proper (§13). Returns the final compiled request's
+    /// census on `EndTurn`, or the error that ended the task.
     async fn run_turns(
         &self,
         session: &mut Session,
@@ -534,7 +541,7 @@ impl Agent {
         cancellation: &CancellationToken,
         accounting: &mut Accounting,
         started: Instant,
-    ) -> Result<(), TaskError> {
+    ) -> Result<ContextCensus, TaskError> {
         // Capabilities are resolved once: in Iteration 1 the model is fixed
         // for the task (§6.4). An unknown model fails before the first
         // request rather than guessing limits.
@@ -568,13 +575,13 @@ impl Agent {
             // a. Compile the model request from durable state (§8). The
             //    compiler owns every context decision; the loop only passes
             //    it the inputs.
-            let request = {
+            let compiled: CompiledContext = {
                 let task = session
                     .tasks
                     .iter()
                     .find(|task| task.id == task_id)
                     .ok_or_else(|| TaskError::Protocol("task record missing".to_owned()))?;
-                let compiled: CompiledContext = self.compiler.compile(ContextInput {
+                self.compiler.compile(ContextInput {
                     session,
                     tools: &self.registry,
                     task,
@@ -582,9 +589,11 @@ impl Agent {
                     capabilities: &capabilities,
                     model: &self.model,
                     config: &self.config,
-                })?;
-                compiled.request
+                })?
             };
+            // Partial move: `request` moves out, `census` (Copy) stays readable
+            // for the `EndTurn` return.
+            let request = compiled.request;
 
             // b. Stream with bounded retry (§6.3). Only a `Completed` event
             //    produces a response; failed attempts leave no trace.
@@ -606,7 +615,7 @@ impl Agent {
                     self.commit(session, assistant, Vec::new())?;
                     accounting.turns = turn;
                     accounting.sync(session, task_id);
-                    return Ok(());
+                    return Ok(compiled.census);
                 }
                 StopReason::ToolCalls => {
                     if !has_calls {
