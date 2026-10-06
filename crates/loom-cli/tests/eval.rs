@@ -1,6 +1,6 @@
 //! Evaluation harness (plan-iteration-2.md §1, step 2A).
 //!
-//! Precedes all optimization work. Three pieces:
+//! Precedes all optimization work. Four pieces:
 //!
 //! 1. **Pinned task set B1–B4 (plus heavy B5).** B1 inspects the Loom
 //!    repo with the read-only tools; B2–B4 exercise the mutating tools
@@ -18,6 +18,12 @@
 //!    agent offline (canned responses, real tools) and require the
 //!    transcript's assistant items to equal the recordings verbatim — the
 //!    V3 / Invariant-10 replayability claim, tested without a network.
+//! 4. **Outcome grading.** B2–B4 are gated on the workspace state they
+//!    leave behind (files, code, green tests) and B6–B7 on real shipped
+//!    bugs (protected regression tests pass, untouched) — the model
+//!    claiming success is never sufficient. Lab tasks (B1/B5) keep
+//!    pinned prompts as regression instruments; field tasks run with
+//!    the engine-default prompt users actually get.
 //!
 //! Also: a **context census** per turn, reported as **exact serialized bytes
 //! by source** (system / user / assistant / tool_result / tool specs) plus the
@@ -120,6 +126,55 @@ struct BugfixCrate {
     expected_passed: u64,
 }
 
+/// Post-task outcome checks for fixture tasks (B2–B4): the run is graded
+/// by the workspace state it leaves behind, not by the model claiming
+/// success. Checks are deliberately cheap and objective — exact bytes
+/// where the prompt pins them, distinctive substrings where it does not,
+/// and `cargo test` where the task is code. Live runs only, like the
+/// bugfix gate: replay re-executes recorded edits for determinism, not
+/// for grading.
+struct OutcomeSpec {
+    /// `(relative path, required bytes)` pairs; one optional trailing
+    /// newline is tolerated (editors and writers emit it, and the prompt
+    /// pins the text, not the byte count).
+    exact_files: &'static [(&'static str, &'static str)],
+    /// `(relative path, required substring)` pairs, case-insensitive: a
+    /// proxy for "the file addresses this subject".
+    contains: &'static [(&'static str, &'static str)],
+    /// When set, `cargo test` must exit 0 with at least this many passing
+    /// tests — the task must not break the suite it touched.
+    tests_green: Option<u64>,
+}
+
+/// B2: greeting.txt must hold exactly the requested text.
+const B2_OUTCOME: OutcomeSpec = OutcomeSpec {
+    exact_files: &[("eval-notes/greeting.txt", "hello eval")],
+    contains: &[],
+    tests_green: None,
+};
+
+/// B3: `sub` must exist beside `add`, and the crate's own suite (1 test
+/// ships with the fixture) must still pass.
+const B3_OUTCOME: OutcomeSpec = OutcomeSpec {
+    exact_files: &[],
+    contains: &[("src/calc.rs", "fn sub")],
+    tests_green: Some(1),
+};
+
+/// B4: summaries.md must exist and address every source document. The
+/// prompt asks for one paragraph per file; a paragraph that never names
+/// its subject cannot be a summary of it, so the distinctive keyword per
+/// document is the proxy. (File order is required by the prompt but not
+/// checked — ordering prose would over-fit the gate.)
+const B4_OUTCOME: OutcomeSpec = OutcomeSpec {
+    exact_files: &[],
+    contains: &[
+        ("docs-notes/summaries.md", "alpha"),
+        ("docs-notes/summaries.md", "beta"),
+    ],
+    tests_green: None,
+};
+
 /// The tools a task may call. Deliberately coarse: the point is to pin
 /// which capabilities a baseline exercised, not to configure the agent.
 #[derive(Debug, Clone, Copy)]
@@ -153,6 +208,10 @@ struct EvalTask {
     /// Read-only (B1) and long-context (B5) keep task-specific prompts
     /// deliberately: they pin baselines and force whole-file reading.
     system_prompt: Option<&'static str>,
+    /// Outcome gate for fixture tasks: the workspace state a run leaves
+    /// behind. `None` for lab tasks (B1/B5) and bugfix tasks (graded by
+    /// their own gate).
+    outcome: Option<&'static OutcomeSpec>,
 }
 
 const TASKS: &[EvalTask] = &[
@@ -165,6 +224,7 @@ const TASKS: &[EvalTask] = &[
         tools: ToolSet::ReadOnly,
         heavy: false,
         system_prompt: Some(READ_ONLY_SYSTEM_PROMPT),
+        outcome: None,
     },
     EvalTask {
         id: "B2",
@@ -175,6 +235,7 @@ const TASKS: &[EvalTask] = &[
         tools: ToolSet::Coding,
         heavy: false,
         system_prompt: None,
+        outcome: Some(&B2_OUTCOME),
     },
     EvalTask {
         id: "B3",
@@ -185,6 +246,7 @@ const TASKS: &[EvalTask] = &[
         tools: ToolSet::Coding,
         heavy: false,
         system_prompt: None,
+        outcome: Some(&B3_OUTCOME),
     },
     EvalTask {
         id: "B4",
@@ -195,6 +257,7 @@ const TASKS: &[EvalTask] = &[
         tools: ToolSet::Coding,
         heavy: false,
         system_prompt: None,
+        outcome: Some(&B4_OUTCOME),
     },
     EvalTask {
         id: "B5",
@@ -214,6 +277,7 @@ const TASKS: &[EvalTask] = &[
         tools: ToolSet::ReadEdit,
         heavy: true,
         system_prompt: Some(LONG_CONTEXT_SYSTEM_PROMPT),
+        outcome: None,
     },
     EvalTask {
         id: "B6",
@@ -225,6 +289,7 @@ const TASKS: &[EvalTask] = &[
         tools: ToolSet::Coding,
         heavy: false,
         system_prompt: None,
+        outcome: None,
     },
     EvalTask {
         id: "B7",
@@ -242,6 +307,7 @@ const TASKS: &[EvalTask] = &[
         // opt-in difficulty probe, not a default-suite task.
         heavy: true,
         system_prompt: None,
+        outcome: None,
     },
 ];
 
@@ -874,6 +940,68 @@ async fn grade_bugfix(
     }))
 }
 
+/// Outcome gate for fixture tasks (B2–B4): the workspace state the run
+/// leaves behind must satisfy the task's [`OutcomeSpec`]. Live runs only.
+async fn grade_outcome(
+    spec: &'static OutcomeSpec,
+    root: &Path,
+    live: bool,
+) -> Option<serde_json::Value> {
+    if !live {
+        return None;
+    }
+    let (code, output) = match spec.tests_green {
+        Some(_) => {
+            let root = root.to_path_buf();
+            match tokio::task::spawn_blocking(move || run_fixture_tests(&root)).await {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(error)) => {
+                    return Some(serde_json::json!({
+                        "bug_fixed": false,
+                        "error": format!("cargo test failed to run: {error}"),
+                    }));
+                }
+                Err(join) => {
+                    return Some(serde_json::json!({
+                        "bug_fixed": false,
+                        "error": format!("gate task join error: {join}"),
+                    }));
+                }
+            }
+        }
+        None => (None, String::new()),
+    };
+    let mut checks = Vec::new();
+    for (rel, expected) in spec.exact_files {
+        // One optional trailing newline is tolerated (see OutcomeSpec).
+        let ok = std::fs::read(root.join(rel))
+            .is_ok_and(|body| body.strip_suffix(b"\n").unwrap_or(&body) == expected.as_bytes());
+        checks.push(serde_json::json!({"exact": rel, "ok": ok}));
+    }
+    for (rel, needle) in spec.contains {
+        let ok = std::fs::read_to_string(root.join(rel)).is_ok_and(|body| {
+            body.to_ascii_lowercase()
+                .contains(&needle.to_ascii_lowercase())
+        });
+        checks.push(serde_json::json!({"contains": rel, "needle": needle, "ok": ok}));
+    }
+    if let Some(expected) = spec.tests_green {
+        let passed = count_tests_passed(&output);
+        checks.push(serde_json::json!({
+            "tests_green": true,
+            "ok": code == Some(0) && passed >= expected,
+        }));
+    }
+    let bug_fixed = checks
+        .iter()
+        .all(|check| check["ok"].as_bool().unwrap_or(false));
+    Some(serde_json::json!({
+        "bug_fixed": bug_fixed,
+        "checks": checks,
+        "cargo_exit": code,
+    }))
+}
+
 /// `cargo test` inside a fixture, bounded by a wall deadline. Returns the
 /// exit code (`None` on timeout) and the combined output.
 fn run_fixture_tests(root: &Path) -> std::io::Result<(Option<i32>, String)> {
@@ -1119,8 +1247,8 @@ async fn run_once(
             "observed_wall_time_ms": observed_ms,
         }),
     };
-    // Outcome grading for real-bug tasks; live runs only.
-    if let Some(gate) = grade_bugfix(
+    // Outcome grading for gated tasks; live runs only.
+    let gate = match grade_bugfix(
         &task.workspace,
         &root,
         protected_before.as_deref(),
@@ -1128,6 +1256,13 @@ async fn run_once(
     )
     .await
     {
+        Some(gate) => Some(gate),
+        None => match task.outcome {
+            Some(spec) => grade_outcome(spec, &root, exchanges.is_some()).await,
+            None => None,
+        },
+    };
+    if let Some(gate) = gate {
         report
             .as_object_mut()
             .unwrap()
@@ -1224,7 +1359,7 @@ async fn eval_live() {
             "{}: at least one live run failed",
             task.id
         );
-        // Real-bug tasks are graded by outcome: a run whose gate failed
+        // Gated tasks are graded by outcome: a run whose gate failed
         // (tests not green, tests rewritten, or suite disabled) fails the
         // live eval even though the transcript itself completed.
         assert!(
@@ -1332,6 +1467,32 @@ fn bugfix_seeds_fail_their_gates() {
         B6_CRATE.expected_passed,
         "the fixed suite must report its expected passing count"
     );
+}
+
+/// The fixture outcome gates must reject an untouched fixture: a fresh
+/// workspace satisfies none of B2/B3/B4 (no greeting, no `sub`, no
+/// summaries), so a run that only claims success cannot pass. B3's
+/// tests-green check is additionally proven satisfiable — the seeded
+/// suite passes with the expected count, so the check discriminates on
+/// the code change, not on a broken baseline.
+#[tokio::test]
+async fn outcome_gates_reject_an_untouched_fixture() {
+    ensure_fixture();
+    let root = fixture_root();
+    for spec in [&B2_OUTCOME, &B3_OUTCOME, &B4_OUTCOME] {
+        let gate = grade_outcome(spec, &root, true)
+            .await
+            .expect("fixture tasks are gated");
+        assert_eq!(
+            gate["bug_fixed"], false,
+            "an untouched fixture must fail every outcome gate: {gate}"
+        );
+    }
+    // The B3 codebase check discriminates, not the suite: the seeded
+    // fixture is already green at the expected count.
+    let (code, output) = run_fixture_tests(&root).expect("cargo test");
+    assert_eq!(code, Some(0));
+    assert_eq!(count_tests_passed(&output), 1);
 }
 
 /// The invariant under test (V3, Invariant 10): replaying recorded

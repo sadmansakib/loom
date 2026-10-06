@@ -34,6 +34,28 @@ token counts (~±8 %), without putting a tokenizer in the kernel:
   (`o200k_base`), wired in `Engine::open`; the eval and benchmark
   harnesses use the same estimator for parity.
 
+## 2026-10-07 — Outcome gates for the fixture tasks (B2–B4)
+
+Rigor follow-up to the real-bug gates: every field task is now graded by
+the workspace state it leaves behind, so "the model said done" no longer
+passes a run. Lab tasks (B1/B5) stay un-gated on purpose — they are
+regression instruments with pinned prompts.
+
+- New `OutcomeSpec` per task: exact file bytes where the prompt pins them
+  (B2: `greeting.txt` must hold exactly `hello eval`, one trailing
+  newline tolerated), distinctive substrings where it does not (B3:
+  `fn sub` in `src/calc.rs`; B4: `summaries.md` must address every source
+  document by keyword), and a green `cargo test` where the task is code
+  (B3: the fixture suite must still pass with ≥ 1 test).
+- Gates run live-only (replay re-executes recorded edits for determinism,
+  not grading); the report gains a `gate` object with per-check results,
+  and `bug_fixed_rate` in the aggregates now covers B2–B4 too. Requests
+  are untouched, so existing records stay replay-valid.
+- New offline invariant `outcome_gates_reject_an_untouched_fixture`:
+  a fresh fixture fails all three gates, and B3's seeded suite is proven
+  green at the expected count so the check discriminates on the code
+  change, not a broken baseline.
+
 ## 2026-10-07 — Real-bug eval tasks with outcome gates (B6–B7)
 
 The suite's field tasks now include faults that actually shipped in this
