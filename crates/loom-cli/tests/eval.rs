@@ -669,10 +669,15 @@ async fn run_once(
     // Census over the recorded requests (live runs only). Reported as exact
     // bytes — the provider-agnostic measurement — plus the ÷3 estimate the
     // context budget itself enforces.
+    // Per-turn cache accounting: the provider reports the cached prefix
+    // tokens for each request, so `hit% = hit / (hit + miss)` is visible per
+    // turn without hand-computing it from the run totals.
     let census_turns: Vec<serde_json::Value> = recorded
         .iter()
         .map(|e| {
             let c = census(&e.request);
+            let hit = e.response.usage.cached_input_tokens.unwrap_or(0);
+            let miss = e.response.usage.input_tokens.saturating_sub(hit);
             serde_json::json!({
                 "system_bytes": c.system,
                 "user_bytes": c.user,
@@ -680,6 +685,8 @@ async fn run_once(
                 "tool_result_bytes": c.tool_result,
                 "tool_specs_bytes": c.tool_specs,
                 "est_tokens": c.est_tokens(),
+                "cache_hit_tokens": hit,
+                "cache_miss_tokens": miss,
             })
         })
         .collect();
@@ -705,6 +712,11 @@ async fn run_once(
             );
             let hit = summary.cached_input_tokens.unwrap_or(0);
             let miss = summary.input_tokens.saturating_sub(hit);
+            let hit_percent = if hit + miss == 0 {
+                0.0
+            } else {
+                (1000.0 * hit as f64 / (hit + miss) as f64).round() / 10.0
+            };
             let (multiplier, window) = price_multiplier(SystemTime::now());
             serde_json::json!({
                 "task": task.id,
@@ -716,6 +728,7 @@ async fn run_once(
                 "input_tokens": summary.input_tokens,
                 "cache_hit_tokens": hit,
                 "cache_miss_tokens": miss,
+                "hit_percent": hit_percent,
                 "output_tokens": summary.output_tokens,
                 "successful_tool_calls": summary.successful_tool_calls,
                 "failed_tool_calls": summary.failed_tool_calls,
@@ -869,6 +882,7 @@ fn aggregates_from(reports: &[serde_json::Value]) -> serde_json::Value {
         "input_tokens": aggregate(&pick("input_tokens")),
         "cache_hit_tokens": aggregate(&pick("cache_hit_tokens")),
         "cache_miss_tokens": aggregate(&pick("cache_miss_tokens")),
+        "hit_percent": aggregate_f64(&pick_f64("hit_percent")),
         "output_tokens": aggregate(&pick("output_tokens")),
         "wall_time_ms": aggregate(&pick("wall_time_ms")),
         "cost_usd": aggregate_f64(&pick_f64("cost_usd")),
