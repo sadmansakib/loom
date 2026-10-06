@@ -36,8 +36,7 @@ struct EditInput {
     old_string: String,
     /// Replacement text.
     new_string: String,
-    /// Cargo run after the edit: `check` or `test`. Omitted runs
-    /// `check` automatically for Rust sources (`.rs`, `Cargo.toml`).
+    /// Optional cargo run after the edit: check or test.
     #[serde(default)]
     verify: Option<crate::verify::Scope>,
 }
@@ -77,7 +76,7 @@ impl Tool for EditFileTool {
             let display = input.path;
             let path = resolve_within(&ctx.workspace_root, &display)?;
             let relative = workspace_relative(&ctx.workspace_root, &path);
-            let scope = input.verify.or_else(|| crate::fusion::auto_scope(&display));
+            let scope = input.verify;
             let old = input.old_string;
             let new = input.new_string;
             let detail = tokio::task::spawn_blocking(move || apply_edit(&path, &old, &new))
@@ -172,63 +171,19 @@ mod tests {
     #[tokio::test]
     async fn replaces_unique_occurrence() {
         let (guard, root) = temp_root();
-        std::fs::write(guard.path().join("f.txt"), b"fn add() {}\n").expect("seed");
+        std::fs::write(guard.path().join("f.rs"), b"fn add() {}\n").expect("seed");
         let output = edit(
             &root,
-            json!({"path": "f.txt", "old_string": "fn add() {}", "new_string": "fn add() { 1 }"}),
+            json!({"path": "f.rs", "old_string": "fn add() {}", "new_string": "fn add() { 1 }"}),
         )
         .await
         .expect("ok");
-        assert_eq!(output.content, "edited f.txt: replaced 1 occurrence");
-        assert_eq!(output.effects.files_written, vec!["f.txt".to_string()]);
+        assert_eq!(output.content, "edited f.rs: replaced 1 occurrence");
+        assert_eq!(output.effects.files_written, vec!["f.rs".to_string()]);
         assert_eq!(
-            std::fs::read_to_string(guard.path().join("f.txt")).expect("read"),
+            std::fs::read_to_string(guard.path().join("f.rs")).expect("read"),
             "fn add() { 1 }\n"
         );
-    }
-
-    #[tokio::test]
-    async fn rust_edits_verify_by_default() {
-        // No `verify` argument: a Rust source gets the fused check, so
-        // the model never needs a hand-run turn for proof.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().canonicalize().expect("canonical root");
-        std::fs::create_dir(root.join("src")).expect("src");
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname = \"fusion-edit-auto\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-             [lib]\npath = \"src/lib.rs\"\n",
-        )
-        .expect("Cargo.toml");
-        std::fs::write(root.join("src/lib.rs"), "pub fn one() -> u32 { 1  }\n").expect("seed");
-
-        let ctx = ToolContext::new(
-            root.to_path_buf(),
-            CancellationToken::new(),
-            Duration::from_secs(120),
-        );
-        let output = EditFileTool
-            .call(
-                json!({
-                    "path": "src/lib.rs",
-                    "old_string": "{ 1  }",
-                    "new_string": "{ 1 }"
-                }),
-                &ctx,
-            )
-            .await
-            .expect("ok");
-        assert!(
-            output.content.contains("--- verify ---"),
-            "{}",
-            output.content
-        );
-        assert!(
-            output.content.contains("exit status: 0"),
-            "{}",
-            output.content
-        );
-        assert_eq!(output.effects.commands_run.len(), 1);
     }
 
     #[tokio::test]

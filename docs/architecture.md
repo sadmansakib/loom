@@ -258,8 +258,8 @@ uses to link failures to the change that likely caused them.
 | `read_artifact` | read | paged read of a spilled artifact (§6.4) |
 | `run_command` | mutating | allow-list (cargo), no shell, both pipes drained concurrently, head+tail bounded capture with explicit omission markers |
 | `verify` | mutating | `cargo check`/`cargo test` through the same bounded exec; success → the pass summary line; failure → structured evidence (§6.5) |
-| `edit_file` | mutating | exact old-text match, must be unique (0 or ≥2 matches = invalid input), 8 MiB file cap; optional `verify` runs `cargo check`/`test` inside the same call (action fusion), defaulting to `check` for Rust sources |
-| `write_file` | mutating | create/overwrite, parents created; optional `verify` as above, same Rust default |
+| `edit_file` | mutating | exact old-text match, must be unique (0 or ≥2 matches = invalid input), 8 MiB file cap; optional `verify` runs `cargo check`/`test` inside the same call (action fusion) |
+| `write_file` | mutating | create/overwrite, parents created; optional `verify` as above |
 
 ### 6.3 Confinement
 
