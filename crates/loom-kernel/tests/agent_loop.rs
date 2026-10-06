@@ -1348,3 +1348,72 @@ async fn default_budget_is_unbounded_and_reports_no_ceilings() {
     assert_eq!(summary.remaining_budget.tool_calls, None);
     assert_eq!(summary.remaining_budget.wall_time, None);
 }
+
+#[tokio::test]
+async fn cancellation_during_retry_backoff_stops_the_task() {
+    // One retryable failure, then a long backoff. Cancellation arrives while
+    // the loop is sleeping, which is the one cancellation window not covered
+    // by the stream/batch tests (§6.3: cancellation wins over retry).
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![retryable(ModelErrorKind::Server, "lost")],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = agent_with_retry(
+        provider,
+        ToolRegistry::new(),
+        10,
+        RetryPolicy::new()
+            .with_initial_backoff(Duration::from_secs(30))
+            .with_jitter_fraction(0.0),
+    );
+
+    let canceller = token.clone();
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        canceller.cancel();
+    });
+    let error = agent
+        .run_task(&mut session, "hello", &sink, &token)
+        .await
+        .expect_err("cancelled while backing off");
+    handle.await.ok();
+
+    assert!(error.is_cancelled());
+
+    // Exactly one attempt, one scheduled retry, no completion, terminal cancel.
+    let kinds = drain(&mut receiver);
+    assert!(matches!(kinds[0], EventKind::TaskStarted));
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| matches!(kind, EventKind::ModelRequestStarted { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| matches!(kind, EventKind::ModelRetry { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        !kinds
+            .iter()
+            .any(|kind| matches!(kind, EventKind::ModelCompleted { .. })),
+        "a failed attempt must not surface a completion"
+    );
+    assert!(matches!(kinds.last(), Some(EventKind::TaskCancelled)));
+
+    // Nothing beyond the user item was committed; the record is cancelled.
+    assert_eq!(session.transcript.len(), 1);
+    assert!(matches!(&session.transcript[0], Item::User { .. }));
+    assert_eq!(session.tasks[0].status, TaskStatus::Cancelled);
+    assert_eq!(
+        session.tasks[0].end_reason.as_deref(),
+        Some("user_cancelled")
+    );
+}
