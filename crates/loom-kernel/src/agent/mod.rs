@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::context::{
     AgentConfig, CompiledContext, ContextBudget, ContextCensus, ContextCompiler, ContextError,
-    ContextInput,
+    ContextInput, FactsSource, NoFacts,
 };
 use crate::event::{EventKind, EventSink};
 use crate::id::{SessionId, TaskId};
@@ -369,6 +369,7 @@ pub struct Agent {
     max_tool_concurrency: usize,
     store: Option<Box<dyn SessionStore>>,
     artifacts: Option<Arc<dyn ArtifactStore>>,
+    facts: Box<dyn FactsSource>,
 }
 
 impl Agent {
@@ -397,6 +398,7 @@ impl Agent {
             max_tool_concurrency: DEFAULT_MAX_TOOL_CONCURRENCY,
             store: None,
             artifacts: None,
+            facts: Box::new(NoFacts),
         }
     }
 
@@ -467,6 +469,19 @@ impl Agent {
     #[must_use]
     pub fn with_artifacts(mut self, artifacts: Option<Arc<dyn ArtifactStore>>) -> Self {
         self.artifacts = artifacts;
+        self
+    }
+
+    /// Attaches a repository-facts source (2E, ADR-022).
+    ///
+    /// The source is scanned **once per task**, at task start, and the
+    /// resulting [`KnownFacts`](crate::context::KnownFacts) is projected as a
+    /// stable system message after the system prompt. Because the snapshot is
+    /// fixed for the task, the cached prefix is never churned mid-task. With
+    /// no source attached the block is empty and the projection is unchanged.
+    #[must_use]
+    pub fn with_facts_source(mut self, facts: Box<dyn FactsSource>) -> Self {
+        self.facts = facts;
         self
     }
 
@@ -639,6 +654,11 @@ impl Agent {
             self.reserved_output_tokens,
         )?;
 
+        // Repository facts for this task (2E, ADR-022): captured exactly once,
+        // before the first compile, so the projected block is byte-stable for
+        // the whole task (§8.1.1) and "what changed" never costs a model turn.
+        let facts = self.facts.scan();
+
         // Loop-owned reaction to tool failures (§13): the loop, not the
         // model, decides whether a failed attempt may be repeated. An
         // identical call is refused until some tool call succeeds, so a
@@ -672,6 +692,7 @@ impl Agent {
                     capabilities: &capabilities,
                     model: &self.model,
                     config: &self.config,
+                    facts: &facts,
                 })?
             };
             // Partial move: `request` moves out, `census` (Copy) stays readable

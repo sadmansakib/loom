@@ -19,7 +19,7 @@
 //! DeepSeek thinking-mode contract demands the complete, unmodified
 //! reasoning of every prior turn once tools are sent (ADR-006).
 
-use super::{AgentConfig, CompiledContext, ContextCensus, ContextError, ContextInput};
+use super::{AgentConfig, CompiledContext, ContextCensus, ContextError, ContextInput, KnownFacts};
 use crate::model::{Message, ModelCapabilities, ModelRequest};
 use crate::tool::{ToolEffects, ToolRegistry};
 use crate::transcript::{Item, ToolResult};
@@ -43,7 +43,7 @@ pub struct DefaultContextCompiler;
 
 impl super::ContextCompiler for DefaultContextCompiler {
     fn compile(&self, input: ContextInput<'_>) -> Result<CompiledContext, ContextError> {
-        let messages = project_messages(input.session, input.config);
+        let (messages, facts_bytes) = project_messages(input.session, input.config, input.facts);
         let tools = exposed_tools(input.tools, input.capabilities);
         let request = ModelRequest {
             model: input.model.to_owned(),
@@ -55,7 +55,7 @@ impl super::ContextCompiler for DefaultContextCompiler {
                 .map(|tokens| tokens.min(input.budget.reserved_output_tokens)),
             temperature: None,
         };
-        let census = census(&request);
+        let census = census(&request, facts_bytes);
         if census.total > input.budget.max_input_tokens {
             return Err(ContextError::BudgetExceeded {
                 estimated: census.total,
@@ -68,13 +68,29 @@ impl super::ContextCompiler for DefaultContextCompiler {
 
 /// Projects the session transcript into model messages (§8.3).
 ///
-/// The system prompt leads (the stable prefix), then every transcript item
-/// in append order except `ContentFilter` assistant turns, which stay in
-/// the transcript but are never replayed.
-fn project_messages(session: &crate::session::Session, config: &AgentConfig) -> Vec<Message> {
+/// The system prompt leads (the stable prefix), then the repository facts
+/// block when one was captured (2E), then every transcript item in append
+/// order except `ContentFilter` assistant turns, which stay in the transcript
+/// but are never replayed.
+///
+/// Returns the messages and the serialized byte length of the facts message
+/// (0 when absent), so the census can attribute it apart from the system
+/// prompt without re-parsing the projection.
+fn project_messages(
+    session: &crate::session::Session,
+    config: &AgentConfig,
+    facts: &KnownFacts,
+) -> (Vec<Message>, u64) {
     let mut messages = vec![Message::System {
         text: config.system_prompt.clone(),
     }];
+    let facts_text = facts.render();
+    let mut facts_bytes = 0u64;
+    if !facts_text.is_empty() {
+        let message = Message::System { text: facts_text };
+        facts_bytes = serialized_size(&message);
+        messages.push(message);
+    }
     for item in &session.transcript {
         let message = match item {
             Item::User { text } => Some(Message::User { text: text.clone() }),
@@ -102,7 +118,7 @@ fn project_messages(session: &crate::session::Session, config: &AgentConfig) -> 
             messages.push(message);
         }
     }
-    messages
+    (messages, facts_bytes)
 }
 
 /// The tools exposed to the model (§8.2): all registered tools, in
@@ -132,20 +148,24 @@ fn serialized_size<T: serde::Serialize>(value: &T) -> u64 {
 
 /// Attributes the request's estimated context to its sources (ADR-016, V18).
 ///
+/// `facts_bytes` is the serialized byte length of the repository facts
+/// message, subtracted from the system-prompt attribution so the two system
+/// messages in the prefix never double-count.
+///
 /// Per-source figures are serialized bytes ÷ [`BYTES_PER_TOKEN`]; `total` is
 /// the authoritative estimate: the whole message list plus tool list,
 /// serialized once, ÷ `BYTES_PER_TOKEN`, plus one token per message for
 /// framing (§8). The two are computed from the same payload, so `total` is
 /// exactly the number the budget check compares.
-fn census(request: &ModelRequest) -> ContextCensus {
-    let mut system_prompt = 0u64;
+fn census(request: &ModelRequest, facts_bytes: u64) -> ContextCensus {
+    let mut system_total = 0u64;
     let mut user_items = 0u64;
     let mut assistant_history = 0u64;
     let mut reasoning_replay = 0u64;
     let mut tool_results = 0u64;
     for message in &request.messages {
         match message {
-            Message::System { .. } => system_prompt += serialized_size(message),
+            Message::System { .. } => system_total += serialized_size(message),
             Message::User { .. } => user_items += serialized_size(message),
             Message::Assistant(assistant) => {
                 // Reasoning is attributed on its own; the rest of the
@@ -171,7 +191,10 @@ fn census(request: &ModelRequest) -> ContextCensus {
 
     let tokens = |bytes: u64| (bytes / u64::from(BYTES_PER_TOKEN)).min(u64::from(u32::MAX)) as u32;
     ContextCensus {
-        system_prompt: tokens(system_prompt),
+        // Everything in a `System` message that is not the facts block is the
+        // system prompt; the two are the only system messages projected.
+        system_prompt: tokens(system_total.saturating_sub(facts_bytes)),
+        repo_facts: tokens(facts_bytes),
         user_items: tokens(user_items),
         assistant_history: tokens(assistant_history),
         reasoning_replay: tokens(reasoning_replay),
@@ -253,6 +276,11 @@ mod tests {
         )
     }
 
+    fn empty_facts() -> &'static KnownFacts {
+        static EMPTY: OnceLock<KnownFacts> = OnceLock::new();
+        EMPTY.get_or_init(KnownFacts::default)
+    }
+
     fn input<'a>(
         session: &'a Session,
         tools: &'a ToolRegistry,
@@ -260,6 +288,26 @@ mod tests {
         budget: ContextBudget,
         capabilities: &'a ModelCapabilities,
         config: &'a AgentConfig,
+    ) -> ContextInput<'a> {
+        input_with_facts(
+            session,
+            tools,
+            task,
+            budget,
+            capabilities,
+            config,
+            empty_facts(),
+        )
+    }
+
+    fn input_with_facts<'a>(
+        session: &'a Session,
+        tools: &'a ToolRegistry,
+        task: &'a TaskRecord,
+        budget: ContextBudget,
+        capabilities: &'a ModelCapabilities,
+        config: &'a AgentConfig,
+        facts: &'a KnownFacts,
     ) -> ContextInput<'a> {
         ContextInput {
             session,
@@ -269,6 +317,7 @@ mod tests {
             capabilities,
             model: "deepseek-flash",
             config,
+            facts,
         }
     }
 
@@ -285,6 +334,25 @@ mod tests {
             &capabilities(),
             &config(),
         ))
+    }
+
+    impl DefaultContextCompiler {
+        /// Compiles a task with a specific repository-facts snapshot.
+        fn compile_with_facts(
+            &self,
+            session: &Session,
+            facts: &KnownFacts,
+        ) -> Result<CompiledContext, ContextError> {
+            self.compile(input_with_facts(
+                session,
+                &registry(),
+                &task_record(),
+                budget(),
+                &capabilities(),
+                &config(),
+                facts,
+            ))
+        }
     }
 
     /// A registered tool (dummy — the compiler only reads specs).
@@ -617,6 +685,80 @@ mod tests {
     fn model_name_flows_into_request() {
         let compiled = compile(&session(), &registry(), budget()).expect("within budget");
         assert_eq!(compiled.request.model, "deepseek-flash");
+    }
+
+    fn facts() -> KnownFacts {
+        KnownFacts {
+            root: PathBuf::from("/ws"),
+            languages: vec!["Rust".into()],
+            build_systems: vec!["Cargo".into()],
+            source_dirs: vec!["src".into()],
+            test_dirs: vec!["tests".into()],
+            config_files: vec!["Cargo.toml".into()],
+            git: crate::context::GitState {
+                branch: Some("main".into()),
+                changed_files: vec!["src/lib.rs".into()],
+            },
+        }
+    }
+
+    #[test]
+    fn facts_block_follows_the_system_prompt() {
+        let mut s = session();
+        s.push_item(Item::User { text: TASK.into() }).unwrap();
+        let f = facts();
+        let compiled = DefaultContextCompiler
+            .compile_with_facts(&s, &f)
+            .expect("within budget");
+        let messages = &compiled.request.messages;
+        assert!(matches!(&messages[0], Message::System { text } if text == SYS));
+        let Message::System { text } = &messages[1] else {
+            panic!("expected the facts system message second");
+        };
+        assert!(text.contains("Repository facts"), "{text}");
+        assert!(matches!(&messages[2], Message::User { .. }));
+        assert!(compiled.census.repo_facts > 0);
+    }
+
+    #[test]
+    fn empty_facts_add_no_message() {
+        // The default (no source) projection is unchanged: system + history.
+        let compiled = compile(&session(), &registry(), budget()).expect("within budget");
+        assert_eq!(compiled.request.messages.len(), 1);
+        assert_eq!(compiled.census.repo_facts, 0);
+    }
+
+    #[test]
+    fn facts_are_attributed_apart_from_the_system_prompt() {
+        let f = facts();
+        let with = DefaultContextCompiler
+            .compile_with_facts(&session(), &f)
+            .expect("within budget");
+        let without = compile(&session(), &registry(), budget()).expect("within budget");
+        assert!(with.census.repo_facts > 0);
+        // The system-prompt attribution is untouched by the extra block.
+        assert_eq!(with.census.system_prompt, without.census.system_prompt);
+        assert!(with.census.total > without.census.total);
+    }
+
+    #[test]
+    fn facts_block_is_stable_across_turns() {
+        // Prefix caching (§8.1.1): one snapshot per task, byte-identical in
+        // every compile, so the cached prefix is never churned mid-task.
+        let mut s = session();
+        s.push_item(Item::User { text: TASK.into() }).unwrap();
+        let f = facts();
+        let first = DefaultContextCompiler
+            .compile_with_facts(&s, &f)
+            .expect("within budget");
+        let mut msg = assistant("working", StopReason::ToolCalls);
+        msg.tool_calls = vec![call("c1", "read_file")];
+        s.append_turn(msg, vec![result_for("c1")]).unwrap();
+        let second = DefaultContextCompiler
+            .compile_with_facts(&s, &f)
+            .expect("within budget");
+        assert_eq!(first.request.messages[0], second.request.messages[0]);
+        assert_eq!(first.request.messages[1], second.request.messages[1]);
     }
 
     #[test]

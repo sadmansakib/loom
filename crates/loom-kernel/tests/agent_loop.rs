@@ -24,7 +24,9 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use futures::stream;
 use loom_kernel::agent::{Agent, RetryPolicy, TaskBudget, TaskError};
-use loom_kernel::context::{AgentConfig, DefaultContextCompiler};
+use loom_kernel::context::{
+    AgentConfig, DefaultContextCompiler, GitState, KnownFacts, StaticFacts,
+};
 use loom_kernel::event::{ChannelEventSink, EventEnvelope, EventKind};
 use loom_kernel::id::SessionId;
 use loom_kernel::model::{
@@ -325,6 +327,74 @@ fn usage(input: u64, output: u64, cached: Option<u64>) -> Usage {
         output_tokens: output,
         cached_input_tokens: cached,
     }
+}
+
+#[tokio::test]
+async fn repository_facts_are_projected_as_a_stable_system_block() {
+    // 2E (ADR-022): the facts block is a deterministic second system message,
+    // identical in every turn of the task, so "what changed?" is answered
+    // without a model turn and the cached prefix is never churned.
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            completed(
+                assistant(
+                    "calling",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_1", "echo", json!({"q": "hi"}))],
+                ),
+                usage(10, 3, None),
+            ),
+            completed(
+                assistant("done", StopReason::EndTurn, Vec::new()),
+                usage(20, 5, None),
+            ),
+        ],
+    );
+    let requests = provider.requests_handle();
+    let mut session = Session::new(SessionId::new());
+    let (sink, _receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let facts = KnownFacts::new(
+        PathBuf::from("/ws"),
+        vec!["Rust".to_owned()],
+        vec!["Cargo".to_owned()],
+        vec!["src".to_owned()],
+        vec!["tests".to_owned()],
+        vec!["Cargo.toml".to_owned()],
+        GitState::new(Some("main".to_owned()), vec!["src/lib.rs".to_owned()]),
+    );
+    let agent = Agent::new(
+        Box::new(provider),
+        Box::new(DefaultContextCompiler),
+        registry_with("echo"),
+        AgentConfig::new(PathBuf::from("."), "you are a test agent"),
+        "fake-model",
+    )
+    .with_max_turns(10)
+    .with_facts_source(Box::new(StaticFacts::new(facts)));
+
+    let summary = agent
+        .run_task(&mut session, "what changed?", &sink, &token)
+        .await
+        .unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert!(
+            matches!(&request.messages[0], Message::System { text } if text == "you are a test agent")
+        );
+        let Message::System { text } = &request.messages[1] else {
+            panic!("the facts block must follow the system prompt");
+        };
+        assert!(text.contains("Repository facts"), "{text}");
+        assert!(text.contains("changed files: src/lib.rs"), "{text}");
+    }
+    // Byte-identical across turns.
+    assert_eq!(requests[0].messages[1], requests[1].messages[1]);
+    drop(requests);
+    assert!(summary.last_context_census.repo_facts > 0);
 }
 
 #[tokio::test]

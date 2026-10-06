@@ -7,6 +7,7 @@
 //! * which transcript history is included (and the §8.3 projection rules),
 //! * whether stored reasoning is replayed,
 //! * which registered tools are exposed,
+//! * the repository facts block (2E, [`KnownFacts`]), when one was captured,
 //! * the budget check that refuses to send a request known to overflow.
 //!
 //! The compiler is **pure and deterministic**: no I/O, no clocks, no task
@@ -20,8 +21,10 @@
 //! (§8), so context selection stays outside the agent loop.
 
 mod default;
+mod facts;
 
 pub use default::DefaultContextCompiler;
+pub use facts::{FactsSource, GitState, KnownFacts, NoFacts, StaticFacts};
 
 use crate::model::{Message, ModelCapabilities, ModelRequest};
 use crate::session::{Session, TaskRecord};
@@ -111,6 +114,10 @@ pub struct ContextInput<'a> {
     /// Agent configuration: workspace root (for relative tool arguments)
     /// plus any future knobs the compiler reads.
     pub config: &'a AgentConfig,
+    /// Repository facts captured once for this task (2E, ADR-022), or an
+    /// empty value when no source is attached. Rendered as a stable system
+    /// message right after the system prompt; empty facts add no message.
+    pub facts: &'a KnownFacts,
 }
 
 /// Agent configuration the context compiler reads.
@@ -157,6 +164,9 @@ impl AgentConfig {
 pub struct ContextCensus {
     /// The static system prompt (§8.1.1).
     pub system_prompt: u32,
+    /// The repository facts block, when one was projected (2E, ADR-022).
+    /// Counted apart from the system prompt it follows.
+    pub repo_facts: u32,
     /// Task and user items in the projection.
     pub user_items: u32,
     /// Replayed assistant history: text and tool-call arguments, excluding
