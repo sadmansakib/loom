@@ -5,8 +5,3 @@
 # OS noise
 .DS_Store
 
-# Internal docs — never publish
-# Only complete architecture docs (docs/architecture.md) are tracked.
-docs/adr/
-docs/research.md
-docs/plan-iteration-*.md
