@@ -31,6 +31,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::budget;
+use crate::evidence::{Evidence, cargo_diagnostics, libtest_failures, nextest_junit};
 
 /// Programs Iteration 1 will execute. Anything else is rejected as
 /// invalid input before a process is created.
@@ -124,7 +125,13 @@ impl Tool for RunCommandTool {
                 )));
             }
             let output = crate::exec::run_bounded(&input.program, &input.args, ctx).await?;
-            Ok(render(&input.program, &input.args, &output))
+            let recent_changes = ctx.recent_changes();
+            Ok(render(
+                &input.program,
+                &input.args,
+                &output,
+                &recent_changes,
+            ))
         })
     }
 }
@@ -133,12 +140,46 @@ impl Tool for RunCommandTool {
 /// command as an effect (ADR-012). A non-zero exit is a *successful*
 /// tool call: the command ran and the model must see the failure, so it
 /// is never mapped to [`ToolError::Execution`].
-fn render(program: &str, args: &[String], output: &std::process::Output) -> ToolOutput {
+///
+/// A **failed** run whose output parses into structured evidence —
+/// compiler diagnostics, libtest failures, nextest JUnit, the same
+/// parsers `verify` uses — is shaped into that compact block instead of
+/// the raw log (ADR-014, ADR-017 decision 3): the failing test, its
+/// assertion, its location, and the recent change it links to. A
+/// successful run keeps its bounded streams: `run_command` is
+/// general-purpose, so its output may itself be the answer the model
+/// asked for. A failed run with nothing parseable falls back to the
+/// bounded raw output, so a failure is never hidden, only capped.
+fn render(
+    program: &str,
+    args: &[String],
+    output: &std::process::Output,
+    recent_changes: &[String],
+) -> ToolOutput {
     let effects = ToolEffects::none().with_command(CommandEffect::new(
         program,
         args.to_vec(),
         output.status.code(),
     ));
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let mut diagnostics = cargo_diagnostics(&raw);
+    // Diagnostics can also be emitted on stderr by some toolchains; parse
+    // it only if stdout yielded none, so the two never duplicate.
+    if diagnostics.is_empty() {
+        diagnostics = cargo_diagnostics(&stderr);
+    }
+    let mut failures = libtest_failures(&raw);
+    if failures.is_empty() {
+        failures = nextest_junit(&raw);
+    }
+    let evidence = Evidence {
+        diagnostics,
+        failures,
+        changed_paths: recent_changes.to_vec(),
+    };
+
     let mut text = format!("$ {program}");
     for arg in args {
         text.push(' ');
@@ -146,13 +187,18 @@ fn render(program: &str, args: &[String], output: &std::process::Output) -> Tool
     }
     text.push('\n');
     text.push_str(&status_line(output.status));
-    if !output.stdout.is_empty() {
-        text.push_str("\n--- stdout ---\n");
-        text.push_str(&String::from_utf8_lossy(&output.stdout));
-    }
-    if !output.stderr.is_empty() {
-        text.push_str("\n--- stderr ---\n");
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
+    if !output.status.success() && !evidence.is_empty() {
+        text.push('\n');
+        text.push_str(&evidence.render());
+    } else {
+        if !raw.is_empty() {
+            text.push_str("\n--- stdout ---\n");
+            text.push_str(&raw);
+        }
+        if !stderr.is_empty() {
+            text.push_str("\n--- stderr ---\n");
+            text.push_str(&stderr);
+        }
     }
     // Errors live at the tail, so keep both ends (ADR-014). The status line and
     // early output survive at the head; the last lines of stderr survive at the
@@ -323,7 +369,7 @@ mod tests {
             stdout,
             stderr: Vec::new(),
         };
-        let rendered = render("echo", &[], &output);
+        let rendered = render("echo", &[], &output, &[]);
         assert!(rendered.truncated);
         assert!(
             rendered.content.contains("bytes omitted"),
@@ -346,7 +392,7 @@ mod tests {
             stdout: b"out".to_vec(),
             stderr: b"err".to_vec(),
         };
-        let rendered = render("cargo", &["test".to_owned()], &output);
+        let rendered = render("cargo", &["test".to_owned()], &output, &[]);
         assert_eq!(
             rendered.content,
             "$ cargo test\nexit status: 2\n--- stdout ---\nout\n--- stderr ---\nerr"
@@ -359,6 +405,94 @@ mod tests {
                 vec!["test".to_string()],
                 Some(2)
             )]
+        );
+    }
+
+    fn libtest_failure_stdout() -> Vec<u8> {
+        let text = "\
+running 2 tests
+test tests::a ... ok
+test tests::b ... FAILED
+
+failures:
+
+---- tests::b stdout ----
+thread 'tests::b' panicked at src/lib.rs:12:5:
+assertion `left == right` failed
+
+failures:
+    tests::b
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured
+";
+        text.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn failed_test_run_is_shaped_into_evidence() {
+        let output = Output {
+            status: ExitStatus::from_raw(1),
+            stdout: libtest_failure_stdout(),
+            stderr: Vec::new(),
+        };
+        let rendered = render(
+            "cargo",
+            &["test".to_owned()],
+            &output,
+            &["src/lib.rs".to_owned()],
+        );
+        assert!(
+            rendered.content.contains("failure evidence:"),
+            "{}",
+            rendered.content
+        );
+        assert!(
+            rendered.content.contains("failing tests (1):"),
+            "{}",
+            rendered.content
+        );
+        assert!(
+            rendered.content.contains("test: tests::b"),
+            "{}",
+            rendered.content
+        );
+        assert!(
+            rendered.content.contains("at src/lib.rs:12:5"),
+            "{}",
+            rendered.content
+        );
+        assert!(
+            rendered.content.contains("relevant change: src/lib.rs"),
+            "change→failure linkage must survive shaping: {}",
+            rendered.content
+        );
+        assert!(
+            !rendered.content.contains("---- tests::b stdout ----"),
+            "the raw log must not ride along: {}",
+            rendered.content
+        );
+        assert!(!rendered.truncated);
+    }
+
+    #[test]
+    fn successful_run_keeps_its_streams() {
+        // A passing run's output may itself be the answer the model asked
+        // for, so it is never replaced by an evidence block.
+        let output = Output {
+            status: ExitStatus::from_raw(0),
+            stdout: libtest_failure_stdout(),
+            stderr: Vec::new(),
+        };
+        let rendered = render("cargo", &["test".to_owned()], &output, &[]);
+        assert!(
+            rendered.content.contains("--- stdout ---"),
+            "{}",
+            rendered.content
+        );
+        assert!(
+            !rendered.content.contains("failure evidence:"),
+            "{}",
+            rendered.content
         );
     }
 
