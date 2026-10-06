@@ -16,8 +16,8 @@ tracing = { workspace = true }
 ignore = { workspace = true }
 regex = { workspace = true }
 # spawn_blocking wraps the blocking std::fs work; `process` backs
-# run_command (architecture.md §9/§12)
-tokio = { workspace = true, features = ["rt", "process"] }
+# run_command and `io-util` its capped stream reads (architecture.md §9/§12)
+tokio = { workspace = true, features = ["rt", "process", "io-util"] }
 # CancellationToken in the search walk (per-file cancellation check)
 tokio-util = { workspace = true }
 

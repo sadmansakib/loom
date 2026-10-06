@@ -13,6 +13,11 @@ use std::sync::OnceLock;
 
 use crate::confinement::resolve_within;
 
+/// Edits larger than this are refused: the whole file is read into memory and
+/// rewritten, so an unbounded read is a memory spike (a large generated file
+/// is the realistic case). 8 MiB covers source files with room to spare.
+const MAX_EDIT_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Replaces one unique exact-string match in an existing UTF-8 file,
 /// confined to the workspace root.
 #[derive(Debug, Default)]
@@ -88,6 +93,18 @@ fn apply_edit(path: &Path, old: &str, new: &str) -> Result<String, ToolError> {
         return Err(ToolError::InvalidInput(
             "old_string must not be empty".to_owned(),
         ));
+    }
+    // Unlike the read tools, a missing file here is an execution error, not an
+    // informational "does not exist": a write path that targets nothing is a
+    // model mistake (read first, or use write_file), and the loop's failure
+    // ledger should refuse a blind repeat (ADR-020).
+    let size = std::fs::metadata(path)
+        .map_err(|err| ToolError::Execution(format!("cannot read \"{}\": {err}", path.display())))?
+        .len();
+    if size > MAX_EDIT_FILE_BYTES {
+        return Err(ToolError::Execution(format!(
+            "file is too large to edit ({size} bytes; limit {MAX_EDIT_FILE_BYTES} bytes)"
+        )));
     }
     let bytes = std::fs::read(path).map_err(|err| {
         ToolError::Execution(format!("cannot read \"{}\": {err}", path.display()))
@@ -214,6 +231,21 @@ mod tests {
         .await
         .expect_err("missing");
         assert!(matches!(err, ToolError::Execution(msg) if msg.contains("gone.rs")));
+    }
+
+    #[tokio::test]
+    async fn oversized_file_is_execution_error() {
+        let (guard, root) = temp_root();
+        let path = guard.path().join("big.rs");
+        let file = std::fs::File::create(&path).expect("create");
+        file.set_len(MAX_EDIT_FILE_BYTES + 1).expect("set length");
+        let err = edit(
+            &root,
+            json!({"path": "big.rs", "old_string": "a", "new_string": "b"}),
+        )
+        .await
+        .expect_err("too large");
+        assert!(matches!(err, ToolError::Execution(msg) if msg.contains("too large")));
     }
 
     #[tokio::test]

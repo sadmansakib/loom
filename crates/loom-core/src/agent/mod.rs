@@ -37,7 +37,7 @@ pub mod tools;
 
 pub use retry::RetryPolicy;
 
-use tools::{ToolBatch, ToolExposure};
+use tools::{MAX_TOOL_OUTPUT_BYTES, ToolBatch, ToolExposure};
 
 /// Default maximum number of model turns per task when nothing else is
 /// configured.
@@ -598,7 +598,10 @@ impl Agent {
     /// Runs are bounded and order-preserving inside [`ToolBatch`]; the
     /// per-call events are emitted in call order (all starts before the
     /// batch, completes after), which is exact for the sequential path and
-    /// an Iteration 1 approximation under read-only concurrency.
+    /// an Iteration 1 approximation under read-only concurrency. Only calls
+    /// that actually run produce start/complete events: a refused repeat
+    /// emits none, and its `RepeatedCall` result is committed to the
+    /// transcript instead.
     ///
     /// The loop — not the model — owns the reaction to a failure (§13):
     /// `failures` refuses an exact repeat of a call that already failed
@@ -617,7 +620,22 @@ impl Agent {
         failures: &mut FailureLedger,
     ) -> Vec<ToolResult> {
         let exposure = ToolExposure::from_names(request.tools.iter().map(|spec| spec.name.clone()));
-        for call in calls {
+
+        // Partition into calls the loop refuses (an exact repeat of a
+        // failure with no success since) and calls that may run. A refused
+        // call never reaches the tool engine, so it starts nothing and emits
+        // no tool events; its `RepeatedCall` result is committed instead.
+        let mut runnable: Vec<ToolCall> = Vec::new();
+        let mut runnable_indices: Vec<usize> = Vec::new();
+        let mut is_runnable = vec![false; calls.len()];
+        for (index, call) in calls.iter().enumerate() {
+            if !failures.refuses(call) {
+                runnable_indices.push(index);
+                runnable.push(call.clone());
+                is_runnable[index] = true;
+            }
+        }
+        for call in &runnable {
             sink.emit(
                 task_id,
                 EventKind::ToolStarted {
@@ -625,18 +643,6 @@ impl Agent {
                     call_id: call.id.clone(),
                 },
             );
-        }
-
-        // Partition into calls the loop refuses (an exact repeat of a
-        // failure with no success since) and calls that may run. A refused
-        // call never reaches the tool engine, so it starts nothing.
-        let mut runnable: Vec<ToolCall> = Vec::new();
-        let mut runnable_indices: Vec<usize> = Vec::new();
-        for (index, call) in calls.iter().enumerate() {
-            if !failures.refuses(call) {
-                runnable_indices.push(index);
-                runnable.push(call.clone());
-            }
         }
 
         let context = ToolContext::new(
@@ -662,7 +668,7 @@ impl Agent {
             })
             .collect();
 
-        for (call, result) in calls.iter().zip(results.iter_mut()) {
+        for (index, (call, result)) in calls.iter().zip(results.iter_mut()).enumerate() {
             match result.status {
                 ToolStatus::Success => {
                     accounting.successful_tool_calls += 1;
@@ -679,13 +685,17 @@ impl Agent {
                 // tool; the task outcome records the cancellation.
                 ToolStatus::Cancelled { .. } => {}
             }
-            sink.emit(
-                task_id,
-                EventKind::ToolCompleted {
-                    name: call.name.clone(),
-                    call_id: call.id.clone(),
-                },
-            );
+            // Pair each start with a completion: refused calls emitted no
+            // start, so they emit no completion either.
+            if is_runnable[index] {
+                sink.emit(
+                    task_id,
+                    EventKind::ToolCompleted {
+                        name: call.name.clone(),
+                        call_id: call.id.clone(),
+                    },
+                );
+            }
         }
         results
     }
@@ -733,7 +743,10 @@ impl FailureLedger {
 
 /// Identity of a call for the failure ledger: tool name plus canonical
 /// argument JSON. `Value` object keys are ordered, so equality is
-/// deterministic.
+/// deterministic — this relies on `serde_json`'s map ordering. The
+/// `preserve_order` feature must stay off anywhere in the workspace, or two
+/// calls differing only in key order would key differently and evade the
+/// refusal.
 fn ledger_key(call: &ToolCall) -> (String, String) {
     (
         call.name.clone(),
@@ -777,6 +790,16 @@ fn append_failure_hint(content: &mut String, kind: ToolFailure) {
         // The refusal result already explains itself.
         ToolFailure::RepeatedCall => return,
     };
+    // The engine bounded `content` before this, so reserve room for the hint
+    // and keep the result within the same output bound.
+    let needed = hint.len() + 1;
+    if content.len() + needed > MAX_TOOL_OUTPUT_BYTES {
+        let mut cut = MAX_TOOL_OUTPUT_BYTES.saturating_sub(needed);
+        while cut > 0 && !content.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        content.truncate(cut);
+    }
     content.push('\n');
     content.push_str(hint);
 }
