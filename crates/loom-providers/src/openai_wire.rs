@@ -25,14 +25,18 @@ pub(crate) const DONE_MARKER: &str = "[DONE]";
 
 /// Provider-injected request knobs that differ between OpenAI-compatible
 /// providers.
-#[derive(Debug, Clone)]
+///
+/// Provider-neutral core fields (`model`, `messages`, `stream`, `tools`,
+/// `max_tokens`, `temperature`) are built by [`build_request_body`];
+/// everything else a provider needs goes in [`WireOptions::extra_body`]
+/// and is merged last, never overwriting a core field.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct WireOptions {
-    /// Serialized `thinking` object (e.g. `{"type":"enabled"}` for
-    /// DeepSeek; a later GLM adapter adds `clear_thinking`).
-    pub thinking: Value,
-    /// Serialized `reasoning_effort` (e.g. `"high"`); always explicit so
-    /// endpoint-default changes cannot silently alter behaviour.
-    pub reasoning_effort: String,
+    /// Extra top-level request fields (e.g. DeepSeek's `thinking` and
+    /// `reasoning_effort`; a later GLM adapter adds `clear_thinking`).
+    /// A core field already present wins, so an adapter cannot
+    /// accidentally override the request shape.
+    pub extra_body: serde_json::Map<String, Value>,
 }
 
 /// Builds the chat-completions request body for one [`ModelRequest`].
@@ -40,8 +44,9 @@ pub(crate) struct WireOptions {
 /// Shape (verified against the DeepSeek API reference, 2026-10-03):
 /// `stream` is always `true` (the core's only model interface is the
 /// stream), `stream_options.include_usage` is requested, `tool_choice`
-/// is `"auto"` **only when tools are sent**, and provider thinking
-/// knobs are merged in verbatim.
+/// is `"auto"` **only when tools are sent**, and provider-specific body
+/// fields ([`WireOptions::extra_body`]) are merged in verbatim — without
+/// overwriting a core field.
 ///
 /// Reasoning replay: an assistant message carries `reasoning_content`
 /// whenever the context compiler replayed its trace — with `tools` in
@@ -89,9 +94,14 @@ pub(crate) fn build_request_body(request: &ModelRequest, options: &WireOptions) 
         "messages": messages,
         "stream": true,
         "stream_options": {"include_usage": true},
-        "thinking": options.thinking,
-        "reasoning_effort": options.reasoning_effort,
     });
+    // Provider-specific fields last, but a core field already present
+    // wins: an adapter cannot reshape the request by accident.
+    if let Some(map) = body.as_object_mut() {
+        for (key, value) in &options.extra_body {
+            map.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(
             request
@@ -154,6 +164,46 @@ pub(crate) struct ChatChunk {
     /// `stream_options.include_usage`.
     #[serde(default)]
     pub usage: Option<WireUsage>,
+    /// A mid-stream failure object. OpenRouter (and some gateways) send
+    /// `{"error": {...}}` as a chunk instead of an HTTP error status,
+    /// then end the stream; without this the failure would surface as a
+    /// generic early-close transport error.
+    #[serde(default)]
+    pub error: Option<WireError>,
+}
+
+/// A mid-stream error object.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct WireError {
+    /// Human-readable message, best effort.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Provider error code: a number (HTTP status) or a string (business
+    /// code). Kept raw; the adapter's classifier decides the kind.
+    #[serde(default)]
+    pub code: Option<Value>,
+}
+
+impl WireError {
+    /// The code as an HTTP status number, when the provider sent one.
+    pub(crate) fn status(&self) -> Option<u16> {
+        match &self.code {
+            Some(Value::Number(number)) => number.as_u64().and_then(|n| u16::try_from(n).ok()),
+            Some(Value::String(text)) => text.parse().ok(),
+            _ => None,
+        }
+    }
+
+    /// Best-effort message for logs, bounded to the classification excerpt
+    /// size so a hostile server cannot balloon memory.
+    pub(crate) fn excerpt(&self) -> String {
+        self.message
+            .as_deref()
+            .unwrap_or("(no message)")
+            .chars()
+            .take(500)
+            .collect()
+    }
 }
 
 /// One `choices[]` entry.
@@ -218,6 +268,11 @@ pub(crate) struct WireUsage {
     /// DeepSeek-specific; absent on providers without cache reporting.
     #[serde(default)]
     pub prompt_cache_hit_tokens: Option<u64>,
+    /// The provider-reported charge for this request in USD (OpenRouter
+    /// reports `0.0` for free models and the actual spend for paid ones);
+    /// absent on providers that do not report cost.
+    #[serde(default)]
+    pub cost: Option<f64>,
 }
 
 /// One accumulated tool call under construction.
@@ -243,6 +298,9 @@ pub(crate) struct ChunkAccumulator {
     tool_calls: BTreeMap<u32, PartialToolCall>,
     finish_reason: Option<String>,
     usage: Option<WireUsage>,
+    /// First mid-stream error chunk seen; a stream carrying one is a
+    /// failure regardless of what else arrived.
+    wire_error: Option<WireError>,
     /// Set when an index-less fragment could not be correlated to a
     /// call; finalize turns this into a Protocol error instead of
     /// silently merging unrelated fragments.
@@ -286,6 +344,11 @@ impl ChunkAccumulator {
         let mut deltas = Vec::new();
         if let Some(usage) = chunk.usage {
             self.usage = Some(usage);
+        }
+        if let Some(error) = chunk.error
+            && self.wire_error.is_none()
+        {
+            self.wire_error = Some(error);
         }
         let Some(choice) = chunk.choices.into_iter().next() else {
             return deltas; // usage-only chunk
@@ -349,15 +412,11 @@ impl ChunkAccumulator {
     /// failure, applying the §5.1 normalization table.
     ///
     /// `saw_done` is whether the `[DONE]` terminator arrived before the
-    /// stream ended. `classify_in_stream` maps provider-specific
-    /// `finish_reason` values that are *failures, not stop conditions*
-    /// (e.g. DeepSeek `"aborted"` → [`ModelErrorKind::Transport`]) to
-    /// their kind. `id_prefix` namespaces synthesized tool-call ids.
+    /// stream ended; `policy` carries the adapter's classification hooks.
     pub(crate) fn finalize(
         self,
         saw_done: bool,
-        classify_in_stream: impl Fn(&str) -> Option<ModelErrorKind>,
-        id_prefix: &str,
+        policy: &FinalizePolicy<'_>,
     ) -> Result<ModelResponse, ModelError> {
         if self.correlation_failed {
             return Err(ModelError::new(
@@ -365,8 +424,18 @@ impl ChunkAccumulator {
                 "tool-call fragment without index could not be correlated to a call",
             ));
         }
+        if let Some(error) = &self.wire_error {
+            // A mid-stream error is definitive: classify it before any
+            // stop-reason interpretation (the stream may still carry a
+            // misleading finish_reason, or end without [DONE]).
+            let kind = (policy.classify_wire_error)(error.status(), &error.excerpt());
+            return Err(ModelError::new(
+                kind,
+                format!("provider reported a mid-stream error: {}", error.excerpt()),
+            ));
+        }
         let raw_finish = self.finish_reason.as_deref();
-        if let Some(kind) = raw_finish.and_then(&classify_in_stream) {
+        if let Some(kind) = raw_finish.and_then(policy.classify_in_stream) {
             // Classified before the early-close check so a connection
             // that dies after a failure finish_reason keeps the sharper
             // classification.
@@ -388,7 +457,7 @@ impl ChunkAccumulator {
         let mut calls = Vec::new();
         let mut any_bad = false;
         for partial in self.tool_calls.values() {
-            match assemble_call(partial, id_prefix) {
+            match assemble_call(partial, policy.id_prefix) {
                 Ok(call) => calls.push(call),
                 Err(_) => any_bad = true,
             }
@@ -466,6 +535,7 @@ impl ChunkAccumulator {
             input_tokens: wire.prompt_tokens.unwrap_or(0),
             output_tokens: wire.completion_tokens.unwrap_or(0),
             cached_input_tokens: wire.prompt_cache_hit_tokens,
+            cost_usd: wire.cost,
         }) {
             Some(usage) => usage,
             None => {
@@ -492,6 +562,41 @@ impl ChunkAccumulator {
 /// synthesis.
 static SYNTHESIZED_CALL_NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static SYNTHESIZED_CALL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Adapter-supplied classification for one completed stream.
+///
+/// The wire module owns accumulation and the stop-normalization table;
+/// each adapter supplies its provider-specific opinions: `finish_reason`
+/// values that mean failure, how to classify a mid-stream error object,
+/// and the prefix for synthesized tool-call ids.
+pub(crate) struct FinalizePolicy<'a> {
+    /// Maps a raw `finish_reason` to a failure kind. `None` means the
+    /// reason is not a failure and normal normalization applies.
+    pub classify_in_stream: &'a dyn Fn(&str) -> Option<ModelErrorKind>,
+    /// Classifies a mid-stream error object (message + HTTP-ish status).
+    pub classify_wire_error: &'a dyn Fn(Option<u16>, &str) -> ModelErrorKind,
+    /// Prefix for synthesized tool-call ids, normally the provider name.
+    pub id_prefix: &'a str,
+}
+
+/// Classifies a generic mid-stream error object by its HTTP-ish status.
+///
+/// Shared by adapters: OpenAI-compatible servers that report errors as a
+/// stream chunk (OpenRouter, several gateways) use HTTP status codes for
+/// the cause. An absent or unknown code is treated as a retryable server
+/// failure — the retry policy bounds it, and silently treating it as
+/// permanent would fail recoverable runs.
+pub(crate) fn classify_wire_error(status: Option<u16>, _message: &str) -> ModelErrorKind {
+    match status {
+        Some(401) => ModelErrorKind::Auth,
+        Some(402) => ModelErrorKind::QuotaExhausted,
+        Some(408) => ModelErrorKind::Transport,
+        Some(429) => ModelErrorKind::RateLimited,
+        Some(503) => ModelErrorKind::Overloaded,
+        Some(code) if code >= 500 => ModelErrorKind::Server,
+        _ => ModelErrorKind::Server,
+    }
+}
 
 /// Assembles one accumulated call, synthesizing an id when the provider
 /// sent none (`ToolCallId` requires non-empty; synthesis is the
@@ -538,6 +643,14 @@ mod tests {
         None
     }
 
+    fn policy(prefix: &str) -> FinalizePolicy<'_> {
+        FinalizePolicy {
+            classify_in_stream: &no_in_stream,
+            classify_wire_error: &classify_wire_error,
+            id_prefix: prefix,
+        }
+    }
+
     fn request() -> ModelRequest {
         ModelRequest {
             model: "deepseek-flash".into(),
@@ -549,10 +662,10 @@ mod tests {
     }
 
     fn wire_options() -> WireOptions {
-        WireOptions {
-            thinking: json!({"type": "enabled"}),
-            reasoning_effort: "high".into(),
-        }
+        let mut extra_body = serde_json::Map::new();
+        extra_body.insert("thinking".into(), json!({"type": "enabled"}));
+        extra_body.insert("reasoning_effort".into(), json!("high"));
+        WireOptions { extra_body }
     }
 
     #[test]
@@ -653,9 +766,9 @@ mod tests {
                 finish_reason: None,
             }],
             usage: None,
+            error: None,
         }
     }
-
     fn text_and_call_fragments() -> ChunkAccumulator {
         let mut acc = ChunkAccumulator::default();
         acc.ingest(chunk_with(ChunkDelta {
@@ -693,7 +806,9 @@ mod tests {
                 prompt_tokens: Some(10),
                 completion_tokens: Some(5),
                 prompt_cache_hit_tokens: Some(4),
+                cost: None,
             }),
+            error: None,
         });
         acc
     }
@@ -701,7 +816,7 @@ mod tests {
     #[test]
     fn stop_with_calls_normalizes_to_tool_calls() {
         let acc = finished(text_and_call_fragments(), "stop");
-        let response = acc.finalize(true, no_in_stream, "test").unwrap();
+        let response = acc.finalize(true, &policy("test")).unwrap();
         assert_eq!(response.message.stop_reason, StopReason::ToolCalls);
         assert_eq!(response.message.tool_calls.len(), 1);
         assert_eq!(response.message.tool_calls[0].name, "read_file");
@@ -711,6 +826,7 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: Some(4),
+                cost_usd: None,
             }
         );
     }
@@ -724,8 +840,9 @@ mod tests {
                 finish_reason: None,
             }],
             usage: None,
+            error: None,
         });
-        let response = bare.finalize(true, no_in_stream, "test").unwrap();
+        let response = bare.finalize(true, &policy("test")).unwrap();
         assert_eq!(response.message.stop_reason, StopReason::ToolCalls);
     }
 
@@ -736,7 +853,7 @@ mod tests {
             content: Some("hello".into()),
             ..Default::default()
         }));
-        let response = acc.finalize(true, no_in_stream, "test").unwrap();
+        let response = acc.finalize(true, &policy("test")).unwrap();
         assert_eq!(response.message.stop_reason, StopReason::EndTurn);
         assert_eq!(response.message.content, "hello");
     }
@@ -744,7 +861,7 @@ mod tests {
     #[test]
     fn early_close_is_transport() {
         let acc = text_and_call_fragments();
-        let error = acc.finalize(false, no_in_stream, "test").unwrap_err();
+        let error = acc.finalize(false, &policy("test")).unwrap_err();
         assert_eq!(error.kind, ModelErrorKind::Transport);
         assert!(error.is_retryable());
     }
@@ -758,8 +875,9 @@ mod tests {
                 finish_reason: Some("tool_calls".into()),
             }],
             usage: None,
+            error: None,
         });
-        let error = acc.finalize(true, no_in_stream, "test").unwrap_err();
+        let error = acc.finalize(true, &policy("test")).unwrap_err();
         assert_eq!(error.kind, ModelErrorKind::Protocol);
         assert!(!error.is_retryable());
     }
@@ -780,7 +898,7 @@ mod tests {
             ..Default::default()
         }));
         let acc = finished(acc, "length");
-        let response = acc.finalize(true, no_in_stream, "test").unwrap();
+        let response = acc.finalize(true, &policy("test")).unwrap();
         assert_eq!(response.message.stop_reason, StopReason::MaxTokens);
         assert!(response.message.tool_calls.is_empty(), "calls discarded");
     }
@@ -791,7 +909,7 @@ mod tests {
         // (e.g. `{}`); Invariant 22 still forbids executing or
         // replaying it.
         let acc = finished(text_and_call_fragments(), "length");
-        let response = acc.finalize(true, no_in_stream, "test").unwrap();
+        let response = acc.finalize(true, &policy("test")).unwrap();
         assert_eq!(response.message.stop_reason, StopReason::MaxTokens);
         assert!(
             response.message.tool_calls.is_empty(),
@@ -814,7 +932,7 @@ mod tests {
             ..Default::default()
         }));
         let acc = finished(acc, "stop");
-        let error = acc.finalize(true, no_in_stream, "test").unwrap_err();
+        let error = acc.finalize(true, &policy("test")).unwrap_err();
         assert_eq!(error.kind, ModelErrorKind::Protocol);
     }
 
@@ -827,18 +945,82 @@ mod tests {
                 finish_reason: Some("aborted".into()),
             }],
             usage: None,
+            error: None,
         });
+        fn classify(reason: &str) -> Option<ModelErrorKind> {
+            match reason {
+                "aborted" => Some(ModelErrorKind::Transport),
+                _ => None,
+            }
+        }
         let error = acc
             .finalize(
                 false,
-                |reason| match reason {
-                    "aborted" => Some(ModelErrorKind::Transport),
-                    _ => None,
+                &FinalizePolicy {
+                    classify_in_stream: &classify,
+                    classify_wire_error: &classify_wire_error,
+                    id_prefix: "test",
                 },
-                "test",
             )
             .unwrap_err();
         assert_eq!(error.kind, ModelErrorKind::Transport);
+    }
+
+    #[test]
+    fn mid_stream_error_object_is_classified() {
+        let mut acc = ChunkAccumulator::default();
+        acc.ingest(ChatChunk {
+            choices: vec![ChunkChoice {
+                delta: ChunkDelta::default(),
+                finish_reason: None,
+            }],
+            usage: None,
+            error: Some(WireError {
+                message: Some("upstream provider is overloaded".into()),
+                code: Some(json!(503)),
+            }),
+        });
+        let error = acc.finalize(true, &policy("test")).unwrap_err();
+        assert_eq!(error.kind, ModelErrorKind::Overloaded);
+        assert!(error.message.contains("upstream provider is overloaded"));
+    }
+
+    #[test]
+    fn mid_stream_error_without_status_is_retryable_server() {
+        let mut acc = ChunkAccumulator::default();
+        acc.ingest(ChatChunk {
+            choices: vec![],
+            usage: None,
+            error: Some(WireError {
+                message: Some("the selected model is unavailable".into()),
+                code: None,
+            }),
+        });
+        let error = acc.finalize(true, &policy("test")).unwrap_err();
+        assert_eq!(error.kind, ModelErrorKind::Server);
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn reported_cost_passes_through_usage() {
+        let mut acc = ChunkAccumulator::default();
+        acc.ingest(chunk_with(ChunkDelta {
+            content: Some("hello".into()),
+            ..Default::default()
+        }));
+        acc.ingest(ChatChunk {
+            choices: vec![],
+            usage: Some(WireUsage {
+                prompt_tokens: Some(100),
+                completion_tokens: Some(20),
+                prompt_cache_hit_tokens: None,
+                cost: Some(0.000123),
+            }),
+            error: None,
+        });
+        let response = acc.finalize(true, &policy("openrouter")).unwrap();
+        assert_eq!(response.usage.cost_usd, Some(0.000123));
+        assert_eq!(response.usage.input_tokens, 100);
     }
 
     #[test]
@@ -856,7 +1038,7 @@ mod tests {
             ..Default::default()
         }));
         let acc = finished(acc, "tool_calls");
-        let response = acc.finalize(true, no_in_stream, "deepseek").unwrap();
+        let response = acc.finalize(true, &policy("deepseek")).unwrap();
         assert!(
             response.message.tool_calls[0]
                 .id
@@ -882,7 +1064,7 @@ mod tests {
                 ..Default::default()
             }));
             let acc = finished(acc, "tool_calls");
-            acc.finalize(true, no_in_stream, "deepseek").unwrap()
+            acc.finalize(true, &policy("deepseek")).unwrap()
         };
         assert_ne!(
             response.message.tool_calls[0].id, second.message.tool_calls[0].id,
@@ -917,7 +1099,7 @@ mod tests {
             ..Default::default()
         }));
         let acc = finished(acc, "tool_calls");
-        let response = acc.finalize(true, no_in_stream, "deepseek").unwrap();
+        let response = acc.finalize(true, &policy("deepseek")).unwrap();
         let calls = &response.message.tool_calls;
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].id.as_str(), "a");
@@ -952,7 +1134,7 @@ mod tests {
             ..Default::default()
         }));
         let acc = finished(acc, "tool_calls");
-        let response = acc.finalize(true, no_in_stream, "deepseek").unwrap();
+        let response = acc.finalize(true, &policy("deepseek")).unwrap();
         let calls = &response.message.tool_calls;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id.as_str(), "a");
@@ -998,7 +1180,7 @@ mod tests {
             ..Default::default()
         }));
         let acc = finished(acc, "tool_calls");
-        let error = acc.finalize(true, no_in_stream, "deepseek").unwrap_err();
+        let error = acc.finalize(true, &policy("deepseek")).unwrap_err();
         assert_eq!(error.kind, ModelErrorKind::Protocol);
     }
 
@@ -1017,7 +1199,7 @@ mod tests {
             ..Default::default()
         }));
         let acc = finished(acc, "tool_calls");
-        let response = acc.finalize(true, no_in_stream, "test").unwrap();
+        let response = acc.finalize(true, &policy("test")).unwrap();
         assert_eq!(response.message.tool_calls[0].arguments.to_string(), "{}");
     }
 
@@ -1030,10 +1212,12 @@ mod tests {
                 prompt_tokens: Some(3),
                 completion_tokens: Some(1),
                 prompt_cache_hit_tokens: None,
+                cost: None,
             }),
+            error: None,
         });
         assert!(deltas.is_empty());
-        let response = acc.finalize(true, no_in_stream, "test").unwrap();
+        let response = acc.finalize(true, &policy("test")).unwrap();
         assert_eq!(response.usage.cached_input_tokens, None);
     }
 
@@ -1055,7 +1239,7 @@ mod tests {
     #[test]
     fn content_filter_discards_tool_calls() {
         let acc = finished(text_and_call_fragments(), "content_filter");
-        let response = acc.finalize(true, no_in_stream, "test").unwrap();
+        let response = acc.finalize(true, &policy("test")).unwrap();
         assert_eq!(response.message.stop_reason, StopReason::ContentFilter);
         assert!(
             response.message.tool_calls.is_empty(),
@@ -1072,8 +1256,9 @@ mod tests {
                 finish_reason: Some("content_filter".into()),
             }],
             usage: None,
+            error: None,
         });
-        let response = acc.finalize(true, no_in_stream, "test").unwrap();
+        let response = acc.finalize(true, &policy("test")).unwrap();
         assert_eq!(response.message.stop_reason, StopReason::ContentFilter);
     }
 
@@ -1086,8 +1271,9 @@ mod tests {
                 finish_reason: Some("quantum_decay".into()),
             }],
             usage: None,
+            error: None,
         });
-        let error = acc.finalize(true, no_in_stream, "test").unwrap_err();
+        let error = acc.finalize(true, &policy("test")).unwrap_err();
         assert_eq!(error.kind, ModelErrorKind::Protocol);
     }
 }
