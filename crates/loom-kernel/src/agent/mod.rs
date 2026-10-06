@@ -370,7 +370,7 @@ pub struct Agent {
     max_tool_concurrency: usize,
     store: Option<Box<dyn SessionStore>>,
     artifacts: Option<Arc<dyn ArtifactStore>>,
-    facts: Box<dyn FactsSource>,
+    facts: Arc<dyn FactsSource>,
     cache: Arc<Mutex<ToolCache>>,
 }
 
@@ -400,7 +400,7 @@ impl Agent {
             max_tool_concurrency: DEFAULT_MAX_TOOL_CONCURRENCY,
             store: None,
             artifacts: None,
-            facts: Box::new(NoFacts),
+            facts: Arc::new(NoFacts),
             cache: Arc::new(Mutex::new(ToolCache::new())),
         }
     }
@@ -484,7 +484,7 @@ impl Agent {
     /// no source attached the block is empty and the projection is unchanged.
     #[must_use]
     pub fn with_facts_source(mut self, facts: Box<dyn FactsSource>) -> Self {
-        self.facts = facts;
+        self.facts = Arc::from(facts);
         self
     }
 
@@ -660,7 +660,14 @@ impl Agent {
         // Repository facts for this task (2E, ADR-015): captured exactly once,
         // before the first compile, so the projected block is byte-stable for
         // the whole task (§8.1.1) and "what changed" never costs a model turn.
-        let facts = self.facts.scan();
+        // The scan walks the tree and shells out to git — blocking work — so
+        // it runs on the blocking pool, never on this async worker.
+        let facts = {
+            let source = Arc::clone(&self.facts);
+            tokio::task::spawn_blocking(move || source.scan())
+                .await
+                .map_err(|_| TaskError::Internal("facts scan panicked".to_owned()))?
+        };
 
         // Pruning checkpoint for this task's turn loop (ADR-011): the
         // compiler returns a frozen decision set when its trigger fires,

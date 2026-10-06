@@ -145,7 +145,7 @@ impl ToolCache {
     /// A cheap pre-probe: lets the caller skip the (blocking) signature
     /// walk entirely for keys that were never stored.
     #[must_use]
-    pub fn has_entry(&self, tool: &str, args: &Value) -> bool {
+    pub(crate) fn has_entry(&self, tool: &str, args: &Value) -> bool {
         self.entries
             .contains_key(&(tool.to_owned(), args.to_string()))
     }
@@ -155,7 +155,7 @@ impl ToolCache {
     /// matches the stored signature. A mismatch drops the entry.
     ///
     /// Map access only: no file I/O, safe to call under the cache lock.
-    pub fn lookup(
+    pub(crate) fn lookup(
         &mut self,
         tool: &str,
         args: &Value,
@@ -186,7 +186,7 @@ impl ToolCache {
     /// `None` (some read path is not a plain file).
     ///
     /// Map access only: no file I/O, safe to call under the cache lock.
-    pub fn store(
+    pub(crate) fn store(
         &mut self,
         tool: &str,
         args: &Value,

@@ -28,6 +28,8 @@
 //! threshold must therefore sit below the model's input budget, which the
 //! defaults (64 K trigger vs ≥ 64 K windows) assume.
 
+use std::collections::{HashMap, HashSet};
+
 use serde::{Deserialize, Serialize};
 
 use crate::model::Message;
@@ -220,15 +222,15 @@ impl ContextCompiler for PruningContextCompiler {
 /// Rewrites projected `ToolResult` messages whose `call_id` is stubbed,
 /// leaving every other message (and the call/result pairing) untouched.
 fn apply_stubs(request: &mut crate::model::ModelRequest, stubs: &[StubDecision]) {
+    let by_call: HashMap<&str, StubReason> = stubs
+        .iter()
+        .map(|stub| (stub.call_id.as_str(), stub.reason))
+        .collect();
     for message in &mut request.messages {
         let Message::ToolResult(result) = message else {
             continue;
         };
-        let Some(reason) = stubs
-            .iter()
-            .find(|stub| stub.call_id == result.call_id.as_str())
-            .map(|stub| stub.reason)
-        else {
+        let Some(reason) = by_call.get(result.call_id.as_str()) else {
             continue;
         };
         result.content = reason.stub_text().to_owned();
@@ -240,21 +242,22 @@ fn apply_stubs(request: &mut crate::model::ModelRequest, stubs: &[StubDecision])
 /// `compile` can gate a fresh checkpoint on the reclaim that is genuinely new
 /// (ADR-011: pruning is episodic — one cache miss per checkpoint).
 fn frozen_reclaim(session: &Session, stubs: &[StubDecision]) -> u64 {
+    let by_call: HashMap<&str, StubReason> = stubs
+        .iter()
+        .map(|stub| (stub.call_id.as_str(), stub.reason))
+        .collect();
     let mut reclaim_bytes = 0u64;
     for item in &session.transcript {
         let Item::ToolResult(result) = item else {
             continue;
         };
-        let Some(stub) = stubs
-            .iter()
-            .find(|stub| stub.call_id == result.call_id.as_str())
-        else {
+        let Some(reason) = by_call.get(result.call_id.as_str()) else {
             continue;
         };
         reclaim_bytes += serialized_size(item).saturating_sub(stub_bytes(
             &result.call_id,
             &result.status,
-            stub.reason,
+            *reason,
         ));
     }
     reclaim_bytes / u64::from(super::BYTES_PER_TOKEN)
@@ -284,18 +287,16 @@ fn decide(
     let transcript: &[Item] = &session.transcript;
 
     // Pass 1 — call metadata (name, canonical args, declared reads) from
-    // assistant tool_calls, in call order.
-    let mut calls: Vec<(String, String, String, Vec<String>)> = Vec::new(); // (id, name, args, reads)
+    // assistant tool_calls, keyed by call id for O(1) lookup in pass 2.
+    let mut calls: HashMap<&str, (String, String, Vec<String>)> = HashMap::new();
     for item in transcript {
         if let Item::Assistant(assistant) = item {
             for call in &assistant.tool_calls {
                 let reads = read_paths(registry, &call.name, &call.arguments);
-                calls.push((
-                    call.id.as_str().to_owned(),
-                    call.name.clone(),
-                    call.arguments.to_string(),
-                    reads,
-                ));
+                calls.insert(
+                    call.id.as_str(),
+                    (call.name.clone(), call.arguments.to_string(), reads),
+                );
             }
         }
     }
@@ -313,15 +314,12 @@ fn decide(
                 assistant_at.push(index);
             }
             Item::ToolResult(result) => {
-                let meta = calls
-                    .iter()
-                    .find(|(id, ..)| *id == result.call_id.as_str())
-                    .and_then(|(id, name, args, reads)| {
-                        is_read_only(name)
-                            .then(|| (name.clone(), args.clone(), reads.clone()))
-                            .map(|meta| (id.clone(), meta))
-                    });
-                let read_call = meta.map(|(_id, meta)| meta);
+                let read_call =
+                    calls
+                        .get(result.call_id.as_str())
+                        .and_then(|(name, args, reads)| {
+                            is_read_only(name).then(|| (name.clone(), args.clone(), reads.clone()))
+                        });
                 if !result.effects.files_written.is_empty()
                     || !result.effects.files_deleted.is_empty()
                 {
@@ -363,20 +361,39 @@ fn decide(
 
     let total_turns = assistant_at.len();
     let mut stubbed: Vec<StubDecision> = Vec::new();
+    let mut stubbed_ids: HashSet<&str> = HashSet::new();
     let mut reclaim_bytes = 0u64;
-    let stub = |facts: &ResultFacts,
-                reason: StubReason,
-                stubbed: &mut Vec<StubDecision>,
-                reclaim_bytes: &mut u64| {
+
+    fn add_stub<'a>(
+        facts: &'a ResultFacts,
+        reason: StubReason,
+        stubbed: &mut Vec<StubDecision>,
+        stubbed_ids: &mut HashSet<&'a str>,
+        reclaim_bytes: &mut u64,
+    ) {
         *reclaim_bytes +=
             facts
                 .bytes
                 .saturating_sub(stub_bytes(&facts.call_id, &facts.status, reason));
+        stubbed_ids.insert(facts.call_id.as_str());
         stubbed.push(StubDecision {
             call_id: facts.call_id.as_str().to_owned(),
             reason,
         });
-    };
+    }
+
+    // Index of the newest call per (name, canonical args): one pass instead
+    // of scanning every later result per candidate.
+    let mut newest_by_call: HashMap<(&str, &str), usize> = HashMap::new();
+    for facts in &results {
+        let Some((name, args, _)) = facts.read_call.as_ref() else {
+            continue;
+        };
+        newest_by_call
+            .entry((name.as_str(), args.as_str()))
+            .and_modify(|index| *index = (*index).max(facts.index))
+            .or_insert(facts.index);
+    }
 
     // (1) Dedupe identical read-only calls, keeping the newest.
     for earlier in &results {
@@ -386,18 +403,15 @@ fn decide(
         let Some((name, args, _)) = earlier.read_call.as_ref() else {
             continue;
         };
-        let is_newest = !results.iter().any(|later| {
-            later.index > earlier.index
-                && later
-                    .read_call
-                    .as_ref()
-                    .is_some_and(|(n, a, _)| n == name && a == args)
-        });
+        let is_newest = newest_by_call
+            .get(&(name.as_str(), args.as_str()))
+            .is_some_and(|index| *index == earlier.index);
         if !is_newest {
-            stub(
+            add_stub(
                 earlier,
                 StubReason::DuplicateRead,
                 &mut stubbed,
+                &mut stubbed_ids,
                 &mut reclaim_bytes,
             );
         }
@@ -405,11 +419,7 @@ fn decide(
 
     // (2) Supersede reads of later-modified paths.
     for earlier in &results {
-        if earlier.index >= protected_from
-            || stubbed
-                .iter()
-                .any(|s| s.call_id == earlier.call_id.as_str())
-        {
+        if earlier.index >= protected_from || stubbed_ids.contains(earlier.call_id.as_str()) {
             continue;
         }
         let Some((_, _, reads)) = earlier.read_call.as_ref() else {
@@ -422,10 +432,11 @@ fn decide(
                     .any(|read| changed.iter().any(|path| paths_overlap(read, path)))
         });
         if superseded {
-            stub(
+            add_stub(
                 earlier,
                 StubReason::SupersededRead,
                 &mut stubbed,
+                &mut stubbed_ids,
                 &mut reclaim_bytes,
             );
         }
@@ -433,20 +444,17 @@ fn decide(
 
     // (3) Stale errors.
     for earlier in &results {
-        if earlier.index >= protected_from
-            || stubbed
-                .iter()
-                .any(|s| s.call_id == earlier.call_id.as_str())
-        {
+        if earlier.index >= protected_from || stubbed_ids.contains(earlier.call_id.as_str()) {
             continue;
         }
         if earlier.status != ToolStatus::Success
             && total_turns.saturating_sub(earlier.turn) > config.stale_error_turns
         {
-            stub(
+            add_stub(
                 earlier,
                 StubReason::StaleError,
                 &mut stubbed,
+                &mut stubbed_ids,
                 &mut reclaim_bytes,
             );
         }
@@ -464,12 +472,18 @@ fn decide(
             facts.index < protected_from
                 && facts.status == ToolStatus::Success
                 && facts.read_call.is_some()
-                && !stubbed.iter().any(|s| s.call_id == facts.call_id.as_str())
+                && !stubbed_ids.contains(facts.call_id.as_str())
         })
         .collect();
     aged.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.index.cmp(&b.index)));
     for facts in aged {
-        stub(facts, StubReason::AgedOut, &mut stubbed, &mut reclaim_bytes);
+        add_stub(
+            facts,
+            StubReason::AgedOut,
+            &mut stubbed,
+            &mut stubbed_ids,
+            &mut reclaim_bytes,
+        );
     }
 
     (stubbed, reclaim_bytes / u64::from(super::BYTES_PER_TOKEN))

@@ -233,8 +233,9 @@ fn render_list(items: &[String], cap: usize) -> String {
 /// task**, at task start, so the snapshot is stable for the whole task and the
 /// cached prefix is never churned mid-task.
 ///
-/// Implementations may block (filesystem and process work); the loop calls
-/// them from the task setup path, alongside the synchronous store seam.
+/// Implementations may block (filesystem and process work); the loop runs
+/// the scan on the blocking pool at task start, so a slow workspace cannot
+/// stall the async runtime.
 pub trait FactsSource: Send + Sync {
     /// Returns one deterministic snapshot of the repository state.
     fn scan(&self) -> KnownFacts;
