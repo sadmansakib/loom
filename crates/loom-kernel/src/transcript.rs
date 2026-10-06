@@ -22,6 +22,7 @@
 //! model messages. The `ContextCompiler` owns the projection from items to
 //! provider-neutral messages.
 
+use crate::artifact::ArtifactRef;
 use crate::model::StopReason;
 use crate::tool::ToolEffects;
 use serde::{Deserialize, Serialize};
@@ -336,10 +337,16 @@ pub struct ToolResult {
     /// empty value for results persisted before Iteration 2 step 2B.
     #[serde(default)]
     pub effects: ToolEffects,
+    /// Set when the full output was stored out of band and `content` only
+    /// says how to refetch it (ADR-012 decision 3, ADR-014). Loom-side
+    /// state: the context compiler strips it from the model projection,
+    /// and it defaults to `None` for results persisted before step 2D.
+    #[serde(default)]
+    pub artifact: Option<ArtifactRef>,
 }
 
 impl ToolResult {
-    /// A result carrying no recorded effects.
+    /// A result carrying no recorded effects and no out-of-band body.
     ///
     /// Used by the engine for failures and read-only calls, and by
     /// fixtures; the engine attaches a successful call's effects from
@@ -356,7 +363,16 @@ impl ToolResult {
             content: content.into(),
             truncated,
             effects: ToolEffects::none(),
+            artifact: None,
         }
+    }
+
+    /// Attaches a handle to the out-of-band body this result collapsed to
+    /// (builder style).
+    #[must_use]
+    pub fn with_artifact(mut self, artifact: ArtifactRef) -> Self {
+        self.artifact = Some(artifact);
+        self
     }
 }
 

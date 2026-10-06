@@ -19,6 +19,7 @@ fn tools() -> Vec<(&'static str, Box<dyn Tool>)> {
         ("write_file", Box::new(loom_tools::WriteFileTool)),
         ("edit_file", Box::new(loom_tools::EditFileTool)),
         ("run_command", Box::new(loom_tools::RunCommandTool::new())),
+        ("artifact_read", Box::new(loom_tools::ArtifactReadTool)),
     ]
 }
 

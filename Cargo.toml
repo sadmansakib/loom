@@ -58,6 +58,11 @@ futures = "0.3.34"
 # identifiers: UUID v7, time-ordered (architecture.md §2 `id` module)
 uuid = { version = "1.27.0", features = ["v7", "serde"] }
 
+# content addressing (ADR-012 decision 3): artifact bodies are keyed by the
+# SHA-256 of their bytes, so identical bodies dedupe and a ref survives the
+# file it was read from changing.
+sha2 = "0.10.9"
+
 # filesystem tooling (loom-tools: gitignore-aware walk + line search)
 ignore = "0.4.33"
 regex = "1.13.1"

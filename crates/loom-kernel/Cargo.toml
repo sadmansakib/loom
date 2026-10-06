@@ -10,6 +10,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
+sha2 = { workspace = true }
 # Event channel (ModelStream); declared here rather than relying on
 # tokio-util transitively enabling tokio/sync. The tool engine adds
 # `time` for ToolContext::timeout enforcement; the agent loop adds

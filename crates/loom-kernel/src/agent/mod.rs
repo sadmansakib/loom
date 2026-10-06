@@ -14,6 +14,7 @@
 //! trait objects and a registry.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
@@ -30,7 +31,7 @@ use crate::model::{
     Usage,
 };
 use crate::session::{PlannedTurn, Session, TaskRecord, TerminalTaskStatus};
-use crate::store::{SessionStore, StoreError};
+use crate::store::{ArtifactStore, SessionStore, StoreError};
 use crate::tool::{ToolContext, ToolRegistry};
 use crate::transcript::{AssistantMessage, Item, ToolCall, ToolFailure, ToolResult, ToolStatus};
 
@@ -367,6 +368,7 @@ pub struct Agent {
     tool_timeout: Duration,
     max_tool_concurrency: usize,
     store: Option<Box<dyn SessionStore>>,
+    artifacts: Option<Arc<dyn ArtifactStore>>,
 }
 
 impl Agent {
@@ -394,6 +396,7 @@ impl Agent {
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
             max_tool_concurrency: DEFAULT_MAX_TOOL_CONCURRENCY,
             store: None,
+            artifacts: None,
         }
     }
 
@@ -451,6 +454,19 @@ impl Agent {
     #[must_use]
     pub fn with_store(mut self, store: Box<dyn SessionStore>) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    /// Attaches an artifact store (§§12, ADR-012 decision 3).
+    ///
+    /// With a store attached, a tool result too large for the inline budget is
+    /// spilled to the store (content-addressed) and the transcript keeps a
+    /// compact [`ArtifactRef`](crate::artifact::ArtifactRef) the model can
+    /// refetch with `artifact_read`. Without one, oversized output is cut as
+    /// before.
+    #[must_use]
+    pub fn with_artifacts(mut self, artifacts: Option<Arc<dyn ArtifactStore>>) -> Self {
+        self.artifacts = artifacts;
         self
     }
 
@@ -920,7 +936,8 @@ impl Agent {
             self.config.workspace_root.clone(),
             cancellation.clone(),
             self.tool_timeout,
-        );
+        )
+        .with_artifacts(self.artifacts.clone());
         let batch = ToolBatch::new(&self.registry, &exposure)
             .with_max_concurrency(self.max_tool_concurrency);
         let ran = batch.execute(&runnable, &context).await;

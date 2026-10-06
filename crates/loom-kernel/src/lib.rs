@@ -7,6 +7,7 @@
 //! `ModelProvider` and `Tool` traits (linked once those modules land).
 
 pub mod agent;
+pub mod artifact;
 pub mod context;
 pub mod event;
 pub mod id;

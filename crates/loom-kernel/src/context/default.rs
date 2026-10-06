@@ -86,12 +86,15 @@ fn project_messages(session: &crate::session::Session, config: &AgentConfig) -> 
                 }
             }
             Item::ToolResult(result) => Some(Message::ToolResult(ToolResult {
-                // Effects are Loom-side state (ADR-012): they persist in the
-                // transcript but are never model-visible, so the projection
-                // strips them. This also keeps request recordings, the
-                // provider wire shape, and the byte census independent of
-                // effect bookkeeping.
+                // Effects and artifact refs are Loom-side state (ADR-012,
+                // ADR-014): they persist in the transcript but are never
+                // model-visible, so the projection strips them. This also
+                // keeps request recordings, the provider wire shape, and the
+                // byte census independent of effect/artifact bookkeeping. The
+                // model only learns an artifact exists from the note the tool
+                // engine appended to the content.
                 effects: ToolEffects::none(),
+                artifact: None,
                 ..result.clone()
             })),
         };

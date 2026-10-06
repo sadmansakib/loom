@@ -23,12 +23,16 @@
 //!   against.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
+
+use crate::artifact::ArtifactRef;
+use crate::store::ArtifactStore;
 
 /// The model-facing definition of one tool (its name, what it does, and
 /// the arguments it accepts).
@@ -88,7 +92,7 @@ pub trait Tool: Send + Sync {
 /// cancellation token clone-shares the turn's token, so per-call timeout
 /// budgets stay expressible while cancellation stays turn-wide.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolContext {
     /// The workspace root all relative paths resolve against. Filesystem
     /// tools must enforce this boundary themselves: relative paths,
@@ -106,6 +110,24 @@ pub struct ToolContext {
     /// `ToolStatus::Error(Timeout)` result is enforced by the engine
     /// (§6.6).
     pub timeout: Duration,
+    /// The store a tool may spill an oversized result into (ADR-012
+    /// decision 3). `None` when the run has no artifacts configured, in
+    /// which case results are only bounded inline.
+    pub artifacts: Option<Arc<dyn ArtifactStore>>,
+}
+
+impl std::fmt::Debug for ToolContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `dyn ArtifactStore` is not `Debug`; report only whether a store
+        // is attached, which is all a caller needs from a log line.
+        formatter
+            .debug_struct("ToolContext")
+            .field("workspace_root", &self.workspace_root)
+            .field("cancellation", &self.cancellation)
+            .field("timeout", &self.timeout)
+            .field("artifacts", &self.artifacts.is_some())
+            .finish()
+    }
 }
 
 impl ToolContext {
@@ -113,6 +135,7 @@ impl ToolContext {
     ///
     /// Explicit rather than defaulted: the engine always knows all three,
     /// and a silent default timeout or token would hide wiring mistakes.
+    /// No artifact store is attached; add one with [`ToolContext::with_artifacts`].
     pub fn new(
         workspace_root: PathBuf,
         cancellation: CancellationToken,
@@ -122,7 +145,16 @@ impl ToolContext {
             workspace_root,
             cancellation,
             timeout,
+            artifacts: None,
         }
+    }
+
+    /// Attaches the artifact store oversized results may spill into
+    /// (builder style).
+    #[must_use]
+    pub fn with_artifacts(mut self, artifacts: Option<Arc<dyn ArtifactStore>>) -> Self {
+        self.artifacts = artifacts;
+        self
     }
 }
 
@@ -229,6 +261,11 @@ pub struct ToolOutput {
     pub truncated: bool,
     /// What the call changed outside Loom's own state.
     pub effects: ToolEffects,
+    /// Set when the full output was stored out of band (ADR-012 decision 3,
+    /// ADR-014): the transcript then carries this compact handle and
+    /// `content` says how to refetch the body with `artifact_read`. `None`
+    /// for an ordinary inline result.
+    pub artifact: Option<ArtifactRef>,
 }
 
 impl ToolOutput {
@@ -238,6 +275,7 @@ impl ToolOutput {
             content: content.into(),
             truncated: false,
             effects: ToolEffects::none(),
+            artifact: None,
         }
     }
 
@@ -252,6 +290,14 @@ impl ToolOutput {
     #[must_use]
     pub fn with_effects(mut self, effects: ToolEffects) -> Self {
         self.effects = effects;
+        self
+    }
+
+    /// Attaches a handle to the out-of-band body this result collapsed to
+    /// (builder style).
+    #[must_use]
+    pub fn with_artifact(mut self, artifact: ArtifactRef) -> Self {
+        self.artifact = Some(artifact);
         self
     }
 

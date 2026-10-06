@@ -24,6 +24,7 @@ use futures::future::{self, Either};
 use futures::stream::{self, StreamExt};
 use tokio::time::timeout;
 
+use crate::artifact::ArtifactRef;
 use crate::tool::{ToolContext, ToolEffects, ToolError, ToolOutput, ToolRegistry};
 use crate::transcript::{ToolCall, ToolFailure, ToolResult, ToolStatus};
 
@@ -111,6 +112,7 @@ pub async fn execute_call(
             unknown_tool_content(registry, &call.name),
             false,
             ToolEffects::none(),
+            None,
         );
     };
     if !exposure.contains(&call.name) {
@@ -123,6 +125,7 @@ pub async fn execute_call(
             ),
             false,
             ToolEffects::none(),
+            None,
         );
     }
     if ctx.cancellation.is_cancelled() {
@@ -139,8 +142,15 @@ pub async fn execute_call(
         // Cancelled mid-flight: the tool future is dropped here.
         Either::Left(((), _timed)) => cancelled_result(call, true),
         Either::Right((Ok(Ok(output)), _)) => {
-            let (content, truncated, effects) = bound(output);
-            finish(call, ToolStatus::Success, content, truncated, effects)
+            let (content, truncated, effects, artifact) = bound(output, ctx);
+            finish(
+                call,
+                ToolStatus::Success,
+                content,
+                truncated,
+                effects,
+                artifact,
+            )
         }
         Either::Right((Ok(Err(ToolError::InvalidInput(msg))), _)) => finish(
             call,
@@ -148,6 +158,7 @@ pub async fn execute_call(
             format!("error: invalid input: {msg}"),
             false,
             ToolEffects::none(),
+            None,
         ),
         Either::Right((Ok(Err(ToolError::Execution(msg))), _)) => finish(
             call,
@@ -155,6 +166,7 @@ pub async fn execute_call(
             format!("error: execution failed: {msg}"),
             false,
             ToolEffects::none(),
+            None,
         ),
         Either::Right((Err(_elapsed), _)) => finish(
             call,
@@ -165,6 +177,7 @@ pub async fn execute_call(
             ),
             false,
             ToolEffects::none(),
+            None,
         ),
     }
 }
@@ -183,25 +196,58 @@ fn unknown_tool_content(registry: &ToolRegistry, name: &str) -> String {
     }
 }
 
+/// The `kind` recorded on artifacts spilled from oversized tool output.
+const ARTIFACT_KIND: &str = "tool_output";
+
 /// Applies [`MAX_TOOL_OUTPUT_BYTES`] on a char boundary; a tool-set
 /// `truncated` flag is never cleared. Effects pass through untouched —
 /// truncating text never changes what the call did.
-fn bound(output: ToolOutput) -> (String, bool, ToolEffects) {
+///
+/// Output over the bound prefers spilling the whole body into the
+/// artifact store over silently cutting it (ADR-014): the model gets a
+/// bounded head plus a note naming the artifact it can refetch with
+/// `artifact_read`. The spill is best-effort — without a store, or if
+/// the store refuses the write, the result is the plain truncation it
+/// would have been before artifacts existed.
+fn bound(
+    output: ToolOutput,
+    ctx: &ToolContext,
+) -> (String, bool, ToolEffects, Option<ArtifactRef>) {
     let ToolOutput {
         content,
         truncated,
         effects,
+        artifact,
     } = output;
     if content.len() <= MAX_TOOL_OUTPUT_BYTES {
-        return (content, truncated, effects);
+        return (content, truncated, effects, artifact);
     }
+    if artifact.is_none()
+        && let Some(store) = &ctx.artifacts
+        && let Ok(reference) =
+            crate::artifact::store_artifact(store.as_ref(), ARTIFACT_KIND, content.as_bytes())
+    {
+        let note = format!(
+            "\n... [full output stored as artifact {} ({} bytes); read it with artifact_read]",
+            reference.id, reference.bytes
+        );
+        let budget = MAX_TOOL_OUTPUT_BYTES.saturating_sub(note.len());
+        let mut head = content;
+        let mut cut = budget.min(head.len());
+        while !head.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        head.truncate(cut);
+        head.push_str(&note);
+        return (head, true, effects, Some(reference));
+    }
+    let mut content = content;
     let mut cut = MAX_TOOL_OUTPUT_BYTES;
     while !content.is_char_boundary(cut) {
         cut -= 1;
     }
-    let mut content = content;
     content.truncate(cut);
-    (content, true, effects)
+    (content, true, effects, artifact)
 }
 
 /// A cancelled call's result; `started` decides which honest message
@@ -218,6 +264,7 @@ fn cancelled_result(call: &ToolCall, started: bool) -> ToolResult {
         content.to_owned(),
         false,
         ToolEffects::none(),
+        None,
     )
 }
 
@@ -228,6 +275,7 @@ fn finish(
     content: String,
     truncated: bool,
     effects: ToolEffects,
+    artifact: Option<ArtifactRef>,
 ) -> ToolResult {
     tracing::debug!(
         target: "tool",
@@ -242,6 +290,7 @@ fn finish(
         content,
         truncated,
         effects,
+        artifact,
     }
 }
 

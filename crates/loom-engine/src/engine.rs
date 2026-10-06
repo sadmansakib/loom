@@ -7,6 +7,7 @@
 //! so local frontends pay no serialization cost (ADR-021).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use loom_kernel::agent::{Agent, TaskError, TaskSummary};
 use loom_kernel::context::{AgentConfig, DefaultContextCompiler};
@@ -19,7 +20,8 @@ use loom_kernel::tool::ToolRegistry;
 use loom_providers::{DeepSeekConfig, DeepSeekProvider, ReasoningEffort};
 use loom_store::SqliteStore;
 use loom_tools::{
-    EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool, WriteFileTool,
+    ArtifactReadTool, EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool,
+    WriteFileTool,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -139,11 +141,14 @@ impl Engine {
         )
         .with_max_turns(config.max_turns);
 
-        // Durable sessions (ADR-008): the same `loom.db` the account store
-        // uses. `--no-save` leaves the run in memory only.
+        // Durable sessions and artifact bodies (ADR-008, ADR-012): the same
+        // `loom.db` the account store uses. `--no-save` leaves the run in
+        // memory only, so nothing spills and `artifact_read` has no store.
         if config.persist {
             let store = SqliteStore::open(paths::db_path()).map_err(EngineError::Session)?;
             agent = agent.with_store(Box::new(store));
+            let artifacts = SqliteStore::open(paths::db_path()).map_err(EngineError::Session)?;
+            agent = agent.with_artifacts(Some(Arc::new(artifacts)));
         }
 
         Ok(Self { agent })
@@ -219,6 +224,7 @@ fn build_registry() -> Result<ToolRegistry, EngineError> {
     register("read_file", Box::new(ReadFileTool))?;
     register("list_dir", Box::new(ListDirTool))?;
     register("search", Box::new(SearchTool))?;
+    register("artifact_read", Box::new(ArtifactReadTool))?;
     register("write_file", Box::new(WriteFileTool))?;
     register("edit_file", Box::new(EditFileTool))?;
     register("run_command", Box::new(RunCommandTool::new()))?;
