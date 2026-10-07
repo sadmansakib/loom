@@ -64,6 +64,10 @@ cargo fmt --check
 Workspace lints: `unsafe_code` forbidden; `missing_docs`, `unwrap_used`,
 `expect_used` warned.
 
+Documentation: [`docs/architecture.md`](docs/architecture.md) (design),
+[`docs/eval.md`](docs/eval.md) (eval suite protocol),
+[`docs/roadmap.md`](docs/roadmap.md) (iterations).
+
 ## License
 
 TBD — this project has not chosen a license yet.
