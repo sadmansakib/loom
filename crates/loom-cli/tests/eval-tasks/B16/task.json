@@ -1,0 +1,23 @@
+{
+  "id": "B16",
+  "prompt": "The test suite of this crate fails. Find the fault in the implementation, fix it, and make `cargo test` pass. The tests under tests/ are the complete and only specification of correct behavior: do not modify anything under tests/, and expect no hidden tests beyond them.",
+  "tools": "coding",
+  "heavy": false,
+  "workspace": "copy",
+  "gate": {
+    "kind": "bugfix",
+    "protected": ["tests/regression.rs"],
+    "fail_to_pass": [
+      "trigger_scales_with_a_large_window",
+      "an_extreme_window_saturates_instead_of_overflowing",
+      "should_prune_uses_the_real_trigger_not_the_floor"
+    ],
+    "pass_to_pass": [
+      "a_small_window_still_gets_the_floor",
+      "zero_percent_trigger_is_the_floor",
+      "the_trigger_is_strict_so_equality_does_not_prune",
+      "a_tiny_total_never_triggers_regardless_of_window"
+    ]
+  },
+  "notes": "Reproduces 6c225d9: the pruning trigger always returned the flat floor instead of scaling with trigger_percent of the model's input budget, so pruning fired as if every model had the smallest configured window."
+}

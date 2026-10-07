@@ -59,6 +59,33 @@ spans 15 tasks (B1–B15).
   and 6/6) and live: 10/10 gated runs at pass rate 1.0
   (deepseek-flash).
 
+## 2026-10-07 — Corpus growth: B16 and B17 from shipped fixes
+
+Round 5 of mining Loom's fix history for bugfix tasks; the suite now
+spans 17 tasks (B1–B17).
+
+- **B16 — window-relative pruning trigger** (6c225d9): the trigger
+  always returned the flat floor instead of scaling with `trigger_percent`
+  of the model's input budget, so pruning fired as if every model had the
+  smallest configured window. F2P: trigger scales with a large window, an
+  extreme window saturates instead of overflowing, `should_prune` uses the
+  real trigger rather than the floor. P2P: a small window still gets the
+  floor, a zero-percent trigger is the floor, the comparison is strict
+  (equality never prunes), a tiny total never triggers regardless of
+  window.
+- **B17 — atomic account activation** (5a2c1d7): `set_active` demoted
+  every account before checking the target id existed, so activating an
+  absent id left the provider with no active account. F2P: an absent id
+  leaves the active account untouched. P2P: an absent id on an already
+  inactive store leaves everyone inactive, switching to a real account
+  demotes the previous one, switching to the already-active account is a
+  no-op `Ok`, an empty store rejects any id, switching among three
+  accounts leaves exactly one active.
+- Both proven SWE-bench style offline (seeds fail exactly their F2P set
+  and pass their P2P set; the real fixes flip everything green — 7/7 and
+  6/6) and live: 10/10 gated runs at pass rate 1.0 (deepseek-flash), first
+  try.
+
 ## 2026-10-07 — Corpus growth: B12 and B13 from shipped fixes
 
 Round 3 of mining Loom's fix history for bugfix tasks; the suite now

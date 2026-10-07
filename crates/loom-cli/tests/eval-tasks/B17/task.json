@@ -1,0 +1,22 @@
+{
+  "id": "B17",
+  "prompt": "The test suite of this crate fails. Find the fault in the implementation, fix it, and make `cargo test` pass. The tests under tests/ are the complete and only specification of correct behavior: do not modify anything under tests/, and expect no hidden tests beyond them.",
+  "tools": "coding",
+  "heavy": false,
+  "workspace": "copy",
+  "gate": {
+    "kind": "bugfix",
+    "protected": ["tests/regression.rs"],
+    "fail_to_pass": [
+      "an_absent_id_leaves_the_active_account_untouched"
+    ],
+    "pass_to_pass": [
+      "an_absent_id_on_an_already_inactive_store_leaves_everyone_inactive",
+      "switching_to_a_real_account_demotes_the_previous_one",
+      "switching_to_the_already_active_account_is_a_no_op_ok",
+      "an_empty_store_rejects_any_id",
+      "switching_among_three_accounts_leaves_exactly_one_active"
+    ]
+  },
+  "notes": "Reproduces 5a2c1d7: set_active demoted every account before checking that the target id existed, so activating an absent id left the provider with no active account instead of leaving the switch untouched."
+}
