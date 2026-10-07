@@ -59,6 +59,27 @@ spans 15 tasks (B1–B15).
   and 6/6) and live: 10/10 gated runs at pass rate 1.0
   (deepseek-flash).
 
+## 2026-10-07 — Budget-exceeded rescue in the pruning compiler
+
+`PruningContextCompiler` could not rescue an inner
+`ContextError::BudgetExceeded`: the inner compiler errored before the
+wrapper's trigger ever fired, so an over-budget projection failed the
+task outright. The wrapper now catches the overrun, decides stubs
+immediately (the reclaim gate does not apply — the budget is already
+blown), recompiles a private stubbed view of the same transcript, and
+freezes a checkpoint like any other trigger, so the rescue costs exactly
+one cache miss and later turns stay byte-stable. It fails closed with
+the original error when nothing is prunable or the pruned view still
+does not fit.
+
+Also shipped in the eval harness: `LOOM_EVAL_TOLERATE_FAILURES=1`
+opts a live run into measurement mode — per-task asserts are skipped,
+every report and the suite headline still land, and the headline is
+labeled `"mode": "tolerant"` (strict asserting stays the default) — and
+`docs/eval.md` documents the suite's protocol end to end. The roadmap's
+near-term list dropped two stale entries: process-group teardown
+(shipped as 2bd4928) and this rescue.
+
 ## 2026-10-07 — Corpus growth: B16 and B17 from shipped fixes
 
 Round 5 of mining Loom's fix history for bugfix tasks; the suite now

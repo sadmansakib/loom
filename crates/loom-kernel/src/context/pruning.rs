@@ -23,10 +23,15 @@
 //! least `protected_tail_tokens` estimated tokens of trailing items
 //! (whichever reaches further back).
 //!
-//! Known limitation: an inner `Err(ContextError::BudgetExceeded)` carries
-//! no request to prune, so the wrapper cannot rescue it. The trigger
-//! threshold must therefore sit below the model's input budget, which the
-//! defaults (64 K trigger vs ≥ 64 K windows) assume.
+//! Budget-exceeded rescue: when the inner compiler's estimate already
+//! overruns the budget — the trigger never got the chance to fire below
+//! the wall — the wrapper decides stubs immediately and recompiles a
+//! stubbed view of the same transcript (same rules, same estimator, same
+//! protected tail). A rescue with nothing prunable, or one that is still
+//! over budget once fully pruned, fails closed with the original
+//! [`ContextError::BudgetExceeded`]. The rescue freezes a checkpoint
+//! like any other trigger, so later turns stay byte-stable and the
+//! rescue costs exactly one cache miss.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -171,15 +176,72 @@ impl PruningContextCompiler {
 
 impl ContextCompiler for PruningContextCompiler {
     fn compile(&self, input: ContextInput<'_>) -> Result<CompiledContext, ContextError> {
-        // The inner compiler takes `input` by value, so copy out everything
-        // the wrapper still needs. These are references and `Copy` values —
-        // no transcript is cloned.
-        let budget = input.budget;
-        let session = input.session;
-        let tools = input.tools;
-        let facts_text = input.facts.render();
-        let mut checkpoint = input.prune_checkpoint.cloned();
-        let mut compiled = self.inner.compile(input)?;
+        // The inner compiler takes `input` by value, so destructure it once
+        // and keep every field the wrapper still needs. These are references
+        // and `Copy` values — no transcript is cloned on the normal path.
+        let ContextInput {
+            session,
+            tools,
+            task,
+            budget,
+            capabilities,
+            model,
+            config,
+            facts,
+            prune_checkpoint,
+        } = input;
+        let facts_text = facts.render();
+        let mut checkpoint = prune_checkpoint.cloned();
+        let mut compiled = match self.inner.compile(ContextInput {
+            session,
+            tools,
+            task,
+            budget,
+            capabilities,
+            model,
+            config,
+            facts,
+            prune_checkpoint,
+        }) {
+            Ok(compiled) => compiled,
+            // Budget-exceeded rescue: the unpruned projection cannot fit,
+            // so the wrapper decides stubs now — ahead of any trigger —
+            // and recompiles a stubbed view of the same transcript. The
+            // reclaim gate does not apply: the budget is already blown, so
+            // cache-churn economics are moot and any prunable result is
+            // worth taking. Fails closed when nothing is prunable or the
+            // pruned view still does not fit.
+            Err(overrun @ ContextError::BudgetExceeded { .. }) => {
+                let (decisions, _reclaim) = decide(session, tools, self.config, &*self.estimator);
+                if decisions.is_empty() {
+                    return Err(overrun);
+                }
+                let stubbed = stubbed_session(session, &decisions);
+                match self.inner.compile(ContextInput {
+                    session: &stubbed,
+                    tools,
+                    task,
+                    budget,
+                    capabilities,
+                    model,
+                    config,
+                    facts,
+                    prune_checkpoint,
+                }) {
+                    Ok(compiled) => {
+                        checkpoint = Some(PruneCheckpoint {
+                            upto_item: session.transcript.len(),
+                            stubs: decisions,
+                        });
+                        compiled
+                    }
+                    // Even fully pruned it does not fit: the budget is
+                    // genuinely blown; surface the original overrun.
+                    Err(_) => return Err(overrun),
+                }
+            }
+            Err(other) => return Err(other),
+        };
 
         // `census` needs the facts-message size the inner projection used;
         // recompute it the same way `project_messages` does.
@@ -255,6 +317,29 @@ fn apply_stubs(request: &mut crate::model::ModelRequest, stubs: &[StubDecision])
         result.content = reason.stub_text().to_owned();
         result.truncated = false;
     }
+}
+
+/// Clones `session` with the stubbed results rewritten in place, as the
+/// private view the budget-exceeded rescue recompiles. The durable
+/// transcript is never mutated — only this copy's projection changes,
+/// mirroring [`apply_stubs`] item for item.
+fn stubbed_session(session: &Session, stubs: &[StubDecision]) -> Session {
+    let by_call: HashMap<&str, StubReason> = stubs
+        .iter()
+        .map(|stub| (stub.call_id.as_str(), stub.reason))
+        .collect();
+    let mut stubbed = session.clone();
+    for item in &mut stubbed.transcript {
+        let Item::ToolResult(result) = item else {
+            continue;
+        };
+        let Some(reason) = by_call.get(result.call_id.as_str()) else {
+            continue;
+        };
+        result.content = reason.stub_text().to_owned();
+        result.truncated = false;
+    }
+    stubbed
 }
 
 /// Tokens the already-frozen stubs reclaim from the *current* transcript, so
@@ -728,6 +813,14 @@ mod tests {
     }
 
     fn input<'a>(session: &'a Session, prune: Option<&'a PruneCheckpoint>) -> ContextInput<'a> {
+        input_with(session, prune, budget())
+    }
+
+    fn input_with<'a>(
+        session: &'a Session,
+        prune: Option<&'a PruneCheckpoint>,
+        budget: ContextBudget,
+    ) -> ContextInput<'a> {
         shared();
         static FACTS: std::sync::OnceLock<crate::context::KnownFacts> = std::sync::OnceLock::new();
         let facts = FACTS.get_or_init(crate::context::KnownFacts::default);
@@ -735,7 +828,7 @@ mod tests {
             session,
             tools: READ_REGISTRY.get().expect("registry"),
             task: TASK.get().expect("task"),
-            budget: budget(),
+            budget,
             capabilities: CAPABILITIES.get().expect("capabilities"),
             model: "deepseek-flash",
             config: AGENT_CONFIG.get().expect("config"),
@@ -792,6 +885,96 @@ mod tests {
             .expect("compiles");
         assert!(compiled.prune_checkpoint.is_none());
         assert!(compiled.census.total < 64_000);
+    }
+
+    /// A budget tight enough that the *inner* compiler refuses the
+    /// unpruned projection — the situation the rescue exists for, where
+    /// the trigger never got the chance to fire below the wall.
+    fn tight() -> ContextBudget {
+        ContextBudget {
+            max_input_tokens: 60_000,
+            reserved_output_tokens: 4_096,
+        }
+    }
+
+    #[test]
+    fn an_inner_budget_overrun_is_rescued_by_a_forced_prune() {
+        // 300 KiB of tool result ≈ 100 K estimated tokens against the 60 K
+        // budget; the old read sits far outside the protected tail.
+        let items = vec![
+            Item::User {
+                text: "go".to_owned(),
+            },
+            assistant_calls("reading", vec![read_call("c1", "src/a.rs")]),
+            result("c1", &big("content", 300)),
+            assistant_text("filler one"),
+            assistant_text("filler two"),
+            assistant_calls("reading again", vec![read_call("c2", "src/b.rs")]),
+            result("c2", &big("tail", 70)),
+            assistant_text("done"),
+        ];
+        let session = session_with(items);
+        let compiled = compiler(PruneConfig::default())
+            .compile(input_with(&session, None, tight()))
+            .expect("rescued compile");
+        assert!(compiled.census.total <= 60_000);
+        let checkpoint = compiled
+            .prune_checkpoint
+            .expect("rescue froze a checkpoint");
+        assert!(checkpoint.stubs.iter().any(|stub| stub.call_id == "c1"));
+        assert!(!checkpoint.stubs.iter().any(|stub| stub.call_id == "c2"));
+        assert!(messages_contain(
+            &compiled.request,
+            StubReason::AgedOut.stub_text()
+        ));
+    }
+
+    #[test]
+    fn a_rescue_without_prunable_results_fails_closed() {
+        // User items are never prunable: over budget with nothing to stub
+        // must surface the inner error, never an empty success.
+        let items = vec![Item::User {
+            text: big("question", 300),
+        }];
+        let session = session_with(items);
+        let error = compiler(PruneConfig::default())
+            .compile(input_with(&session, None, tight()))
+            .expect_err("over budget");
+        assert!(matches!(error, ContextError::BudgetExceeded { .. }));
+    }
+
+    #[test]
+    fn a_rescued_session_stays_stubbed_and_byte_stable() {
+        let items = vec![
+            Item::User {
+                text: "go".to_owned(),
+            },
+            assistant_calls("reading", vec![read_call("c1", "src/a.rs")]),
+            result("c1", &big("content", 300)),
+            assistant_text("filler one"),
+            assistant_text("filler two"),
+            assistant_calls("reading again", vec![read_call("c2", "src/b.rs")]),
+            result("c2", &big("tail", 70)),
+            assistant_text("done"),
+        ];
+        let session = session_with(items);
+        let first = compiler(PruneConfig::default())
+            .compile(input_with(&session, None, tight()))
+            .expect("rescued compile");
+        let checkpoint = first.prune_checkpoint.clone().expect("frozen");
+        let second = compiler(PruneConfig::default())
+            .compile(input_with(&session, Some(&checkpoint), tight()))
+            .expect("frozen compile");
+        assert!(messages_contain(
+            &second.request,
+            StubReason::AgedOut.stub_text()
+        ));
+        // Byte-stability between events: passing the frozen checkpoint
+        // back must reproduce the rescued request exactly (ADR-011).
+        assert_eq!(
+            serde_json::to_string(&first.request).expect("serialize"),
+            serde_json::to_string(&second.request).expect("serialize")
+        );
     }
 
     #[test]

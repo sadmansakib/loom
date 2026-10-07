@@ -64,7 +64,11 @@ works; this document tracks direction.
   stub strategies (duplicate reads, superseded reads, stale errors,
   age-out of all remaining unprotected reads); frozen, replayable
   checkpoints with a delta-reclaim gate so a parked session costs zero
-  extra cache misses and each trigger costs exactly one.
+  extra cache misses and each trigger costs exactly one. A projection
+  that overruns the budget outright is rescued by a forced prune —
+  decide stubs, recompile a stubbed view of the same transcript — and
+  fails closed only when nothing is prunable or the pruned view still
+  does not fit.
 
 ### Tools
 
@@ -81,7 +85,9 @@ works; this document tracks direction.
   char-boundary-safe cuts and explicit omission markers; oversize
   spills to a content-addressed artifact store and the model gets a
   paged read tool to recover it. Command streams keep a 64 KiB head
-  *and* tail — errors live at the tail.
+  *and* tail — errors live at the tail. A command timeout kills the
+  entire process group, so grandchildren (`rustc` under `cargo`)
+  cannot outlive the kill.
 - **Evidence shaping.** Failed builds/tests parsed into compact
   structured evidence (cargo JSON diagnostics, libtest, nextest JUnit)
   and linked to the recent change on the likely-causing path;
@@ -141,68 +147,57 @@ requires unwinding shipped invariants.
    output caps, environment scrubbing), and audit records for every
    executed command. Seam: the existing allow-list check and
    `CommandEffect` records.
-2. **Process-group teardown.** A timeout kills the direct child
-   (`kill_on_drop`) but not grandchildren (`rustc` under `cargo`).
-   Proper teardown needs process groups (`killpg` — via a small
-   `unsafe`-containing helper crate or a sandboxing dependency, since
-   the workspace forbids `unsafe` in-tree). Seam: `exec.rs`, where the
-   child is spawned.
-3. **Verification beyond Cargo.** `verify` scopes to
+2. **Verification beyond Cargo.** `verify` scopes to
    `cargo check`/`cargo test`. Extend to the ecosystems the facts
    scanner already detects (npm/pyproject/go/Make): command selection
    per detected build system, plus evidence parsers per ecosystem's
    failure format. Seam: the `cargo`-only scope check and the evidence
    parser registry.
-4. **Budget-exceeded rescue.** The pruning wrapper cannot rescue an
-   inner `BudgetExceeded` (the inner compiler errors before the wrapper
-   can decide to prune). Ship a compile path that treats the inner
-   budget error as a prune trigger — re-compile with aggressive stubs
-   instead of failing the task. Seam: `PruningContextCompiler::compile`.
-5. **CLI session resume.** The engine can load and resume a persisted
+3. **CLI session resume.** The engine can load and resume a persisted
    session; the CLI has no `--resume`/`--session` surface for it. Add
    listing, selection, and continuation, plus transcript export.
 
 ### Mid term
 
-6. **More providers.** DeepSeek and OpenRouter share one OpenAI-shaped
+4. **More providers.** DeepSeek and OpenRouter share one OpenAI-shaped
    wire; the abstraction is proven only for that shape. Add a
    non-OpenAI-shaped provider (Anthropic-style messages, or Gemini) to
    pressure the `ModelProvider` boundary itself, including
    capability-correct pruning floors per model. OpenRouter's catalog is
    the model to copy for capability discovery: fetch in the frontend,
    pass to the engine as data.
-7. **Long-term memory.** Designed (session-persistent knowledge with
+5. **Long-term memory.** Designed (session-persistent knowledge with
    explicit add/expire semantics) but not built. The `FactsSource` seam
    and the facts block projection are the insertion point; the hard
    part is eviction and staleness policy, not storage.
-8. **Adaptive pruning thresholds.** Current constants (80% trigger,
+6. **Adaptive pruning thresholds.** Current constants (80% trigger,
    20K floors) come from one benchmark corpus. Ship measurement-driven
    tuning: per-model trigger curves using the census and cache
    hit/miss data the loop already records, evaluated by the replay
    harness.
-9. **Search parity.** The hand-built gitignore chain diverges from the
+7. **Search parity.** The hand-built gitignore chain diverges from the
    `ignore` crate on negation-precedence edge cases (documented in
    code). Either adopt the crate's matcher for chained files or pin
    the divergence with fixture tests from real repositories.
-10. **Artifacts lifecycle.** Spilled artifacts accumulate in `loom.db`
+8. **Artifacts lifecycle.** Spilled artifacts accumulate in `loom.db`
     with no retention policy. Add reference-counting from live
     transcripts plus a GC (age- or size-bounded) and a size-reporting
     command.
 
 ### Later
 
-11. **Parallel agent orchestration.** Multiple tasks over one session,
+9. **Parallel agent orchestration.** Multiple tasks over one session,
     worktree-per-agent isolation, and a merge path. The lease support
     in the store is the first brick; needs conflict policy and an
     orchestrator above the engine.
-12. **Mid-task model selection.** The model is fixed per task by design
+10. **Mid-task model selection.** The model is fixed per task by design
     (capabilities resolve once). Allow planned switches at task
     boundaries — cheap given the budget plumbing, but it invalidates
     the single-capability assumption baked into the loop's setup.
-13. **Frontends.** The engine boundary is frontend-neutral (no
+11. **Frontends.** The engine boundary is frontend-neutral (no
     printing, typed results, ordered events). A TUI or desktop client
     is additive once session resume ships.
-14. **Distributed verification.** Farm `verify` runs (the expensive
+12. **Distributed verification.** Farm `verify` runs (the expensive
     step) to remote or containerized runners with the same evidence
     contract, so local context budgets are never spent on build logs.
 
