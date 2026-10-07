@@ -1079,6 +1079,13 @@ async fn eval_live() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
+    // Measurement mode: a baseline run must survive a failed run and still
+    // write every remaining task's report plus the suite headline. Strict
+    // (asserting every run green) stays the default — that is the CI
+    // contract; tolerance is opt-in per invocation.
+    let tolerate_failures = std::env::var("LOOM_EVAL_TOLERATE_FAILURES")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
 
     let dir = eval_dir();
     let records_dir = dir.join("records");
@@ -1152,22 +1159,24 @@ async fn eval_live() {
         std::fs::write(&path, serde_json::to_string_pretty(&report).unwrap()).unwrap();
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
         eprintln!("wrote {}", path.display());
-        assert!(
-            reports.iter().all(|r| r["success"].as_bool().unwrap()),
-            "{}: at least one live run failed",
-            task.id
-        );
-        // Gated tasks are graded by outcome: a run whose gate failed
-        // (tests not green, tests rewritten, or suite disabled) fails the
-        // live eval even though the transcript itself completed.
-        assert!(
-            reports
-                .iter()
-                .filter(|r| r.get("gate").is_some_and(|g| !g.is_null()))
-                .all(|r| r["gate"]["bug_fixed"].as_bool().unwrap_or(false)),
-            "{}: at least one run failed the bug-fix gate",
-            task.id
-        );
+        if !tolerate_failures {
+            assert!(
+                reports.iter().all(|r| r["success"].as_bool().unwrap()),
+                "{}: at least one live run failed",
+                task.id
+            );
+            // Gated tasks are graded by outcome: a run whose gate failed
+            // (tests not green, tests rewritten, or suite disabled) fails the
+            // live eval even though the transcript itself completed.
+            assert!(
+                reports
+                    .iter()
+                    .filter(|r| r.get("gate").is_some_and(|g| !g.is_null()))
+                    .all(|r| r["gate"]["bug_fixed"].as_bool().unwrap_or(false)),
+                "{}: at least one run failed the bug-fix gate",
+                task.id
+            );
+        }
         suite.push((task.id.clone(), reports));
     }
 
@@ -1202,6 +1211,7 @@ async fn eval_live() {
     }
     let headline = serde_json::json!({
         "model": model,
+        "mode": if tolerate_failures { "tolerant" } else { "strict" },
         "tasks": per_task,
         "gated_runs": gated_runs,
         "gated_solved": gated_solved,
