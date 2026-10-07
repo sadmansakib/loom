@@ -46,14 +46,21 @@
 //! Running:
 //!
 //! ```text
-//! # live (spends tokens, needs DEEPSEEK_API_KEY):
+//! # live (spends tokens, needs DEEPSEEK_API_KEY; free models cost $0):
 //! DEEPSEEK_API_KEY=... cargo test -p loom-cli --test eval \
 //!     -- --ignored --nocapture
+//! # live on OpenRouter (free-tier models cost nothing but are rate-limited):
+//! LOOM_EVAL_PROVIDER=openrouter OPENROUTER_API_KEY=... \
+//!     LOOM_EVAL_MODEL=deepseek/deepseek-chat-v3-0324:free \
+//!     cargo test -p loom-cli --test eval -- --ignored --nocapture
 //! # offline replay of whatever recordings exist (always safe):
 //! cargo test -p loom-cli --test eval -- --nocapture
 //! ```
 //!
-//! Knobs: `LOOM_EVAL_MODEL` (default `deepseek-flash`), `LOOM_EVAL_RUNS`
+//! Knobs: `LOOM_EVAL_PROVIDER` (`deepseek` default, or `openrouter`),
+//! `LOOM_EVAL_MODEL` (default `deepseek-flash`; OpenRouter ids like
+//! `vendor/model:free` are accepted — files are named with a slug),
+//! `LOOM_EVAL_RUNS`
 //! (default 5), `LOOM_EVAL_DIR` (default `<workspace>/target/eval`),
 //! `LOOM_EVAL_TASKS` (comma-separated task ids; default all).
 //! Live output lands in `LOOM_EVAL_DIR`: `records/<task>-<model>-<run>.jsonl`
@@ -87,7 +94,10 @@ use loom_core::kernel::model::{
 use loom_core::kernel::session::Session;
 use loom_core::kernel::tool::ToolRegistry;
 use loom_core::kernel::transcript::{AssistantMessage, Item, ToolArguments, ToolCall, ToolCallId};
-use loom_core::providers::{DeepSeekConfig, DeepSeekProvider, ReasoningEffort, model_capabilities};
+use loom_core::providers::{
+    DeepSeekConfig, DeepSeekProvider, OPENROUTER_DEFAULT_BASE_URL, OpenRouterConfig,
+    OpenRouterProvider, ReasoningEffort, TimeoutConfig, fetch_catalog, model_capabilities,
+};
 use loom_core::tools::{
     EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool, VerifyTool, WriteFileTool,
 };
@@ -574,6 +584,9 @@ fn cost_usd(model: &str, hit: u64, miss: u64, output: u64, multiplier: f64) -> f
     let prices = match model {
         "deepseek-flash" => &FLASH,
         "deepseek-v4-pro" => &PRO,
+        // Free-tier OpenRouter ids price at zero by construction; the
+        // provider-reported figure (preferred when present) agrees.
+        other if other.ends_with(":free") => return 0.0,
         other => panic!("no price table for model `{other}`"),
     };
     let per_million = |tokens: u64, price: f64| tokens as f64 / 1_000_000.0 * price;
@@ -581,6 +594,13 @@ fn cost_usd(model: &str, hit: u64, miss: u64, output: u64, multiplier: f64) -> f
         * (per_million(miss, prices.input_miss)
             + per_million(hit, prices.input_hit)
             + per_million(output, prices.output))
+}
+
+/// Filesystem-safe form of a model id — OpenRouter ids carry `/` and `:`
+/// (`deepseek/deepseek-chat-v3-0324:free` → `deepseek-deepseek-chat-v3-0324-free`),
+/// and every report/record filename embeds the model.
+fn slug(model: &str) -> String {
+    model.replace(['/', ':'], "-")
 }
 
 /// Peak Mon–Fri 01:00–04:00 & 06:00–10:00 UTC; else off-peak (0.5×).
@@ -992,6 +1012,19 @@ async fn run_once(
     let micro = serde_json::to_value(loom_core::kernel::analytics::session_stats(&session))
         .unwrap_or(serde_json::json!(null));
 
+    // Provider-reported charges win when present (OpenRouter bills the
+    // account and reports the exact figure); the DeepSeek table remains
+    // the fallback, since DeepSeek never reports cost.
+    let reported_cost: Option<f64> = recorded
+        .iter()
+        .any(|e| e.response.usage.cost_usd.is_some())
+        .then(|| {
+            recorded
+                .iter()
+                .filter_map(|e| e.response.usage.cost_usd)
+                .sum()
+        });
+
     let mut report = match &outcome {
         Ok(summary) => {
             assert_eq!(
@@ -1028,7 +1061,13 @@ async fn run_once(
                 "wall_time_ms": summary.wall_time.as_millis() as u64,
                 "observed_wall_time_ms": observed_ms,
                 "price_window": window,
-                "cost_usd": cost_usd(model, hit, miss, summary.output_tokens, multiplier),
+                "cost_usd": reported_cost
+                    .unwrap_or_else(|| cost_usd(model, hit, miss, summary.output_tokens, multiplier)),
+                "cost_source": if reported_cost.is_some() {
+                    "provider-reported"
+                } else {
+                    "price-table"
+                },
                 "compiler_census": {
                     "system_prompt": summary.last_context_census.system_prompt,
                     "repo_facts": summary.last_context_census.repo_facts,
@@ -1076,11 +1115,27 @@ async fn run_once(
 
 /// N live runs of every runnable task, recordings + aggregates to disk.
 #[tokio::test]
-#[ignore = "live: needs DEEPSEEK_API_KEY; spends real tokens"]
+#[ignore = "live: needs DEEPSEEK_API_KEY (or OPENROUTER_API_KEY); spends real tokens"]
 async fn eval_live() {
-    let Ok(api_key) = std::env::var("DEEPSEEK_API_KEY") else {
-        eprintln!("skipping eval_live: DEEPSEEK_API_KEY is not set");
-        return;
+    let provider_name =
+        std::env::var("LOOM_EVAL_PROVIDER").unwrap_or_else(|_| String::from("deepseek"));
+    let api_key = match provider_name.as_str() {
+        "openrouter" => {
+            let Ok(key) = std::env::var("OPENROUTER_API_KEY") else {
+                eprintln!(
+                    "skipping eval_live: OPENROUTER_API_KEY is not set (LOOM_EVAL_PROVIDER=openrouter)"
+                );
+                return;
+            };
+            key
+        }
+        _ => {
+            let Ok(key) = std::env::var("DEEPSEEK_API_KEY") else {
+                eprintln!("skipping eval_live: DEEPSEEK_API_KEY is not set");
+                return;
+            };
+            key
+        }
     };
     let model = std::env::var("LOOM_EVAL_MODEL").unwrap_or_else(|_| String::from("deepseek-flash"));
     let runs: usize = std::env::var("LOOM_EVAL_RUNS")
@@ -1109,6 +1164,24 @@ async fn eval_live() {
         .map(|raw| raw.split(',').map(|id| id.trim().to_owned()).collect());
 
     let all_tasks = tasks();
+    // The OpenRouter arm resolves capabilities from the live catalog —
+    // parity with the CLI, which fetches it before the engine opens.
+    let openrouter_catalog = if provider_name == "openrouter" {
+        Some(
+            fetch_catalog(
+                OPENROUTER_DEFAULT_BASE_URL,
+                &api_key,
+                TimeoutConfig::default(),
+            )
+            .await
+            .expect("fetching the OpenRouter catalog"),
+        )
+    } else {
+        None
+    };
+    // OpenRouter model ids carry `/` and `:` — every artifact filename
+    // embeds the model, so files use this slug instead.
+    let file_model = slug(&model);
     let mut suite: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
     for task in &all_tasks {
         if let Some(only) = &only
@@ -1123,26 +1196,43 @@ async fn eval_live() {
         }
         let mut reports = Vec::new();
         for run in 1..=runs {
-            let deepseek = DeepSeekProvider::new(
-                DeepSeekConfig::new(api_key.clone()).with_reasoning_effort(ReasoningEffort::High),
-            )
-            .unwrap();
-            let provider_label = deepseek.name().to_owned();
-            let (provider, exchanges) = RecordingProvider::new(deepseek);
-            let (report, recorded, session) = run_once(
-                task,
-                &model,
-                &provider_label,
-                Box::new(provider),
-                Some(exchanges),
-            )
-            .await;
+            let (provider, exchanges, provider_label) = if provider_name == "openrouter" {
+                let openrouter = OpenRouterProvider::new(
+                    OpenRouterConfig::new(api_key.clone()),
+                    openrouter_catalog
+                        .clone()
+                        .expect("catalog fetched for the openrouter arm"),
+                )
+                .expect("openrouter provider");
+                let label = openrouter.name().to_owned();
+                let (provider, exchanges) = RecordingProvider::new(openrouter);
+                (
+                    Box::new(provider) as Box<dyn ModelProvider>,
+                    exchanges,
+                    label,
+                )
+            } else {
+                let deepseek = DeepSeekProvider::new(
+                    DeepSeekConfig::new(api_key.clone())
+                        .with_reasoning_effort(ReasoningEffort::High),
+                )
+                .expect("deepseek provider");
+                let label = deepseek.name().to_owned();
+                let (provider, exchanges) = RecordingProvider::new(deepseek);
+                (
+                    Box::new(provider) as Box<dyn ModelProvider>,
+                    exchanges,
+                    label,
+                )
+            };
+            let (report, recorded, session) =
+                run_once(task, &model, &provider_label, provider, Some(exchanges)).await;
             eprintln!(
                 "{} run {}/{}: success={} bug_fixed={}",
                 task.id, run, runs, report["success"], report["gate"]["bug_fixed"]
             );
             std::fs::write(
-                records_dir.join(format!("{}-{model}-{run}.jsonl", task.id)),
+                records_dir.join(format!("{}-{file_model}-{run}.jsonl", task.id)),
                 recorded
                     .iter()
                     .map(|e| serde_json::to_string(e).unwrap())
@@ -1152,7 +1242,7 @@ async fn eval_live() {
             )
             .unwrap();
             std::fs::write(
-                sessions_dir.join(format!("{}-{model}-{run}.session.json", task.id)),
+                sessions_dir.join(format!("{}-{file_model}-{run}.session.json", task.id)),
                 serde_json::to_string(&session).unwrap(),
             )
             .unwrap();
@@ -1163,7 +1253,7 @@ async fn eval_live() {
             "harness": "eval 2A",
             "task": task.id,
             "model": model,
-            "provider": "deepseek",
+            "provider": provider_name,
             "units": {
                 "census": "exact serialized bytes (provider-agnostic, deterministic)",
                 "est_tokens": "bytes/3 budget heuristic",
@@ -1173,7 +1263,7 @@ async fn eval_live() {
             "aggregates": aggregates_from(&reports),
             "notes": task.notes,
         });
-        let path = dir.join(format!("report-{}-{model}.json", task.id));
+        let path = dir.join(format!("report-{}-{file_model}.json", task.id));
         std::fs::write(&path, serde_json::to_string_pretty(&report).unwrap()).unwrap();
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
         eprintln!("wrote {}", path.display());
@@ -1210,7 +1300,7 @@ async fn eval_live() {
         },
         &suite,
     );
-    let headline_path = dir.join(format!("report-suite-{model}.json"));
+    let headline_path = dir.join(format!("report-suite-{file_model}.json"));
     std::fs::write(
         &headline_path,
         serde_json::to_string_pretty(&headline).unwrap(),

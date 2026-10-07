@@ -54,6 +54,18 @@ LOOM_EVAL_TOLERATE_FAILURES=1     # measurement mode; default strict
 DEEPSEEK_API_KEY=... cargo test -p loom-cli --test eval -- --ignored --nocapture
 ```
 
+The provider is DeepSeek by default. `LOOM_EVAL_PROVIDER=openrouter`
+switches the live arm to OpenRouter: the key comes from
+`OPENROUTER_API_KEY`, the model catalog is fetched before the runs
+(capabilities come from it, like the CLI), and `LOOM_EVAL_MODEL` takes a
+full OpenRouter id — `nvidia/nemotron-3-super-120b-a12b:free`,
+`google/gemma-4-31b-it:free`. Report and record filenames slug the model
+id (`/` and `:` become `-`). Provider-reported charges (the `cost_usd`
+the account actually pays, `cost_source: "provider-reported"`) win over
+the DeepSeek price table, which stays the fallback; free-tier ids price
+at $0 either way. The free tier is rate-limited (requests/day, not
+dollars) — check the dashboard before a full-suite run.
+
 - **Strict mode** (default): asserts every run green and every gate
   solved — the CI contract.
 - **Tolerant mode**: survives failed runs, still writes every per-task

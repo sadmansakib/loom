@@ -131,6 +131,19 @@ scrub floor (`*_API_KEY`) always applies; the engine loads the manifest
 at open and the spec advertises the allowed programs. Rejections and
 timeouts surface as audited tool errors.
 
+## 2026-10-07 — Live eval on OpenRouter (free tier)
+
+The live eval arm can now run the suite against OpenRouter:
+`LOOM_EVAL_PROVIDER=openrouter` with `OPENROUTER_API_KEY` and a full
+model id (`nvidia/nemotron-3-super-120b-a12b:free`), fetching the model
+catalog before the runs so capabilities resolve exactly like the CLI.
+Report and record filenames slug the model id (`/` and `:` become `-`).
+Provider-reported charges now win over the DeepSeek price table
+(`cost_source: "provider-reported"`; the table stays the fallback and
+free-tier ids price at $0 either way). Spot-run: B2 solved by
+`nemotron-3-super-120b-a12b:free` in 3 turns, cost $0. The key was also
+rotated in the account store (old `...beb6` removed, `...ef7a` active).
+
 ## 2026-10-07 — Budget-exceeded rescue in the pruning compiler
 
 `PruningContextCompiler` could not rescue an inner
