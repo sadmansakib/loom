@@ -34,6 +34,31 @@ token counts (~±8 %), without putting a tokenizer in the kernel:
   (`o200k_base`), wired in `Engine::open`; the eval and benchmark
   harnesses use the same estimator for parity.
 
+## 2026-10-07 — Corpus growth: B14 and B15 from shipped fixes
+
+Round 4 of mining Loom's fix history for bugfix tasks; the suite now
+spans 15 tasks (B1–B15).
+
+- **B14 — verified result cache** (b534c65): the read-only tool cache
+  served hits on the `(tool, args)` key alone, ignoring whether the
+  files behind the recorded answer had changed. F2P: a content change,
+  a touch without an edit, an absent file appearing, a read file
+  disappearing — each a miss. P2P: unchanged repeat hit, different
+  args miss, overlapping write invalidates, directory write
+  invalidates beneath it, run_command clears everything, disjoint
+  write keeps the entry.
+- **B15 — failure evidence shaping** (9a50d23): failed `run_command`
+  output went to the model raw instead of shaped into evidence. F2P: a
+  failed libtest run shapes into test failures plus recent changes,
+  multiple failures keep document order, a panic without a message
+  still shapes its location. P2P: a successful run keeps its streams,
+  an unparseable failure falls back to raw output, empty streams are
+  omitted.
+- Both proven SWE-bench style offline (seeds fail exactly their F2P
+  set, pass their P2P set; real fixes flip everything green — 10/10
+  and 6/6) and live: 10/10 gated runs at pass rate 1.0
+  (deepseek-flash).
+
 ## 2026-10-07 — Corpus growth: B12 and B13 from shipped fixes
 
 Round 3 of mining Loom's fix history for bugfix tasks; the suite now

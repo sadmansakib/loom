@@ -1,0 +1,26 @@
+{
+  "id": "B14",
+  "prompt": "The test suite of this crate fails. Find the fault in the implementation, fix it, and make `cargo test` pass. The tests under tests/ are the complete and only specification of correct behavior: do not modify anything under tests/, and expect no hidden tests beyond them.",
+  "tools": "coding",
+  "heavy": false,
+  "workspace": "copy",
+  "gate": {
+    "kind": "bugfix",
+    "protected": ["tests/regression.rs"],
+    "fail_to_pass": [
+      "a_content_change_is_a_miss",
+      "a_touch_without_an_edit_is_a_miss",
+      "an_absent_file_that_appears_is_a_miss",
+      "a_read_file_that_disappears_is_a_miss"
+    ],
+    "pass_to_pass": [
+      "an_unchanged_repeat_is_a_hit",
+      "different_args_do_not_hit",
+      "an_overlapping_write_invalidates",
+      "a_directory_write_invalidates_beneath_it",
+      "run_command_clears_everything",
+      "a_disjoint_write_keeps_the_entry"
+    ]
+  },
+  "notes": "Reproduces the failure mode b534c65 closed: a read-only result cache served hits on the (tool, args) key alone, without proving the touched files' state (size, mtime, content hash, existence) unchanged."
+}
