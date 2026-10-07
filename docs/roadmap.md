@@ -88,10 +88,19 @@ works; this document tracks direction.
   *and* tail — errors live at the tail. A command timeout kills the
   entire process group, so grandchildren (`rustc` under `cargo`)
   cannot outlive the kill.
+- **Multi-ecosystem verification.** `verify` detects the workspace's
+  build system from root marker files (cargo > npm > python > go >
+  make) or takes an explicit `ecosystem` argument; the command comes
+  from a fixed per-ecosystem table — never from model input, so no
+  allow-list is needed. Ecosystems without a build-agnostic `check`
+  (npm) refuse the scope rather than guess a script, and the fused
+  verify in `edit_file`/`write_file` skips with a note instead of
+  failing the edit.
 - **Evidence shaping.** Failed builds/tests parsed into compact
-  structured evidence (cargo JSON diagnostics, libtest, nextest JUnit)
-  and linked to the recent change on the likely-causing path;
-  unparseable failures degrade to bounded raw output, never hidden.
+  structured evidence (cargo JSON diagnostics, libtest, nextest JUnit,
+  go vet/test, pytest, python compileall) and linked to the recent
+  change on the likely-causing path; unparseable failures degrade to
+  bounded raw output, never hidden.
 - **Batch scheduling.** Wave scheduler: concurrent read-only calls,
   write/read conflicts serialized by overlapping paths, results in call
   order, cancellation-safe, poison-safe.
@@ -141,63 +150,57 @@ requires unwinding shipped invariants.
 
 ### Near term
 
-1. **Command execution policy.** Today `run_command`/`verify` allow-list
+1. **Command execution policy.** Today `run_command` allow-lists
    exactly `cargo`. Ship a configurable policy: allow-list per workspace
    (manifest-declared commands), per-command resource limits (wall time,
    output caps, environment scrubbing), and audit records for every
    executed command. Seam: the existing allow-list check and
    `CommandEffect` records.
-2. **Verification beyond Cargo.** `verify` scopes to
-   `cargo check`/`cargo test`. Extend to the ecosystems the facts
-   scanner already detects (npm/pyproject/go/Make): command selection
-   per detected build system, plus evidence parsers per ecosystem's
-   failure format. Seam: the `cargo`-only scope check and the evidence
-   parser registry.
-3. **CLI session resume.** The engine can load and resume a persisted
+2. **CLI session resume.** The engine can load and resume a persisted
    session; the CLI has no `--resume`/`--session` surface for it. Add
    listing, selection, and continuation, plus transcript export.
 
 ### Mid term
 
-4. **More providers.** DeepSeek and OpenRouter share one OpenAI-shaped
+3. **More providers.** DeepSeek and OpenRouter share one OpenAI-shaped
    wire; the abstraction is proven only for that shape. Add a
    non-OpenAI-shaped provider (Anthropic-style messages, or Gemini) to
    pressure the `ModelProvider` boundary itself, including
    capability-correct pruning floors per model. OpenRouter's catalog is
    the model to copy for capability discovery: fetch in the frontend,
    pass to the engine as data.
-5. **Long-term memory.** Designed (session-persistent knowledge with
+4. **Long-term memory.** Designed (session-persistent knowledge with
    explicit add/expire semantics) but not built. The `FactsSource` seam
    and the facts block projection are the insertion point; the hard
    part is eviction and staleness policy, not storage.
-6. **Adaptive pruning thresholds.** Current constants (80% trigger,
+5. **Adaptive pruning thresholds.** Current constants (80% trigger,
    20K floors) come from one benchmark corpus. Ship measurement-driven
    tuning: per-model trigger curves using the census and cache
    hit/miss data the loop already records, evaluated by the replay
    harness.
-7. **Search parity.** The hand-built gitignore chain diverges from the
+6. **Search parity.** The hand-built gitignore chain diverges from the
    `ignore` crate on negation-precedence edge cases (documented in
    code). Either adopt the crate's matcher for chained files or pin
    the divergence with fixture tests from real repositories.
-8. **Artifacts lifecycle.** Spilled artifacts accumulate in `loom.db`
+7. **Artifacts lifecycle.** Spilled artifacts accumulate in `loom.db`
     with no retention policy. Add reference-counting from live
     transcripts plus a GC (age- or size-bounded) and a size-reporting
     command.
 
 ### Later
 
-9. **Parallel agent orchestration.** Multiple tasks over one session,
+8. **Parallel agent orchestration.** Multiple tasks over one session,
     worktree-per-agent isolation, and a merge path. The lease support
     in the store is the first brick; needs conflict policy and an
     orchestrator above the engine.
-10. **Mid-task model selection.** The model is fixed per task by design
+9. **Mid-task model selection.** The model is fixed per task by design
     (capabilities resolve once). Allow planned switches at task
     boundaries — cheap given the budget plumbing, but it invalidates
     the single-capability assumption baked into the loop's setup.
-11. **Frontends.** The engine boundary is frontend-neutral (no
+10. **Frontends.** The engine boundary is frontend-neutral (no
     printing, typed results, ordered events). A TUI or desktop client
     is additive once session resume ships.
-12. **Distributed verification.** Farm `verify` runs (the expensive
+11. **Distributed verification.** Farm `verify` runs (the expensive
     step) to remote or containerized runners with the same evidence
     contract, so local context budgets are never spent on build logs.
 

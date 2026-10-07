@@ -15,9 +15,11 @@ use loom_tools::{
 
 /// Sum of `serde_json::to_string(spec)` over all eight shipped tools.
 /// Action fusion (2M) adds a `verify` argument (an inlined check/test
-/// enum) to `write_file` and `edit_file`, ~280 B each; the total stays
-/// ~10 % under the pre-compaction 5,339 B mark the 2K budget set.
-const TOTAL_SPEC_BUDGET_BYTES: usize = 4_820;
+/// enum) to `write_file` and `edit_file`, ~280 B each. Multi-ecosystem
+/// verify (roadmap: verification beyond cargo) adds the `ecosystem`
+/// parameter and its enum schema to `verify`, ~290 B; the total stays
+/// under the pre-compaction 5,339 B mark the 2K budget set.
+const TOTAL_SPEC_BUDGET_BYTES: usize = 5_150;
 /// No single tool's serialized spec may exceed this.
 const PER_SPEC_BUDGET_BYTES: usize = 840;
 

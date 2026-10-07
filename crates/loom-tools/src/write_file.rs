@@ -86,7 +86,9 @@ impl Tool for WriteFileTool {
                 let (rendered, command) = crate::fusion::run_fused(scope, ctx, &relative).await?;
                 content = format!("{content}\n\n--- verify ---\n{}", rendered.content);
                 truncated = rendered.truncated;
-                effects = effects.with_command(command);
+                if let Some(command) = command {
+                    effects = effects.with_command(command);
+                }
             }
             let mut output = ToolOutput::new(content).with_effects(effects);
             if truncated {

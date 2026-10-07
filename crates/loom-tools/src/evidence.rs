@@ -7,11 +7,19 @@
 //! never a full process log. The full log still follows the `ArtifactRef`
 //! overflow path (ADR-012/014) in the tool that produced it.
 //!
-//! Three stable sources are parsed:
+//! Three stable cargo sources are parsed:
 //! - compiler diagnostics, from `cargo --message-format=json` (stable);
 //! - test failures, from libtest **human** output (`panicked at file:line:col`,
 //!   `---- <name> stdout ----` sections) — libtest JSON is nightly-only;
 //! - nextest JUnit XML, when present (stable).
+//!
+//! Beyond cargo (roadmap "verification beyond Cargo"), the same
+//! [`Diagnostic`]/[`TestFailure`] shapes are parsed from other ecosystems'
+//! stable human formats: Go toolchain lines (`go_diagnostics`,
+//! `go_failures`), pytest sections (`pytest_failures`), and
+//! `python -m compileall` groups (`python_diagnostics`). Ecosystems whose
+//! runners define no stable format (npm, Make) ride the bounded raw
+//! fallback instead of a guessing parser.
 //!
 //! Change→failure linkage is by **recently changed path** (from recorded 2B
 //! `ToolEffects`), not by symbol: symbol-level linkage waits for repository
@@ -448,6 +456,280 @@ fn element_body(tag: &str) -> Option<String> {
     (!body.is_empty()).then(|| body.to_owned())
 }
 
+/// Splits a Go-shaped diagnostic line (`<file>:<line>[:<col>]: <message>`)
+/// into its location and message tail, when the file is a `.go` path.
+///
+/// Shared by `go vet`/`go build` diagnostics (column 0 lines) and `go
+/// test` log lines (indented), so the caller chooses which lines to offer.
+fn go_location(line: &str) -> Option<(Location, &str)> {
+    let at = line.find(".go:")?;
+    let file = &line[..at + ".go".len()];
+    let rest = &line[at + ".go:".len()..];
+    let (numbers, message) = rest.split_once(": ")?;
+    let mut fields = numbers.split(':');
+    let line_number = fields.next()?.trim().parse::<u32>().ok()?;
+    let column = match fields.next() {
+        Some(raw) if !raw.trim().is_empty() => raw.trim().parse::<u32>().ok()?,
+        _ => 1,
+    };
+    if fields.next().is_some() {
+        return None;
+    }
+    let message = message.trim();
+    if message.is_empty() {
+        return None;
+    }
+    Some((Location::new(file, line_number, column), message))
+}
+
+/// Parses Go toolchain diagnostics (`go vet`, `go build`, `go test`
+/// compile failures) from human output.
+///
+/// The stable shape is one diagnostic per line — `./pkg/math.go:12:2:
+/// unreachable code` — with `# <package>` section headers, blank lines,
+/// and indented test-log lines ignored. Everything kept is a real
+/// complaint; the toolchain does not label a level.
+#[must_use]
+pub fn go_diagnostics(output: &str) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for line in output.lines() {
+        if line.starts_with([' ', '\t', '#']) {
+            continue;
+        }
+        let Some((location, message)) = go_location(line) else {
+            continue;
+        };
+        diagnostics.push(Diagnostic {
+            level: "error".to_owned(),
+            message: message.to_owned(),
+            location: Some(location),
+            code: None,
+        });
+    }
+    diagnostics
+}
+
+/// Parses `go test` human output into failing tests.
+///
+/// Recognizes `--- FAIL: <name> (<dur>)` sections and the indented
+/// `<file>_test.go:<line>: <message>` log lines inside them. A section
+/// ends at the next `--- ` marker or a bare package status line
+/// (`FAIL`, `PASS`, `ok <pkg>`, `FAIL <pkg>`).
+#[must_use]
+pub fn go_failures(output: &str) -> Vec<TestFailure> {
+    let mut failures = Vec::new();
+    let mut current: Option<TestFailure> = None;
+    for line in output.lines() {
+        if let Some(name) = line.trim().strip_prefix("--- FAIL: ") {
+            if let Some(failure) = current.take() {
+                failures.push(failure);
+            }
+            let name = name.split_once(" (").map_or(name, |(name, _)| name);
+            current = Some(TestFailure {
+                name: name.trim().to_owned(),
+                message: String::new(),
+                location: None,
+            });
+            continue;
+        }
+        if line.starts_with("--- ") {
+            // A sibling PASS/SKIP section ends the failure.
+            if let Some(failure) = current.take() {
+                failures.push(failure);
+            }
+            continue;
+        }
+        let trimmed = line.trim();
+        let is_status = trimmed == "FAIL"
+            || trimmed == "PASS"
+            || trimmed.starts_with("ok ")
+            || trimmed.starts_with("FAIL");
+        let Some(failure) = current.as_mut() else {
+            continue;
+        };
+        if is_status {
+            if let Some(failure) = current.take() {
+                failures.push(failure);
+            }
+            continue;
+        }
+        if line.starts_with([' ', '\t'])
+            && let Some((location, message)) = go_location(trimmed)
+        {
+            if failure.location.is_none() {
+                failure.location = Some(location);
+            }
+            if failure.message.is_empty() {
+                failure.message = message.to_owned();
+            }
+        }
+    }
+    if let Some(failure) = current.take() {
+        failures.push(failure);
+    }
+    failures
+}
+
+/// Parses pytest human output into failing tests.
+///
+/// Recognizes the `____ <test name> ____` sections under `FAILURES`:
+/// `E   <assertion detail>` lines supply the message (joined with
+/// spaces), and the outermost column-0 traceback anchor
+/// (`<file>.py:<line>: <whatever>`) supplies the location. Indented
+/// source lines, blank lines, `>` markers, and repr lines are body;
+/// only rule bars (`====`, `----`) end a section. Falls back to the
+/// `FAILED <nodeid> - <message>` short summary lines when no section
+/// parsed.
+#[must_use]
+pub fn pytest_failures(output: &str) -> Vec<TestFailure> {
+    let mut failures = Vec::new();
+    let mut current: Option<TestFailure> = None;
+    for line in output.lines() {
+        if let Some(name) = pytest_section_header(line) {
+            if let Some(failure) = current.take() {
+                failures.push(failure);
+            }
+            current = Some(TestFailure {
+                name,
+                message: String::new(),
+                location: None,
+            });
+            continue;
+        }
+        let Some(failure) = current.as_mut() else {
+            continue;
+        };
+        if let Some(detail) = pytest_detail(line) {
+            if failure.message.is_empty() {
+                failure.message = detail.to_owned();
+            } else {
+                failure.message.push(' ');
+                failure.message.push_str(detail);
+            }
+            continue;
+        }
+        // Section body: indented source lines, blank lines, the `>`
+        // failing-line marker, column-0 repr lines (`self = <...>`), and
+        // traceback frames are all body; a frame anchors the location
+        // (the outermost frame wins) and is followed by the `E` details
+        // in real output, so it must not end the section either. Only
+        // rule bars (`====`, `----`) end a section.
+        let trimmed = line.trim();
+        if line.starts_with([' ', '\t']) || trimmed.is_empty() || line.starts_with('>') {
+            continue;
+        }
+        if let Some(location) = python_anchor(line) {
+            if failure.location.is_none() {
+                failure.location = Some(location);
+            }
+            continue;
+        }
+        if (trimmed.starts_with("==") || trimmed.starts_with("--"))
+            && let Some(failure) = current.take()
+        {
+            failures.push(failure);
+        }
+        // Any other column-0 line is body (reprs, markers); keep scanning.
+    }
+    if let Some(failure) = current.take() {
+        failures.push(failure);
+    }
+    if failures.is_empty() {
+        for line in output.lines() {
+            let trimmed = line.trim();
+            let Some(rest) = trimmed.strip_prefix("FAILED ") else {
+                continue;
+            };
+            let Some((nodeid, message)) = rest.split_once(" - ") else {
+                continue;
+            };
+            failures.push(TestFailure {
+                name: nodeid.trim().to_owned(),
+                message: message.trim().to_owned(),
+                location: None,
+            });
+        }
+    }
+    failures
+}
+
+/// The test name in a pytest `____ <name> ____` section header.
+fn pytest_section_header(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("___") || !trimmed.ends_with("___") {
+        return None;
+    }
+    let name = trimmed.trim_matches('_').trim();
+    (!name.is_empty() && !name.starts_with('=')).then(|| name.to_owned())
+}
+
+/// The assertion detail on a pytest `E   <detail>` line.
+fn pytest_detail(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix('E')?;
+    let detail = rest.trim_start();
+    (rest.starts_with(char::is_whitespace) && !detail.is_empty())
+        .then_some(detail)
+        .filter(|detail| !detail.starts_with("_"))
+}
+
+/// A pytest traceback anchor: `<file>.py:<line>: <whatever>`.
+fn python_anchor(line: &str) -> Option<Location> {
+    let at = line.find(".py:")?;
+    let file = &line[..at + ".py".len()];
+    let rest = &line[at + ".py:".len()..];
+    let (number, _) = rest.split_once(':')?;
+    let line_number = number.trim().parse::<u32>().ok()?;
+    Some(Location::new(file, line_number, 1))
+}
+
+/// Parses `python -m compileall` error output into diagnostics.
+///
+/// The shape is a `*** Cannot compile <path>` headline, a `File "<path>",
+/// line <n>` position, and a closing `<Error>: <message>` line; only the
+/// closing line is guaranteed, so incomplete groups are dropped rather
+/// than guessed at.
+#[must_use]
+pub fn python_diagnostics(output: &str) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let mut pending: Option<(String, Option<u32>)> = None;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("*** Cannot compile ") {
+            // The headline ends with ` ***`; strip it so the path is clean.
+            let path = rest.trim().trim_end_matches('*').trim();
+            pending = Some((path.to_owned(), None));
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("File \"") {
+            if let Some((path, number)) = rest.split_once("\", line ") {
+                let line_number = number.trim().parse::<u32>().ok();
+                match pending.as_mut() {
+                    Some(pending) => {
+                        if pending.1.is_none() {
+                            pending.1 = line_number;
+                        }
+                    }
+                    None => pending = Some((path.to_owned(), line_number)),
+                }
+            }
+            continue;
+        }
+        if let Some((kind, message)) = trimmed.split_once(": ")
+            && kind.ends_with("Error")
+            && let Some((file, line_number)) = pending.take()
+        {
+            diagnostics.push(Diagnostic {
+                level: "error".to_owned(),
+                message: message.to_owned(),
+                location: line_number.map(|line| Location::new(file, line, 1)),
+                code: None,
+            });
+        }
+    }
+    diagnostics
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,5 +912,138 @@ test result: FAILED. 1 passed; 1 failed
         assert!(paths_match("/ws/src/lib.rs", "src/lib.rs"));
         assert!(paths_match("src/lib.rs", "src/lib.rs"));
         assert!(!paths_match("src/lib.rs", "src/other.rs"));
+    }
+
+    #[test]
+    fn go_vet_diagnostics_are_parsed() {
+        let output = "\
+# example.com/m [example.com/m.test]
+./main.go:9:2: undefined: z
+./pkg/math.go:12: unreachable code
+ok  \texample.com/m\t0.5s
+some prose line without a location
+";
+        let diagnostics = go_diagnostics(output);
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0],
+            Diagnostic {
+                level: "error".to_owned(),
+                message: "undefined: z".to_owned(),
+                location: Some(Location::new("./main.go", 9, 2)),
+                code: None,
+            }
+        );
+        // No column: defaults to 1, message may span colons.
+        assert_eq!(
+            diagnostics[1].location,
+            Some(Location::new("./pkg/math.go", 12, 1))
+        );
+        assert_eq!(diagnostics[1].message, "unreachable code");
+    }
+
+    #[test]
+    fn go_test_failures_are_parsed_with_locations() {
+        let output = "\
+--- FAIL: TestSum (0.00s)
+    main_test.go:12: sum(2, 2) = 5, want 4
+    main_test.go:13: later log line
+--- PASS: TestOther (0.00s)
+--- FAIL: TestDiv (0.01s)
+    div_test.go:4: division by zero
+FAIL
+FAIL\texample.com/m\t0.012s
+";
+        let failures = go_failures(output);
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert_eq!(failures[0].name, "TestSum");
+        // The first log line supplies location and message; later ones are
+        // extra detail, not duplication.
+        assert_eq!(
+            failures[0].location,
+            Some(Location::new("main_test.go", 12, 1))
+        );
+        assert_eq!(failures[0].message, "sum(2, 2) = 5, want 4");
+        assert_eq!(failures[1].name, "TestDiv");
+        assert_eq!(failures[1].message, "division by zero");
+    }
+
+    #[test]
+    fn pytest_sections_supply_message_and_location() {
+        let output = "\
+FAILURES
+_______________________ TestMath.test_sum _______________________
+
+    def test_sum():
+>       assert sum(2, 2) == 5
+E       assert 4 == 5
+E       +  where 4 = sum(2, 2)
+
+tests/test_math.py:8: AssertionError
+=========================== short test summary info ============================
+";
+        let failures = pytest_failures(output);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].name, "TestMath.test_sum");
+        assert_eq!(failures[0].message, "assert 4 == 5 +  where 4 = sum(2, 2)");
+        assert_eq!(
+            failures[0].location,
+            Some(Location::new("tests/test_math.py", 8, 1))
+        );
+    }
+
+    #[test]
+    fn pytest_falls_back_to_short_summary_lines() {
+        let output = "\
+=========================== short test summary info ============================
+FAILED tests/test_math.py::test_sum - assert 4 == 5
+FAILED tests/test_math.py::test_div - ZeroDivisionError: division by zero
+============================== 2 failed in 0.01s ===============================
+";
+        let failures = pytest_failures(output);
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert_eq!(failures[0].name, "tests/test_math.py::test_sum");
+        assert_eq!(failures[0].message, "assert 4 == 5");
+        assert_eq!(failures[1].message, "ZeroDivisionError: division by zero");
+        assert!(failures[0].location.is_none());
+    }
+
+    #[test]
+    fn compileall_errors_are_parsed() {
+        let output = "\
+*** Cannot compile src/broken.py ***
+  File \"src/broken.py\", line 3
+    def f(:
+          ^
+SyntaxError: invalid syntax
+";
+        let diagnostics = python_diagnostics(output);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0],
+            Diagnostic {
+                level: "error".to_owned(),
+                message: "invalid syntax".to_owned(),
+                location: Some(Location::new("src/broken.py", 3, 1)),
+                code: None,
+            }
+        );
+    }
+
+    #[test]
+    fn compileall_groups_without_a_position_lose_the_location() {
+        // A closing error line with no File anchor: kept messageless rather
+        // than guessed at... but the closing line always follows an anchor
+        // in real compileall output; here the anchor has a bad line number,
+        // so the location is dropped and the message kept.
+        let output = "\
+*** Cannot compile src/x.py ***
+  File \"src/x.py\", line ?
+SyntaxError: invalid syntax
+";
+        let diagnostics = python_diagnostics(output);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].message, "invalid syntax");
+        assert!(diagnostics[0].location.is_none());
     }
 }

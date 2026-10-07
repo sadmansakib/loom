@@ -59,6 +59,38 @@ spans 15 tasks (B1–B15).
   and 6/6) and live: 10/10 gated runs at pass rate 1.0
   (deepseek-flash).
 
+## 2026-10-07 — Verification beyond cargo
+
+`verify` was cargo-only; it now serves the build systems the facts
+scanner already detects. The tool reads the workspace's root marker
+files (cargo > npm > python > go > make) or takes an explicit
+`ecosystem` argument, and the command comes from a fixed
+per-ecosystem table — `cargo check/test --message-format=json`,
+`go vet/test ./...`, `python3 -m compileall/pytest`, `npm test`,
+`make check/test` — never from model input, so no allow-list is
+needed. Ecosystems without a build-agnostic check (npm) refuse the
+scope rather than guess a script. New evidence parsers compress go
+vet/build diagnostics, go test `--- FAIL:` sections, pytest `FAILURES`
+sections (with short-summary fallback), and `compileall` syntax
+errors into the same structured evidence as cargo; npm/make keep the
+bounded raw fallback. The fused verify in `edit_file`/`write_file`
+detects the ecosystem too (cargo when no marker) and skips with a
+note instead of failing the edit when a scope cannot run. The
+serialized-spec total budget rose 4,820 → 5,150 B for the new
+parameter's schema; the per-tool budget (840 B) held.
+
+## 2026-10-07 — B1–B17 baseline measured
+
+First full tolerant-mode baseline of the 17-task suite on
+deepseek-flash, 5 runs each: 61/75 gated runs (81.3%). Eleven runs
+were quota-corrupted — the DeepSeek account drained mid-suite, so B8
+and B9 (all runs) never measured and one B7 run aborted; excluding
+quota-only failures the signal is 61/64 (95.3%). B7 (heavy task) is
+the one genuine failure mode: the model burns the whole 8,192-token
+reserved output on reasoning and stops at `max_tokens`. Suite cost by
+harness accounting: $0.23. Live runs paused until the account is
+topped up; the replay corpus keeps the 70 green recordings.
+
 ## 2026-10-07 — Budget-exceeded rescue in the pruning compiler
 
 `PruningContextCompiler` could not rescue an inner
