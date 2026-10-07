@@ -22,8 +22,11 @@ process-wrap = { workspace = true }
 # killpg in the drop guard that reaps the whole group on cancellation
 nix = { version = "0.29", features = ["signal"] }
 # spawn_blocking wraps the blocking std::fs work; `process` backs
-# run_command and `io-util` its capped stream reads (architecture.md §9/§12)
-tokio = { workspace = true, features = ["rt", "process", "io-util"] }
+# run_command and `io-util` its capped stream reads; `time` enforces
+# per-command wall-time caps from the policy manifest (architecture.md §9/§12)
+tokio = { workspace = true, features = ["rt", "process", "io-util", "time"] }
+# .loom/commands.toml manifest parsing (command execution policy)
+toml = "0.9"
 # CancellationToken in the search walk (per-file cancellation check)
 tokio-util = { workspace = true }
 

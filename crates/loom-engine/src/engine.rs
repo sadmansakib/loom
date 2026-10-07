@@ -21,6 +21,7 @@ use loom_kernel::store::StoreError;
 use loom_kernel::tool::ToolRegistry;
 use loom_providers::{ProviderCatalog, ReasoningEffort};
 use loom_store::SqliteStore;
+use loom_tools::policy::CommandPolicy;
 use loom_tools::{
     ArtifactReadTool, EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool,
     VerifyTool, WriteFileTool,
@@ -148,7 +149,7 @@ impl Engine {
         // adapter-specific knowledge lives in `provider`.
         let handle = crate::provider::build(&config, credential.secret.expose())?;
 
-        let registry = build_registry()?;
+        let registry = build_registry(&CommandPolicy::from_manifest(&workspace)?)?;
         let system_prompt = config.system_prompt.unwrap_or_else(default_system_prompt);
         // Stage-1 repository facts (2E, ADR-015): the composition root owns the
         // I/O; the loop scans once per task through this source.
@@ -244,7 +245,9 @@ impl Engine {
 ///
 /// Read-only tools first, so the prompt prefix stays stable; the mutating
 /// tools follow and force the tool engine's sequential mode (§10).
-fn build_registry() -> Result<ToolRegistry, EngineError> {
+/// `run_command` runs under the workspace's command policy (manifest
+/// `.loom/commands.toml`, else the shipped `cargo`-only default).
+fn build_registry(policy: &CommandPolicy) -> Result<ToolRegistry, EngineError> {
     let mut registry = ToolRegistry::new();
     let mut register = |name: &'static str, tool: Box<dyn loom_kernel::tool::Tool>| {
         registry
@@ -260,7 +263,10 @@ fn build_registry() -> Result<ToolRegistry, EngineError> {
     register("artifact_read", Box::new(ArtifactReadTool))?;
     register("write_file", Box::new(WriteFileTool))?;
     register("edit_file", Box::new(EditFileTool))?;
-    register("run_command", Box::new(RunCommandTool::new()))?;
+    register(
+        "run_command",
+        Box::new(RunCommandTool::with_policy(policy.clone())),
+    )?;
     register("verify", Box::new(VerifyTool::new()))?;
     Ok(registry)
 }
@@ -315,6 +321,11 @@ pub enum EngineError {
     /// The account store could not be opened.
     #[error("opening the account store: {0}")]
     Store(#[source] auth::AuthError),
+    /// The workspace's command policy manifest exists but is invalid
+    /// (roadmap: command execution policy). Failing the open keeps a
+    /// broken manifest from silently widening execution to default.
+    #[error("loading the command policy: {0}")]
+    CommandPolicy(#[from] loom_tools::policy::PolicyError),
     /// No credential could be resolved (ADR-009).
     #[error(transparent)]
     Auth(#[from] auth::AuthError),

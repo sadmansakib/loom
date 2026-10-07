@@ -181,7 +181,9 @@ impl Tool for VerifyTool {
                     ))
                 })?;
             let (program, args) = ecosystem.command(input.scope)?;
-            let output = crate::exec::run_bounded(program, &args, ctx).await?;
+            let output =
+                crate::exec::run_bounded(program, &args, ctx, &crate::exec::ExecLimits::default())
+                    .await?;
             let effects = ToolEffects::none().with_command(CommandEffect::new(
                 program,
                 args.clone(),

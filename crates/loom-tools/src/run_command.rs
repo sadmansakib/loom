@@ -1,26 +1,26 @@
-//! The `run_command` tool: bounded, allow-listed process execution.
+//! The `run_command` tool: bounded, allow-listed process execution
+//! under the workspace's [`CommandPolicy`](crate::policy::CommandPolicy).
 //!
 //! Mutating (architecture §10). There is **no shell**: the program and
 //! its arguments are passed to [`tokio::process::Command`] directly, so
 //! argument content can never be re-interpreted as shell syntax. The
-//! program itself must be in an explicit allow-list — Iteration 1 allows
-//! only the Rust build driver. The child runs with the workspace root as
-//! its working directory and is killed when the call future is dropped
-//! (timeout or cancellation), so a runaway command cannot outlive the
-//! turn.
+//! program must have a rule in the policy — the shipped default allows
+//! only the Rust build driver; a workspace extends the list with a
+//! `.loom/commands.toml` manifest, which also carries per-command
+//! limits: a wall-time cap (the whole process group is killed on
+//! expiry), a per-stream output window, and extra environment
+//! scrubbing. The credential floor is always applied, so a child can
+//! never read Loom's provider keys. The child runs with the workspace
+//! root as its working directory and is killed when the call future is
+//! dropped (timeout or cancellation), so a runaway command cannot
+//! outlive the turn.
 //!
-//! A timeout or cancellation kills the direct child (`kill_on_drop`) but not
-//! processes it spawned: tearing down the whole process group needs an
-//! `unsafe` `libc::killpg`, and this crate is `unsafe_code = "forbid"`. A
-//! timeout during `cargo build` can therefore leave `rustc` children running
-//! until they finish. Process-group teardown belongs with the sandbox/policy
-//! iteration (roadmap §5.3).
-//!
-//! Execution policy proper (resource limits, broader allow-lists,
-//! sandboxing) is a later iteration's seam; this is the minimal safe
-//! shape that lets Loom verify its own edits today.
+//! Audit: every executed command is recorded as a structured
+//! [`CommandEffect`](loom_kernel::tool::CommandEffect) in the session
+//! transcript; policy rejections and rule timeouts land as the call's
+//! error status, so the session is the audit log.
 
-use std::sync::OnceLock;
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use loom_kernel::tool::{
@@ -32,45 +32,68 @@ use serde_json::Value;
 
 use crate::budget;
 use crate::evidence::{Evidence, cargo_diagnostics, libtest_failures, nextest_junit};
-
-/// Programs Iteration 1 will execute. Anything else is rejected as
-/// invalid input before a process is created.
-const DEFAULT_ALLOWED: &[&str] = &["cargo"];
+use crate::policy::CommandPolicy;
 
 /// Runs an allow-listed program in the workspace root and returns its
 /// combined output and exit status.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RunCommandTool {
-    allowed: Vec<String>,
+    policy: CommandPolicy,
+    spec: ToolSpec,
 }
 
 impl Default for RunCommandTool {
     fn default() -> Self {
-        Self {
-            allowed: DEFAULT_ALLOWED
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect(),
-        }
+        Self::under(CommandPolicy::cargo_only())
     }
 }
 
 impl RunCommandTool {
-    /// The shipped tool: `cargo` only.
+    fn under(policy: CommandPolicy) -> Self {
+        // The admitted program list is policy data, so the spec closes
+        // over this instance's policy — stable within an engine, since
+        // the policy is fixed at open.
+        let description = format!(
+            "Runs an allow-listed program in the workspace root and returns \
+             its combined stdout/stderr and exit status. No shell: pass the \
+             program and each argument separately. Allowed: {}.",
+            policy
+                .allowed_names()
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        Self {
+            spec: ToolSpec {
+                name: "run_command".to_owned(),
+                description,
+                parameters: crate::schema::parameters::<RunInput>(),
+            },
+            policy,
+        }
+    }
+
+    /// The shipped tool: the workspace's manifest policy resolved by
+    /// the engine, or `cargo`-only when opened directly.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// A tool allowing a different program set (tests, future
-    /// allow-list policy).
+    /// A tool under an explicit policy (the engine's entry point after
+    /// loading a workspace manifest).
+    pub fn with_policy(policy: CommandPolicy) -> Self {
+        Self::under(policy)
+    }
+
+    /// A tool allowing a different program set with shipped-default
+    /// limits (tests, embedders).
     pub fn with_allowed<I, S>(allowed: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        Self {
-            allowed: allowed.into_iter().map(Into::into).collect(),
-        }
+        Self::under(CommandPolicy::allowing(allowed))
     }
 }
 
@@ -78,7 +101,7 @@ impl RunCommandTool {
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 struct RunInput {
-    /// Executable name, no path; allowed: cargo.
+    /// Executable name, no path; must be policy-allowed.
     program: String,
     /// Arguments, one array entry each.
     #[serde(default)]
@@ -87,15 +110,7 @@ struct RunInput {
 
 impl Tool for RunCommandTool {
     fn spec(&self) -> &ToolSpec {
-        static SPEC: OnceLock<ToolSpec> = OnceLock::new();
-        SPEC.get_or_init(|| ToolSpec {
-            name: "run_command".to_owned(),
-            description: "Runs an allow-listed program in the workspace root and returns \
-                          its combined stdout/stderr and exit status. No shell: pass the \
-                          program and each argument separately. Allowed: `cargo`."
-                .to_owned(),
-            parameters: crate::schema::parameters::<RunInput>(),
-        })
+        &self.spec
     }
 
     fn is_read_only(&self) -> bool {
@@ -116,14 +131,35 @@ impl Tool for RunCommandTool {
                     input.program
                 )));
             }
-            if !self.allowed.iter().any(|name| name == &input.program) {
+            let Some(rule) = self.policy.rule(&input.program) else {
                 return Err(ToolError::InvalidInput(format!(
                     "program \"{}\" is not allowed; allowed: {}",
                     input.program,
-                    self.allowed.join(", ")
+                    self.policy.allowed_names().join(", ")
                 )));
-            }
-            let output = crate::exec::run_bounded(&input.program, &input.args, ctx).await?;
+            };
+            let limits = crate::exec::ExecLimits {
+                stream_window: rule.max_output_bytes,
+                scrub: rule.env_scrub.clone(),
+            };
+            let bounded = crate::exec::run_bounded(&input.program, &input.args, ctx, &limits);
+            let output = match rule.timeout_secs {
+                None => bounded.await?,
+                Some(secs) => {
+                    match tokio::time::timeout(Duration::from_secs(secs), bounded).await {
+                        Ok(result) => result?,
+                        // The elapsed future was dropped, so the drop guard
+                        // killed the whole process group; the model sees the
+                        // cap and can retry with a smaller ask.
+                        Err(_elapsed) => {
+                            return Err(ToolError::Execution(format!(
+                                "command \"{}\" timed out after {secs}s (process group killed)",
+                                input.program
+                            )));
+                        }
+                    }
+                }
+            };
             let recent_changes = ctx.recent_changes();
             Ok(render(
                 &input.program,
@@ -503,5 +539,155 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured
     #[test]
     fn the_schema_and_the_parser_agree() {
         crate::schema::agreement::check::<RunInput>(json!({"program": "cargo"}));
+    }
+
+    #[tokio::test]
+    async fn a_rule_timeout_kills_the_command() {
+        let (_guard, root) = temp_root();
+        // `sleep` admitted with a 1s wall cap; the group is killed at
+        // the cap and the model sees an execution error naming it.
+        let policy = CommandPolicy::parse("[[command]]\nprogram = \"sleep\"\ntimeout_secs = 1\n")
+            .expect("policy");
+        let tool = RunCommandTool::with_policy(policy);
+        let started = std::time::Instant::now();
+        let error = run(&tool, &root, json!({"program": "sleep", "args": ["30"]}))
+            .await
+            .expect_err("timed out");
+        assert!(
+            matches!(&error, ToolError::Execution(message) if message.contains("timed out after 1s")),
+            "{error}"
+        );
+        assert!(
+            started.elapsed().as_secs() < 10,
+            "must not wait for the child"
+        );
+    }
+
+    /// Re-exec harness for the scrub tests: Rust 2024 makes environment
+    /// mutation `unsafe`, and this workspace forbids `unsafe`, so the
+    /// probe variable is injected by re-spawning the test binary with a
+    /// controlled environment (`LOOM_SCRUB_MANIFEST`/`LOOM_SCRUB_SCRIPT`
+    /// carry the scenario). The re-entered probe runs the real tool and
+    /// reports `SCRUB_RESULT=ok|leak` on stdout; the parent asserts on
+    /// that line.
+    async fn scrub_probe(manifest: &str, env_pairs: &[(&str, &str)], child_script: &str) {
+        if let (Ok(manifest), Ok(script)) = (
+            std::env::var("LOOM_SCRUB_MANIFEST"),
+            std::env::var("LOOM_SCRUB_SCRIPT"),
+        ) {
+            let (_guard, root) = temp_root();
+            let policy = CommandPolicy::parse(&manifest).expect("policy");
+            let tool = RunCommandTool::with_policy(policy);
+            let output = run(
+                &tool,
+                &root,
+                json!({"program": "sh", "args": ["-c", script]}),
+            )
+            .await
+            .expect("child run");
+            let ok =
+                output.content.contains("scrubbed") && !output.content.contains("loom-test-secret");
+            println!("SCRUB_RESULT={}", if ok { "ok" } else { "leak" });
+            return;
+        }
+        let mut command = std::process::Command::new(std::env::current_exe().expect("exe"));
+        command
+            .args([
+                "--exact",
+                "run_command::tests::scrub_reexec_driver",
+                "--nocapture",
+            ])
+            .env("LOOM_SCRUB_MANIFEST", manifest)
+            .env("LOOM_SCRUB_SCRIPT", child_script);
+        for (name, value) in env_pairs {
+            command.env(name, value);
+        }
+        let out = command.output().expect("re-exec");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "re-exec'd test failed");
+        assert!(
+            stdout.contains("SCRUB_RESULT=ok"),
+            "the secret leaked into the child: {stdout}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_credential_floor_hides_provider_keys() {
+        // No manifest rule scrubs this name: only the non-negotiable
+        // floor can remove it from the child.
+        scrub_probe(
+            "[[command]]\nprogram = \"sh\"\n",
+            &[("OPENROUTER_API_KEY", "loom-test-secret")],
+            "if [ -n \"$OPENROUTER_API_KEY\" ]; then echo leaked; else echo scrubbed; fi",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_rule_scrubs_extra_environment_names() {
+        scrub_probe(
+            "[[command]]\nprogram = \"sh\"\nenv_scrub = [\"LOOM_TEST_SECRET\"]\n",
+            &[("LOOM_TEST_SECRET", "loom-test-secret")],
+            "if [ -n \"$LOOM_TEST_SECRET\" ]; then echo leaked; else echo scrubbed; fi",
+        )
+        .await;
+    }
+
+    // The --exact entry point the scrub tests re-exec into; the harness
+    // above does the asserting, this only re-enters the child branch.
+    #[tokio::test]
+    async fn scrub_reexec_driver() {
+        scrub_probe(
+            "[[command]]\nprogram = \"sh\"\n",
+            &[],
+            "if [ -n \"$LOOM_SCRUB_MANIFEST\" ]; then echo leaked; else echo scrubbed; fi",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_rule_output_window_caps_the_stream() {
+        let (_guard, root) = temp_root();
+        let policy =
+            CommandPolicy::parse("[[command]]\nprogram = \"seq\"\nmax_output_bytes = 1024\n")
+                .expect("policy");
+        let tool = RunCommandTool::with_policy(policy);
+        let output = run(
+            &tool,
+            &root,
+            json!({"program": "seq", "args": ["1", "200000"]}),
+        )
+        .await
+        .expect("ok");
+        // The stream window's omission marker survives into the tool
+        // output, and the whole result stays near the window size —
+        // the 1.2 MB stream never reaches the model.
+        assert!(
+            output.content.contains("bytes omitted"),
+            "the cut must be explicit: {}",
+            &output.content[..output.content.len().min(200)]
+        );
+        assert!(
+            output.content.len() < 8 * 1024,
+            "content length {} exceeded the window: {}",
+            output.content.len(),
+            &output.content[..output.content.len().min(300)]
+        );
+        assert!(
+            output.content.contains("200000"),
+            "the tail must survive the window: {}",
+            &output.content[output.content.len().saturating_sub(200)..]
+        );
+    }
+
+    #[test]
+    fn the_spec_lists_the_policys_programs() {
+        let policy = CommandPolicy::parse("[[command]]\nprogram = \"git\"\n").expect("policy");
+        let tool = RunCommandTool::with_policy(policy);
+        assert!(
+            tool.spec().description.contains("Allowed: `cargo`, `git`."),
+            "{}",
+            tool.spec().description
+        );
     }
 }

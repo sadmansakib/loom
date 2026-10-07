@@ -26,6 +26,20 @@ const STREAM_HEAD_BYTES: usize = MAX_TOOL_OUTPUT_BYTES;
 /// command's diagnosis usually lands.
 const STREAM_TAIL_BYTES: usize = MAX_TOOL_OUTPUT_BYTES;
 
+/// Per-command execution limits from the command policy.
+///
+/// `None` fields keep the shipped constants; a rule that sets them
+/// tightens nothing else. The credential floor
+/// ([`SCRUB_FLOOR`](crate::policy::SCRUB_FLOOR)) always applies on top
+/// of `scrub` — a caller cannot widen it.
+#[derive(Default)]
+pub(crate) struct ExecLimits {
+    /// Per-stream head/tail window override in bytes.
+    pub stream_window: Option<usize>,
+    /// Extra environment names removed from the child.
+    pub scrub: Vec<String>,
+}
+
 /// Kills the whole process group when dropped while still armed.
 ///
 /// process-wrap's tokio `KillOnDrop` shim only sets tokio's own
@@ -61,7 +75,11 @@ pub(crate) async fn run_bounded(
     program: &str,
     args: &[String],
     ctx: &ToolContext,
+    limits: &ExecLimits,
 ) -> Result<std::process::Output, ToolError> {
+    let window = limits.stream_window;
+    let head_cap = window.unwrap_or(STREAM_HEAD_BYTES);
+    let tail_cap = window.unwrap_or(STREAM_TAIL_BYTES);
     let mut child = CommandWrap::with_new(program, |command| {
         command
             .args(args)
@@ -69,6 +87,15 @@ pub(crate) async fn run_bounded(
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // The credential floor plus the rule's extra names; the child
+        // never sees Loom's own keys (command execution policy).
+        for name in crate::policy::SCRUB_FLOOR
+            .iter()
+            .copied()
+            .chain(limits.scrub.iter().map(String::as_str))
+        {
+            command.env_remove(name);
+        }
     })
     .wrap(ProcessGroup::leader())
     .spawn()
@@ -91,7 +118,10 @@ pub(crate) async fn run_bounded(
         .stderr()
         .take()
         .ok_or_else(|| ToolError::Execution(String::from("cannot capture stderr pipe")))?;
-    let (stdout, stderr) = futures::join!(read_capped(stdout), read_capped(stderr));
+    let (stdout, stderr) = futures::join!(
+        read_capped(stdout, head_cap, tail_cap),
+        read_capped(stderr, head_cap, tail_cap)
+    );
     let stdout =
         stdout.map_err(|error| ToolError::Execution(format!("cannot read output: {error}")))?;
     let stderr =
@@ -108,16 +138,16 @@ pub(crate) async fn run_bounded(
     })
 }
 
-/// Reads a child stream to EOF, keeping the first [`STREAM_HEAD_BYTES`] and
-/// the last [`STREAM_TAIL_BYTES`] with an explicit `... [N bytes omitted]`
+/// Reads a child stream to EOF, keeping the first `head_cap` and the
+/// last `tail_cap` bytes with an explicit `... [N bytes omitted]`
 /// marker naming the dropped middle, so the child cannot block writing to a
 /// full pipe and the tail (where errors land) survives.
-async fn read_capped<R>(mut reader: R) -> std::io::Result<Vec<u8>>
+async fn read_capped<R>(mut reader: R, head_cap: usize, tail_cap: usize) -> std::io::Result<Vec<u8>>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut head = Vec::new();
-    let mut tail: VecDeque<u8> = VecDeque::with_capacity(STREAM_TAIL_BYTES);
+    let mut tail: VecDeque<u8> = VecDeque::with_capacity(tail_cap);
     let mut chunk = [0_u8; 8192];
     let mut total: u64 = 0;
     loop {
@@ -127,16 +157,16 @@ where
         }
         total += read as u64;
         let data = &chunk[..read];
-        if head.len() < STREAM_HEAD_BYTES {
-            let room = STREAM_HEAD_BYTES - head.len();
+        if head.len() < head_cap {
+            let room = head_cap - head.len();
             let take = room.min(read);
             head.extend_from_slice(&data[..take]);
             tail.extend(&data[take..]);
         } else {
             tail.extend(data);
         }
-        if tail.len() > STREAM_TAIL_BYTES {
-            tail.drain(..tail.len() - STREAM_TAIL_BYTES);
+        if tail.len() > tail_cap {
+            tail.drain(..tail.len() - tail_cap);
         }
     }
     let kept = head.len() + tail.len();
@@ -159,7 +189,12 @@ mod tests {
         let (mut writer, reader) = tokio::io::duplex(64);
         writer.write_all(b"hello").await.unwrap();
         drop(writer);
-        assert_eq!(read_capped(reader).await.unwrap(), b"hello");
+        assert_eq!(
+            read_capped(reader, STREAM_HEAD_BYTES, STREAM_TAIL_BYTES)
+                .await
+                .unwrap(),
+            b"hello"
+        );
     }
 
     #[tokio::test]
@@ -171,7 +206,9 @@ mod tests {
         let producer = tokio::spawn(async move {
             writer.write_all(&payload).await.unwrap();
         });
-        let kept = read_capped(reader).await.unwrap();
+        let kept = read_capped(reader, STREAM_HEAD_BYTES, STREAM_TAIL_BYTES)
+            .await
+            .unwrap();
         producer.await.unwrap();
         let payload: Vec<u8> = (0..300_000).map(|i| (i % 251) as u8).collect();
         let marker = b"... [";
@@ -203,7 +240,9 @@ mod tests {
         let producer = tokio::spawn(async move {
             writer.write_all(&payload).await.unwrap();
         });
-        let kept = read_capped(reader).await.unwrap();
+        let kept = read_capped(reader, STREAM_HEAD_BYTES, STREAM_TAIL_BYTES)
+            .await
+            .unwrap();
         producer.await.unwrap();
         let payload = vec![b'x'; STREAM_HEAD_BYTES - 1];
         assert_eq!(kept, payload);
@@ -235,7 +274,10 @@ mod tests {
 
         // Cancelling the task drops the future mid-run — the same
         // cancellation path a timeout or Ctrl-C takes in production.
-        let task = tokio::spawn(async move { run_bounded("sh", &args, &ctx).await });
+        let task =
+            tokio::spawn(
+                async move { run_bounded("sh", &args, &ctx, &ExecLimits::default()).await },
+            );
         let alive = || {
             std::process::Command::new("pgrep")
                 .arg("-f")

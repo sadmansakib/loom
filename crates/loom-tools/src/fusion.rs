@@ -37,7 +37,8 @@ pub(crate) async fn run_fused(
             return Ok((note, None));
         }
     };
-    let output = crate::exec::run_bounded(program, &args, ctx).await?;
+    let output =
+        crate::exec::run_bounded(program, &args, ctx, &crate::exec::ExecLimits::default()).await?;
     let effect = CommandEffect::new(program, args.clone(), output.status.code());
     let mut recent = ctx.recent_changes();
     recent.push(changed.to_owned());
