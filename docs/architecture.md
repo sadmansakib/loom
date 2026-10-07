@@ -60,11 +60,18 @@ property.
   mutex-guarded connection — they are called at turn boundaries (persist
   once per turn) where the cost is bounded and the transactionality is
   worth more than async purity. This is documented at each call site.
-- **No shell.** The only subprocesses Loom launches are `git` (repository
-  facts, with `-c core.quotepath=false`) and allow-listed programs from the
-  `run_command`/`verify` tools (`cargo` only). Program names must be bare
-  — a path-qualified name is rejected before any process exists. Children
-  are spawned with `kill_on_drop(true)`.
+- **No shell for model-driven work.** The subprocesses Loom launches
+  for tools are `git` (repository facts, with `-c core.quotepath=false`),
+  policy-allowed programs from `run_command` (§6.8; `cargo` by default),
+  and the fixed per-ecosystem commands of `verify` (§6.2), which never
+  come from model input. The one `sh -c` is the user-configured
+  credential command (§8), never model-reachable. Program names must
+  be bare — a path-qualified name is rejected before any process exists.
+  Every child has provider credential variables scrubbed from its
+  environment.
+  Children are spawned with `kill_on_drop(true)` in their own process
+  group; a timeout kills the whole group, so grandchildren (`rustc` under
+  `cargo`) cannot outlive the kill.
 
 ---
 
@@ -224,9 +231,15 @@ never assistant content or reasoning.
   miss; a parked session costs zero.
 - Stubbed results keep their call id and carry a deterministic stub body
   telling the model how to recover the content (re-run the call).
-- Budget still applies after pruning: if the pruned projection still
-  overflows, `BudgetExceeded` propagates — the trigger floor assumes
-  windows of at least 64K tokens.
+- **Forced prune.** A projection that overruns the budget outright —
+  before the trigger has frozen anything that covers it — is rescued by
+  deciding stubs on the spot and recompiling a stubbed view of the same
+  transcript (same rules, same estimator). `BudgetExceeded` propagates
+  only when nothing is prunable or the pruned view still does not fit;
+  the trigger floor assumes windows of at least 64K tokens.
+- There is no summarization stage: user items, assistant content, and
+  reasoning are never reduced. A session whose non-prunable history
+  outgrows the window fails closed (roadmap: handoff compaction).
 
 ---
 
@@ -256,9 +269,9 @@ uses to link failures to the change that likely caused them.
 | `search` | read | regex, gitignore-aware (hand-built ancestor chain, nearest file wins), 1 MiB/file cap, binary skip, summary mode >100 matches |
 | `list_dir` | read | one level, byte-sorted, symlinks not followed for typing |
 | `read_artifact` | read | paged read of a spilled artifact (§6.4) |
-| `run_command` | mutating | allow-list (cargo), no shell, both pipes drained concurrently, head+tail bounded capture with explicit omission markers |
-| `verify` | mutating | `cargo check`/`cargo test` through the same bounded exec; success → the pass summary line; failure → structured evidence (§6.5) |
-| `edit_file` | mutating | exact old-text match, must be unique (0 or ≥2 matches = invalid input), 8 MiB file cap; optional `verify` runs `cargo check`/`test` inside the same call (action fusion) |
+| `run_command` | mutating | workspace command policy (§6.8; default `cargo` only), no shell, both pipes drained concurrently, head+tail bounded capture with explicit omission markers |
+| `verify` | mutating | `check`/`test` scope for the ecosystem detected from root markers (cargo > npm > python > go > make) or an explicit `ecosystem` argument; the command comes from a fixed per-ecosystem table, never from model input; ecosystems without a build-agnostic scope (npm `check`) refuse rather than guess; success → the pass summary line; failure → structured evidence (§6.5) |
+| `edit_file` | mutating | exact old-text match, must be unique (0 or ≥2 matches = invalid input), 8 MiB file cap; optional `verify` runs the detected ecosystem's check/test inside the same call (action fusion), skipping with a note when the scope is unsupported |
 | `write_file` | mutating | create/overwrite, parents created; optional `verify` as above |
 
 ### 6.3 Confinement
@@ -286,8 +299,9 @@ a 64 KiB head *and* a 64 KiB tail each, because errors live at the tail.
 
 Failed builds and tests are not shown as raw logs. Parsers extract
 structure: cargo's `--message-format=json` diagnostics (primary span),
-libtest human output (failing test, panicked-at location, message), and
-nextest JUnit. The renderer emits a bounded block — up to 20 diagnostics /
+libtest human output (failing test, panicked-at location, message),
+nextest JUnit, go vet/test, pytest, and python compileall — each with a
+stdout-then-stderr fallback. The renderer emits a bounded block — up to 20 diagnostics /
 20 failures, 240-char clips — and links each failure to the recorded
 recent change on an overlapping path ("relevant change: src/lib.rs").
 Unparseable failures fall back to bounded raw output. A failure is never
@@ -313,6 +327,27 @@ write to an overlapping path invalidates the entry. Signature computation
 is blocking work and runs on the blocking pool — never under the cache
 mutex, never on an async worker. A cheap `has_entry` probe lets the
 common first-read path skip hashing entirely.
+
+### 6.8 Command policy
+
+`run_command` executes only programs with a rule in the workspace's
+`CommandPolicy` (`loom-tools/src/policy.rs`), resolved once at
+`Engine::open`. The shipped default allows exactly `cargo`. A
+`.loom/commands.toml` manifest adds `[[command]]` rules, each keyed by
+bare program name with optional limits: `timeout_secs` (≤ 3600; on
+expiry the whole process group is killed and the call fails visibly),
+`max_output_bytes` (per-stream head/tail window, ≤ 1 MiB), and
+`env_scrub` (extra variables removed from the child). A credential
+scrub floor (`DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`,
+`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`,
+`GOOGLE_API_KEY`) applies to every child regardless of manifest — a
+manifest can add to it, never remove from it. An invalid manifest
+fails `Engine::open` (`EngineError::CommandPolicy`) rather than
+falling back to the default. The tool spec lists the admitted programs,
+so it is stable for the engine's lifetime. Every executed command is
+recorded as a `CommandEffect` (program, args, exit status) and
+rejections/timeouts as the call's error status: the session transcript
+is the audit log.
 
 ---
 
@@ -420,14 +455,26 @@ accounting in the loop.
 
 ## 11. Evaluation harness
 
-The CLI ships a replay-based eval: recorded provider transcripts are
-replayed through the real compiler and loop, and the harness asserts the
-replayed transcript matches the recording verbatim, requests are
-byte-identical across replays (the determinism contract), zero events
-were dropped, and reports per-turn context census plus tool-cache
-hit/miss and hit-percent with mean/median/min/max aggregates. Pinned
-tasks B1–B5 cover the benchmark suite; the heavy corpus is gated behind
-`LOOM_EVAL_TASKS`.
+The eval suite (`docs/eval.md` is the protocol guide) has two halves.
+
+- **Offline proofs**, run on every commit: recorded provider exchanges
+  replay through the real compiler and loop, asserting the replayed
+  transcript matches the recording verbatim, requests are byte-identical
+  across replays (the determinism contract), and zero events were
+  dropped. Corpus invariants are proven too: every seed fails exactly its
+  fail-to-pass set and passes exactly its pass-to-pass set, and the gate
+  rejects an untouched workspace.
+- **Live measurement**: N runs per task (default 5) against a real
+  provider. Field tasks (B2–B4, B6–B17, mined from Loom's own fix
+  history) are graded by outcome — SWE-bench-shaped gates of
+  `fail_to_pass`, `pass_to_pass`, and `protected` paths; lab tasks (B1,
+  B5) pin a system prompt as narrow regression instruments. Reports carry
+  per-run turns, census, est/billed tokens, cached input tokens, cost,
+  wall time, and tool-cache hit/miss, with aggregates per task and a
+  suite headline (gated pass rate). Strict mode asserts every gate green;
+  tolerant mode survives failures for baselines.
+
+Compare suites by medians over N ≥ 5; the observed noise floor is ±10%.
 
 ---
 
@@ -444,7 +491,8 @@ tasks B1–B5 cover the benchmark suite; the heavy corpus is gated behind
 **Security**
 - Path confinement on every tool path, symlink-hardened, regression-tested
   against escapes.
-- No shell, bare-name allow-list for subprocesses, `kill_on_drop`.
+- No model-reachable shell, bare-name policy allow-list for subprocesses,
+  process-group kill, credential env scrub floor on every child.
 - Secrets only in the OS keychain; canary-tested.
 - `unsafe_code = "forbid"` in kernel and tools.
 
@@ -457,8 +505,9 @@ tasks B1–B5 cover the benchmark suite; the heavy corpus is gated behind
 - Blocking work on the blocking pool; hashing never under a lock.
 - Facts scanned once per task; capabilities resolved once per task.
 
-**Testing** — the workspace carries ~450 tests: unit tests per module,
+**Testing** — the workspace carries ~515 tests (13 live-API tests
+ignored by default): unit tests per module,
 protocol and invariant tests against in-memory seams, security regression
 tests for confinement, canary tests for secrets, integration tests that
-run real `git`/`cargo`, and the replay eval. CI bar: all tests green,
+run real `git`/`cargo`, the replay eval, and corpus-invariant proofs. CI bar: all tests green,
 clippy clean, `cargo fmt --check` clean.

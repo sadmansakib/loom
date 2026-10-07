@@ -8,6 +8,26 @@ works; this document tracks direction.
 
 ---
 
+## Goals
+
+Every planned item below is justified against these. An item that
+serves none of them does not ship.
+
+1. **G1** Maximize successful work per model invocation.
+2. **G2** Minimize unnecessary model turns.
+3. **G3** Minimize irrelevant context and token consumption.
+4. **G4** Move deterministic work from the model into the runtime.
+5. **G5** Make individual model turns high-bandwidth and actionable.
+6. **G6** Delegate only when subagent economics justify it.
+7. **G7** Keep model/provider/tool concerns cleanly separated.
+8. **G8** Build an extensible, incremental Rust core without
+   speculative complexity.
+9. **G9** Measure execution efficiency empirically.
+10. **G10** Eventually let Loom optimize how it solves tasks from its
+    own execution data.
+
+---
+
 ## Shipped
 
 ### Foundations
@@ -101,6 +121,15 @@ works; this document tracks direction.
   go vet/test, pytest, python compileall) and linked to the recent
   change on the likely-causing path; unparseable failures degrade to
   bounded raw output, never hidden.
+- **Command execution policy.** `run_command` runs under a workspace
+  policy: the shipped default allows exactly `cargo`, and a
+  `.loom/commands.toml` manifest extends it with per-rule limits — a
+  wall-time cap (the whole process group is killed at the expiry and
+  the model sees the error), a per-stream output window, and extra
+  environment scrubbing. Provider credential env names are scrubbed
+  from every spawned child regardless of manifest; every executed
+  command is recorded as a structured `CommandEffect` in the session
+  transcript, so the session is the audit log.
 - **Batch scheduling.** Wave scheduler: concurrent read-only calls,
   write/read conflicts serialized by overlapping paths, results in call
   order, cancellation-safe, poison-safe.
@@ -134,88 +163,232 @@ works; this document tracks direction.
   stays synchronous. Unknown models, missing catalogs, and windows
   below the 64K pruning floor all fail at setup, not mid-task.
   Provider-reported cost is carried on usage for paid spend.
-- **Eval harness.** Replay-based equivalence testing (transcript and
-  byte-identical request assertions), zero-dropped-event assertions,
-  per-turn census and cache hit/miss reporting with aggregates, and a
-  pinned benchmark task suite.
-- **Verification bar.** ~465 tests (plus 13 live-API tests ignored by
+- **Eval suite** (`docs/eval.md`). Offline proofs on every commit:
+  replay equivalence (transcript and byte-identical requests),
+  zero-dropped events, and corpus invariants (each seed fails exactly
+  its fail-to-pass set, passes exactly its pass-to-pass set, and an
+  untouched workspace fails its gate). Live measurement: 17 tasks
+  (15 outcome-gated bugfix tasks mined from Loom's own fix history,
+  2 lab instruments), N runs per task, per-run turns / census / billed
+  and cached tokens / cost / wall time / tool-cache hits, per-task
+  aggregates and a gated-pass-rate suite headline; strict and tolerant
+  modes.
+- **Verification bar.** ~515 tests (13 live-API tests ignored by
   default), clippy clean, fmt clean.
 
 ---
 
 ## Not yet shipped
 
-Ordered by expected value. Each item names the seam it plugs into; none
-requires unwinding shipped invariants.
+Ordered by expected value against the goals. Each item names the goals
+it serves, the evidence behind it, and the seam it plugs into; none
+requires unwinding shipped invariants. Evidence is drawn from a survey
+of harnesses with working userbases (Claude Code, Codex CLI, OpenCode,
+Aider, Pi, mini-SWE-agent, SWE-agent, OpenHands, ForgeCode,
+Terminus-KIRA, Codebuff, Amp, Crush, gptme, Plandex, Goose, OpenDev,
+Sema Code, oh-my-pi, Serena, RTK, Meta-Harness) and the published
+ablations behind them. Two findings frame the whole list: on
+Terminal-Bench the *harness* moves the same model by 16–25 points, and
+harnesses in the same score tier differ in cost by up to 4×. So every
+item is gated on measurement (item 1), and vendor-reported numbers are
+treated as hypotheses until Loom's own eval reproduces them.
 
-### Near term
+### Near term — measurement and the cheapest wins
 
-1. **Command execution policy.** Today `run_command` allow-lists
-   exactly `cargo`. Ship a configurable policy: allow-list per workspace
-   (manifest-declared commands), per-command resource limits (wall time,
-   output caps, environment scrubbing), and audit records for every
-   executed command. Seam: the existing allow-list check and
-   `CommandEffect` records.
-2. **CLI session resume.** The engine can load and resume a persisted
-   session; the CLI has no `--resume`/`--session` surface for it. Add
-   listing, selection, and continuation, plus transcript export.
+1. **Efficiency eval, phase 2** (G9, G10). The suite measures outcome
+   and cost; extend it so it can *rank harness changes*:
+   - a 30-task hard subset as the iteration gate (the Meta-Harness
+     protocol), then external slices (SWE-bench Verified,
+     Terminal-Bench) for comparability;
+   - headline **$ and turns per solved task**, cache-read ratio, and
+     tool-failure rate alongside pass rate;
+   - per-tool, per-model **failure-mode micro-evals** (edit-apply
+     success, malformed-call rate, repeated-call rate) as release gates
+     (ForgeCode);
+   - `loom stats`: what each mechanism saved — pruning, tool-cache hits,
+     evidence shaping, output filters — from the events already
+     recorded (RTK's `gain`).
+   Seam: the live eval reports and the event stream.
+2. **Sandboxed shell** (G2, G3, G5). Strong models working through a
+   shell are ~53% cheaper than through fixed tool menus (Fan et al.,
+   2026); Pi, mini-SWE-agent, and Terminus run mostly or only on a
+   shell. Replace "allow-list of bare programs" with "any command
+   inside an OS sandbox": Seatbelt on macOS, Landlock/bubblewrap on
+   Linux, writes confined to the workspace, network off by default, the
+   credential scrub floor kept. The shipped command policy becomes the
+   escalation layer. Keep bounded head+tail capture and process-group
+   kill. Seam: `run_command` and the policy module.
+3. **Command-aware output filters** (G3, G4). RTK-style per-command
+   reducers for *successful* and general output (git status/diff/log,
+   ls/tree, grep, test passes) — RTK reports a 56% average reduction —
+   with the full output teed to an artifact on failure so nothing is
+   lost. Evidence shaping already does this for failed builds; this
+   generalizes it. Seam: `loom-tools` render tables, the artifact store.
+4. **Bootstrap facts** (G2, G4). Extend the facts block with a
+   project instruction file (`AGENTS.md`, falling back to `CLAUDE.md`;
+   bounded), a depth-limited file tree, and toolchain/package-manager
+   versions. Meta-Harness found exactly this snapshot by search and
+   measured 2–5 early turns saved. Still frozen per task, so the
+   cached prefix is unaffected. Seam: `FsFactsSource`.
+5. **Edits that need no follow-up** (G1, G2, G5).
+   - **Multi-edit**: `edits: [{old_string, new_string}]`, applied
+     atomically, across one or more files.
+   - **Result shows the edited region** (±N lines), so the model never
+     re-reads to confirm (SWE-agent, Claude Code).
+   - **Syntax guard**: a tree-sitter parse of the edited file before
+     writing; an edit that breaks parsing is refused with the error
+     location (SWE-agent's lint-guarded edit: 18.0 vs 15.0 resolved).
+   Exact unique-match replace stays the default format: whitespace-fuzzy
+   fallbacks were measured never to fire, and anchor formats (hashline)
+   help weak models but cost strong models 8–38% more. Format becomes a
+   per-model profile setting (item 9), chosen by measurement. Seam:
+   `edit_file`/`write_file`.
+6. **Pre-dispatch call repair and cheap re-reads** (G2, G4).
+   - Repair malformed tool calls before dispatch: argument aliases
+     (`path`/`file_path`), stringified JSON objects, whitespace-padded
+     `old_string` with exactly one trimmed match (ForgeCode). Every
+     repair saves a failed round trip; repairs are recorded in effects
+     so the eval can count them.
+   - A tool-cache hit returns `unchanged since call <id>` instead of
+     the whole content again, while the earlier result is still in the
+     projection unstubbed.
+   Seam: between stop-reason validation and `plan_turn`; the tool cache.
+7. **Search and read shape** (G2, G3). `search` grouped by file with a
+   files-only mode and optional context lines; a `glob` tool. Measure
+   the read window: SWE-agent found a ~100-line window beat both 30
+   lines and whole files, while Loom defaults to 2000. Seam: `search`,
+   `read_file`, a new read-only tool.
+8. **Completion gate and plan** (G1, G2).
+   - On `EndTurn`, if files changed since the last green `verify`,
+     refuse once with the diff summary and the original instruction
+     (Terminus-KIRA's double confirmation, SWE-agent's
+     `review_on_submit`, LangChain's pre-finish checklist: +13.7 points
+     from harness changes only).
+   - A `todo` tool; the runtime re-appends the current list at the tail
+     of the projection when it changes, so the goal never sinks into
+     mid-history. Enforced plans took ForgeCode from 38% to 66%;
+     planning cut cost ~30% for strong models (Fan et al.).
+   Seam: the stop-reason branch of the loop; a kernel-owned tool.
 
-### Mid term
+### Mid term — context and model policy
 
-3. **More providers.** DeepSeek and OpenRouter share one OpenAI-shaped
-   wire; the abstraction is proven only for that shape. Add a
-   non-OpenAI-shaped provider (Anthropic-style messages, or Gemini) to
-   pressure the `ModelProvider` boundary itself, including
-   capability-correct pruning floors per model. OpenRouter's catalog is
-   the model to copy for capability discovery: fetch in the frontend,
-   pass to the engine as data.
-4. **Long-term memory.** Designed (session-persistent knowledge with
-   explicit add/expire semantics) but not built. The `FactsSource` seam
-   and the facts block projection are the insertion point; the hard
-   part is eviction and staleness policy, not storage.
-5. **Adaptive pruning thresholds.** Current constants (80% trigger,
-   20K floors) come from one benchmark corpus. Ship measurement-driven
-   tuning: per-model trigger curves using the census and cache
-   hit/miss data the loop already records, evaluated by the replay
-   harness.
-6. **Search parity.** The hand-built gitignore chain diverges from the
-   `ignore` crate on negation-precedence edge cases (documented in
-   code). Either adopt the crate's matcher for chained files or pin
-   the divergence with fixture tests from real repositories.
-7. **Artifacts lifecycle.** Spilled artifacts accumulate in `loom.db`
-    with no retention policy. Add reference-counting from live
-    transcripts plus a GC (age- or size-bounded) and a size-reporting
-    command.
+9. **Model profiles** (G3, G7). A `ModelProfile` beside
+   `ModelCapabilities`, carried as data: edit format, read window,
+   reasoning-effort schedule, tool argument names. Includes a
+   **progressive reasoning policy** — high effort for the opening turns
+   and for verification, low in between (ForgeCode). The loop sets
+   effort per turn; adapters only translate it. Seam: provider
+   capabilities and the request compiler.
+10. **Pruning, phase 2** (G3).
+    - **Turn-age masking**: stub read-only results older than K turns
+      even below the window trigger — SWE-agent's last-5-observations
+      ablation beat full history (18.0 vs 15.0), and an 80% trigger on a
+      1M-token window never fires.
+    - **Cold-cache pruning**: when the gap since the last request
+      exceeds the provider's cache TTL, the prefix misses anyway, so
+      re-decide for free, bypassing the delta-reclaim gate (Codebuff).
+    - **Reasoning clearing**: drop reasoning older than N turns in the
+      same pass (Anthropic `clear_thinking`), where providers allow it.
+    - **Usage-calibrated estimates**: correct the bytes÷3 estimate
+      against the previous turn's billed `input_tokens` (Sema Code).
+      This settles the tokenizer question without a tokenizer.
+    - Stubs stay one line: models rarely use recovery hints (Fan et al.).
+    Every addition keeps the checkpoint freeze: one cache miss per
+    decision. Seam: `PruningContextCompiler`, census.
+11. **Deterministic openers** (G2, G4). Runtime-executed steps before
+    the first model turn, chosen by task shape: read files the prompt
+    names, `git diff` for changed files, a baseline `verify` to capture
+    pre-existing failures. Their results enter the transcript as
+    ordinary tool results, so replay and pruning need no special case
+    (Codebuff's programmatic steps). Seam: the loop's setup phase.
+12. **Handoff compaction** (G3). The last resort when non-prunable
+    history outgrows the window: instead of recursive in-place
+    summarization (which Codex reports degrades accuracy), generate a
+    goal-directed handoff — task, decisions, open problems, relevant
+    files — and continue in a fresh projection (Amp's Handoff). One
+    cache miss, frozen like a prune checkpoint. Prefer provider-native
+    compaction where an adapter has it. Seam: a final strategy in the
+    pruning decorator.
+13. **Background commands** (G2, G5). Long builds and tests run
+    detached; the runtime injects a completion notice at the next turn
+    boundary instead of blocking a turn on them (Sema Code, Crush). Seam:
+    the bounded exec and turn assembly.
+14. **Non-OpenAI provider** (G7). An Anthropic-messages adapter to
+    pressure the `ModelProvider` boundary. The compiler emits
+    **segments marked cacheable or volatile**, so cache breakpoints are
+    placed by the adapter and the kernel stays provider-blind (OpenDev).
+    Capability discovery copies the OpenRouter catalog pattern.
+15. **CLI session resume.** Listing, selection, continuation, and
+    transcript export (also the input for item 19).
+16. **Search parity.** Adopt the `ignore` crate's matcher for chained
+    gitignore files or pin the documented negation-precedence
+    divergence with real-repository fixtures.
+17. **Artifacts lifecycle.** Reference counting from live transcripts,
+    an age/size-bounded GC, and a size-reporting command.
 
-### Later
+### Later — structure and self-improvement
 
-8. **Parallel agent orchestration.** Multiple tasks over one session,
-    worktree-per-agent isolation, and a merge path. The lease support
-    in the store is the first brick; needs conflict policy and an
-    orchestrator above the engine.
-9. **Mid-task model selection.** The model is fixed per task by design
-    (capabilities resolve once). Allow planned switches at task
-    boundaries — cheap given the budget plumbing, but it invalidates
-    the single-capability assumption baked into the loop's setup.
-10. **Frontends.** The engine boundary is frontend-neutral (no
-    printing, typed results, ordered events). A TUI or desktop client
-    is additive once session resume ships.
-11. **Distributed verification.** Farm `verify` runs (the expensive
-    step) to remote or containerized runners with the same evidence
-    contract, so local context budgets are never spent on build logs.
+18. **Symbol tools** (G4, G5). Tree-sitter `symbols_overview` and
+    `replace_symbol` for Rust, TypeScript, and Python; LSP-backed
+    references and rename after that (Serena). One call replaces a
+    search→read→edit chain. Builds on the item 5 parser.
+19. **Delegation by measured economics** (G6). A read-only scout on a
+    cheap model that returns a ≤1 KB answer (Codebuff file-picker, Amp
+    Librarian), one level deep only. Delegate when estimated parent
+    context saved × remaining parent turns exceeds the subagent's cost —
+    computed from the census and cost data the loop already records,
+    and checked by the eval. Requires mid-task model selection for the
+    child only; the parent's model stays fixed per task. Seam: the
+    engine composes a child `Agent`; leases and cancellation already
+    exist.
+20. **Self-optimization** (G10). In order:
+    1. trace export: one directory per task with transcript, events,
+       census, harness version, and outcome;
+    2. every tunable — prune trigger and floors, read window, reasoning
+       schedule, edit format — moved from constants into one config
+       struct, so the replay and live evals can sweep it (this subsumes
+       adaptive pruning thresholds);
+    3. an outer loop in the Meta-Harness shape that reads *raw* traces,
+       harness source, and scores and proposes changes (compressed
+       feedback measured worse);
+    4. lessons: recurring failure→fix pairs mined from history into
+       short, expiring rules injected through the facts block (gptme
+       lessons, `rtk learn`). This is the long-term memory item; the
+       hard part is staleness and eviction, not storage.
+21. **Parallel orchestration.** Worktree-per-agent isolation with a
+    merge path, above the engine. Only after item 19 shows delegation
+    pays.
+22. **Frontends.** A TUI or desktop client, additive once resume ships.
+23. **Distributed verification.** Remote or containerized `verify`
+    runners with the same evidence contract.
+
+### Deliberately not planned
+
+Each would add surface without evidence it serves the goals (G8):
+
+- **Embedding/vector retrieval.** None of eleven harnesses in a 2026
+  source study uses it; deterministic search plus symbols suffices.
+- **Agent frameworks, multi-level subagent trees.** One level is enough
+  where delegation pays at all.
+- **MCP/skills marketplace and deferred tool loading.** Schema
+  filtering saves tokens only with large tool menus (21–57K
+  tokens/turn at ~30 tools; nothing at ~9). Revisit if third-party
+  tools arrive.
+- **Hashline or patch formats as the default edit.** Per-model profile
+  option only, if measurement favors it.
+- **A real per-provider tokenizer.** Usage calibration (item 10) gives
+  the accuracy where it matters.
 
 ### Open questions
 
 - Should the failure ledger loosen for idempotent read-only retries
-  after non-deterministic errors (e.g. transient filesystem races),
-  or does strictness keep paying for itself?
-- Is the bytes÷3 token estimate worth replacing with a real tokenizer
-  per provider, given the pruning trigger only needs consistency —
-  but cross-model comparability in eval may eventually need real
-  counts?
-- Where does user-facing configuration live (allow-lists, provider
-  defaults): per-workspace manifest, user config, or both with a
-  defined precedence?
+  after non-deterministic errors, and should it tighten to near-repeats
+  (same tool and path failing three times with different arguments)?
+- Where does user-facing configuration live (sandbox escalations,
+  provider defaults, model profiles): per-workspace manifest, user
+  config, or both with defined precedence?
+- What sandbox escape hatch, if any, is acceptable for network-needing
+  commands (dependency fetches) without reintroducing an allow-list?
 
 ---
 
@@ -227,3 +400,5 @@ requires unwinding shipped invariants.
   it that way).
 - Any new model-visible byte passes the output budget with an explicit
   marker.
+- Any change claimed to save turns or tokens ships with a live-eval
+  comparison (medians, N ≥ 5) against the previous baseline.
