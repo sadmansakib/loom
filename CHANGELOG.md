@@ -131,6 +131,18 @@ scrub floor (`*_API_KEY`) always applies; the engine loads the manifest
 at open and the spec advertises the allowed programs. Rejections and
 timeouts surface as audited tool errors.
 
+## 2026-10-08 — Dynamic output reservation
+
+The per-turn output reservation now derives from the model's
+capabilities instead of a fixed 8,192: `OutputReservation::Auto` (the
+new default) takes the model's declared output maximum, floored at the
+old default and capped at 32,768, clamped to half the context window so
+input always keeps room. `Agent::with_reserved_output_tokens` pins an
+explicit value (still window-clamped). Motivation, measured: the free-
+tier eval lost B13 to `finish_reason=length` — nemotron declares a
+235,929-token output ceiling that the fixed reservation cut to 8,192.
+DeepSeek-shaped models (declared 8,192) are unchanged.
+
 ## 2026-10-07 — Live eval on OpenRouter (free tier)
 
 The live eval arm can now run the suite against OpenRouter:

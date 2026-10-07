@@ -27,8 +27,8 @@ use crate::context::{
 use crate::event::{EventKind, EventSink};
 use crate::id::{SessionId, TaskId};
 use crate::model::{
-    ModelError, ModelErrorKind, ModelEvent, ModelProvider, ModelRequest, ModelResponse, StopReason,
-    Usage,
+    ModelCapabilities, ModelError, ModelErrorKind, ModelEvent, ModelProvider, ModelRequest,
+    ModelResponse, StopReason, Usage,
 };
 use crate::session::{PlannedTurn, Session, TaskRecord, TerminalTaskStatus};
 use crate::store::{ArtifactStore, SessionStore, StoreError};
@@ -48,10 +48,54 @@ use tools::{MAX_TOOL_OUTPUT_BYTES, ToolBatch, ToolExposure};
 pub const DEFAULT_MAX_TURNS: u32 = 50;
 
 /// Default output-token reservation: the share of the context window held
-/// back for the model's reply (§8). It also bounds `max_tokens` on each
-/// request whenever the model reports an output limit. Configurable via
+/// back for the model's reply (§8). Used verbatim when the model reports
+/// no output limit, and as the floor of the automatic derivation
+/// ([`OutputReservation::Auto`]) otherwise. Configurable via
 /// [`Agent::with_reserved_output_tokens`].
 pub const DEFAULT_RESERVED_OUTPUT_TOKENS: u32 = 8_192;
+
+/// Hard ceiling on a single model turn's output reservation, whatever the
+/// model declares. Task budgets (§14) bound aggregate spend; this only
+/// shapes individual turns, so a model advertising a 200K-token output
+/// ceiling cannot dump it all in one go.
+pub const MAX_RESERVED_OUTPUT_TOKENS: u32 = 32_768;
+
+/// How the per-turn output reservation is chosen (§8).
+///
+/// `Auto` (the default) derives it from the model's capabilities: the
+/// model's declared output maximum when it reports one, floored at
+/// [`DEFAULT_RESERVED_OUTPUT_TOKENS`] and capped at
+/// [`MAX_RESERVED_OUTPUT_TOKENS`], then clamped to half the context
+/// window so the projection always keeps room for input. `Fixed` pins an
+/// explicit value — still window-clamped, since a reservation that
+/// starves input is a misconfiguration, not a choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputReservation {
+    /// Derive from model capabilities (default).
+    Auto,
+    /// Explicit reservation, clamped to half the context window.
+    Fixed(u32),
+}
+
+/// Resolves the output reservation actually used for a task's requests.
+///
+/// The derived value feeds [`ContextBudget::from_window`] and bounds
+/// `max_tokens` on each request (the compiler applies the model's own
+/// output limit on top, so a smaller declared maximum always wins).
+#[must_use]
+pub fn derive_reserved_output_tokens(
+    capabilities: &ModelCapabilities,
+    reservation: OutputReservation,
+) -> u32 {
+    let window_half = capabilities.max_context_tokens / 2;
+    match reservation {
+        OutputReservation::Fixed(reserved) => reserved.min(window_half),
+        OutputReservation::Auto => DEFAULT_RESERVED_OUTPUT_TOKENS
+            .max(capabilities.max_output_tokens.unwrap_or(0))
+            .min(MAX_RESERVED_OUTPUT_TOKENS)
+            .min(window_half),
+    }
+}
 
 /// Default per-tool-call timeout: the bound on the agent's wait for a tool
 /// result (§6.6). Configurable via [`Agent::with_tool_timeout`].
@@ -365,7 +409,7 @@ pub struct Agent {
     retry: RetryPolicy,
     max_turns: u32,
     budget: TaskBudget,
-    reserved_output_tokens: u32,
+    output_reservation: OutputReservation,
     tool_timeout: Duration,
     max_tool_concurrency: usize,
     store: Option<Box<dyn SessionStore>>,
@@ -395,7 +439,7 @@ impl Agent {
             retry: RetryPolicy::default(),
             max_turns: DEFAULT_MAX_TURNS,
             budget: TaskBudget::default(),
-            reserved_output_tokens: DEFAULT_RESERVED_OUTPUT_TOKENS,
+            output_reservation: OutputReservation::Auto,
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
             max_tool_concurrency: DEFAULT_MAX_TOOL_CONCURRENCY,
             store: None,
@@ -419,10 +463,12 @@ impl Agent {
         self
     }
 
-    /// Sets the output-token reservation (§8).
+    /// Sets an explicit output-token reservation (§8), overriding the
+    /// automatic [`OutputReservation::Auto`] derivation. The value is
+    /// still clamped to half the model's context window.
     #[must_use]
     pub fn with_reserved_output_tokens(mut self, reserved_output_tokens: u32) -> Self {
-        self.reserved_output_tokens = reserved_output_tokens;
+        self.output_reservation = OutputReservation::Fixed(reserved_output_tokens);
         self
     }
 
@@ -652,10 +698,10 @@ impl Agent {
                 .ok_or_else(|| TaskError::UnknownModel {
                     model: self.model.clone(),
                 })?;
-        let budget = ContextBudget::from_window(
-            capabilities.max_context_tokens,
-            self.reserved_output_tokens,
-        )?;
+        let reserved_output_tokens =
+            derive_reserved_output_tokens(&capabilities, self.output_reservation);
+        let budget =
+            ContextBudget::from_window(capabilities.max_context_tokens, reserved_output_tokens)?;
 
         // Repository facts for this task (2E, ADR-015): captured exactly once,
         // before the first compile, so the projected block is byte-stable for
@@ -1260,4 +1306,58 @@ fn now_millis() -> u64 {
 /// A duration's whole milliseconds, saturating at `u64::MAX`.
 fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEFAULT_RESERVED_OUTPUT_TOKENS, MAX_RESERVED_OUTPUT_TOKENS, OutputReservation,
+        derive_reserved_output_tokens,
+    };
+    use crate::model::ModelCapabilities;
+
+    #[test]
+    fn auto_honors_a_declared_output_maximum_up_to_the_hard_cap() {
+        // OpenRouter free-tier shape: declares 235_929 on a 262_144 window.
+        let caps = ModelCapabilities::new(262_144).with_max_output_tokens(235_929);
+        assert_eq!(
+            derive_reserved_output_tokens(&caps, OutputReservation::Auto),
+            MAX_RESERVED_OUTPUT_TOKENS,
+        );
+        // Declaring exactly the default floor changes nothing.
+        let caps = ModelCapabilities::new(128_000).with_max_output_tokens(8_192);
+        assert_eq!(
+            derive_reserved_output_tokens(&caps, OutputReservation::Auto),
+            DEFAULT_RESERVED_OUTPUT_TOKENS,
+        );
+    }
+
+    #[test]
+    fn auto_keeps_half_the_window_for_input() {
+        // A declaration larger than half the window is clamped.
+        let caps = ModelCapabilities::new(10_000).with_max_output_tokens(60_000);
+        assert_eq!(
+            derive_reserved_output_tokens(&caps, OutputReservation::Auto),
+            5_000
+        );
+        // No declared maximum: the default floor, still window-clamped.
+        let caps = ModelCapabilities::new(10_000);
+        assert_eq!(
+            derive_reserved_output_tokens(&caps, OutputReservation::Auto),
+            5_000
+        );
+    }
+
+    #[test]
+    fn fixed_is_authoritative_but_window_clamped() {
+        let caps = ModelCapabilities::new(10_000).with_max_output_tokens(60_000);
+        assert_eq!(
+            derive_reserved_output_tokens(&caps, OutputReservation::Fixed(4_096)),
+            4_096,
+        );
+        assert_eq!(
+            derive_reserved_output_tokens(&caps, OutputReservation::Fixed(60_000)),
+            5_000,
+        );
+    }
 }
