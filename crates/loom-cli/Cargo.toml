@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 loom-core = { workspace = true }
+loom-store = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
@@ -28,6 +29,8 @@ tempfile = { workspace = true }
 serde = { workspace = true }
 # eval harness tests only (record/replay provider taps model streams)
 futures = { workspace = true }
+# stats test: build a store + sessions for the spawned binary to read
+loom-kernel = { workspace = true }
 
 [lints]
 workspace = true

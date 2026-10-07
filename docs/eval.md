@@ -63,7 +63,30 @@ DEEPSEEK_API_KEY=... cargo test -p loom-cli --test eval -- --ignored --nocapture
 
 Reports land in `target/eval/`: `report-<ID>-<model>.json` per task
 (per-run metrics + aggregates) and `report-suite-<model>.json` (the
-headline: gated pass rate over every gated run of the session).
+headline: gated pass rate over every gated run of the session, plus the
+`economics` block — total and per-solved cost, turns per solved
+mean/median, token-weighted cache-read ratio over successful runs, and
+the transcript-derived tool-failure rate).
+
+## Micro-evals (call quality from the transcript)
+
+Every run report — success or failure — embeds a `micro` block computed
+by `loom_core::kernel::analytics::session_stats` from the run's
+transcript: per-tool fault taxonomy (success / invalid-input /
+execution / timeout / repeated / unknown / not-exposed / cancelled),
+edit-family acceptance, identical-call repeats (name + canonical
+arguments), and oversize spills (with the bytes each kept out of
+context). `eval_live` also persists each run's full session JSON to
+`target/eval/records/sessions/<ID>-<model>-<run>.session.json`; the
+offline test `eval_micro_walks_recorded_sessions` recomputes every
+snapshot, cross-checks it against the live run's embedded `micro`
+block (exact equality), and writes `report-micro-<model>.json` — the
+token-free half of the release-gate numbers. `loom stats --json`
+computes the same shape from any stored session.
+
+What the transcript does *not* carry — billed usage, cache hit/miss,
+prune decisions — is never estimated from it; those numbers exist only
+in live-run reports.
 
 ## Units and their honesty rules
 

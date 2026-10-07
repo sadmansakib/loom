@@ -986,6 +986,12 @@ async fn run_once(
         })
     });
 
+    // Micro-eval block: transcript-derived call quality (per-tool fault
+    // taxonomy, edit acceptance, identical repeats, spills). Computed in
+    // both arms — a failed run still shows what the model did wrong.
+    let micro = serde_json::to_value(loom_core::kernel::analytics::session_stats(&session))
+        .unwrap_or(serde_json::json!(null));
+
     let mut report = match &outcome {
         Ok(summary) => {
             assert_eq!(
@@ -1036,6 +1042,7 @@ async fn run_once(
                 },
                 "census_final_turn": census_totals,
                 "census_per_turn": census_turns,
+                "micro": &micro,
             })
         }
         Err(error) => serde_json::json!({
@@ -1047,6 +1054,7 @@ async fn run_once(
             "error": error.to_string(),
             "retries": tally.retries,
             "observed_wall_time_ms": observed_ms,
+            "micro": &micro,
         }),
     };
     // Outcome grading for gated tasks; live runs only.
@@ -1090,6 +1098,11 @@ async fn eval_live() {
     let dir = eval_dir();
     let records_dir = dir.join("records");
     std::fs::create_dir_all(&records_dir).unwrap();
+    // Full session snapshots (transcript JSON) per run: what the offline
+    // micro-eval walker and `loom stats` consume — the same numbers,
+    // recomputable without spending a token.
+    let sessions_dir = records_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
 
     let only: Option<Vec<String>> = std::env::var("LOOM_EVAL_TASKS")
         .ok()
@@ -1116,7 +1129,7 @@ async fn eval_live() {
             .unwrap();
             let provider_label = deepseek.name().to_owned();
             let (provider, exchanges) = RecordingProvider::new(deepseek);
-            let (report, recorded, _session) = run_once(
+            let (report, recorded, session) = run_once(
                 task,
                 &model,
                 &provider_label,
@@ -1136,6 +1149,11 @@ async fn eval_live() {
                     .collect::<Vec<_>>()
                     .join("\n")
                     + "\n",
+            )
+            .unwrap();
+            std::fs::write(
+                sessions_dir.join(format!("{}-{model}-{run}.session.json", task.id)),
+                serde_json::to_string(&session).unwrap(),
             )
             .unwrap();
             reports.push(report);
@@ -1183,10 +1201,54 @@ async fn eval_live() {
     // Suite headline: the pass rate over every gated run of the session —
     // the number the suite exists to move. Lab tasks (B1/B5) carry no
     // gate and do not enter the rate.
+    let headline = suite_headline(
+        &model,
+        if tolerate_failures {
+            "tolerant"
+        } else {
+            "strict"
+        },
+        &suite,
+    );
+    let headline_path = dir.join(format!("report-suite-{model}.json"));
+    std::fs::write(
+        &headline_path,
+        serde_json::to_string_pretty(&headline).unwrap(),
+    )
+    .unwrap();
+    eprintln!(
+        "suite pass rate: {}/{} gated runs ({}) — wrote {}",
+        headline["gated_solved"],
+        headline["gated_runs"],
+        headline["pass_rate"],
+        headline_path.display()
+    );
+}
+
+/// Builds the suite headline from per-task run reports — pure, so a unit
+/// test can pin the economics math without a live run.
+///
+/// Beyond the pass rate it carries the release-gate economics:
+/// spend per solved run, turns per solved run, the token-weighted
+/// cache-read ratio over successful runs, and the transcript-derived
+/// tool-failure rate. Failed runs carry no cost/turn numbers (the
+/// provider may never have completed a request), so every economics
+/// field states its population in the note.
+fn suite_headline(
+    model: &str,
+    mode: &str,
+    suite: &[(String, Vec<serde_json::Value>)],
+) -> serde_json::Value {
     let mut per_task = serde_json::Map::new();
     let mut gated_runs = 0usize;
     let mut gated_solved = 0usize;
-    for (id, reports) in &suite {
+    let mut solved_turns: Vec<u64> = Vec::new();
+    let mut total_cost = 0.0;
+    let mut hit_tokens = 0u64;
+    let mut miss_tokens = 0u64;
+    let mut failed_calls = 0u64;
+    let mut total_calls = 0u64;
+    for (id, reports) in suite {
         let gated: Vec<&serde_json::Value> = reports
             .iter()
             .filter(|r| r.get("gate").is_some_and(|g| !g.is_null()))
@@ -1200,6 +1262,12 @@ async fn eval_live() {
                 .count();
             gated_runs += gated.len();
             gated_solved += solved;
+            solved_turns.extend(
+                gated
+                    .iter()
+                    .filter(|r| r["gate"]["bug_fixed"].as_bool().unwrap_or(false))
+                    .filter_map(|r| r["turns"].as_u64()),
+            );
             serde_json::json!({
                 "kind": "field",
                 "runs": gated.len(),
@@ -1208,10 +1276,34 @@ async fn eval_live() {
             })
         };
         per_task.insert(id.clone(), entry);
+        for run in reports {
+            total_cost += run["cost_usd"].as_f64().unwrap_or(0.0);
+            if run["success"].as_bool().unwrap_or(false) {
+                hit_tokens += run["cache_hit_tokens"].as_u64().unwrap_or(0);
+                miss_tokens += run["cache_miss_tokens"].as_u64().unwrap_or(0);
+            }
+            failed_calls += run["micro"]["totals"]["failed"].as_u64().unwrap_or(0);
+            total_calls += run["micro"]["totals"]["calls"].as_u64().unwrap_or(0);
+        }
     }
-    let headline = serde_json::json!({
+    let mean_turns = |xs: &[u64]| -> Option<f64> {
+        (!xs.is_empty()).then(|| xs.iter().sum::<u64>() as f64 / xs.len() as f64)
+    };
+    let median_turns = |xs: &mut Vec<u64>| -> Option<f64> {
+        if xs.is_empty() {
+            return None;
+        }
+        xs.sort_unstable();
+        let n = xs.len();
+        Some(if n % 2 == 1 {
+            xs[n / 2] as f64
+        } else {
+            (xs[n / 2 - 1] as f64 + xs[n / 2] as f64) / 2.0
+        })
+    };
+    serde_json::json!({
         "model": model,
-        "mode": if tolerate_failures { "tolerant" } else { "strict" },
+        "mode": mode,
         "tasks": per_task,
         "gated_runs": gated_runs,
         "gated_solved": gated_solved,
@@ -1220,17 +1312,107 @@ async fn eval_live() {
         } else {
             serde_json::json!(gated_solved as f64 / gated_runs as f64)
         },
-    });
-    let headline_path = dir.join(format!("report-suite-{model}.json"));
-    std::fs::write(
-        &headline_path,
-        serde_json::to_string_pretty(&headline).unwrap(),
-    )
-    .unwrap();
-    eprintln!(
-        "suite pass rate: {gated_solved}/{gated_runs} gated runs ({}) — wrote {}",
-        headline["pass_rate"],
-        headline_path.display()
+        "economics": {
+            "total_cost_usd": (total_cost * 1e4).round() / 1e4,
+            "usd_per_solved": if gated_solved == 0 { serde_json::json!(null) } else {
+                serde_json::json!((total_cost / gated_solved as f64 * 1e4).round() / 1e4)
+            },
+            "turns_per_solved_mean": mean_turns(&solved_turns),
+            "turns_per_solved_median": median_turns(&mut solved_turns),
+            "note": "cost over all runs (failures bill too); turns over gated solved runs",
+            "cache_read_ratio": if hit_tokens + miss_tokens == 0 {
+                serde_json::json!(null)
+            } else {
+                serde_json::json!((hit_tokens as f64 / (hit_tokens + miss_tokens) as f64 * 1e4).round() / 1e4)
+            },
+            "cache_note": "token-weighted over successful runs only",
+            "tool_failure_rate": {
+                "failed": failed_calls,
+                "total": total_calls,
+                "rate": if total_calls == 0 { serde_json::json!(null) } else {
+                    serde_json::json!((failed_calls as f64 / total_calls as f64 * 1e4).round() / 1e4)
+                },
+                "note": "micro-eval totals over all runs incl. failures",
+            },
+        },
+    })
+}
+
+#[test]
+fn suite_headline_computes_pass_rate_and_economics() {
+    let run =
+        |solved: bool, cost: f64, turns: u64, hit: u64, miss: u64, failed: u64, calls: u64| {
+            serde_json::json!({
+                "success": solved,
+                "turns": turns,
+                "cost_usd": cost,
+                "cache_hit_tokens": hit,
+                "cache_miss_tokens": miss,
+                "gate": {"bug_fixed": solved},
+                "micro": {"totals": {"failed": failed, "calls": calls}},
+            })
+        };
+    let suite = vec![
+        (
+            "B2".to_owned(),
+            vec![
+                run(true, 0.01, 10, 900, 100, 1, 10),
+                run(true, 0.02, 14, 800, 200, 3, 10),
+            ],
+        ),
+        ("B3".to_owned(), vec![run(false, 0.03, 20, 0, 500, 5, 10)]),
+        // Lab: no gate, no economics — contributes nothing but presence.
+        (
+            "B1".to_owned(),
+            vec![serde_json::json!({"success": true, "turns": 3})],
+        ),
+    ];
+    let headline = suite_headline("m", "strict", &suite);
+
+    assert_eq!(headline["gated_runs"], serde_json::json!(3));
+    assert_eq!(headline["gated_solved"], serde_json::json!(2));
+    assert_eq!(headline["pass_rate"], serde_json::json!(2.0 / 3.0));
+    assert_eq!(headline["tasks"]["B1"]["kind"], serde_json::json!("lab"));
+
+    let econ = &headline["economics"];
+    assert_eq!(econ["total_cost_usd"], serde_json::json!(0.06));
+    assert_eq!(econ["usd_per_solved"], serde_json::json!(0.03));
+    assert_eq!(econ["turns_per_solved_mean"], serde_json::json!(12.0));
+    assert_eq!(econ["turns_per_solved_median"], serde_json::json!(12.0));
+    // Token-weighted over successful runs: (900+800) / (900+800+100+200).
+    assert_eq!(econ["cache_read_ratio"], serde_json::json!(0.85));
+    assert_eq!(
+        econ["tool_failure_rate"],
+        serde_json::json!({"failed": 9, "total": 30, "rate": 0.3, "note": "micro-eval totals over all runs incl. failures"})
+    );
+}
+
+#[test]
+fn suite_headline_handles_an_empty_or_all_lab_suite() {
+    let headline = suite_headline("m", "tolerant", &[]);
+    assert_eq!(headline["gated_runs"], serde_json::json!(0));
+    assert_eq!(headline["pass_rate"], serde_json::json!(null));
+    assert_eq!(
+        headline["economics"]["usd_per_solved"],
+        serde_json::json!(null)
+    );
+    assert_eq!(
+        headline["economics"]["cache_read_ratio"],
+        serde_json::json!(null)
+    );
+    assert_eq!(
+        headline["economics"]["tool_failure_rate"]["rate"],
+        serde_json::json!(null)
+    );
+    let lab_only = vec![(
+        "B1".to_owned(),
+        vec![serde_json::json!({"success": true, "turns": 3, "cost_usd": 0.01})],
+    )];
+    let headline = suite_headline("m", "strict", &lab_only);
+    assert_eq!(headline["tasks"]["B1"]["kind"], serde_json::json!("lab"));
+    assert_eq!(
+        headline["economics"]["total_cost_usd"],
+        serde_json::json!(0.01)
     );
 }
 
@@ -1278,6 +1460,54 @@ fn aggregates_from(reports: &[serde_json::Value]) -> serde_json::Value {
                 "solved": solved,
                 "runs": gated.len(),
                 "rate": solved as f64 / gated.len() as f64,
+            }),
+        );
+    }
+    // Micro-eval rollups: per-task call quality from the transcript
+    // blocks every run now carries (successes and failures alike).
+    let calls: u64 = reports
+        .iter()
+        .filter_map(|r| r["micro"]["totals"]["calls"].as_u64())
+        .sum();
+    if calls > 0 {
+        let failed: u64 = reports
+            .iter()
+            .filter_map(|r| r["micro"]["totals"]["failed"].as_u64())
+            .sum();
+        let malformed: u64 = reports
+            .iter()
+            .filter_map(|r| r["micro"]["malformed_calls"].as_u64())
+            .sum();
+        let attempts: u64 = reports
+            .iter()
+            .filter_map(|r| r["micro"]["edit_apply"]["attempts"].as_u64())
+            .sum();
+        let applied: u64 = reports
+            .iter()
+            .filter_map(|r| r["micro"]["edit_apply"]["applied"].as_u64())
+            .sum();
+        let repeats: u64 = reports
+            .iter()
+            .filter_map(|r| r["micro"]["identical_repeats"].as_u64())
+            .sum();
+        let spills: u64 = reports
+            .iter()
+            .filter_map(|r| r["micro"]["spills"].as_array().map(|s| s.len() as u64))
+            .sum();
+        let rate = |n: u64, d: u64| (n as f64 / d as f64 * 1e4).round() / 1e4;
+        aggregates.as_object_mut().unwrap().insert(
+            "micro".to_owned(),
+            serde_json::json!({
+                "calls": calls,
+                "tool_error_rate": rate(failed, calls),
+                "malformed_rate": rate(malformed, calls),
+                "edit_apply_rate": if attempts == 0 {
+                    serde_json::json!(null)
+                } else {
+                    serde_json::json!(rate(applied, attempts))
+                },
+                "identical_repeats": repeats,
+                "spills": spills,
             }),
         );
     }
@@ -1491,6 +1721,129 @@ async fn eval_replay_recordings() {
             exchanges.len()
         );
         assert_replay_equivalence(task, &model, &exchanges).await;
+    }
+}
+
+/// Offline micro-eval: recompute call quality from the session snapshots
+/// `eval_live` persists under `records/sessions`, and cross-check each
+/// against the `micro` block the live run embedded in its report — the
+/// same function over the same transcript must agree exactly. Self-skips
+/// when no snapshots exist (fresh checkout); with a corpus present this
+/// is the token-free half of the release-gate numbers, and `loom stats`
+/// computes the same shape from the store.
+#[test]
+fn eval_micro_walks_recorded_sessions() {
+    let sessions_dir = eval_dir().join("records").join("sessions");
+    let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
+        eprintln!(
+            "no eval sessions at {} — run eval_live first",
+            sessions_dir.display()
+        );
+        return;
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().is_some_and(|e| e == "json")
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".session.json"))
+        })
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        eprintln!(
+            "no eval sessions in {} — run eval_live first",
+            sessions_dir.display()
+        );
+        return;
+    }
+    let analytics = loom_core::kernel::analytics::session_stats;
+    // model -> (per-session entries, summed counters)
+    let mut by_model: std::collections::BTreeMap<
+        String,
+        (Vec<serde_json::Value>, u64, u64, u64, u64),
+    > = std::collections::BTreeMap::new();
+    for file in &files {
+        let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let parts: Vec<&str> = stem.split('-').collect();
+        // {task}-{model...}-{run}.session
+        let (Some(task), Ok(run), Some(model)) = (
+            parts.first().copied(),
+            parts.last().copied().unwrap_or("").parse::<usize>(),
+            parts
+                .get(1..parts.len().saturating_sub(1))
+                .map(|m| m.join("-")),
+        ) else {
+            eprintln!("{}: unparsable session name — skipped", file.display());
+            continue;
+        };
+        let text = std::fs::read_to_string(file).unwrap();
+        let session: Session = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("{}: session snapshot does not parse: {e}", file.display()));
+        let stats = analytics(&session);
+        let recomputed = serde_json::to_value(&stats).unwrap();
+
+        // Cross-check against the live run's embedded micro block: same
+        // function, same transcript — exact equality or something is
+        // lying about what ran.
+        let report_path = eval_dir().join(format!("report-{task}-{model}.json"));
+        if let Ok(report_text) = std::fs::read_to_string(&report_path)
+            && let Ok(report) = serde_json::from_str::<serde_json::Value>(&report_text)
+            && let Some(live_micro) = report["runs"]
+                .as_array()
+                .and_then(|runs| runs.get(run - 1))
+                .map(|r| &r["micro"])
+        {
+            assert_eq!(
+                live_micro,
+                &recomputed,
+                "{} run {run}: live micro block disagrees with the recomputed stats",
+                file.display()
+            );
+        }
+
+        let entry = serde_json::json!({
+            "session": stem,
+            "turns": stats.turns,
+            "calls": stats.totals.calls,
+            "failed": stats.totals.failed,
+            "malformed_calls": stats.malformed_calls,
+            "identical_repeats": stats.identical_repeats,
+            "edit_apply": stats.edit_apply,
+            "spills": stats.spills.len(),
+        });
+        let slot = by_model
+            .entry(model)
+            .or_insert_with(|| (Vec::new(), 0, 0, 0, 0));
+        slot.0.push(entry);
+        slot.1 += stats.turns;
+        slot.2 += stats.totals.calls;
+        slot.3 += stats.totals.failed;
+        slot.4 += stats.malformed_calls;
+    }
+    for (model, (entries, turns, calls, failed, malformed)) in by_model {
+        let report = serde_json::json!({
+            "harness": "eval 2A micro",
+            "model": model,
+            "sessions": entries,
+            "totals": {
+                "sessions": entries.len(),
+                "turns": turns,
+                "calls": calls,
+                "failed": failed,
+                "malformed_calls": malformed,
+            },
+            "note": "recomputed offline from records/sessions; equals each live run's micro block",
+        });
+        let path = eval_dir().join(format!("report-micro-{model}.json"));
+        std::fs::write(&path, serde_json::to_string_pretty(&report).unwrap()).unwrap();
+        eprintln!(
+            "micro: {} sessions, {calls} calls, {failed} failed — wrote {}",
+            entries.len(),
+            path.display()
+        );
     }
 }
 

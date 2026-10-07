@@ -15,6 +15,7 @@ mod catalog;
 mod output;
 mod paths;
 mod run;
+mod stats_command;
 
 use args::{Cli, Command};
 
@@ -25,6 +26,7 @@ fn main() -> ExitCode {
     let outcome = match cli.command {
         Command::Run(args) => run::run(*args),
         Command::Auth(args) => auth_command::run(args.command).map(|()| ExitCode::SUCCESS),
+        Command::Stats(args) => stats_command::run(args),
     };
 
     match outcome {

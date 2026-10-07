@@ -28,6 +28,8 @@ pub enum Command {
     Run(Box<RunArgs>),
     /// Manage saved provider credentials (`loom.db` + OS keychain).
     Auth(AuthArgs),
+    /// Transcript analytics over stored sessions.
+    Stats(StatsArgs),
 }
 
 /// Arguments for `loom run`.
@@ -89,6 +91,18 @@ pub struct AuthArgs {
     /// The auth operation.
     #[command(subcommand)]
     pub command: AuthCommand,
+}
+
+/// Arguments for `loom stats`.
+#[derive(Debug, Args)]
+pub struct StatsArgs {
+    /// Only sessions whose id contains this substring.
+    #[arg(long, short = 's')]
+    pub session: Option<String>,
+
+    /// Emit machine-readable JSON instead of the human table.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Credential management operations.

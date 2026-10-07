@@ -200,14 +200,25 @@ treated as hypotheses until Loom's own eval reproduces them.
    - a 30-task hard subset as the iteration gate (the Meta-Harness
      protocol), then external slices (SWE-bench Verified,
      Terminal-Bench) for comparability;
-   - headline **$ and turns per solved task**, cache-read ratio, and
-     tool-failure rate alongside pass rate;
-   - per-tool, per-model **failure-mode micro-evals** (edit-apply
-     success, malformed-call rate, repeated-call rate) as release gates
-     (ForgeCode);
+   - ~~headline **$ and turns per solved task**, cache-read ratio, and
+     tool-failure rate alongside pass rate~~ — shipped: the suite
+     headline now carries an `economics` block (total and per-solved
+     cost, turns per solved mean/median, token-weighted cache-read
+     ratio over successful runs, micro-eval tool-failure rate);
+   - ~~per-tool, per-model **failure-mode micro-evals** (edit-apply
+     success, malformed-call rate, repeated-call rate) as release
+     gates~~ — shipped offline half: every run report (success or
+     failure) embeds a `micro` block (per-tool fault taxonomy, edit
+     acceptance, identical repeats, spills), recomputable from the
+     session snapshots `eval_live` persists under
+     `records/sessions/` and cross-checked by an offline test; the
+     per-model comparison dimension and the 30-task gate remain;
    - `loom stats`: what each mechanism saved — pruning, tool-cache hits,
      evidence shaping, output filters — from the events already
-     recorded (RTK's `gain`).
+     recorded (RTK's `gain`). Shipped transcript half (`loom stats`
+     reports turns, per-tool call quality, edit acceptance, repeats,
+     spill savings from any stored session); mechanism attribution
+     needs persisted events, not just transcripts.
    Seam: the live eval reports and the event stream.
 2. **Sandboxed shell** (G2, G3, G5). Strong models working through a
    shell are ~53% cheaper than through fixed tool menus (Fan et al.,

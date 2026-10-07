@@ -91,6 +91,46 @@ reserved output on reasoning and stops at `max_tokens`. Suite cost by
 harness accounting: $0.23. Live runs paused until the account is
 topped up; the replay corpus keeps the 70 green recordings.
 
+## 2026-10-07 — Micro-evals, headline economics, and `loom stats`
+
+The efficiency-eval offline half (roadmap item 1): the suite can now
+rank harness changes by call quality and economics, not just outcome.
+
+- `loom-kernel` grows `analytics::session_stats`: per-tool fault
+  taxonomy (success / invalid-input / execution / timeout / repeated /
+  unknown / not-exposed / cancelled), edit-family acceptance,
+  identical-call repeats (name + canonical arguments, including
+  non-adjacent ones the ledger cannot see), and oversize spills with
+  the bytes each kept out of context. Pure over the transcript; the
+  same numbers from a live run, a stored session, or a recording.
+- Every eval run report — success or failure — embeds a `micro` block
+  from that function; `eval_live` also persists each run's session JSON
+  under `target/eval/records/sessions/`, and a new offline test
+  recomputes every snapshot, cross-checks it against the live block
+  (exact equality), and writes `report-micro-<model>.json`.
+- The suite headline gains an `economics` block: total and per-solved
+  cost, turns per solved (mean/median), token-weighted cache-read
+  ratio over successful runs, and the tool-failure rate — each field
+  stating the population it is computed over.
+- `loom stats [--session PREFIX] [--json]`: the same analytics over
+  the durable store (`LOOM_DB`), human table or JSON. Billed usage,
+  cache ratios, and prune savings are never estimated from transcripts
+  — those live in live-run reports only.
+- `aggregates_from` gains per-task micro rollups (tool-error,
+  malformed, and edit-apply rates, repeats, spills).
+
+Roadmap item 1 updated to reflect the shipped offline half.
+
+## 2026-10-07 — Run_command under a workspace command policy (02fcaf3)
+
+Backfill: the command execution policy shipped as 02fcaf3 without a
+CHANGELOG entry. `.loom/commands.toml` extends the cargo-only default
+(`[[command]]` rules: `timeout_secs` ≤ 3600, `max_output_bytes` ≤ 1 MiB,
+`env_scrub`); a timeout kills the whole process group; a credential
+scrub floor (`*_API_KEY`) always applies; the engine loads the manifest
+at open and the spec advertises the allowed programs. Rejections and
+timeouts surface as audited tool errors.
+
 ## 2026-10-07 — Budget-exceeded rescue in the pruning compiler
 
 `PruningContextCompiler` could not rescue an inner
