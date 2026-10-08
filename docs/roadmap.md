@@ -396,6 +396,13 @@ treated as hypotheses until Loom's own eval reproduces them.
     cache miss, frozen like a prune checkpoint. Prefer provider-native
     compaction where an adapter has it. Seam: a final strategy in the
     pruning decorator.
+     **Evidence-based deferral (2026-10-09).** Handoff sits behind the
+     pruning trigger, and the harness's largest transcript (B14, the
+     longest task) grows to a 62 KB final request ≈ 21K est-tokens — below
+     the 64K floor trigger measured during item 10's scoping. Pruning is
+     dormant on this stack, so its last-resort fallback is strictly
+     dominated. Revisit when corpora or funded long-horizon sessions
+     actually cross the window.
 13. **Background commands** (G2, G5). Long builds and tests run
     detached; the runtime injects a completion notice at the next turn
     boundary instead of blocking a turn on them (Sema Code, Crush). Seam:
