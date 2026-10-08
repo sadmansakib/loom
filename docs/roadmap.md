@@ -407,6 +407,21 @@ treated as hypotheses until Loom's own eval reproduces them.
     detached; the runtime injects a completion notice at the next turn
     boundary instead of blocking a turn on them (Sema Code, Crush). Seam:
     the bounded exec and turn assembly.
+
+     **Evidence-based deferral (2026-10-09).** Corpus survey of the
+     post-items-4-8 records: zero command calls are batched with
+     independent tool calls in the same assistant message (the runtime
+     already executes same-message calls concurrently), and every
+     non-command follow-up lands on the next turn — after the result is
+     visible. In the harness's edit→verify loops the command result is
+     the input to the next decision, so detaching adds a poll protocol
+     without removing a wait; waits cost wall time, not turns (G2/G5
+     unaffected). The lever is interactive wall-time — a user queueing
+     work while builds run — which needs the interactive CLI (items 15,
+     19) to matter. It also injects wall-clock-dependent notices at turn
+     boundaries, breaking the byte-stable census and replay equivalence
+     the eval harness is built on. Revisit when interactive sessions
+     exist, or a corpus shows same-message command+work batching.
 14. **Non-OpenAI provider** (G7). An Anthropic-messages adapter to
     pressure the `ModelProvider` boundary. The compiler emits
     **segments marked cacheable or volatile**, so cache breakpoints are
