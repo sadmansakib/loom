@@ -1,8 +1,15 @@
-//! The `edit_file` tool: exact-match replacement in one workspace file.
+//! The `edit_file` tool: exact-match replacement in workspace files.
 //!
-//! Mutating (architecture §10). The match must be unique: an ambiguous
+//! Mutating (architecture §10). Each match must be unique: an ambiguous
 //! edit is refused as invalid input rather than guessing which
-//! occurrence the model meant.
+//! occurrence the model meant. A call is either the classic single edit
+//! (`old_string`/`new_string` against `path`) or an atomic batch
+//! (`edits: [{old_string, new_string, path?}]`, applied in order — the
+//! optional per-edit `path` defaults to the top-level one). Batch edits
+//! apply against the evolving text, and nothing is written unless every
+//! edit matches exactly once. The result echoes each edited region
+//! (±[`ECHO_CONTEXT_LINES`] numbered lines, final file state), so the
+//! model never re-reads to confirm what it just wrote.
 
 use futures::future::BoxFuture;
 use loom_kernel::tool::{
@@ -11,9 +18,10 @@ use loom_kernel::tool::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use crate::budget::{self, EDIT_ECHO_MAX_BYTES};
 use crate::confinement::{resolve_within, workspace_relative};
 
 /// Edits larger than this are refused: the whole file is read into memory and
@@ -21,7 +29,25 @@ use crate::confinement::{resolve_within, workspace_relative};
 /// is the realistic case). 8 MiB covers source files with room to spare.
 const MAX_EDIT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Replaces one unique exact-string match in an existing UTF-8 file,
+/// Context lines shown above and below each edited region in the echo.
+const ECHO_CONTEXT_LINES: usize = 3;
+
+/// One edit in a batch. The optional `path` defaults to the top-level
+/// `path`, so a batch touching one file repeats only the strings.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+struct EditSpec {
+    /// File to edit; defaults to the call's `path`.
+    #[serde(default)]
+    path: Option<String>,
+    /// Text to replace; must occur exactly once here.
+    old_string: String,
+    /// Replacement text.
+    new_string: String,
+}
+
+/// Replaces unique exact-string matches in existing UTF-8 files,
 /// confined to the workspace root.
 #[derive(Debug, Default)]
 pub struct EditFileTool;
@@ -30,15 +56,56 @@ pub struct EditFileTool;
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 struct EditInput {
-    /// Workspace-relative file path.
+    /// Workspace-relative file path; the default target of every edit.
     path: String,
-    /// Exact text to replace; must occur exactly once.
-    old_string: String,
-    /// Replacement text.
-    new_string: String,
+    /// Exact text to replace in `path`; must occur exactly once.
+    #[serde(default)]
+    old_string: Option<String>,
+    /// Replacement text for `old_string`.
+    #[serde(default)]
+    new_string: Option<String>,
+    /// Atomic batch: every edit matches or nothing is written; applied
+    /// in order.
+    #[serde(default)]
+    edits: Option<Vec<EditSpec>>,
     /// Optional cargo run after the edit: check or test.
     #[serde(default)]
     verify: Option<crate::verify::Scope>,
+}
+
+impl EditInput {
+    /// Splits the call into ordered `(display_path, old, new)` triples,
+    /// rejecting the missing/mixed forms once, up front.
+    fn batch(&self) -> Result<Vec<(String, String, String)>, ToolError> {
+        let single_old = self.old_string.as_deref();
+        let single_new = self.new_string.as_deref();
+        let edits = self.edits.as_deref();
+        match (single_old, single_new, edits) {
+            (Some(old), Some(new), None) => {
+                Ok(vec![(self.path.clone(), old.to_owned(), new.to_owned())])
+            }
+            (None, None, Some(edits)) => {
+                if edits.is_empty() {
+                    return Err(ToolError::InvalidInput(String::from(
+                        "edits must contain at least one edit",
+                    )));
+                }
+                Ok(edits
+                    .iter()
+                    .map(|edit| {
+                        (
+                            edit.path.clone().unwrap_or_else(|| self.path.clone()),
+                            edit.old_string.clone(),
+                            edit.new_string.clone(),
+                        )
+                    })
+                    .collect())
+            }
+            _ => Err(ToolError::InvalidInput(String::from(
+                "pass either old_string + new_string (single edit) or edits (batch), not a mix",
+            ))),
+        }
+    }
 }
 
 impl Tool for EditFileTool {
@@ -46,9 +113,11 @@ impl Tool for EditFileTool {
         static SPEC: OnceLock<ToolSpec> = OnceLock::new();
         SPEC.get_or_init(|| ToolSpec {
             name: "edit_file".to_owned(),
-            description: "Replaces an exact string in one workspace file. `old_string` \
+            description: "Replaces exact strings in workspace files. `old_string` \
                           must occur exactly once — include enough context to make it \
-                          unique."
+                          unique. `edits: [{old_string, new_string, path?}]` applies an \
+                          atomic batch. The result shows each edited region — no re-read \
+                          needed."
                 .to_owned(),
             parameters: crate::schema::parameters::<EditInput>(),
         })
@@ -60,7 +129,18 @@ impl Tool for EditFileTool {
 
     fn touched_paths(&self, input: &Value) -> Option<Vec<PathTouch>> {
         Some(match serde_json::from_value::<EditInput>(input.clone()) {
-            Ok(parsed) => vec![PathTouch::write(parsed.path)],
+            Ok(parsed) => match parsed.batch() {
+                Ok(batch) => {
+                    let mut touches: Vec<PathTouch> = Vec::new();
+                    for (path, _, _) in batch {
+                        if !touches.iter().any(|touch| touch.path == path) {
+                            touches.push(PathTouch::write(path));
+                        }
+                    }
+                    touches
+                }
+                Err(_) => Vec::new(),
+            },
             Err(_) => Vec::new(),
         })
     }
@@ -73,20 +153,40 @@ impl Tool for EditFileTool {
         Box::pin(async move {
             let input: EditInput = serde_json::from_value(input)
                 .map_err(|err| ToolError::InvalidInput(format!("invalid arguments: {err}")))?;
-            let display = input.path;
-            let path = resolve_within(&ctx.workspace_root, &display)?;
-            let relative = workspace_relative(&ctx.workspace_root, &path);
+            let batch = input.batch()?;
+            // Confinement is checked per edit before anything runs: a
+            // batch that would escape the workspace fails as a whole,
+            // before any file is read.
             let scope = input.verify;
-            let old = input.old_string;
-            let new = input.new_string;
-            let detail = tokio::task::spawn_blocking(move || apply_edit(&path, &old, &new))
+            let edits: Vec<(PathBuf, String, String)> = batch
+                .into_iter()
+                .map(|(display, old, new)| {
+                    Ok((resolve_within(&ctx.workspace_root, &display)?, old, new))
+                })
+                .collect::<Result<Vec<_>, ToolError>>()?;
+            let root = ctx.workspace_root.clone();
+            let outcome = tokio::task::spawn_blocking(move || apply_edits(&root, &edits))
                 .await
                 .map_err(|err| ToolError::Execution(format!("edit task failed: {err}")))??;
-            let mut effects = ToolEffects::none().with_file_written(relative.clone());
-            let mut content = format!("edited {display}: {detail}");
+            let mut effects = ToolEffects::none();
+            for (relative, _) in &outcome.files {
+                effects = effects.with_file_written(relative.clone());
+            }
+            let (echo, truncated_echo) = render_echo(&outcome);
+            let mut content = format!("edited {}", outcome.detail);
+            if !echo.is_empty() {
+                content.push_str("\n\n");
+                content.push_str(&echo);
+            }
             let mut truncated = false;
             if let Some(scope) = scope {
-                let (rendered, command) = crate::fusion::run_fused(scope, ctx, &relative).await?;
+                let verify_target = outcome
+                    .files
+                    .first()
+                    .map(|(relative, _)| relative.clone())
+                    .unwrap_or_default();
+                let (rendered, command) =
+                    crate::fusion::run_fused(scope, ctx, &verify_target).await?;
                 content = format!("{content}\n\n--- verify ---\n{}", rendered.content);
                 truncated = rendered.truncated;
                 if let Some(command) = command {
@@ -94,7 +194,7 @@ impl Tool for EditFileTool {
                 }
             }
             let mut output = ToolOutput::new(content).with_effects(effects);
-            if truncated {
+            if truncated || truncated_echo {
                 output = output.with_truncated();
             }
             Ok(output)
@@ -102,45 +202,179 @@ impl Tool for EditFileTool {
     }
 }
 
-/// Reads, matches exactly once, replaces, writes back. Returns a short
-/// human/model-readable detail on success.
-fn apply_edit(path: &Path, old: &str, new: &str) -> Result<String, ToolError> {
-    if old.is_empty() {
-        return Err(ToolError::InvalidInput(
-            "old_string must not be empty".to_owned(),
-        ));
-    }
+/// Everything the caller needs after a successful batch: the success
+/// line, the final text of each distinct file, and where each
+/// replacement landed (file index + final byte span) for the echo.
+struct EditOutcome {
+    detail: String,
+    /// `(workspace_relative, final_text)` per distinct file.
+    files: Vec<(String, String)>,
+    /// `(file index, start, len)` per edit, in application order.
+    spans: Vec<(usize, usize, usize)>,
+}
+
+/// Reads every target file once, applies the edits in order against the
+/// evolving texts, and writes all files back only when every edit
+/// matched exactly once. `root` is the workspace root, for relative
+/// paths in the effects.
+fn apply_edits(root: &Path, edits: &[(PathBuf, String, String)]) -> Result<EditOutcome, ToolError> {
+    let batch_len = edits.len();
+    let prefix = |index: usize| -> String {
+        if batch_len > 1 {
+            format!("edit {} of {batch_len}: ", index + 1)
+        } else {
+            String::new()
+        }
+    };
     // Unlike the read tools, a missing file here is an execution error, not an
     // informational "does not exist": a write path that targets nothing is a
     // model mistake (read first, or use write_file), and the loop's failure
     // ledger should refuse a blind repeat (ADR-020).
-    let size = std::fs::metadata(path)
-        .map_err(|err| ToolError::Execution(format!("cannot read \"{}\": {err}", path.display())))?
-        .len();
-    if size > MAX_EDIT_FILE_BYTES {
-        return Err(ToolError::Execution(format!(
-            "file is too large to edit ({size} bytes; limit {MAX_EDIT_FILE_BYTES} bytes)"
-        )));
-    }
-    let bytes = std::fs::read(path).map_err(|err| {
-        ToolError::Execution(format!("cannot read \"{}\": {err}", path.display()))
-    })?;
-    let text = String::from_utf8(bytes)
-        .map_err(|_| ToolError::Execution(String::from("file is not valid UTF-8")))?;
-    match text.matches(old).count() {
-        0 => Err(ToolError::InvalidInput(String::from(
-            "old_string not found in file",
-        ))),
-        1 => {
-            let updated = text.replacen(old, new, 1);
-            std::fs::write(path, updated)
-                .map_err(|err| ToolError::Execution(format!("cannot write: {err}")))?;
-            Ok(String::from("replaced 1 occurrence"))
+    let mut files: Vec<(PathBuf, String)> = Vec::new();
+    for (path, _, _) in edits {
+        if files.iter().any(|(p, _)| p == path) {
+            continue;
         }
-        n => Err(ToolError::InvalidInput(format!(
-            "old_string appears {n} times; include more surrounding text to make it unique"
-        ))),
+        let size = std::fs::metadata(path)
+            .map_err(|err| {
+                ToolError::Execution(format!("cannot read \"{}\": {err}", path.display()))
+            })?
+            .len();
+        if size > MAX_EDIT_FILE_BYTES {
+            return Err(ToolError::Execution(format!(
+                "file is too large to edit ({size} bytes; limit {MAX_EDIT_FILE_BYTES} bytes)"
+            )));
+        }
+        let bytes = std::fs::read(path).map_err(|err| {
+            ToolError::Execution(format!("cannot read \"{}\": {err}", path.display()))
+        })?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| ToolError::Execution(String::from("file is not valid UTF-8")))?;
+        files.push((path.clone(), text));
     }
+    // Apply in order, tracking each replacement's byte span so later
+    // edits on the same file shift earlier spans instead of orphaning
+    // them. A replaced range can never overlap a recorded span: each
+    // consumed a distinct unique match.
+    let mut spans: Vec<Vec<(usize, usize)>> = vec![Vec::new(); files.len()];
+    for (index, (path, old, new)) in edits.iter().enumerate() {
+        let file_idx = match files.iter().position(|(p, _)| p == path) {
+            Some(idx) => idx,
+            None => {
+                // Unreachable: the load loop above inserted every edit's
+                // path. Stated as an error rather than a panic so the
+                // invariant is checkable, not assumed.
+                return Err(ToolError::Execution(String::from(
+                    "internal error: edit target was not loaded",
+                )));
+            }
+        };
+        let text = &mut files[file_idx].1;
+        if old.is_empty() {
+            return Err(ToolError::InvalidInput(format!(
+                "{}old_string must not be empty",
+                prefix(index)
+            )));
+        }
+        match (text.matches(old).count(), text.find(old)) {
+            (0, _) => {
+                return Err(ToolError::InvalidInput(format!(
+                    "{}old_string not found in file",
+                    prefix(index)
+                )));
+            }
+            (1, Some(start)) => {
+                let end = start + old.len();
+                text.replace_range(start..end, new);
+                let delta = new.len() as isize - old.len() as isize;
+                for (recorded_start, _) in &mut spans[file_idx] {
+                    if start < *recorded_start {
+                        *recorded_start = (*recorded_start as isize + delta) as usize;
+                    }
+                }
+                spans[file_idx].push((start, new.len()));
+            }
+            (n, _) => {
+                return Err(ToolError::InvalidInput(format!(
+                    "{}old_string appears {n} times; include more surrounding text to make it unique",
+                    prefix(index)
+                )));
+            }
+        }
+    }
+    // Every edit matched exactly once: write everything back.
+    for (path, text) in &files {
+        std::fs::write(path, text)
+            .map_err(|err| ToolError::Execution(format!("cannot write: {err}")))?;
+    }
+    let resolved: Vec<(String, String)> = files
+        .iter()
+        .map(|(path, text)| (workspace_relative(root, path), text.clone()))
+        .collect();
+    let per_file_counts: Vec<usize> = spans.iter().map(Vec::len).collect();
+    let detail = if resolved.len() == 1 {
+        let (relative, _) = &resolved[0];
+        format!(
+            "{relative}: replaced {} occurrence{}",
+            per_file_counts[0],
+            if per_file_counts[0] == 1 { "" } else { "s" }
+        )
+    } else {
+        let summary = resolved
+            .iter()
+            .zip(&per_file_counts)
+            .map(|((relative, _), count)| format!("{relative} ×{count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{} edits across {} files ({summary})",
+            per_file_counts.iter().sum::<usize>(),
+            resolved.len()
+        )
+    };
+    let mut echoes = Vec::new();
+    for (file_idx, file_spans) in spans.iter().enumerate() {
+        for (start, len) in file_spans {
+            echoes.push((file_idx, *start, *len));
+        }
+    }
+    Ok(EditOutcome {
+        detail,
+        files: resolved,
+        spans: echoes,
+    })
+}
+
+/// Renders the edited regions from the final file state: one numbered
+/// snippet per edit, ±[`ECHO_CONTEXT_LINES`] lines, capped by the echo
+/// byte budget. Returns the text and whether the budget cut anything.
+fn render_echo(outcome: &EditOutcome) -> (String, bool) {
+    let mut joined = String::new();
+    for (file_idx, start, len) in &outcome.spans {
+        let (relative, text) = &outcome.files[*file_idx];
+        let total_lines = text.lines().count().max(1);
+        let line_of =
+            |byte: usize| -> usize { 1 + text[..byte.min(text.len())].matches('\n').count() };
+        let first_line = line_of(*start);
+        let mut last_line = line_of(start + len);
+        if *len > 0 && text[..(start + len).min(text.len())].ends_with('\n') {
+            last_line -= 1;
+        }
+        let last_line = last_line.max(first_line);
+        let ctx_first = first_line.saturating_sub(ECHO_CONTEXT_LINES).max(1);
+        let ctx_last = (last_line + ECHO_CONTEXT_LINES).min(total_lines);
+        joined.push_str(&format!(
+            "{relative}: lines {first_line}-{last_line} of {total_lines}\n"
+        ));
+        for (number, line) in text.lines().enumerate().take(ctx_last).skip(ctx_first - 1) {
+            joined.push_str(&format!("{}\t{line}\n", number + 1));
+        }
+    }
+    if joined.is_empty() {
+        return (String::new(), false);
+    }
+    let half = EDIT_ECHO_MAX_BYTES / 2;
+    budget::head_tail(&joined, half, half)
 }
 
 #[cfg(test)]
@@ -180,12 +414,163 @@ mod tests {
         )
         .await
         .expect("ok");
-        assert_eq!(output.content, "edited f.rs: replaced 1 occurrence");
+        assert!(
+            output
+                .content
+                .starts_with("edited f.rs: replaced 1 occurrence\n\n"),
+            "{}",
+            output.content
+        );
+        // The echo shows the edited region with numbered lines, so the
+        // model never re-reads to confirm.
+        assert!(
+            output
+                .content
+                .contains("f.rs: lines 1-1 of 1\n1\tfn add() { 1 }"),
+            "{}",
+            output.content
+        );
         assert_eq!(output.effects.files_written, vec!["f.rs".to_string()]);
         assert_eq!(
             std::fs::read_to_string(guard.path().join("f.rs")).expect("read"),
             "fn add() { 1 }\n"
         );
+    }
+
+    #[tokio::test]
+    async fn batch_edits_apply_in_order_and_echo_each_region() {
+        let (guard, root) = temp_root();
+        std::fs::write(
+            guard.path().join("f.rs"),
+            "fn one() {}\nfn two() {}\nfn three() {}\n",
+        )
+        .expect("seed");
+        let output = edit(
+            &root,
+            json!({
+                "path": "f.rs",
+                "edits": [
+                    {"old_string": "fn one() {}", "new_string": "fn uno() {}"},
+                    {"old_string": "fn three() {}", "new_string": "fn tres() {}"}
+                ]
+            }),
+        )
+        .await
+        .expect("ok");
+        assert!(
+            output
+                .content
+                .starts_with("edited f.rs: replaced 2 occurrences"),
+            "{}",
+            output.content
+        );
+        // Both regions are echoed from the final state; in a 3-line file
+        // each ±3-line window covers everything, so the headers carry the
+        // edited span.
+        assert!(
+            output.content.contains(
+                "f.rs: lines 1-1 of 3\n1\tfn uno() {}\n2\tfn two() {}\n3\tfn tres() {}\n"
+            ),
+            "{}",
+            output.content
+        );
+        assert!(
+            output.content.contains("f.rs: lines 3-3 of 3\n"),
+            "{}",
+            output.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(guard.path().join("f.rs")).expect("read"),
+            "fn uno() {}\nfn two() {}\nfn tres() {}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_edits_can_span_files() {
+        let (guard, root) = temp_root();
+        std::fs::write(guard.path().join("a.rs"), b"alpha\n").expect("seed a");
+        std::fs::write(guard.path().join("b.rs"), b"beta\n").expect("seed b");
+        let output = edit(
+            &root,
+            json!({
+                "path": "a.rs",
+                "edits": [
+                    {"old_string": "alpha", "new_string": "ALPHA"},
+                    {"path": "b.rs", "old_string": "beta", "new_string": "BETA"}
+                ]
+            }),
+        )
+        .await
+        .expect("ok");
+        assert!(
+            output
+                .content
+                .starts_with("edited 2 edits across 2 files (a.rs ×1, b.rs ×1)"),
+            "{}",
+            output.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(guard.path().join("a.rs")).expect("read a"),
+            "ALPHA\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(guard.path().join("b.rs")).expect("read b"),
+            "BETA\n"
+        );
+        assert_eq!(output.effects.files_written.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_batch_edit_writes_nothing() {
+        let (guard, root) = temp_root();
+        std::fs::write(guard.path().join("a.rs"), b"alpha\n").expect("seed a");
+        let err = edit(
+            &root,
+            json!({
+                "path": "a.rs",
+                "edits": [
+                    {"old_string": "alpha", "new_string": "ALPHA"},
+                    {"old_string": "missing", "new_string": "x"}
+                ]
+            }),
+        )
+        .await
+        .expect_err("second edit fails");
+        assert!(
+            matches!(&err, ToolError::InvalidInput(msg) if msg.contains("edit 2 of 2") && msg.contains("not found")),
+            "{err:?}"
+        );
+        // Atomic: the first edit matched, but nothing reached the disk.
+        assert_eq!(
+            std::fs::read_to_string(guard.path().join("a.rs")).expect("read a"),
+            "alpha\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_single_and_batch_forms_are_rejected() {
+        let (_guard, root) = temp_root();
+        let err = edit(
+            &root,
+            json!({
+                "path": "f.rs",
+                "old_string": "a",
+                "new_string": "b",
+                "edits": [{"old_string": "a", "new_string": "b"}]
+            }),
+        )
+        .await
+        .expect_err("mixed");
+        assert!(matches!(err, ToolError::InvalidInput(msg) if msg.contains("not a mix")));
+    }
+
+    #[tokio::test]
+    async fn empty_batch_is_rejected() {
+        let (_guard, root) = temp_root();
+        let err = edit(&root, json!({"path": "f.rs", "edits": []}))
+            .await
+            .expect_err("empty");
+        assert!(matches!(err, ToolError::InvalidInput(msg) if msg.contains("at least one edit")));
     }
 
     #[tokio::test]
@@ -284,6 +669,10 @@ mod tests {
         crate::schema::agreement::check::<EditInput>(
             json!({"path": "f.rs", "old_string": "a", "new_string": "b", "verify": "check"}),
         );
+        crate::schema::agreement::check::<EditInput>(json!({
+            "path": "f.rs",
+            "edits": [{"old_string": "a", "new_string": "b"}, {"path": "g.rs", "old_string": "c", "new_string": "d"}]
+        }));
     }
 
     #[tokio::test]

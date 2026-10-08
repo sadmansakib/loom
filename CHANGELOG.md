@@ -3,6 +3,23 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-08 — Multi-edit batches and edited-region echo (roadmap item 5, phase A)
+
+`edit_file` now accepts `edits: [{old_string, new_string, path?}]`: an
+atomic batch applied in order, across one or more files — if any edit
+fails to match, nothing is written. Batch error messages carry
+`edit {i} of {n}:` prefixes; single-edit messages are unchanged. Every
+successful result echoes the edited region (±3 numbered lines, 8 KiB
+cap) so the model never re-reads to confirm an edit; echo spans track
+final-state positions across earlier edits in the same batch.
+
+Measured on the edit-heavy tasks (B3/B4/B6, one run each, free tier):
+all solved; turns 27 → 21; input tokens −21%; post-edit re-reads 1
+across three runs (corpus baseline ≈ 4 per run); the batch form was
+adopted by the model on first contact. The tree-sitter syntax guard is
+deferred (heavy dependency; the verify fusion already refuses broken
+Rust).
+
 ## 2026-10-06 — Process-group kill for tool commands
 
 `run_command`'s timeout killed only the direct child; a grandchild

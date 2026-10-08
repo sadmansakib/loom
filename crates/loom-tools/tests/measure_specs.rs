@@ -19,12 +19,18 @@ use loom_tools::{
 /// verify (roadmap: verification beyond cargo) adds the `ecosystem`
 /// parameter and its enum schema to `verify`, ~290 B. The sandboxed
 /// shell (roadmap item 2) grows `run_command`'s description ~140 B —
-/// any-program semantics must state the sandbox contract — so the
-/// budget was raised to 5,350 B, still under the pre-compaction 5,339 B
-/// drift mark the 2K budget set out to correct.
-const TOTAL_SPEC_BUDGET_BYTES: usize = 5_350;
-/// No single tool's serialized spec may exceed this.
+/// any-program semantics must state the sandbox contract. Multi-edit
+/// (roadmap item 5) gives `edit_file` a nested `edits` array schema,
+/// ~+790 B: the batch contract has to be legible in the spec. The
+/// budget rose to 6,150 B with that; per-tool budgets keep every other
+/// tool honest.
+const TOTAL_SPEC_BUDGET_BYTES: usize = 6_150;
+/// No single tool's serialized spec may exceed this, except those with
+/// an explicit entry in [`SPEC_BUDGETS`].
 const PER_SPEC_BUDGET_BYTES: usize = 840;
+/// Per-tool overrides, for tools whose schema itself (not prose) is the
+/// cost: a nested batch schema cannot be shortened, only justified.
+const SPEC_BUDGETS: &[(&str, usize)] = &[("edit_file", 1_700)];
 
 #[test]
 fn serialized_specs_stay_within_budget() {
@@ -53,9 +59,14 @@ fn serialized_specs_stay_within_budget() {
                 .expect("params serialize")
                 .len()
         );
+        let budget = SPEC_BUDGETS
+            .iter()
+            .find(|(name, _)| *name == spec.name)
+            .map(|(_, budget)| *budget)
+            .unwrap_or(PER_SPEC_BUDGET_BYTES);
         assert!(
-            json.len() <= PER_SPEC_BUDGET_BYTES,
-            "{} serialized spec is {} bytes (budget {PER_SPEC_BUDGET_BYTES}); \
+            json.len() <= budget,
+            "{} serialized spec is {} bytes (budget {budget}); \
              shorten its description or field docs",
             spec.name,
             json.len()

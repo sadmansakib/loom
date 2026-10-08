@@ -263,6 +263,15 @@ treated as hypotheses until Loom's own eval reproduces them.
    help weak models but cost strong models 8–38% more. Format becomes a
    per-model profile setting (item 9), chosen by measurement. Seam:
    `edit_file`/`write_file`.
+   **Multi-edit + echo shipped 2026-10-08** (phase A): `edits:
+   [{old_string, new_string, path?}]` batches atomically across files
+   (all-or-nothing, in order, per-edit uniqueness), and every result
+   echoes the edited region (±3 numbered lines, 8 KiB cap). A/B on the
+   edit-heavy tasks (B3/B4/B6, 1 run each, free tier): all solved,
+   turns 27 → 21, input tokens −21%, post-edit re-reads 1 across three
+   runs (corpus baseline ≈ 4/run), batch form adopted on first contact.
+   Syntax guard (tree-sitter) deferred: heavy dependency; the verify
+   fusion already covers Rust parse failures.
 6. **Pre-dispatch call repair and cheap re-reads** (G2, G4).
    - Repair malformed tool calls before dispatch: argument aliases
      (`path`/`file_path`), stringified JSON objects, whitespace-padded

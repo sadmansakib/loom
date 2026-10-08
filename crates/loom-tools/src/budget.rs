@@ -23,6 +23,12 @@ pub(crate) const COMMAND_HEAD_BYTES: usize = 16 * 1024;
 /// Bytes kept from the tail of a `run_command` result (errors live here).
 pub(crate) const COMMAND_TAIL_BYTES: usize = 16 * 1024;
 
+/// Bytes kept from an `edit_file` echo of the edited regions. Each edit
+/// shows ±3 numbered lines of its final state, so the model never
+/// re-reads to confirm what it wrote; a pathological batch (many edits,
+/// long lines) is bounded by this cap instead of flooding the turn.
+pub(crate) const EDIT_ECHO_MAX_BYTES: usize = 8 * 1024;
+
 /// The explicit-omission marker appended where output was dropped.
 pub(crate) fn omitted(count: u64) -> String {
     format!("... [{count} bytes omitted]")
