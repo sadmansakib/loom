@@ -166,7 +166,23 @@ pub async fn execute_call(
                 .lock()
                 .ok()
                 .and_then(|mut cache| cache.lookup(&call.name, &call.arguments, current));
-            if let Some(output) = hit {
+            if let Some((output, original_id)) = hit {
+                // Roadmap item 6: when the original result is still in the
+                // projected request, a repeat is served as a cheap stub —
+                // the full content is already visible to the model, so
+                // re-serving a bounded duplicate spends context twice.
+                // When compaction dropped the original, the full (re-
+                // bounded) content is served as before.
+                if ctx.projected_calls.contains(&original_id) {
+                    return finish(
+                        call,
+                        ToolStatus::Success,
+                        format!("unchanged since call {original_id}"),
+                        false,
+                        ToolEffects::none(),
+                        None,
+                    );
+                }
                 let (content, truncated, effects, artifact) = bound(output, ctx);
                 return finish(
                     call,
@@ -203,7 +219,13 @@ pub async fn execute_call(
                 .ok()
                 .flatten();
                 if let Ok(mut cache) = cache.lock() {
-                    cache.store(&call.name, &call.arguments, signature, &output);
+                    cache.store(
+                        &call.name,
+                        &call.arguments,
+                        signature,
+                        call.id.as_str(),
+                        &output,
+                    );
                 }
             }
             let (content, truncated, effects, artifact) = bound(output, ctx);
@@ -919,6 +941,70 @@ mod tests {
             "a recorded write to the read path invalidates the entry"
         );
         assert_eq!(third.content, first.content);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_repeat_of_a_projected_call_is_served_as_a_stub() {
+        let dir = std::env::temp_dir().join(format!("loom-tools-stub-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(dir.join("src")).expect("workspace");
+        std::fs::write(dir.join("src/a.rs"), "fn a() {}").expect("file");
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let tool = MockTool {
+            spec: spec("read_file"),
+            read_only: true,
+            action: Action::Track {
+                reads: vec!["src/a.rs".to_owned()],
+                writes: Vec::new(),
+                declared: true,
+                active: Arc::new(AtomicUsize::new(0)),
+                max_seen: Arc::new(AtomicUsize::new(0)),
+                log: log.clone(),
+                label: "read".to_owned(),
+                ms: 0,
+            },
+        };
+        let registry = registry(vec![tool]);
+        let exposure = ToolExposure::from_names(["read_file"]);
+        let token = CancellationToken::new();
+        let cache = Arc::new(Mutex::new(crate::tool_cache::ToolCache::new()));
+        // The original call's result is still in the projection the model
+        // sees, so the engine marks its id as projected.
+        let ctx = ToolContext::new(dir.clone(), token.clone(), Duration::from_secs(5))
+            .with_cache(Some(cache.clone()))
+            .with_projected_calls(std::iter::once("call-read_file".to_owned()).collect());
+        let started = AtomicBool::new(false);
+
+        let first = execute_call(
+            &registry,
+            &exposure,
+            &make_call("read_file"),
+            &ctx,
+            &started,
+        )
+        .await;
+        let second = execute_call(
+            &registry,
+            &exposure,
+            &make_call("read_file"),
+            &ctx,
+            &started,
+        )
+        .await;
+        assert_eq!(first.status, ToolStatus::Success);
+        assert_eq!(second.status, ToolStatus::Success);
+        assert_eq!(
+            second.content, "unchanged since call call-read_file",
+            "a repeat whose original is still projected is a cheap stub"
+        );
+        assert_eq!(
+            log.lock().expect("log").len(),
+            1,
+            "the stub must not re-execute the tool"
+        );
+        assert_eq!(cache.lock().expect("cache").hits(), 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }

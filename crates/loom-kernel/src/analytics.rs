@@ -144,6 +144,9 @@ pub struct SessionStats {
     /// Identical calls (same name + canonical arguments) beyond the
     /// first — includes both executed repeats and ledger refusals.
     pub identical_repeats: u64,
+    /// Calls Loom repaired before or during execution (sum of the
+    /// per-effect repair notes, e.g. whitespace-tolerant edit matches).
+    pub repairs: u64,
     /// Spilled oversize results, in transcript order.
     pub spills: Vec<Spill>,
 }
@@ -184,6 +187,7 @@ pub fn session_stats(session: &Session) -> SessionStats {
                 let counts = stats.tools.entry(name.clone()).or_default();
                 counts.record(&result.status);
                 stats.totals.record(&result.status);
+                stats.repairs += result.effects.repairs.len() as u64;
 
                 if name == "edit_file" || name == "write_file" {
                     stats.edit_apply.attempts += 1;
@@ -215,6 +219,7 @@ mod tests {
     use crate::artifact::ArtifactRef;
     use crate::id::ArtifactId;
     use crate::model::StopReason;
+    use crate::tool::ToolEffects;
     use crate::transcript::{AssistantMessage, ToolArguments, ToolCall, ToolResult};
     use serde_json::json;
 
@@ -259,6 +264,21 @@ mod tests {
             transcript: items,
             tasks: Vec::new(),
         }
+    }
+
+    #[test]
+    fn repairs_are_counted_from_effects() {
+        let mut repaired = ok_result("a", "edited f.rs");
+        repaired.effects = ToolEffects::none().with_repair("old_string matched after trimming");
+        let items = vec![
+            Item::Assistant(assistant(
+                "go",
+                vec![call("a", "edit_file", json!({"path": "f.rs"}))],
+            )),
+            Item::ToolResult(repaired),
+        ];
+        let stats = session_stats(&session(items));
+        assert_eq!(stats.repairs, 1);
     }
 
     #[test]

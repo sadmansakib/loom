@@ -22,6 +22,7 @@
 //! - [`ToolRegistry`] — name-keyed set of tools the engine dispatches
 //!   against.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -212,6 +213,13 @@ pub struct ToolContext {
     /// and the engine invalidates entries when any recorded effect touches
     /// their paths — so a stale result is never served.
     pub cache: Option<Arc<Mutex<ToolCache>>>,
+    /// Call ids whose results are still visible in the request the model
+    /// sees this turn (post-projection). A cache hit whose original call
+    /// is in this set is served as a cheap `unchanged since call <id>`
+    /// stub — the full result is one scroll up; re-serving bounded
+    /// duplicates of in-view output spends context twice. Hits whose
+    /// original has been compacted away fall back to the full content.
+    pub projected_calls: HashSet<String>,
 }
 
 /// Cap on [`ToolContext::recent_changes`]: the most recent mutations are
@@ -236,6 +244,7 @@ impl std::fmt::Debug for ToolContext {
             .field("artifacts", &self.artifacts.is_some())
             .field("recent_changes", &recent_changes)
             .field("cache", &self.cache.is_some())
+            .field("projected_calls", &self.projected_calls.len())
             .finish()
     }
 }
@@ -258,6 +267,7 @@ impl ToolContext {
             artifacts: None,
             recent_changes: Arc::new(Mutex::new(Vec::new())),
             cache: None,
+            projected_calls: HashSet::new(),
         }
     }
 
@@ -282,6 +292,15 @@ impl ToolContext {
     #[must_use]
     pub fn with_cache(mut self, cache: Option<Arc<Mutex<ToolCache>>>) -> Self {
         self.cache = cache;
+        self
+    }
+
+    /// Supplies the call ids still visible in the projected request, used
+    /// to decide whether a cache hit is served as an `unchanged since
+    /// call <id>` stub (builder style, roadmap item 6).
+    #[must_use]
+    pub fn with_projected_calls(mut self, projected_calls: HashSet<String>) -> Self {
+        self.projected_calls = projected_calls;
         self
     }
 
@@ -362,6 +381,12 @@ pub struct ToolEffects {
     pub files_deleted: Vec<String>,
     /// External commands executed.
     pub commands_run: Vec<CommandEffect>,
+    /// Loom-internal repairs applied to a slightly malformed call before
+    /// or during execution (e.g. a whitespace-padded `old_string` that
+    /// only matched after trimming). Notes for the record, not side
+    /// effects — they never invalidate caches or count as writes.
+    #[serde(default)]
+    pub repairs: Vec<String>,
 }
 
 impl ToolEffects {
@@ -395,6 +420,14 @@ impl ToolEffects {
     #[must_use]
     pub fn with_command(mut self, command: CommandEffect) -> Self {
         self.commands_run.push(command);
+        self
+    }
+
+    /// Records a repair Loom applied to this call's arguments before or
+    /// during execution.
+    #[must_use]
+    pub fn with_repair(mut self, note: impl Into<String>) -> Self {
+        self.repairs.push(note.into());
         self
     }
 }

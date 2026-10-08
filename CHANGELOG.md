@@ -3,6 +3,22 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-08 — Call repair and cheap re-reads (roadmap item 6)
+
+Two robustness halves, chosen by corpus: a whitespace-trim fallback for
+`edit_file` `old_string` (exact match 0 → apply the one trimmed match;
+the 84-run corpus had 43 not-found failures of exactly this shape) and
+a stub for repeat read-only calls — when a tool-cache hit's producing
+result is still in the projection, the repeat returns `unchanged since
+call <id>` instead of re-serving bounded content. Repairs are recorded
+in `effects.repairs` and counted by `loom stats`. Argument aliases and
+stringified-JSON repair were skipped: zero occurrences in the corpus.
+A/B on the free tier (B3/B6/B9, nemotron ×1 + B9 ×2 re-runs): all
+solved, 5 stub hits across 4 runs, 0 repairs (the item-5 echo already
+removed the padding trigger for this model — the repair stays as a net
+for models that do pad). B9's turn spread (6/12/40) is task variance,
+not regression: the 40-turn run fired no stubs and still solved.
+
 ## 2026-10-08 — Multi-edit batches and edited-region echo (roadmap item 5, phase A)
 
 `edit_file` now accepts `edits: [{old_string, new_string, path?}]`: an

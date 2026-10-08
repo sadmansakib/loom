@@ -282,6 +282,16 @@ treated as hypotheses until Loom's own eval reproduces them.
      the whole content again, while the earlier result is still in the
      projection unstubbed.
    Seam: between stop-reason validation and `plan_turn`; the tool cache.
+    **Shipped 2026-10-08** — the two halves the corpus justified:
+    whitespace-trim repair for `edit_file` `old_string` (43 not-found
+    failures in the 84-run corpus; recorded in `effects.repairs` and
+    counted by `loom stats`) and the `unchanged since call <id>` stub
+    for repeat read-only calls while the original result is still in
+    the projection. Argument aliases and stringified-JSON repair were
+    skipped: zero occurrences in the same corpus. A/B on nemotron
+    (B3/B6/B9): all solved; 5 stub hits across 4 runs; 0 repairs — the
+    item-5 echo already removed the padding trigger for this model, so
+    the repair is a net for models that do pad.
 7. **Search and read shape** (G2, G3). `search` grouped by file with a
    files-only mode and optional context lines; a `glob` tool. Measure
    the read window: SWE-agent found a ~100-line window beat both 30

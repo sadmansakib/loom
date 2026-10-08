@@ -27,8 +27,8 @@ use crate::context::{
 use crate::event::{EventKind, EventSink};
 use crate::id::{SessionId, TaskId};
 use crate::model::{
-    ModelCapabilities, ModelError, ModelErrorKind, ModelEvent, ModelProvider, ModelRequest,
-    ModelResponse, StopReason, Usage,
+    Message, ModelCapabilities, ModelError, ModelErrorKind, ModelEvent, ModelProvider,
+    ModelRequest, ModelResponse, StopReason, Usage,
 };
 use crate::session::{PlannedTurn, Session, TaskRecord, TerminalTaskStatus};
 use crate::store::{ArtifactStore, SessionStore, StoreError};
@@ -1024,6 +1024,19 @@ impl Agent {
             );
         }
 
+        // Call ids whose results the model still sees in this request
+        // (post-projection). The tool engine serves a cache hit for one of
+        // these as a cheap `unchanged since call <id>` stub (roadmap
+        // item 6): the full content is already in view.
+        let projected_calls: HashSet<String> = request
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::ToolResult(result) => Some(result.call_id.as_str().to_owned()),
+                _ => None,
+            })
+            .collect();
+
         let context = ToolContext::new(
             self.config.workspace_root.clone(),
             cancellation.clone(),
@@ -1031,7 +1044,8 @@ impl Agent {
         )
         .with_artifacts(self.artifacts.clone())
         .with_recent_changes(recent_changes.to_vec())
-        .with_cache(Some(self.cache.clone()));
+        .with_cache(Some(self.cache.clone()))
+        .with_projected_calls(projected_calls);
         let batch = ToolBatch::new(&self.registry, &exposure)
             .with_max_concurrency(self.max_tool_concurrency);
         let ran = batch.execute(&runnable, &context).await;

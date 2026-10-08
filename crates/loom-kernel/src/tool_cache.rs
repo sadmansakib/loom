@@ -88,11 +88,13 @@ fn hash_file(path: &Path) -> io::Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
-/// A cached call: the signature it was stored under and the raw output
-/// (before bounding, so a hit is re-bounded exactly like a fresh call).
+/// A cached call: the signature it was stored under, the id of the call
+/// that produced it, and the raw output (before bounding, so a hit is
+/// re-bounded exactly like a fresh call).
 #[derive(Debug, Clone)]
 struct Entry {
     signature: Vec<FileSignature>,
+    call_id: String,
     output: ToolOutput,
 }
 
@@ -150,9 +152,10 @@ impl ToolCache {
             .contains_key(&(tool.to_owned(), args.to_string()))
     }
 
-    /// Returns the cached output for `(tool, args)` when `current` — the
-    /// caller-computed [`compute_signature`] of the call's read set —
-    /// matches the stored signature. A mismatch drops the entry.
+    /// Returns the cached output for `(tool, args)` and the id of the call
+    /// that produced it, when `current` — the caller-computed
+    /// [`compute_signature`] of the call's read set — matches the stored
+    /// signature. A mismatch drops the entry.
     ///
     /// Map access only: no file I/O, safe to call under the cache lock.
     pub(crate) fn lookup(
@@ -160,7 +163,7 @@ impl ToolCache {
         tool: &str,
         args: &Value,
         current: Option<Vec<FileSignature>>,
-    ) -> Option<ToolOutput> {
+    ) -> Option<(ToolOutput, String)> {
         let key = (tool.to_owned(), args.to_string());
         if !self.entries.contains_key(&key) {
             self.misses += 1;
@@ -172,7 +175,10 @@ impl ToolCache {
         };
         if hit {
             self.hits += 1;
-            return self.entries.get(&key).map(|entry| entry.output.clone());
+            return self
+                .entries
+                .get(&key)
+                .map(|entry| (entry.output.clone(), entry.call_id.clone()));
         }
         self.entries.remove(&key);
         self.misses += 1;
@@ -180,10 +186,10 @@ impl ToolCache {
     }
 
     /// Stores `output` for `(tool, args)` under `signature` — the
-    /// caller-computed [`compute_signature`] of the call's read set.
-    /// Does nothing when the output had side effects (only read-only,
-    /// effect-free results are cacheable) or when the signature is
-    /// `None` (some read path is not a plain file).
+    /// caller-computed [`compute_signature`] of the call's read set — as
+    /// the result of `call_id`. Does nothing when the output had side
+    /// effects (only read-only, effect-free results are cacheable) or when
+    /// the signature is `None` (some read path is not a plain file).
     ///
     /// Map access only: no file I/O, safe to call under the cache lock.
     pub(crate) fn store(
@@ -191,6 +197,7 @@ impl ToolCache {
         tool: &str,
         args: &Value,
         signature: Option<Vec<FileSignature>>,
+        call_id: &str,
         output: &ToolOutput,
     ) {
         if !output.effects.is_empty() {
@@ -203,6 +210,7 @@ impl ToolCache {
             (tool.to_owned(), args.to_string()),
             Entry {
                 signature,
+                call_id: call_id.to_owned(),
                 output: output.clone(),
             },
         );
@@ -271,11 +279,43 @@ mod tests {
         let reads = vec!["src/a.rs".to_owned()];
 
         let mut cache = ToolCache::new();
-        cache.store("read_file", &args, sig(&dir, &reads), &output("fn a() {}"));
+        cache.store(
+            "read_file",
+            &args,
+            sig(&dir, &reads),
+            "call-1",
+            &output("fn a() {}"),
+        );
         let hit = cache.lookup("read_file", &args, sig(&dir, &reads));
-        assert_eq!(hit.map(|out| out.content), Some("fn a() {}".to_owned()));
+        assert_eq!(
+            hit.map(|(out, _)| out.content),
+            Some("fn a() {}".to_owned())
+        );
         assert_eq!(cache.hits(), 1);
         assert_eq!(cache.misses(), 0);
+    }
+
+    #[test]
+    fn a_hit_carries_the_producing_call_id() {
+        let dir = workspace();
+        write(&dir, "src/a.rs", "fn a() {}");
+        let args = serde_json::json!({ "path": "src/a.rs" });
+        let reads = vec!["src/a.rs".to_owned()];
+
+        let mut cache = ToolCache::new();
+        cache.store(
+            "read_file",
+            &args,
+            sig(&dir, &reads),
+            "toolu_1",
+            &output("fn a() {}"),
+        );
+        let hit = cache.lookup("read_file", &args, sig(&dir, &reads));
+        assert_eq!(
+            hit.map(|(_, id)| id),
+            Some("toolu_1".to_owned()),
+            "a hit must report which call produced the cached output"
+        );
     }
 
     #[test]
@@ -286,7 +326,13 @@ mod tests {
         let reads = vec!["src/a.rs".to_owned()];
 
         let mut cache = ToolCache::new();
-        cache.store("read_file", &args, sig(&dir, &reads), &output("fn a() {}"));
+        cache.store(
+            "read_file",
+            &args,
+            sig(&dir, &reads),
+            "call-1",
+            &output("fn a() {}"),
+        );
         // Same size, same mtime resolution risk: the content hash decides.
         write(&dir, "src/a.rs", "fn b() {}");
         assert!(
@@ -304,7 +350,13 @@ mod tests {
         let reads = vec!["src/new.rs".to_owned()];
 
         let mut cache = ToolCache::new();
-        cache.store("read_file", &args, sig(&dir, &reads), &output("not found"));
+        cache.store(
+            "read_file",
+            &args,
+            sig(&dir, &reads),
+            "call-1",
+            &output("not found"),
+        );
         assert!(
             cache
                 .lookup("read_file", &args, sig(&dir, &reads))
@@ -326,7 +378,13 @@ mod tests {
         let reads = vec!["src".to_owned()];
 
         let mut cache = ToolCache::new();
-        cache.store("list_dir", &args, sig(&dir, &reads), &output("a.rs"));
+        cache.store(
+            "list_dir",
+            &args,
+            sig(&dir, &reads),
+            "call-1",
+            &output("a.rs"),
+        );
         assert!(cache.is_empty());
         assert!(cache.lookup("list_dir", &args, sig(&dir, &reads)).is_none());
     }
@@ -341,7 +399,13 @@ mod tests {
         let mut cache = ToolCache::new();
         let side_effecting =
             output("fn a() {}").with_effects(ToolEffects::none().with_file_written("src/a.rs"));
-        cache.store("read_file", &args, sig(&dir, &reads), &side_effecting);
+        cache.store(
+            "read_file",
+            &args,
+            sig(&dir, &reads),
+            "call-1",
+            &side_effecting,
+        );
         assert!(cache.is_empty());
     }
 
@@ -356,8 +420,20 @@ mod tests {
         let reads_b = vec!["src/b.rs".to_owned()];
 
         let mut cache = ToolCache::new();
-        cache.store("read_file", &args_a, sig(&dir, &reads_a), &output("a"));
-        cache.store("read_file", &args_b, sig(&dir, &reads_b), &output("b"));
+        cache.store(
+            "read_file",
+            &args_a,
+            sig(&dir, &reads_a),
+            "call-a",
+            &output("a"),
+        );
+        cache.store(
+            "read_file",
+            &args_b,
+            sig(&dir, &reads_b),
+            "call-b",
+            &output("b"),
+        );
         assert_eq!(cache.len(), 2);
 
         cache.invalidate_effects(&ToolEffects::none().with_file_written("src/a.rs"));
@@ -385,8 +461,20 @@ mod tests {
         let reads_b = vec!["src/b.rs".to_owned()];
 
         let mut cache = ToolCache::new();
-        cache.store("read_file", &args_a, sig(&dir, &reads_a), &output("a"));
-        cache.store("read_file", &args_b, sig(&dir, &reads_b), &output("b"));
+        cache.store(
+            "read_file",
+            &args_a,
+            sig(&dir, &reads_a),
+            "call-a",
+            &output("a"),
+        );
+        cache.store(
+            "read_file",
+            &args_b,
+            sig(&dir, &reads_b),
+            "call-b",
+            &output("b"),
+        );
 
         let command = crate::tool::CommandEffect::new("cargo", vec!["test".to_owned()], Some(0));
         cache.invalidate_effects(&ToolEffects::none().with_command(command));

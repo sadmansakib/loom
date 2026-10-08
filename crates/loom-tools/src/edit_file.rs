@@ -172,8 +172,16 @@ impl Tool for EditFileTool {
             for (relative, _) in &outcome.files {
                 effects = effects.with_file_written(relative.clone());
             }
+            for note in &outcome.repairs {
+                effects = effects.with_repair(note.clone());
+            }
+            let repair_note = if outcome.repairs.is_empty() {
+                String::new()
+            } else {
+                format!("\n(repaired: {})", outcome.repairs.join("; "))
+            };
             let (echo, truncated_echo) = render_echo(&outcome);
-            let mut content = format!("edited {}", outcome.detail);
+            let mut content = format!("edited {}{}", outcome.detail, repair_note);
             if !echo.is_empty() {
                 content.push_str("\n\n");
                 content.push_str(&echo);
@@ -211,6 +219,10 @@ struct EditOutcome {
     files: Vec<(String, String)>,
     /// `(file index, start, len)` per edit, in application order.
     spans: Vec<(usize, usize, usize)>,
+    /// Repair notes for calls Loom salvaged (e.g. a whitespace-padded
+    /// `old_string` that only matched after trimming) — surfaced in the
+    /// result and recorded in the effects for the session stats.
+    repairs: Vec<String>,
 }
 
 /// Reads every target file once, applies the edits in order against the
@@ -257,6 +269,7 @@ fn apply_edits(root: &Path, edits: &[(PathBuf, String, String)]) -> Result<EditO
     // them. A replaced range can never overlap a recorded span: each
     // consumed a distinct unique match.
     let mut spans: Vec<Vec<(usize, usize)>> = vec![Vec::new(); files.len()];
+    let mut repairs: Vec<String> = Vec::new();
     for (index, (path, old, new)) in edits.iter().enumerate() {
         let file_idx = match files.iter().position(|(p, _)| p == path) {
             Some(idx) => idx,
@@ -278,10 +291,36 @@ fn apply_edits(root: &Path, edits: &[(PathBuf, String, String)]) -> Result<EditO
         }
         match (text.matches(old).count(), text.find(old)) {
             (0, _) => {
-                return Err(ToolError::InvalidInput(format!(
-                    "{}old_string not found in file",
-                    prefix(index)
-                )));
+                // Repair pass (roadmap item 6): models pad `old_string`
+                // with incidental whitespace far more often than they
+                // genuinely misremember the text. When exactly one trimmed
+                // copy of the old string matches, apply the edit and note
+                // the repair; anything else keeps the original error.
+                let trimmed = old.trim();
+                let repaired = match text.matches(trimmed).count() {
+                    1 if !trimmed.is_empty() => text.find(trimmed),
+                    _ => None,
+                };
+                if let Some(start) = repaired {
+                    let end = start + trimmed.len();
+                    text.replace_range(start..end, new);
+                    let delta = new.len() as isize - trimmed.len() as isize;
+                    for (recorded_start, _) in &mut spans[file_idx] {
+                        if start < *recorded_start {
+                            *recorded_start = (*recorded_start as isize + delta) as usize;
+                        }
+                    }
+                    spans[file_idx].push((start, new.len()));
+                    repairs.push(format!(
+                        "{}old_string matched after trimming whitespace",
+                        prefix(index)
+                    ));
+                } else {
+                    return Err(ToolError::InvalidInput(format!(
+                        "{}old_string not found in file",
+                        prefix(index)
+                    )));
+                }
             }
             (1, Some(start)) => {
                 let end = start + old.len();
@@ -342,6 +381,7 @@ fn apply_edits(root: &Path, edits: &[(PathBuf, String, String)]) -> Result<EditO
         detail,
         files: resolved,
         spans: echoes,
+        repairs,
     })
 }
 
@@ -431,9 +471,65 @@ mod tests {
             output.content
         );
         assert_eq!(output.effects.files_written, vec!["f.rs".to_string()]);
+        assert!(output.effects.repairs.is_empty());
         assert_eq!(
             std::fs::read_to_string(guard.path().join("f.rs")).expect("read"),
             "fn add() { 1 }\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_whitespace_padded_old_string_is_repaired() {
+        let (guard, root) = temp_root();
+        std::fs::write(guard.path().join("f.rs"), b"fn add() {}\n").expect("seed");
+        // The model padded the old string with a stray newline and spaces;
+        // the file itself has none, so only a trimmed match can succeed.
+        let output = edit(
+            &root,
+            json!({"path": "f.rs", "old_string": "\n  fn add() {}  ", "new_string": "fn add() { 1 }"}),
+        )
+        .await
+        .expect("repaired edit applies");
+        assert!(
+            output.content.contains("replaced 1 occurrence"),
+            "{}",
+            output.content
+        );
+        assert!(
+            output
+                .content
+                .contains("(repaired: old_string matched after trimming whitespace)"),
+            "{}",
+            output.content
+        );
+        assert_eq!(
+            output.effects.repairs,
+            vec!["old_string matched after trimming whitespace".to_string()]
+        );
+        assert_eq!(
+            std::fs::read_to_string(guard.path().join("f.rs")).expect("read"),
+            "fn add() { 1 }\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trimmed_match_that_is_still_ambiguous_keeps_the_error() {
+        let (guard, root) = temp_root();
+        std::fs::write(guard.path().join("f.rs"), b"fn a() {}\nfn a() {}\n").expect("seed");
+        let err = edit(
+            &root,
+            json!({"path": "f.rs", "old_string": " fn a() {}", "new_string": "fn a() { 1 }"}),
+        )
+        .await
+        .expect_err("two trimmed matches must not be repaired");
+        match err {
+            ToolError::InvalidInput(msg) => assert_eq!(msg, "old_string not found in file"),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        // Nothing was written.
+        assert_eq!(
+            std::fs::read_to_string(guard.path().join("f.rs")).expect("read"),
+            "fn a() {}\nfn a() {}\n"
         );
     }
 
