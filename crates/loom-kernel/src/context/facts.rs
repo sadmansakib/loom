@@ -32,6 +32,35 @@ const RENDER_LIST_CAP: usize = 16;
 /// inventory).
 const RENDER_LANGUAGE_CAP: usize = 8;
 
+/// A project instruction file surfaced at task start (roadmap item 4).
+///
+/// The scanner picks the first of the well-known instruction files that
+/// exists (`AGENTS.md`, falling back to `CLAUDE.md`) and stores a bounded
+/// head of its content, so the model starts with the project's own rules
+/// instead of rediscovering them by exploration.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct InstructionFile {
+    /// Workspace-relative path of the file that matched.
+    pub path: String,
+    /// Full size of the file in bytes (reported when the text is truncated).
+    pub total_bytes: usize,
+    /// Bounded head of the file content.
+    pub text: String,
+}
+
+impl InstructionFile {
+    /// Builds an instruction-file snapshot.
+    #[must_use]
+    pub fn new(path: impl Into<String>, total_bytes: usize, text: String) -> Self {
+        Self {
+            path: path.into(),
+            total_bytes,
+            text,
+        }
+    }
+}
+
 /// Git state observed when the facts were captured.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -86,6 +115,17 @@ pub struct KnownFacts {
     pub test_dirs: Vec<String>,
     /// Workspace-relative configuration files recognised by the scan, sorted.
     pub config_files: Vec<String>,
+    /// Toolchain and package-manager versions detected for the build
+    /// systems (e.g. `cargo 1.89.0`), in probe order. Empty when nothing
+    /// was probed or every probe failed.
+    pub toolchains: Vec<String>,
+    /// Depth-limited workspace tree, pre-rendered one line per entry
+    /// (directories carry a trailing `/`, children indented two spaces per
+    /// level). Bounded by the scanner; empty when nothing was walked.
+    pub tree: Vec<String>,
+    /// Project instruction file (`AGENTS.md`, falling back to `CLAUDE.md`),
+    /// bounded.
+    pub instructions: Option<InstructionFile>,
     /// Git state at capture time.
     pub git: GitState,
 }
@@ -101,6 +141,9 @@ impl KnownFacts {
         source_dirs: Vec<String>,
         test_dirs: Vec<String>,
         config_files: Vec<String>,
+        toolchains: Vec<String>,
+        tree: Vec<String>,
+        instructions: Option<InstructionFile>,
         git: GitState,
     ) -> Self {
         Self {
@@ -110,6 +153,9 @@ impl KnownFacts {
             source_dirs,
             test_dirs,
             config_files,
+            toolchains,
+            tree,
+            instructions,
             git,
         }
     }
@@ -125,6 +171,9 @@ impl KnownFacts {
             && self.source_dirs.is_empty()
             && self.test_dirs.is_empty()
             && self.config_files.is_empty()
+            && self.toolchains.is_empty()
+            && self.tree.is_empty()
+            && self.instructions.is_none()
             && self.git.is_empty()
     }
 
@@ -179,6 +228,30 @@ impl KnownFacts {
                 "config files: {}",
                 render_list(&self.config_files, RENDER_LIST_CAP)
             );
+        }
+        if !self.toolchains.is_empty() {
+            let _ = writeln!(out, "toolchains: {}", self.toolchains.join(", "));
+        }
+        if let Some(instructions) = &self.instructions {
+            if instructions.total_bytes > instructions.text.len() {
+                let _ = writeln!(
+                    out,
+                    "project instructions ({}; first {} of {} bytes):",
+                    instructions.path,
+                    instructions.text.len(),
+                    instructions.total_bytes
+                );
+            } else {
+                let _ = writeln!(out, "project instructions ({}):", instructions.path);
+            }
+            let _ = writeln!(out, "{}", instructions.text);
+            let _ = writeln!(out, "(end of project instructions)");
+        }
+        if !self.tree.is_empty() {
+            let _ = writeln!(out, "file tree:");
+            for line in &self.tree {
+                let _ = writeln!(out, "{line}");
+            }
         }
         match (&self.git.branch, self.git.changed_files.is_empty()) {
             // No branch and no changes: no repository was observed.
@@ -287,6 +360,13 @@ mod tests {
             source_dirs: vec!["crates/loom-kernel/src".into(), "src".into()],
             test_dirs: vec!["tests".into()],
             config_files: vec!["Cargo.toml".into()],
+            toolchains: vec!["cargo 1.89.0".into(), "rustc 1.89.0".into()],
+            tree: vec!["Cargo.toml".into(), "src/".into(), "  lib.rs".into()],
+            instructions: Some(InstructionFile::new(
+                "AGENTS.md",
+                21,
+                "Run cargo test first.".into(),
+            )),
             git: GitState {
                 branch: Some("main".into()),
                 changed_files: vec!["src/lib.rs".into()],
@@ -316,6 +396,13 @@ mod tests {
         assert!(rendered.contains("source dirs: crates/loom-kernel/src, src"));
         assert!(rendered.contains("test dirs: tests"));
         assert!(rendered.contains("config files: Cargo.toml"));
+        assert!(rendered.contains("toolchains: cargo 1.89.0, rustc 1.89.0"));
+        assert!(rendered.contains("project instructions (AGENTS.md):"));
+        assert!(rendered.contains("Run cargo test first."));
+        assert!(rendered.contains("(end of project instructions)"));
+        assert!(rendered.contains("file tree:"));
+        assert!(rendered.contains("src/"));
+        assert!(rendered.contains("  lib.rs"));
         assert!(rendered.contains("git branch: main"));
         assert!(rendered.contains("changed files: src/lib.rs"));
         assert!(!rendered.ends_with('\n'), "no trailing newline");
@@ -358,5 +445,33 @@ mod tests {
     #[test]
     fn default_source_observes_nothing() {
         assert!(NoFacts.scan().is_empty());
+    }
+
+    #[test]
+    fn truncated_instructions_report_their_size() {
+        let mut f = facts();
+        f.instructions = Some(InstructionFile::new(
+            "AGENTS.md",
+            10_000,
+            "first 4096 bytes".into(),
+        ));
+        let rendered = f.render();
+        assert!(
+            rendered.contains("project instructions (AGENTS.md; first 16 of 10000 bytes):"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn tree_only_facts_still_render() {
+        let f = KnownFacts {
+            tree: vec!["src/".into(), "  main.rs".into()],
+            ..KnownFacts::default()
+        };
+        assert!(!f.is_empty());
+        let rendered = f.render();
+        assert!(rendered.starts_with("Repository facts"));
+        assert!(rendered.contains("file tree:"));
+        assert!(!rendered.contains("languages:"));
     }
 }

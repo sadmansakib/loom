@@ -131,6 +131,24 @@ scrub floor (`*_API_KEY`) always applies; the engine loads the manifest
 at open and the spec advertises the allowed programs. Rejections and
 timeouts surface as audited tool errors.
 
+## 2026-10-08 — Bootstrap facts: tree, toolchains, project instructions (roadmap item 4)
+
+The frozen Repository-facts block now carries three more surfaces so the
+model stops paying early turns to discover them: a depth-limited file
+tree (4 levels, 200-line cap with a `(+N more entries)` marker),
+toolchain versions probed from detected build systems (cargo/rustc,
+node/npm, python3, go), and the project instruction file (AGENTS.md,
+falling back to CLAUDE.md, head-bounded to 4 KiB with an explicit
+`first N of M bytes` notice). Everything stays in one frozen block per
+task, so prompt prefix caching is untouched.
+
+Measured (nemotron-3-super-120b-a12b:free, 15 tasks × 1 run, same
+recipe as the pre-change baseline): gated pass rate 11/14 → **13/14**
+(78.6% → 92.9%); B9 went from a 50-turn-cap failure to solved in 8
+turns; list_dir calls collapsed ~14/run → 1/run and read_file ~25/run →
+~7/run. Only B15 (hard synthesis) still hits the turn cap — a model
+limit, not a harness one. Cost $0 provider-reported.
+
 ## 2026-10-08 — Sandboxed shell (roadmap item 2)
 
 `run_command` now runs any bare program name inside an OS sandbox

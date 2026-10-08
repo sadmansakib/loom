@@ -17,15 +17,42 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ignore::WalkBuilder;
-use loom_kernel::context::{FactsSource, GitState, KnownFacts};
+use loom_kernel::context::{FactsSource, GitState, InstructionFile, KnownFacts};
 
 /// How deep into the tree the walk descends. Enough to reach
 /// `crates/<crate>/src` and `crates/<crate>/tests` in a monorepo, bounded so a
 /// pathological tree cannot stall the scan.
 const MAX_DEPTH: usize = 4;
 
+/// Depth of the rendered file tree (shallower than the walk: the tree is a
+/// map, not an inventory). Four levels reach `crates/<crate>/src/<file>` in
+/// a monorepo; shallow repos are unaffected.
+const TREE_DEPTH: usize = 4;
+
 /// Hard cap on entries visited, a backstop against enormous trees.
 const MAX_ENTRIES: usize = 20_000;
+
+/// Hard cap on rendered tree lines; the remainder is summarised by a
+/// `(+N more entries)` marker so the block stays bounded.
+const TREE_MAX_LINES: usize = 200;
+
+/// Project instruction files, in preference order.
+const INSTRUCTION_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
+
+/// Head of an instruction file kept in the facts block.
+const INSTRUCTIONS_MAX_BYTES: usize = 4096;
+
+/// Toolchain probes per detected build system, in deterministic order.
+/// Each entry is `(build system, program, args, human prefix)` — the
+/// rendered line is the trimmed stdout verbatim (e.g. `cargo 1.89.0`).
+const TOOLCHAIN_PROBES: &[(&str, &str, &[&str])] = &[
+    ("Cargo", "cargo", &["--version"]),
+    ("Cargo", "rustc", &["--version"]),
+    ("npm", "node", &["--version"]),
+    ("npm", "npm", &["--version"]),
+    ("Python", "python3", &["--version"]),
+    ("Go", "go", &["version"]),
+];
 
 /// Files whose presence identifies a build system, and the system they imply.
 const BUILD_SYSTEMS: &[(&str, &str)] = &[
@@ -113,6 +140,7 @@ pub fn scan(root: &Path) -> KnownFacts {
     let mut test_dirs: BTreeSet<String> = BTreeSet::new();
     let mut config_files: BTreeSet<String> = BTreeSet::new();
     let mut build_systems: BTreeSet<String> = BTreeSet::new();
+    let mut tree = TreeNode::default();
 
     let walker = WalkBuilder::new(root)
         .max_depth(Some(MAX_DEPTH))
@@ -133,7 +161,8 @@ pub fn scan(root: &Path) -> KnownFacts {
             continue;
         };
         let rel = relative(root, path);
-        if entry.file_type().is_some_and(|t| t.is_dir()) {
+        let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
+        if is_dir {
             match name {
                 "src" => {
                     source_dirs.insert(rel.clone());
@@ -143,9 +172,7 @@ pub fn scan(root: &Path) -> KnownFacts {
                 }
                 _ => {}
             }
-            continue;
-        }
-        if let Some(system) = BUILD_SYSTEMS
+        } else if let Some(system) = BUILD_SYSTEMS
             .iter()
             .find(|(file, _)| *file == name)
             .map(|(_, system)| *system)
@@ -163,15 +190,33 @@ pub fn scan(root: &Path) -> KnownFacts {
         {
             *languages.entry(language.to_owned()).or_default() += 1;
         }
+        // The rendered tree is shallower than the walk and skips the root.
+        if entry.depth() >= 1 && entry.depth() <= TREE_DEPTH && rel != "." {
+            tree.insert(&rel, is_dir);
+        }
+    }
+
+    let rendered = tree.render();
+    let total_entries = rendered.len();
+    let mut tree_lines: Vec<String> = rendered.into_iter().take(TREE_MAX_LINES).collect();
+    if total_entries > TREE_MAX_LINES {
+        // One line per entry: the marker states exactly what is omitted.
+        tree_lines.push(format!(
+            "(+{} more entries)",
+            total_entries - TREE_MAX_LINES
+        ));
     }
 
     KnownFacts::new(
         root.to_path_buf(),
         ranked_languages(&languages),
-        build_systems.into_iter().collect(),
+        build_systems.iter().cloned().collect(),
         source_dirs.into_iter().collect(),
         test_dirs.into_iter().collect(),
         config_files.into_iter().collect(),
+        toolchain_versions(&build_systems),
+        tree_lines,
+        read_instructions(root),
         git_state(root),
     )
 }
@@ -181,6 +226,120 @@ fn ranked_languages(counts: &BTreeMap<String, usize>) -> Vec<String> {
     let mut ranked: Vec<(&String, &usize)> = counts.iter().collect();
     ranked.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
     ranked.into_iter().map(|(name, _)| name.clone()).collect()
+}
+
+/// A bounded, sorted directory tree accumulated during the walk.
+#[derive(Default)]
+struct TreeNode {
+    dirs: BTreeMap<String, TreeNode>,
+    files: BTreeSet<String>,
+}
+
+impl TreeNode {
+    /// Inserts a workspace-relative path (slash-separated).
+    fn insert(&mut self, rel: &str, is_dir: bool) {
+        let mut node = self;
+        let mut rest = rel;
+        loop {
+            match rest.split_once('/') {
+                Some((head, tail)) => {
+                    node = node.dirs.entry(head.to_owned()).or_default();
+                    rest = tail;
+                }
+                None => {
+                    if is_dir {
+                        node.dirs.entry(rest.to_owned()).or_default();
+                    } else {
+                        node.files.insert(rest.to_owned());
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Renders every entry as an indented line (directories carry `/`),
+    /// children sorted by name. The result is bounded by the walk itself
+    /// (depth and entry caps); callers cap the line count.
+    fn render(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        self.render_node(0, &mut lines);
+        lines
+    }
+
+    fn render_node(&self, depth: usize, lines: &mut Vec<String>) {
+        let indent = "  ".repeat(depth);
+        let mut names: Vec<(&str, bool)> = self
+            .dirs
+            .keys()
+            .map(|name| (name.as_str(), true))
+            .chain(self.files.iter().map(|name| (name.as_str(), false)))
+            .collect();
+        names.sort();
+        for (name, is_dir) in names {
+            if is_dir {
+                lines.push(format!("{indent}{name}/"));
+                if let Some(child) = self.dirs.get(name) {
+                    child.render_node(depth + 1, lines);
+                }
+            } else {
+                lines.push(format!("{indent}{name}"));
+            }
+        }
+    }
+}
+
+/// Reads the first well-known project instruction file under `root`.
+fn read_instructions(root: &Path) -> Option<InstructionFile> {
+    for name in INSTRUCTION_FILES {
+        let path = root.join(name);
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let total = bytes.len();
+        let text = truncate_utf8_head(&bytes, INSTRUCTIONS_MAX_BYTES);
+        return Some(InstructionFile::new(name.to_owned(), total, text));
+    }
+    None
+}
+
+/// Head of `bytes`, cut on a UTF-8 character boundary.
+fn truncate_utf8_head(bytes: &[u8], cap: usize) -> String {
+    let mut end = bytes.len().min(cap);
+    // Only when a cut happens can `bytes[end]` land mid-character.
+    while end > 0 && end < bytes.len() && (bytes[end] & 0xC0) == 0x80 {
+        end -= 1;
+    }
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+/// Probes toolchain versions for the detected build systems, in
+/// [`TOOLCHAIN_PROBES`] order. Each probe degrades to nothing on failure.
+fn toolchain_versions(build_systems: &BTreeSet<String>) -> Vec<String> {
+    TOOLCHAIN_PROBES
+        .iter()
+        .filter(|(system, _, _)| build_systems.contains(*system))
+        .filter_map(|(_, program, args)| run_version(program, args))
+        .collect()
+}
+
+/// Runs `<program> <args>` and returns the first stdout line (e.g.
+/// `cargo 1.89.0 (...)`), or `None` on any failure.
+fn run_version(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let line = String::from_utf8(output.stdout)
+        .ok()?
+        .lines()
+        .next()?
+        .trim()
+        .to_owned();
+    (!line.is_empty()).then_some(line)
 }
 
 /// Workspace-relative, slash-separated path (the root itself maps to `.`).
@@ -319,6 +478,93 @@ mod tests {
         assert_eq!(facts.source_dirs, vec!["src".to_owned()]);
         assert_eq!(facts.test_dirs, vec!["tests".to_owned()]);
         assert_eq!(facts.config_files, vec!["Cargo.toml".to_owned()]);
+    }
+
+    #[test]
+    fn scan_surfaces_instructions_tree_and_toolchains() {
+        let dir = tempdir();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src/nested/deeper/still")).unwrap();
+        fs::write(root.join("AGENTS.md"), "Run `cargo test -p x` first.\n").unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        fs::write(root.join("src/lib.rs"), "").unwrap();
+        fs::write(root.join("src/nested/mod.rs"), "").unwrap();
+        fs::write(root.join("src/nested/deeper/leaf.rs"), "").unwrap();
+        // Below TREE_DEPTH: walked for languages, never rendered in the tree.
+        fs::write(root.join("src/nested/deeper/still/hidden.rs"), "").unwrap();
+
+        let facts = scan(root);
+        let instructions = facts.instructions.expect("AGENTS.md surfaces");
+        assert_eq!(instructions.path, "AGENTS.md");
+        assert_eq!(instructions.total_bytes, 29);
+        assert_eq!(instructions.text, "Run `cargo test -p x` first.\n");
+        assert_eq!(
+            facts.tree,
+            vec![
+                "AGENTS.md".to_owned(),
+                "Cargo.toml".to_owned(),
+                "src/".to_owned(),
+                "  lib.rs".to_owned(),
+                "  nested/".to_owned(),
+                "    deeper/".to_owned(),
+                "      leaf.rs".to_owned(),
+                "      still/".to_owned(),
+                "    mod.rs".to_owned(),
+            ]
+        );
+        if Command::new("cargo").arg("--version").output().is_ok() {
+            assert!(
+                facts.toolchains.iter().any(|v| v.starts_with("cargo ")),
+                "{:?}",
+                facts.toolchains
+            );
+        }
+    }
+
+    #[test]
+    fn claude_md_is_the_fallback_instructions_file() {
+        let dir = tempdir();
+        fs::write(dir.path().join("CLAUDE.md"), "claude rules\n").unwrap();
+        let facts = scan(dir.path());
+        assert_eq!(
+            facts.instructions.expect("CLAUDE.md surfaces").path,
+            "CLAUDE.md"
+        );
+    }
+
+    #[test]
+    fn instructions_are_head_bounded() {
+        let dir = tempdir();
+        let body = "x".repeat(10_000);
+        fs::write(dir.path().join("AGENTS.md"), &body).unwrap();
+        let facts = scan(dir.path());
+        let instructions = facts.instructions.expect("instructions");
+        assert_eq!(instructions.total_bytes, 10_000);
+        assert_eq!(instructions.text.len(), INSTRUCTIONS_MAX_BYTES);
+    }
+
+    #[test]
+    fn tree_cap_appends_a_marker() {
+        let dir = tempdir();
+        let root = dir.path();
+        for i in 0..(TREE_MAX_LINES + 10) {
+            fs::write(root.join(format!("file{i:03}.txt")), "").unwrap();
+        }
+        let facts = scan(root);
+        assert_eq!(facts.tree.len(), TREE_MAX_LINES + 1);
+        assert_eq!(
+            facts.tree.last().map(String::as_str),
+            Some("(+10 more entries)")
+        );
+    }
+
+    #[test]
+    fn utf8_head_cuts_on_a_character_boundary() {
+        // `é` is two bytes; cutting between them would be invalid UTF-8.
+        let bytes = "é".repeat(100).into_bytes();
+        let head = truncate_utf8_head(&bytes, 4097);
+        assert!(head.len() <= 4096);
+        assert!(head.chars().all(|c| c == 'é'));
     }
 
     #[test]

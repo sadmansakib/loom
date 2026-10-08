@@ -246,6 +246,10 @@ treated as hypotheses until Loom's own eval reproduces them.
    versions. Meta-Harness found exactly this snapshot by search and
    measured 2–5 early turns saved. Still frozen per task, so the
    cached prefix is unaffected. Seam: `FsFactsSource`.
+   **Shipped 2026-10-08** — tree depth 4 / 200-line cap, cargo·rustc /
+   node·npm / python3 / go probes, AGENTS.md→CLAUDE.md 4 KiB head.
+   Measured on the free-tier suite (15 × 1): gated 11/14 → 13/14,
+   B9 cap-fail → solved in 8 turns, list_dir ~14/run → 1/run.
 5. **Edits that need no follow-up** (G1, G2, G5).
    - **Multi-edit**: `edits: [{old_string, new_string}]`, applied
      atomically, across one or more files.

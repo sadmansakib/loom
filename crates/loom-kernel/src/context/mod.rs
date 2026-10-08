@@ -25,7 +25,7 @@ mod facts;
 mod pruning;
 
 pub use default::DefaultContextCompiler;
-pub use facts::{FactsSource, GitState, KnownFacts, NoFacts, StaticFacts};
+pub use facts::{FactsSource, GitState, InstructionFile, KnownFacts, NoFacts, StaticFacts};
 pub use pruning::{PruneConfig, PruningContextCompiler, StubDecision, StubReason};
 
 use crate::model::{Message, ModelCapabilities, ModelRequest};

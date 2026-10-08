@@ -740,10 +740,7 @@ mod tests {
             source_dirs: vec!["src".into()],
             test_dirs: vec!["tests".into()],
             config_files: vec!["Cargo.toml".into()],
-            git: crate::context::GitState {
-                branch: Some("main".into()),
-                changed_files: vec!["src/lib.rs".into()],
-            },
+            ..KnownFacts::default()
         }
     }
 

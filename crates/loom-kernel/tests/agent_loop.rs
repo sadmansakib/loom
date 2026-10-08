@@ -363,6 +363,9 @@ async fn repository_facts_are_projected_as_a_stable_system_block() {
         vec!["src".to_owned()],
         vec!["tests".to_owned()],
         vec!["Cargo.toml".to_owned()],
+        Vec::new(),
+        Vec::new(),
+        None,
         GitState::new(Some("main".to_owned()), vec!["src/lib.rs".to_owned()]),
     );
     let agent = Agent::new(
