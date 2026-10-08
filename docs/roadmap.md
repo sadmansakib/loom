@@ -297,6 +297,16 @@ treated as hypotheses until Loom's own eval reproduces them.
    the read window: SWE-agent found a ~100-line window beat both 30
    lines and whole files, while Loom defaults to 2000. Seam: `search`,
    `read_file`, a new read-only tool.
+   **Evidence-based skip (2026-10-08).** A default-100 probe (B1/B3/B6
+   ×1, same model) measured 2–3.5× WORSE than the 2000-line default:
+   B3 5→15 turns / 14.2K→49.5K input tokens, B1 4→14 / 42.7K→86.2K.
+   Paging replays the transcript per page, and with the bootstrap tree
+   (item 4) and `search` already narrowing reads, models self-bound
+   (median explicit window 34 lines). The corpus also showed `search`
+   results already lean (median 2.5 KB, ~2/run, grouped-by-file above
+   the 100-match threshold), so files-only/context-line modes and `glob`
+   have no measurable lever here. Reverted; the 2000-line default with
+   explicit `offset`/`limit` stands.
 8. **Completion gate and plan** (G1, G2).
    - On `EndTurn`, if files changed since the last green `verify`,
      refuse once with the diff summary and the original instruction
