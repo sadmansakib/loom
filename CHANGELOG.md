@@ -131,6 +131,37 @@ scrub floor (`*_API_KEY`) always applies; the engine loads the manifest
 at open and the spec advertises the allowed programs. Rejections and
 timeouts surface as audited tool errors.
 
+## 2026-10-08 — Sandboxed shell (roadmap item 2)
+
+`run_command` now runs any bare program name inside an OS sandbox
+instead of an allow-list: Seatbelt (`sandbox-exec`) on macOS,
+bubblewrap (`bwrap`) on Linux — both pure process wrappers, so the
+workspace's `unsafe_code = "forbid"` stands (this rules out Landlock).
+Writes are denied by default and granted only to the canonical
+workspace, the system temp dir, and the cargo home; the network is
+off; the wrapper leads the process group, so bounded head+tail capture
+and group kill are unchanged, and every child inherits the confinement
+(a model-run `bash -c` pipeline cannot exceed its parent's grants).
+Bare names are resolved on `PATH` before wrapping so a missing program
+still fails with the legible "cannot run" error.
+
+The `.loom/commands.toml` manifest is now the escalation layer:
+`network = true`, `extra_writable = ["/abs/path"]` (absolute paths
+validated), `sandbox = false` for trusted sandbox-incompatible tools,
+plus the existing `timeout_secs`, `max_output_bytes`, and `env_scrub`
+limits. The credential scrub floor still applies to every child
+unconditionally. `verify` honors the same policy when it escalates its
+fixed per-ecosystem commands. The default system prompt states the
+sandbox contract (eval falls back to `default_system_prompt()`, so
+nothing drifts).
+
+Verified empirically: `cargo check -p loom-tools --offline` green
+inside the generated Seatbelt profile (4.7 s, target/ writes allowed),
+and a network probe inside the profile fails DNS resolution. New
+regression test: `touch` to `$HOME` is denied by the sandbox. Tool
+spec budget raised 5,150 → 5,350 B for the `run_command` description's
+sandbox contract (still under the pre-compaction 5,339 B drift mark).
+
 ## 2026-10-08 — Dynamic output reservation
 
 The per-turn output reservation now derives from the model's

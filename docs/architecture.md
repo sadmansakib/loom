@@ -62,7 +62,7 @@ property.
   worth more than async purity. This is documented at each call site.
 - **No shell for model-driven work.** The subprocesses Loom launches
   for tools are `git` (repository facts, with `-c core.quotepath=false`),
-  policy-allowed programs from `run_command` (§6.8; `cargo` by default),
+  bare programs from `run_command` (§6.8), each wrapped in an OS sandbox,
   and the fixed per-ecosystem commands of `verify` (§6.2), which never
   come from model input. The one `sh -c` is the user-configured
   credential command (§8), never model-reachable. Program names must
@@ -269,7 +269,7 @@ uses to link failures to the change that likely caused them.
 | `search` | read | regex, gitignore-aware (hand-built ancestor chain, nearest file wins), 1 MiB/file cap, binary skip, summary mode >100 matches |
 | `list_dir` | read | one level, byte-sorted, symlinks not followed for typing |
 | `read_artifact` | read | paged read of a spilled artifact (§6.4) |
-| `run_command` | mutating | workspace command policy (§6.8; default `cargo` only), no shell, both pipes drained concurrently, head+tail bounded capture with explicit omission markers |
+| `run_command` | mutating | any bare program inside an OS sandbox (§6.8; writes confined to workspace + temp + cargo home, network off), manifest rules escalate; no shell, both pipes drained concurrently, head+tail bounded capture with explicit omission markers |
 | `verify` | mutating | `check`/`test` scope for the ecosystem detected from root markers (cargo > npm > python > go > make) or an explicit `ecosystem` argument; the command comes from a fixed per-ecosystem table, never from model input; ecosystems without a build-agnostic scope (npm `check`) refuse rather than guess; success → the pass summary line; failure → structured evidence (§6.5) |
 | `edit_file` | mutating | exact old-text match, must be unique (0 or ≥2 matches = invalid input), 8 MiB file cap; optional `verify` runs the detected ecosystem's check/test inside the same call (action fusion), skipping with a note when the scope is unsupported |
 | `write_file` | mutating | create/overwrite, parents created; optional `verify` as above |
@@ -328,26 +328,47 @@ is blocking work and runs on the blocking pool — never under the cache
 mutex, never on an async worker. A cheap `has_entry` probe lets the
 common first-read path skip hashing entirely.
 
-### 6.8 Command policy
+### 6.8 Sandboxed shell and command policy
 
-`run_command` executes only programs with a rule in the workspace's
-`CommandPolicy` (`loom-tools/src/policy.rs`), resolved once at
-`Engine::open`. The shipped default allows exactly `cargo`. A
-`.loom/commands.toml` manifest adds `[[command]]` rules, each keyed by
-bare program name with optional limits: `timeout_secs` (≤ 3600; on
-expiry the whole process group is killed and the call fails visibly),
-`max_output_bytes` (per-stream head/tail window, ≤ 1 MiB), and
-`env_scrub` (extra variables removed from the child). A credential
-scrub floor (`DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`,
-`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`,
-`GOOGLE_API_KEY`) applies to every child regardless of manifest — a
-manifest can add to it, never remove from it. An invalid manifest
-fails `Engine::open` (`EngineError::CommandPolicy`) rather than
-falling back to the default. The tool spec lists the admitted programs,
-so it is stable for the engine's lifetime. Every executed command is
-recorded as a `CommandEffect` (program, args, exit status) and
-rejections/timeouts as the call's error status: the session transcript
-is the audit log.
+`run_command` runs any bare program name — inside an OS sandbox
+(`loom-tools/src/sandbox.rs`). The sandbox is the security boundary;
+the workspace's `CommandPolicy` (`loom-tools/src/policy.rs`),
+resolved once at `Engine::open`, is the *escalation* layer on top.
+
+**Sandbox** (default for every program, policy or not):
+- macOS: `sandbox-exec` with a generated Seatbelt profile; Linux:
+  `bubblewrap` (`bwrap`). Both are pure process wrappers — no
+  `unsafe` (workspace forbids it, ruling out Landlock).
+- File writes denied by default; granted only to the canonical
+  workspace, the system temp dir, and the cargo home
+  (`CARGO_HOME` or `~/.cargo`, kept writable so builds work
+  offline). Everything else stays readable.
+- Network denied by default.
+- The wrapper leads the process group (existing bounded capture and
+  group kill unchanged), and the confinement is inherited by every
+  child — a model-run `bash -c` pipeline cannot escape what its
+  parent was granted.
+- Bare names are resolved on `PATH` before wrapping, so a missing
+  program fails with the same legible error as before.
+
+**Escalation** (`.loom/commands.toml`, `[[command]]` rules keyed by
+bare program name): `network = true` lifts the network deny;
+`extra_writable = ["/abs/path"]` adds writable roots (absolute paths
+only, validated); `sandbox = false` runs unsandboxed — for trusted,
+sandbox-incompatible tools only. The old limits still apply:
+`timeout_secs` (≤ 3600; on expiry the whole process group is killed
+and the call fails visibly), `max_output_bytes` (per-stream head/tail
+window, ≤ 1 MiB), and `env_scrub` (extra variables removed from the
+child). A credential scrub floor (`DEEPSEEK_API_KEY`,
+`OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`GEMINI_API_KEY`, `GOOGLE_API_KEY`) applies to every child regardless
+of manifest — a manifest can add to it, never remove from it. An
+invalid manifest fails `Engine::open`
+(`EngineError::CommandPolicy`) rather than falling back to the
+default. The tool spec names the escalated programs, so it is stable
+for the engine's lifetime. Every executed command is recorded as a
+`CommandEffect` (program, args, exit status) and timeouts as the
+call's error status: the session transcript is the audit log.
 
 ---
 
@@ -491,8 +512,9 @@ Compare suites by medians over N ≥ 5; the observed noise floor is ±10%.
 **Security**
 - Path confinement on every tool path, symlink-hardened, regression-tested
   against escapes.
-- No model-reachable shell, bare-name policy allow-list for subprocesses,
-  process-group kill, credential env scrub floor on every child.
+- No model-reachable shell; every model-run subprocess is a bare name
+  inside an OS sandbox (writes confined, network off), process-group
+  kill, credential env scrub floor on every child.
 - Secrets only in the OS keychain; canary-tested.
 - `unsafe_code = "forbid"` in kernel and tools.
 

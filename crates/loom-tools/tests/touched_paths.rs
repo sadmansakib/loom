@@ -82,7 +82,7 @@ fn run_command_and_verify_are_wildcards() {
         None
     );
     assert_eq!(
-        touches(&loom_tools::VerifyTool, json!({"scope": "test"})),
+        touches(&loom_tools::VerifyTool::new(), json!({"scope": "test"})),
         None
     );
 }

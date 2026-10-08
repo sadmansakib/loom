@@ -37,8 +37,18 @@ pub(crate) async fn run_fused(
             return Ok((note, None));
         }
     };
-    let output =
-        crate::exec::run_bounded(program, &args, ctx, &crate::exec::ExecLimits::default()).await?;
+    let sandbox = crate::sandbox::Sandbox::resolve(
+        &ctx.workspace_root,
+        crate::sandbox::SandboxGrants::from_rule(None),
+    );
+    let output = crate::exec::run_bounded(
+        program,
+        &args,
+        ctx,
+        &crate::exec::ExecLimits::default(),
+        &sandbox,
+    )
+    .await?;
     let effect = CommandEffect::new(program, args.clone(), output.status.code());
     let mut recent = ctx.recent_changes();
     recent.push(changed.to_owned());

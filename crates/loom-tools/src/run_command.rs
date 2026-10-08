@@ -1,23 +1,28 @@
-//! The `run_command` tool: bounded, allow-listed process execution
-//! under the workspace's [`CommandPolicy`](crate::policy::CommandPolicy).
+//! The `run_command` tool: bounded process execution inside an OS
+//! sandbox, with the workspace's
+//! [`CommandPolicy`](crate::policy::CommandPolicy) as the escalation
+//! layer.
 //!
 //! Mutating (architecture §10). There is **no shell**: the program and
-//! its arguments are passed to [`tokio::process::Command`] directly, so
-//! argument content can never be re-interpreted as shell syntax. The
-//! program must have a rule in the policy — the shipped default allows
-//! only the Rust build driver; a workspace extends the list with a
-//! `.loom/commands.toml` manifest, which also carries per-command
+//! its arguments are passed to the spawned process directly, so
+//! argument content can never be re-interpreted as shell syntax (a
+//! model may still run `bash` itself — the sandbox is inherited by
+//! everything it spawns). Any bare executable name is accepted and
+//! runs inside the OS sandbox: writes confined to the workspace (plus
+//! temp and cargo-home caches), network off. A `.loom/commands.toml`
+//! rule escalates a program — network access, extra writable
+//! directories, or unsandboxed execution — and carries the always-on
 //! limits: a wall-time cap (the whole process group is killed on
 //! expiry), a per-stream output window, and extra environment
-//! scrubbing. The credential floor is always applied, so a child can
-//! never read Loom's provider keys. The child runs with the workspace
-//! root as its working directory and is killed when the call future is
-//! dropped (timeout or cancellation), so a runaway command cannot
-//! outlive the turn.
+//! scrubbing. The credential floor is always applied, sandbox or not,
+//! so a child can never read Loom's provider keys. The child runs with
+//! the workspace root as its working directory and is killed when the
+//! call future is dropped (timeout or cancellation), so a runaway
+//! command cannot outlive the turn.
 //!
 //! Audit: every executed command is recorded as a structured
 //! [`CommandEffect`](loom_kernel::tool::CommandEffect) in the session
-//! transcript; policy rejections and rule timeouts land as the call's
+//! transcript; escalation grants and rule timeouts land as the call's
 //! error status, so the session is the audit log.
 
 use std::time::Duration;
@@ -34,8 +39,8 @@ use crate::budget;
 use crate::evidence::{Evidence, cargo_diagnostics, libtest_failures, nextest_junit};
 use crate::policy::CommandPolicy;
 
-/// Runs an allow-listed program in the workspace root and returns its
-/// combined output and exit status.
+/// Runs a program in the workspace root inside an OS sandbox and
+/// returns its combined output and exit status.
 #[derive(Debug, Clone)]
 pub struct RunCommandTool {
     policy: CommandPolicy,
@@ -50,19 +55,22 @@ impl Default for RunCommandTool {
 
 impl RunCommandTool {
     fn under(policy: CommandPolicy) -> Self {
-        // The admitted program list is policy data, so the spec closes
+        // The escalation grants are policy data, so the spec closes
         // over this instance's policy — stable within an engine, since
         // the policy is fixed at open.
+        let escalated = policy
+            .allowed_names()
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let description = format!(
-            "Runs an allow-listed program in the workspace root and returns \
-             its combined stdout/stderr and exit status. No shell: pass the \
-             program and each argument separately. Allowed: {}.",
-            policy
-                .allowed_names()
-                .iter()
-                .map(|name| format!("`{name}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
+            "Runs any bare program in the workspace inside an OS sandbox \
+             (writes confined to the workspace, network off); returns \
+             combined stdout/stderr and exit status. No shell: pass the \
+             program and each argument separately (`bash` is fine — its \
+             children stay sandboxed). Escalated, grants beyond the \
+             sandbox default: {escalated}."
         );
         Self {
             spec: ToolSpec {
@@ -101,7 +109,8 @@ impl RunCommandTool {
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 struct RunInput {
-    /// Executable name, no path; must be policy-allowed.
+    /// Executable name, no path; runs inside the sandbox unless the
+    /// policy escalates it.
     program: String,
     /// Arguments, one array entry each.
     #[serde(default)]
@@ -131,19 +140,26 @@ impl Tool for RunCommandTool {
                     input.program
                 )));
             }
-            let Some(rule) = self.policy.rule(&input.program) else {
-                return Err(ToolError::InvalidInput(format!(
-                    "program \"{}\" is not allowed; allowed: {}",
-                    input.program,
-                    self.policy.allowed_names().join(", ")
+            // The sandbox wrapper reports a missing program as an opaque
+            // non-zero exit; resolve bare names on PATH first so the
+            // model gets the same "cannot run" either way.
+            if resolve_in_path(&input.program).is_none() {
+                return Err(ToolError::Execution(format!(
+                    "cannot run \"{}\": not found on PATH",
+                    input.program
                 )));
-            };
+            }
+            // No rule is the sandboxed default; a rule escalates.
+            let rule = self.policy.rule(&input.program);
             let limits = crate::exec::ExecLimits {
-                stream_window: rule.max_output_bytes,
-                scrub: rule.env_scrub.clone(),
+                stream_window: rule.and_then(|rule| rule.max_output_bytes),
+                scrub: rule.map(|rule| rule.env_scrub.clone()).unwrap_or_default(),
             };
-            let bounded = crate::exec::run_bounded(&input.program, &input.args, ctx, &limits);
-            let output = match rule.timeout_secs {
+            let grants = crate::sandbox::SandboxGrants::from_rule(rule);
+            let sandbox = crate::sandbox::Sandbox::resolve(&ctx.workspace_root, grants);
+            let bounded =
+                crate::exec::run_bounded(&input.program, &input.args, ctx, &limits, &sandbox);
+            let output = match rule.and_then(|rule| rule.timeout_secs) {
                 None => bounded.await?,
                 Some(secs) => {
                     match tokio::time::timeout(Duration::from_secs(secs), bounded).await {
@@ -185,6 +201,16 @@ impl Tool for RunCommandTool {
 /// general-purpose, so its output may itself be the answer the model
 /// asked for. A failed run with nothing parseable falls back to the
 /// bounded raw output, so a failure is never hidden, only capped.
+/// Resolves a bare program name against `PATH`, mirroring the search the
+/// OS would perform — used to fail fast (and legibly) before the program
+/// enters the sandbox wrapper, which cannot report a missing binary.
+fn resolve_in_path(program: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
 fn render(
     program: &str,
     args: &[String],
@@ -318,13 +344,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disallowed_program_is_invalid_input() {
+    async fn writes_outside_the_workspace_are_denied() {
         let (_guard, root) = temp_root();
-        let tool = RunCommandTool::with_allowed(["echo"]);
-        let err = run(&tool, &root, json!({"program": "rm", "args": ["-rf", "."]}))
-            .await
-            .expect_err("disallowed");
-        assert!(matches!(err, ToolError::InvalidInput(msg) if msg.contains("not allowed")));
+        // The sandbox's writable set is workspace + temp + cargo home; the
+        // real HOME sits outside all three, so a write there must fail.
+        let target = std::env::var("HOME")
+            .map(|home| std::path::PathBuf::from(home).join("loom-sandbox-escape-probe"))
+            .expect("HOME is set");
+        let _ = std::fs::remove_file(&target);
+        let tool = RunCommandTool::new();
+        let output = run(
+            &tool,
+            &root,
+            json!({"program": "touch", "args": [target.to_str().expect("utf8")]}),
+        )
+        .await
+        .expect("the call itself succeeds");
+        assert!(
+            !target.exists(),
+            "the sandbox must deny writes outside the workspace"
+        );
+        assert!(
+            !output.content.contains("exit status: 0"),
+            "{}",
+            output.content
+        );
+        let _ = std::fs::remove_file(&target);
     }
 
     #[tokio::test]
@@ -685,7 +730,8 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured
         let policy = CommandPolicy::parse("[[command]]\nprogram = \"git\"\n").expect("policy");
         let tool = RunCommandTool::with_policy(policy);
         assert!(
-            tool.spec().description.contains("Allowed: `cargo`, `git`."),
+            tool.spec().description.contains("Escalated,")
+                && tool.spec().description.contains("`git`"),
             "{}",
             tool.spec().description
         );

@@ -94,10 +94,16 @@ pub enum PolicyError {
     },
 }
 
-/// One allow-listed program and its limits.
+/// One policy rule: escalation grants and limits for a program.
+///
+/// Rules no longer gate *whether* a program runs — every bare name may
+/// run inside the OS sandbox. A rule is the escalation layer: what a
+/// program may do beyond the boxed default (network, extra writable
+/// paths, unsandboxed execution) and the limits that always apply
+/// (timeout, output window, env scrubbing).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandRule {
-    /// The bare executable name this rule admits.
+    /// The bare executable name this rule escalates.
     pub program: String,
     /// Wall-time cap in seconds; `None` leaves the engine's per-turn
     /// timeout as the only bound.
@@ -108,10 +114,18 @@ pub struct CommandRule {
     /// Extra environment names scrubbed from the child, beyond the
     /// credential floor.
     pub env_scrub: Vec<String>,
+    /// Grant network access inside the sandbox for this program.
+    pub network: bool,
+    /// Run this program outside the OS sandbox entirely — the loudest
+    /// possible grant, for operators who mean it.
+    pub sandbox: bool,
+    /// Extra writable directories (absolute paths) beyond the
+    /// workspace/temp/cargo-home set.
+    pub extra_writable: Vec<String>,
 }
 
 impl CommandRule {
-    /// A rule admitting `program` with shipped-default limits.
+    /// A rule escalating `program` with shipped-default limits.
     #[must_use]
     fn bare(program: impl Into<String>) -> Self {
         Self {
@@ -119,6 +133,9 @@ impl CommandRule {
             timeout_secs: None,
             max_output_bytes: None,
             env_scrub: Vec::new(),
+            network: false,
+            sandbox: true,
+            extra_writable: Vec::new(),
         }
     }
 }
@@ -190,11 +207,20 @@ impl CommandPolicy {
             max_output_bytes: Option<usize>,
             #[serde(default)]
             env_scrub: Vec<String>,
+            #[serde(default)]
+            network: bool,
+            #[serde(default = "default_sandbox")]
+            sandbox: bool,
+            #[serde(default)]
+            extra_writable: Vec<String>,
         }
         let manifest: Manifest = toml::from_str(text).map_err(|error| PolicyError::Invalid {
             path: path.clone(),
             message: error.to_string(),
         })?;
+        fn default_sandbox() -> bool {
+            true
+        }
         let mut policy = Self::cargo_only();
         for entry in manifest.command {
             let rule = CommandRule {
@@ -202,6 +228,9 @@ impl CommandPolicy {
                 timeout_secs: entry.timeout_secs,
                 max_output_bytes: entry.max_output_bytes,
                 env_scrub: entry.env_scrub,
+                network: entry.network,
+                sandbox: entry.sandbox,
+                extra_writable: entry.extra_writable,
             };
             validate(&rule, &path)?;
             if policy.rule(&rule.program).is_some() {
@@ -292,6 +321,15 @@ fn validate(rule: &CommandRule, path: &str) -> Result<(), PolicyError> {
             });
         }
     }
+    for dir in &rule.extra_writable {
+        let path_buf = std::path::Path::new(dir);
+        if !path_buf.is_absolute() {
+            return Err(PolicyError::Invalid {
+                path: path.to_owned(),
+                message: format!("extra_writable entry \"{dir}\" must be an absolute path"),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -358,7 +396,7 @@ mod tests {
 
     #[test]
     fn unknown_manifest_fields_are_rejected() {
-        let error = CommandPolicy::parse("[[command]]\nprogram = \"git\"\nsandbox = true\n")
+        let error = CommandPolicy::parse("[[command]]\nprogram = \"git\"\nallow_network = true\n")
             .expect_err("unknown field");
         assert!(error.to_string().contains("unknown field"), "{error}");
     }

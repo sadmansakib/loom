@@ -220,15 +220,20 @@ treated as hypotheses until Loom's own eval reproduces them.
      spill savings from any stored session); mechanism attribution
      needs persisted events, not just transcripts.
    Seam: the live eval reports and the event stream.
-2. **Sandboxed shell** (G2, G3, G5). Strong models working through a
+2. **Sandboxed shell** (G2, G3, G5) — **shipped 2026-10-08**. Strong
+   models working through a
    shell are ~53% cheaper than through fixed tool menus (Fan et al.,
    2026); Pi, mini-SWE-agent, and Terminus run mostly or only on a
-   shell. Replace "allow-list of bare programs" with "any command
-   inside an OS sandbox": Seatbelt on macOS, Landlock/bubblewrap on
-   Linux, writes confined to the workspace, network off by default, the
-   credential scrub floor kept. The shipped command policy becomes the
-   escalation layer. Keep bounded head+tail capture and process-group
-   kill. Seam: `run_command` and the policy module.
+   shell. Replaced "allow-list of bare programs" with "any command
+   inside an OS sandbox": Seatbelt on macOS, bubblewrap on Linux
+   (Landlock needs `unsafe`, which the workspace forbids), writes
+   confined to workspace + temp + cargo home, network off by default,
+   the credential scrub floor kept. The shipped command policy became
+   the escalation layer (`network`, `extra_writable`, `sandbox =
+   false`, plus the existing timeout/output-window/env-scrub limits).
+   Bounded head+tail capture and process-group kill kept; bare names
+   resolve on `PATH` before wrapping so missing-program errors stay
+   legible. Seam: `run_command`, `verify`, and the policy module.
 3. **Command-aware output filters** (G3, G4). RTK-style per-command
    reducers for *successful* and general output (git status/diff/log,
    ls/tree, grep, test passes) — RTK reports a 56% average reduction —

@@ -267,7 +267,7 @@ fn build_registry(policy: &CommandPolicy) -> Result<ToolRegistry, EngineError> {
         "run_command",
         Box::new(RunCommandTool::with_policy(policy.clone())),
     )?;
-    register("verify", Box::new(VerifyTool::new()))?;
+    register("verify", Box::new(VerifyTool::with_policy(policy.clone())))?;
     Ok(registry)
 }
 
@@ -281,8 +281,9 @@ pub fn default_system_prompt() -> String {
         "You are Loom, a coding agent working inside one workspace. Use the provided \
          tools to inspect and change the workspace: list and search before reading, \
          read before editing, write or edit files to make changes, and verify \
-         changes with cargo. Run allow-listed commands (cargo) directly only when \
-         you need a raw command. Prefer the smallest change that works. When you \
+         changes with cargo. Raw commands run inside an OS sandbox — writes stay \
+         in the workspace and the network is off — so run any bare program the \
+         task needs. Prefer the smallest change that works. When you \
          answer, be concise and name the workspace-relative paths you relied on.\n\
          Spend context carefully: issue every independent read-only call in \
          the same turn — they run in parallel — and never mix a mutation \

@@ -34,6 +34,7 @@ use crate::evidence::{
     Evidence, cargo_diagnostics, go_diagnostics, go_failures, libtest_failures, nextest_junit,
     pytest_failures, python_diagnostics,
 };
+use crate::policy::CommandPolicy;
 
 /// The build system a verification runs for. Variant meanings live in
 /// the command table and the `ecosystem` field docs.
@@ -97,7 +98,11 @@ impl Ecosystem {
 
 /// The `verify` tool.
 #[derive(Debug, Default)]
-pub struct VerifyTool;
+pub struct VerifyTool {
+    /// Escalation rules for the build drivers (`cargo`, `go`, …) —
+    /// drivers without a rule run inside the boxed default sandbox.
+    policy: CommandPolicy,
+}
 
 /// How much verification to run.
 ///
@@ -140,7 +145,17 @@ impl VerifyTool {
     /// The shipped tool.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self {
+            policy: CommandPolicy::cargo_only(),
+        }
+    }
+
+    /// A tool under an explicit policy (the engine's entry point after
+    /// loading a workspace manifest), so build drivers escalate exactly
+    /// like `run_command` programs.
+    #[must_use]
+    pub fn with_policy(policy: CommandPolicy) -> Self {
+        Self { policy }
     }
 }
 
@@ -181,9 +196,17 @@ impl Tool for VerifyTool {
                     ))
                 })?;
             let (program, args) = ecosystem.command(input.scope)?;
-            let output =
-                crate::exec::run_bounded(program, &args, ctx, &crate::exec::ExecLimits::default())
-                    .await?;
+            // Drivers escalate through the same policy rules as
+            // `run_command`; a driver without a rule runs inside the
+            // boxed default sandbox (network off).
+            let rule = self.policy.rule(program);
+            let limits = crate::exec::ExecLimits {
+                stream_window: rule.and_then(|rule| rule.max_output_bytes),
+                scrub: rule.map(|rule| rule.env_scrub.clone()).unwrap_or_default(),
+            };
+            let grants = crate::sandbox::SandboxGrants::from_rule(rule);
+            let sandbox = crate::sandbox::Sandbox::resolve(&ctx.workspace_root, grants);
+            let output = crate::exec::run_bounded(program, &args, ctx, &limits, &sandbox).await?;
             let effects = ToolEffects::none().with_command(CommandEffect::new(
                 program,
                 args.clone(),

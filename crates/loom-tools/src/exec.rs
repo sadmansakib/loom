@@ -68,21 +68,28 @@ impl Drop for GroupKillOnDrop {
 ///
 /// Mirrors the `run_command` execution contract: bare program name, no shell,
 /// workspace-root working directory, cancellation by dropping the future.
-/// The child leads its own process group and the group is killed on drop,
-/// so a timeout or cancel reaps grandchildren too — with tokio's plain
-/// `kill_on_drop` only the direct child died (documented debt, now closed).
+/// The child leads its own process group and the group is killed on
+/// drop, so a timeout or cancel reaps grandchildren too — with tokio's
+/// plain `kill_on_drop` only the direct child died (documented debt,
+/// now closed).
+///
+/// `sandbox` confines the command at the OS level when its grants
+/// enable it; the wrapper leads the process group, so the group-kill
+/// and pipe-drain contract covers everything the command spawns.
 pub(crate) async fn run_bounded(
     program: &str,
     args: &[String],
     ctx: &ToolContext,
     limits: &ExecLimits,
+    sandbox: &crate::sandbox::Sandbox,
 ) -> Result<std::process::Output, ToolError> {
     let window = limits.stream_window;
     let head_cap = window.unwrap_or(STREAM_HEAD_BYTES);
     let tail_cap = window.unwrap_or(STREAM_TAIL_BYTES);
-    let mut child = CommandWrap::with_new(program, |command| {
+    let (wrapper, wrapped_args) = sandbox.wrap(program, args);
+    let mut child = CommandWrap::with_new(wrapper, |command| {
         command
-            .args(args)
+            .args(&wrapped_args)
             .current_dir(&ctx.workspace_root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -274,10 +281,13 @@ mod tests {
 
         // Cancelling the task drops the future mid-run — the same
         // cancellation path a timeout or Ctrl-C takes in production.
-        let task =
-            tokio::spawn(
-                async move { run_bounded("sh", &args, &ctx, &ExecLimits::default()).await },
-            );
+        let sandbox = crate::sandbox::Sandbox::resolve(
+            &ctx.workspace_root,
+            crate::sandbox::SandboxGrants::from_rule(None),
+        );
+        let task = tokio::spawn(async move {
+            run_bounded("sh", &args, &ctx, &ExecLimits::default(), &sandbox).await
+        });
         let alive = || {
             std::process::Command::new("pgrep")
                 .arg("-f")
