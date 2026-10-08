@@ -336,6 +336,16 @@ treated as hypotheses until Loom's own eval reproduces them.
    and for verification, low in between (ForgeCode). The loop sets
    effort per turn; adapters only translate it. Seam: provider
    capabilities and the request compiler.
+
+   **Evidence-based deferral (2026-10-08).** No measurable lever exists
+   today: the OpenRouter catalog lists zero reasoning-capable free
+   models (and the adapter deliberately never sends OpenRouter's
+   `reasoning` object — wrong for some upstream models), the funded
+   DeepSeek key is drained, tool-argument-name aliases failed 0 times
+   in the 838-call corpus (item 6 survey), the 2000-line read default
+   won its A/B (item 7), and Loom has a single edit format. Revisit
+   when a funded DeepSeek key returns, a reasoning-capable free model
+   appears, or item 14's multi-provider work makes profiles structural.
 10. **Pruning, phase 2** (G3).
     - **Turn-age masking**: stub read-only results older than K turns
       even below the window trigger — SWE-agent's last-5-observations
