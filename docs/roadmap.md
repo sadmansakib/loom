@@ -319,6 +319,14 @@ treated as hypotheses until Loom's own eval reproduces them.
      planning cut cost ~30% for strong models (Fan et al.).
    Seam: the stop-reason branch of the loop; a kernel-owned tool.
 
+   **Refusal half shipped 2026-10-08 (phase A).** The EndTurn gate
+   refuses once when files changed since the last green check
+   (`exit status: 0` from a command-shaped result; fused write+verify
+   satisfies it in one step). A/B on the free tier: the refusal fired
+   exactly once on the checkless canary (+2 turns) and never on the
+   synthesis task — the gate is cheap insurance, not a turn-saver. The
+   `todo` tool stays deferred.
+
 ### Mid term — context and model policy
 
 9. **Model profiles** (G3, G7). A `ModelProfile` beside

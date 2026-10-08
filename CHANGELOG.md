@@ -3,6 +3,21 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-08 — Completion gate (roadmap item 8, phase A)
+
+When the model tries to finish while files changed since the last green
+check (`exit status: 0` from a command-bearing tool), the agent refuses
+the EndTurn once: it lists the changed paths, asks for the relevant
+checks, and quotes the original task (Terminus-KIRA double-confirm
+shape). A second finish attempt is always accepted — the gate nags, it
+does not trap. Fused write+verify satisfies the gate in one step, and
+checks only count when shaped like commands. Free-tier A/B: the refusal
+fired exactly once on the checkless canary (B2, +2 turns) and never on
+the synthesis task (B15), which now converges edit→test→green in 15
+turns — attributed to items 4–6, not the gate; the gate ships as cheap
+insurance (542 tests green, replay made one-canned-turn drift-tolerant).
+The roadmap's `todo`-tool half is deferred to a later phase.
+
 ## 2026-10-08 — Call repair and cheap re-reads (roadmap item 6)
 
 Two robustness halves, chosen by corpus: a whitespace-trim fallback for

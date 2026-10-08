@@ -35,7 +35,9 @@ use loom_kernel::model::{
 };
 use loom_kernel::session::{PlannedTurn, Session, TaskRecord, TaskStatus};
 use loom_kernel::store::{MemorySessionStore, SessionStore, StoreError};
-use loom_kernel::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolSpec};
+use loom_kernel::tool::{
+    CommandEffect, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolRegistry, ToolSpec,
+};
 use loom_kernel::transcript::{
     AssistantMessage, Item, ItemIndex, ToolArguments, ToolCall, ToolCallId, ToolFailure, ToolStatus,
 };
@@ -217,6 +219,42 @@ impl Tool for FailingTool {
             *invocations.lock().unwrap() += 1;
             Err(ToolError::Execution("boom".to_owned()))
         })
+    }
+}
+
+/// A tool that records a file write, optionally with a fused green check —
+/// drives the completion gate's mutation/green tracking without a filesystem.
+struct WritingTool {
+    spec: ToolSpec,
+    green: bool,
+}
+
+impl Tool for WritingTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    fn call<'a>(
+        &'a self,
+        _input: Value,
+        _ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
+        let mut effects = ToolEffects::default().with_file_written("src/lib.rs".to_owned());
+        effects = effects.with_command(CommandEffect::new(
+            "cargo",
+            vec!["check".to_owned()],
+            Some(0),
+        ));
+        let content = if self.green {
+            String::from("edited src/lib.rs\n--- verify ---\n$ cargo check\nexit status: 0")
+        } else {
+            String::from("edited src/lib.rs")
+        };
+        Box::pin(async move { Ok(ToolOutput::new(content).with_effects(effects)) })
     }
 }
 
@@ -450,6 +488,122 @@ async fn end_turn_completes_the_task_and_commits_the_assistant() {
     assert!(matches!(kinds[3], EventKind::ModelCompleted { .. }));
     assert!(matches!(kinds[4], EventKind::TaskCompleted));
     assert_eq!(kinds.len(), 5);
+}
+
+#[tokio::test]
+async fn an_unverified_finish_is_refused_once_then_accepted() {
+    // Roadmap item 8: a write lands, the model tries to finish without a
+    // green check, the loop injects one refusal quoting the changed path
+    // and the original task, and a second EndTurn completes the task.
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(WritingTool {
+            spec: spec("write"),
+            green: false,
+        }))
+        .unwrap();
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            completed(
+                assistant(
+                    "working",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_1", "write", json!({}))],
+                ),
+                usage(10, 3, None),
+            ),
+            completed(
+                assistant("done", StopReason::EndTurn, Vec::new()),
+                usage(20, 5, None),
+            ),
+            completed(
+                assistant("really done", StopReason::EndTurn, Vec::new()),
+                usage(30, 7, None),
+            ),
+        ],
+    );
+    let requests = provider.requests_handle();
+    let mut session = Session::new(SessionId::new());
+    let (sink, _receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = agent(provider, registry, 10);
+
+    let summary = agent
+        .run_task(&mut session, "fix the bug", &sink, &token)
+        .await
+        .unwrap();
+
+    // Three model requests: write, refused finish, accepted finish.
+    assert_eq!(summary.model_requests, 3);
+    let requests = requests.lock().unwrap();
+    let refusal_projected = requests[2]
+        .messages
+        .iter()
+        .any(|m| matches!(m, Message::User { text } if text.contains("Hold on") && text.contains("src/lib.rs") && text.contains("fix the bug")));
+    assert!(refusal_projected, "the refusal must reach the model");
+    drop(requests);
+
+    // The refusal persists in the transcript as a user item.
+    assert!(
+        session
+            .transcript
+            .iter()
+            .any(|i| matches!(i, Item::User { text } if text.contains("Hold on")))
+    );
+    assert_eq!(summary.turns, 3);
+}
+
+#[tokio::test]
+async fn a_fused_green_check_finishes_without_refusal() {
+    // The same write carrying a fused `exit status: 0` check satisfies the
+    // gate: the first EndTurn completes the task.
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(WritingTool {
+            spec: spec("write"),
+            green: true,
+        }))
+        .unwrap();
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            completed(
+                assistant(
+                    "working",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_1", "write", json!({}))],
+                ),
+                usage(10, 3, None),
+            ),
+            completed(
+                assistant("done", StopReason::EndTurn, Vec::new()),
+                usage(20, 5, None),
+            ),
+        ],
+    );
+    let requests = provider.requests_handle();
+    let mut session = Session::new(SessionId::new());
+    let (sink, _receiver) = ChannelEventSink::new();
+    let token = CancellationToken::new();
+    let agent = agent(provider, registry, 10);
+
+    let summary = agent
+        .run_task(&mut session, "fix the bug", &sink, &token)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        summary.model_requests, 2,
+        "no refusal when the check is green"
+    );
+    let requests = requests.lock().unwrap();
+    assert!(
+        !requests[1]
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::User { text } if text.contains("Hold on")))
+    );
 }
 
 #[tokio::test]

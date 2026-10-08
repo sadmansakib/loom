@@ -728,6 +728,11 @@ impl Agent {
         // failure forces a change of approach instead of trial and error.
         let mut failures = FailureLedger::default();
 
+        // Completion gate (roadmap item 8): an EndTurn is refused once
+        // while unverified mutations are outstanding, so "done" always
+        // refers to a state some green check actually covered.
+        let mut completion = CompletionGate::default();
+
         for turn in 1..=self.max_turns {
             // Enforce the task's resource envelope before spending anything
             // further (§14). Checked once per turn, so the unit in flight when
@@ -785,6 +790,30 @@ impl Agent {
                             "EndTurn response carried tool calls".to_owned(),
                         ));
                     }
+                    // Completion gate (roadmap item 8): refuse the finish
+                    // once when files changed since the last green check,
+                    // quoting the changed paths and the original task. The
+                    // refusal is a normal user item — persisted, projected,
+                    // and answered like any other turn. One refusal only:
+                    // the model may insist, and the loop never deadlocks
+                    // with a task that cannot be verified.
+                    if completion.pending() && !completion.refused && turn < self.max_turns {
+                        completion.refused = true;
+                        self.commit(session, assistant, Vec::new())?;
+                        let text = completion_refusal(session);
+                        let reminder = Item::User { text };
+                        if let Some(store) = &self.store {
+                            store
+                                .append_item(&session.id, session.next_index(), &reminder)
+                                .map_err(persistence)?;
+                        }
+                        session
+                            .push_item(reminder)
+                            .map_err(|error| TaskError::Internal(error.to_string()))?;
+                        accounting.turns = turn;
+                        accounting.sync(session, task_id);
+                        continue;
+                    }
                     self.commit(session, assistant, Vec::new())?;
                     accounting.turns = turn;
                     accounting.sync(session, task_id);
@@ -808,6 +837,13 @@ impl Agent {
                             &recent_changes(session),
                         )
                         .await;
+                    // The gate learns from every result before the turn
+                    // commits: mutations bump the epoch, green checks pin
+                    // it. A fused edit (write + green check in one result)
+                    // lands verified.
+                    for result in &results {
+                        completion.note(result);
+                    }
                     // A batch interrupted by cancellation still commits its
                     // completed results plus cancelled fillers (§6.1, §10).
                     self.commit(session, assistant, results)?;
@@ -1171,6 +1207,81 @@ fn ledger_key(call: &ToolCall) -> (String, String) {
     )
 }
 
+/// Completion-gate state for one task (roadmap item 8).
+///
+/// Tracks whether any file mutations are outstanding — changed after the
+/// last green check the model ran. "Green check" is detected from the
+/// result shape every command-bearing tool shares (`$ cmd` first, an
+/// `exit status: 0` line), covering `verify`, `run_command`, and the fused
+/// edit check alike.
+#[derive(Default)]
+struct CompletionGate {
+    /// Mutation epoch: bumped on every committed file write or delete.
+    mutations: u64,
+    /// The epoch that had a green check; `None` when nothing ever passed.
+    verified_at: Option<u64>,
+    /// Whether the one-shot refusal already fired.
+    refused: bool,
+}
+
+impl CompletionGate {
+    /// Learns one committed tool result.
+    fn note(&mut self, result: &ToolResult) {
+        if !result.effects.files_written.is_empty() || !result.effects.files_deleted.is_empty() {
+            self.mutations += 1;
+        }
+        if green_check(result) {
+            self.verified_at = Some(self.mutations);
+        }
+    }
+
+    /// Whether unverified mutations are outstanding.
+    fn pending(&self) -> bool {
+        self.mutations > 0 && self.verified_at != Some(self.mutations)
+    }
+}
+
+/// Whether a result is a green command run: successful, command-shaped
+/// (`$ …`), and reporting exit status 0.
+fn green_check(result: &ToolResult) -> bool {
+    if !matches!(result.status, ToolStatus::Success) {
+        return false;
+    }
+    let mut command_shaped = false;
+    for line in result.content.lines() {
+        if line.starts_with("$ ") {
+            command_shaped = true;
+        }
+        if line.trim() == "exit status: 0" {
+            return command_shaped;
+        }
+    }
+    false
+}
+
+/// The one-shot refusal text: changed paths plus the original task,
+/// head-bounded so an oversized instruction cannot balloon the turn.
+fn completion_refusal(session: &Session) -> String {
+    let paths = recent_changes(session);
+    let instruction = session
+        .transcript
+        .iter()
+        .find_map(|item| match item {
+            Item::User { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let instruction_head = instruction.chars().take(800).collect::<String>();
+    format!(
+        "Hold on — these files changed since the last green check: {}. \
+         Before finishing, run the relevant checks (verify, cargo test, \
+         cargo check) and fix what fails. If the checks pass, the task is \
+         complete. Original task: {}",
+        paths.join(", "),
+        instruction_head,
+    )
+}
+
 /// Workspace-relative paths the task has mutated so far (2F, ADR-017).
 ///
 /// Derived from the recorded [`ToolEffects`](crate::tool::ToolEffects) on
@@ -1325,10 +1436,12 @@ fn duration_millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_RESERVED_OUTPUT_TOKENS, MAX_RESERVED_OUTPUT_TOKENS, OutputReservation,
-        derive_reserved_output_tokens,
+        CompletionGate, DEFAULT_RESERVED_OUTPUT_TOKENS, MAX_RESERVED_OUTPUT_TOKENS,
+        OutputReservation, completion_refusal, derive_reserved_output_tokens, green_check,
     };
     use crate::model::ModelCapabilities;
+    use crate::session::Session;
+    use crate::transcript::{Item, ToolResult, ToolStatus};
 
     #[test]
     fn auto_honors_a_declared_output_maximum_up_to_the_hard_cap() {
@@ -1373,5 +1486,79 @@ mod tests {
             derive_reserved_output_tokens(&caps, OutputReservation::Fixed(60_000)),
             5_000,
         );
+    }
+
+    fn gate_result(content: &str, written: &[&str]) -> ToolResult {
+        let mut effects = crate::tool::ToolEffects::default();
+        for path in written {
+            effects = effects.with_file_written((*path).to_owned());
+        }
+        let mut r = ToolResult::new(
+            crate::transcript::ToolCallId::try_from("call_1".to_owned()).unwrap(),
+            ToolStatus::Success,
+            content.to_owned(),
+            false,
+        );
+        r.effects = effects;
+        r
+    }
+
+    #[test]
+    fn the_gate_demands_a_green_check_after_mutations() {
+        let mut gate = CompletionGate::default();
+        assert!(!gate.pending(), "no mutations yet: nothing to verify");
+        gate.note(&gate_result("$ cargo check\nexit status: 0\n", &[]));
+        assert!(!gate.pending(), "green without mutations is not pending");
+        gate.note(&gate_result("edited src/lib.rs", &["src/lib.rs"]));
+        assert!(gate.pending(), "a write after green is outstanding");
+        gate.note(&gate_result("$ cargo test\nexit status: 0\n", &[]));
+        assert!(!gate.pending(), "green after the write settles it");
+        gate.note(&gate_result("$ cargo test\nexit status: 101\n", &[]));
+        assert!(
+            !gate.pending(),
+            "a failing check alone does not reopen the gate: no files changed since the green"
+        );
+        gate.note(&gate_result("edited src/main.rs", &["src/main.rs"]));
+        assert!(gate.pending(), "a write after the failing check reopens it");
+    }
+
+    #[test]
+    fn a_fused_write_with_a_green_check_lands_verified() {
+        let mut gate = CompletionGate::default();
+        gate.note(&gate_result(
+            "edited src/lib.rs\n--- verify ---\n$ cargo check\nexit status: 0",
+            &["src/lib.rs"],
+        ));
+        assert!(!gate.pending(), "effects bump before the green pin");
+    }
+
+    #[test]
+    fn green_checks_must_be_command_shaped() {
+        // A tool result that merely mentions the marker is not a check.
+        assert!(!green_check(&gate_result("exit status: 0", &[])));
+        assert!(green_check(&gate_result(
+            "$ cargo test\nexit status: 0",
+            &[]
+        )));
+    }
+
+    #[test]
+    fn the_refusal_quotes_changed_paths_and_the_task() {
+        let mut session = Session::new(crate::id::SessionId::new());
+        session
+            .push_item(Item::User {
+                text: "fix the bug".to_owned(),
+            })
+            .unwrap();
+        session
+            .push_item(Item::ToolResult(gate_result(
+                "edited src/lib.rs",
+                &["src/lib.rs"],
+            )))
+            .unwrap();
+        let text = completion_refusal(&session);
+        assert!(text.contains("src/lib.rs"), "{text}");
+        assert!(text.contains("fix the bug"), "{text}");
+        assert!(text.contains("cargo test"), "{text}");
     }
 }

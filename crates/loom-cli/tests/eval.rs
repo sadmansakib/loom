@@ -485,6 +485,11 @@ struct ReplayProvider {
     model: String,
     script: Mutex<VecDeque<ModelResponse>>,
     served: AtomicUsize,
+    /// How many past-the-recording turns were served. Loop-level
+    /// additions that react after the recording's final EndTurn (the
+    /// completion gate's refusal) need one extra model beat; genuine
+    /// drift needs many, so anything beyond one still fails loud.
+    overruns: Arc<AtomicUsize>,
 }
 
 impl ReplayProvider {
@@ -493,7 +498,22 @@ impl ReplayProvider {
             model: model.to_owned(),
             script: Mutex::new(exchanges.iter().map(|e| e.response.clone()).collect()),
             served: AtomicUsize::new(0),
+            overruns: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// How many past-the-recording beats were served (the completion
+    /// gate's refusal turn); the turn-count assertion allows exactly
+    /// this many extra assistant messages.
+    #[allow(dead_code)]
+    fn served_overruns(&self) -> usize {
+        self.overruns.load(Ordering::SeqCst)
+    }
+
+    /// Shared handle to the overrun counter, readable after the provider
+    /// itself is boxed into the agent.
+    fn overruns_handle(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.overruns)
     }
 }
 
@@ -514,10 +534,20 @@ impl ModelProvider for ReplayProvider {
     fn stream<'a>(&'a self, request: &'a ModelRequest) -> ModelStream<'a> {
         assert_eq!(request.model, self.model, "replay: model drifted");
         let next = self.script.lock().unwrap().pop_front().unwrap_or_else(|| {
-            panic!(
-                "replay script exhausted after {} responses",
-                self.served.load(Ordering::SeqCst)
-            )
+            let overruns = self.overruns.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                overruns == 0,
+                "replay drifted: a second turn past the recording"
+            );
+            ModelResponse {
+                message: AssistantMessage {
+                    content: String::from("(replay: past the end of the recording)"),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    stop_reason: StopReason::EndTurn,
+                },
+                usage: Usage::default(),
+            }
         });
         self.served.fetch_add(1, Ordering::SeqCst);
         Box::pin(futures::stream::iter([Ok(ModelEvent::Completed(next))]))
@@ -1724,6 +1754,7 @@ async fn outcome_gates_reject_an_untouched_workspace() {
 /// assistant turns verbatim in the transcript.
 async fn assert_replay_equivalence(task: &EvalTask, model: &str, exchanges: &[Exchange]) {
     let replay = ReplayProvider::new(model, exchanges);
+    let overruns = replay.overruns_handle();
     let (report, _recorded, session) =
         run_once(task, model, "replay", Box::new(replay), None).await;
     assert!(
@@ -1740,13 +1771,17 @@ async fn assert_replay_equivalence(task: &EvalTask, model: &str, exchanges: &[Ex
             _ => None,
         })
         .collect();
+    // One beat past the recording is the completion gate's refusal on
+    // old recordings; the gate lands in new recordings natively.
+    let expected_turns = exchanges.len() + overruns.load(Ordering::SeqCst);
     assert_eq!(
         replayed.len(),
-        exchanges.len(),
-        "{}: replay produced {} assistant turns, recording has {}",
+        expected_turns,
+        "{}: replay produced {} assistant turns, recording has {} (+{} gate beats)",
         task.id,
         replayed.len(),
-        exchanges.len()
+        exchanges.len(),
+        overruns.load(Ordering::SeqCst)
     );
     for (i, (got, recorded)) in replayed.iter().zip(exchanges).enumerate() {
         assert_eq!(
