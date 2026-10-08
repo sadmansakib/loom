@@ -362,6 +362,16 @@ treated as hypotheses until Loom's own eval reproduces them.
     - Stubs stay one line: models rarely use recovery hints (Fan et al.).
     Every addition keeps the checkpoint freeze: one cache miss per
     decision. Seam: `PruningContextCompiler`, census.
+    **Turn-age masking shipped 2026-10-09** (default K=8, `PruneConfig::
+    age_mask_turns`; episodic via the same reclaim gate, checkpoint freeze
+    kept). A/B on the longest tasks (B9/B14): dormant at current transcript
+    sizes — no stub fired, both solved, no regression — so it ships as
+    bounded-growth insurance, not a measured win. **Cold-cache pruning,
+    reasoning clearing, and usage-calibrated estimates deferred with
+    evidence**: eval requests are back-to-back (gap < cache TTL), the free
+    eval model emits no reasoning traces, and bytes÷3 already tracks billed
+    input within ±20% (median ratios: nemotron 0.97, deepseek 0.88, deepseek
+    large requests 1.22 — conservative exactly where triggers matter).
 11. **Deterministic openers** (G2, G4). Runtime-executed steps before
     the first model turn, chosen by task shape: read files the prompt
     names, `git diff` for changed files, a baseline `verify` to capture

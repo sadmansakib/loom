@@ -68,6 +68,12 @@ pub struct PruneConfig {
     pub protected_tail_turns: usize,
     /// Errors older than this many turns are stale.
     pub stale_error_turns: usize,
+    /// Turn-age masking (roadmap item 10): stub successful read-only
+    /// results older than this many assistant turns *even below the
+    /// window trigger* — SWE-agent's last-observations ablation beat
+    /// full history (18.0 vs 15.0), and a window-relative trigger never
+    /// fires on a large context. `None` disables the behavior.
+    pub age_mask_turns: Option<usize>,
 }
 
 impl PruneConfig {
@@ -93,6 +99,7 @@ impl Default for PruneConfig {
             protected_tail_tokens: 20_000,
             protected_tail_turns: 3,
             stale_error_turns: 4,
+            age_mask_turns: Some(8),
         }
     }
 }
@@ -108,6 +115,9 @@ pub enum StubReason {
     StaleError,
     /// A large read-only result aged out of the unprotected region.
     AgedOut,
+    /// A read-only result older than `age_mask_turns` (turn-age
+    /// masking, independent of the window trigger).
+    TurnAge,
 }
 
 impl StubReason {
@@ -126,6 +136,9 @@ impl StubReason {
             }
             Self::AgedOut => {
                 "[pruned] aged out by context pruning; re-run the tool to recover the content"
+            }
+            Self::TurnAge => {
+                "[pruned] read-only result older than the kept turn window; re-run the tool to recover the content"
             }
         }
     }
@@ -212,7 +225,8 @@ impl ContextCompiler for PruningContextCompiler {
             // worth taking. Fails closed when nothing is prunable or the
             // pruned view still does not fit.
             Err(overrun @ ContextError::BudgetExceeded { .. }) => {
-                let (decisions, _reclaim) = decide(session, tools, self.config, &*self.estimator);
+                let (decisions, _reclaim) =
+                    decide(session, tools, self.config, &*self.estimator, true);
                 if decisions.is_empty() {
                     return Err(overrun);
                 }
@@ -271,9 +285,25 @@ impl ContextCompiler for PruningContextCompiler {
         // what the frozen stubs already reclaim; otherwise a session parked
         // above the trigger would re-decide (and rewrite earlier projected
         // messages) on every turn.
+        //
+        // Turn-age masking (roadmap item 10) adds a second trigger arm:
+        // when configured, the decision pass also runs *below* the window
+        // trigger so old read-only results are masked as they age out. The
+        // same reclaim gate applies — an aging batch is only worth a cache
+        // miss when it reclaims at least `min_reclaim_tokens` beyond the
+        // frozen checkpoint — so the projection stays byte-stable between
+        // aging batches.
         let trigger = self.config.trigger_tokens(budget.max_input_tokens);
-        if compiled.census.total > trigger {
-            let (decisions, reclaim) = decide(session, tools, self.config, &*self.estimator);
+        let window_triggered = compiled.census.total > trigger;
+        let age_masking = self.config.age_mask_turns.is_some();
+        if window_triggered || age_masking {
+            let (decisions, reclaim) = decide(
+                session,
+                tools,
+                self.config,
+                &*self.estimator,
+                window_triggered,
+            );
             let already = checkpoint.as_ref().map_or(0, |frozen| {
                 frozen_reclaim(session, &frozen.stubs, &*self.estimator)
             });
@@ -398,6 +428,7 @@ fn decide(
     registry: &ToolRegistry,
     config: PruneConfig,
     estimator: &dyn TokenEstimator,
+    window_triggered: bool,
 ) -> (Vec<StubDecision>, u64) {
     let transcript: &[Item] = &session.transcript;
 
@@ -587,11 +618,13 @@ fn decide(
     // (checked in `compile`), never a cap: every unprotected read-only
     // result is stubbed, so the projection cannot grow without bound once
     // the trigger is crossed. Sorted largest-first for a deterministic,
-    // size-prioritised order.
+    // size-prioritised order. Window-triggered (or budget-rescue) passes
+    // only: turn-age masking alone must not nuke the whole history.
     let mut aged: Vec<&ResultFacts> = results
         .iter()
         .filter(|facts| {
-            facts.index < protected_from
+            window_triggered
+                && facts.index < protected_from
                 && facts.status == ToolStatus::Success
                 && facts.read_call.is_some()
                 && !stubbed_ids.contains(facts.call_id.as_str())
@@ -607,6 +640,33 @@ fn decide(
             &mut reclaim_tokens,
             estimator,
         );
+    }
+
+    // (5) Turn-age masking: stub successful read-only results older than
+    // `age_mask_turns` assistant turns, independent of the window
+    // trigger — the transcript replay is capped at a rolling window, so
+    // a long task's request size plateaus instead of growing without
+    // bound. Runs after the other passes so already-stubbed calls keep
+    // their more specific reasons; the protected tail always wins.
+    if let Some(max_age) = config.age_mask_turns {
+        for earlier in &results {
+            if earlier.index >= protected_from || stubbed_ids.contains(earlier.call_id.as_str()) {
+                continue;
+            }
+            if earlier.status == ToolStatus::Success
+                && earlier.read_call.is_some()
+                && total_turns.saturating_sub(earlier.turn) > max_age
+            {
+                add_stub(
+                    earlier,
+                    StubReason::TurnAge,
+                    &mut stubbed,
+                    &mut stubbed_ids,
+                    &mut reclaim_tokens,
+                    estimator,
+                );
+            }
+        }
     }
 
     (stubbed, reclaim_tokens)
@@ -885,6 +945,171 @@ mod tests {
             .expect("compiles");
         assert!(compiled.prune_checkpoint.is_none());
         assert!(compiled.census.total < 64_000);
+    }
+
+    /// A 100 KiB read at turn 1, 60 KiB of later history, nine filler
+    /// turns: the read is older than `age_mask_turns` (default 8), sits
+    /// outside the default 20 K-token protected tail (the later bulk
+    /// carries the tail past it), and its ~33 K estimated tokens clear
+    /// the reclaim gate — masked *below* the window trigger.
+    #[test]
+    fn old_reads_are_masked_below_the_window_trigger() {
+        let mut items = vec![
+            Item::User {
+                text: "go".to_owned(),
+            },
+            assistant_calls("reading", vec![read_call("c1", "src/a.rs")]),
+            result("c1", &big("content", 100)),
+            assistant_text("filler one"),
+            assistant_text("filler two"),
+            assistant_text("filler three"),
+            assistant_calls("later bulk", vec![read_call("c2", "src/b.rs")]),
+            result("c2", &big("bulk", 60)),
+        ];
+        for turn in 4..=9 {
+            items.push(assistant_text(&format!("filler {turn}")));
+        }
+        let session = session_with(items);
+        let compiled = compiler(PruneConfig::default())
+            .compile(input(&session, None))
+            .expect("compiles");
+        let checkpoint = compiled.prune_checkpoint.as_ref().expect("age mask fired");
+        assert_eq!(
+            checkpoint.stubs,
+            vec![StubDecision {
+                call_id: "c1".to_owned(),
+                reason: StubReason::TurnAge,
+            }]
+        );
+        assert!(
+            messages_serialized(&compiled.request.messages)
+                .contains("older than the kept turn window")
+        );
+    }
+
+    /// A tiny old read reclaims less than `min_reclaim_tokens`, so the
+    /// aging batch is not worth a cache miss: no checkpoint, full
+    /// content, byte-stable projection.
+    #[test]
+    fn turn_age_masking_respects_the_reclaim_gate() {
+        let mut items = vec![
+            Item::User {
+                text: "go".to_owned(),
+            },
+            assistant_calls("reading", vec![read_call("c1", "src/a.rs")]),
+            result("c1", &big("content", 5)),
+        ];
+        for turn in 1..=9 {
+            items.push(assistant_text(&format!("filler {turn}")));
+        }
+        let session = session_with(items);
+        let compiled = compiler(PruneConfig::default())
+            .compile(input(&session, None))
+            .expect("compiles");
+        assert!(compiled.prune_checkpoint.is_none());
+        assert!(messages_serialized(&compiled.request.messages).contains("contentxxxx"));
+    }
+
+    /// A tight age window (2) with the default tails: the turn-2 read
+    /// masks (older than 2 turns, outside both tails thanks to the later
+    /// bulk); the turn-9 bulk read stays full (inside the protected
+    /// tail).
+    #[test]
+    fn turn_age_masking_leaves_the_protected_tail_alone() {
+        let items = vec![
+            Item::User {
+                text: "go".to_owned(),
+            },
+            assistant_text("warmup"),
+            assistant_calls("old read", vec![read_call("c5", "src/old.rs")]),
+            result("c5", &big("old", 100)),
+            assistant_text("four"),
+            assistant_text("five"),
+            assistant_text("six"),
+            assistant_text("seven"),
+            assistant_calls("tail bulk", vec![read_call("c9", "src/tail.rs")]),
+            result("c9", &big("tail", 60)),
+            assistant_text("done"),
+        ];
+        let session = session_with(items);
+        let compiled = compiler(PruneConfig {
+            age_mask_turns: Some(2),
+            ..PruneConfig::default()
+        })
+        .compile(input(&session, None))
+        .expect("compiles");
+        let checkpoint = compiled.prune_checkpoint.as_ref().expect("age mask fired");
+        assert_eq!(
+            checkpoint.stubs,
+            vec![StubDecision {
+                call_id: "c5".to_owned(),
+                reason: StubReason::TurnAge,
+            }]
+        );
+        assert!(messages_serialized(&compiled.request.messages).contains("tailxxxx"));
+    }
+
+    /// `age_mask_turns: None` opts out entirely: an old large read below
+    /// the window trigger keeps its full content and no checkpoint forms.
+    #[test]
+    fn turn_age_masking_off_when_none() {
+        let mut items = vec![
+            Item::User {
+                text: "go".to_owned(),
+            },
+            assistant_calls("reading", vec![read_call("c1", "src/a.rs")]),
+            result("c1", &big("content", 100)),
+        ];
+        for turn in 1..=9 {
+            items.push(assistant_text(&format!("filler {turn}")));
+        }
+        let session = session_with(items);
+        let compiled = compiler(PruneConfig {
+            age_mask_turns: None,
+            ..PruneConfig::default()
+        })
+        .compile(input(&session, None))
+        .expect("compiles");
+        assert!(compiled.prune_checkpoint.is_none());
+        assert!(messages_serialized(&compiled.request.messages).contains("contentxxxx"));
+    }
+
+    /// Feeding the checkpoint back keeps the projection byte-stable: the
+    /// aging decision is frozen, not recomputed per turn.
+    #[test]
+    fn an_age_mask_checkpoint_freezes_the_projection() {
+        let mut items = vec![
+            Item::User {
+                text: "go".to_owned(),
+            },
+            assistant_calls("reading", vec![read_call("c1", "src/a.rs")]),
+            result("c1", &big("content", 100)),
+            assistant_text("filler one"),
+            assistant_text("filler two"),
+            assistant_text("filler three"),
+            assistant_calls("later bulk", vec![read_call("c2", "src/b.rs")]),
+            result("c2", &big("bulk", 60)),
+        ];
+        for turn in 4..=9 {
+            items.push(assistant_text(&format!("filler {turn}")));
+        }
+        let session = session_with(items.clone());
+        let first = compiler(PruneConfig::default())
+            .compile(input(&session, None))
+            .expect("compiles");
+        let checkpoint = first.prune_checkpoint.clone().expect("fired");
+        items.push(assistant_text("one more turn"));
+        let session = session_with(items);
+        let second = compiler(PruneConfig::default())
+            .compile(input(&session, Some(&checkpoint)))
+            .expect("compiles");
+        // The frozen stub still applies and no new decision churned the
+        // older history: the projected prefix is unchanged.
+        assert!(
+            messages_serialized(&second.request.messages)
+                .contains("older than the kept turn window")
+        );
+        assert_eq!(second.prune_checkpoint.as_ref(), Some(&checkpoint));
     }
 
     /// A budget tight enough that the *inner* compiler refuses the

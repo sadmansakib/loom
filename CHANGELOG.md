@@ -3,6 +3,28 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — Pruning phase 2: turn-age masking (roadmap item 10)
+
+Read-only results older than 8 turns (configurable via `PruneConfig::
+age_mask_turns`) are stubbed even below the context-window trigger, with
+the same reclaim gate (batches stay episodic — one cache miss per
+decision) and the checkpoint freeze intact: the projection stays
+byte-stable between batches. Age masking alone never clears history —
+the whole-history pass still requires the window trigger or a budget
+rescue.
+
+Measured honestly: on the current stack the longest eval tasks no
+longer build large transcripts, so the mask stayed dormant in A/B
+(B9/B14 both solved, no stubs fired, no regression). It ships as
+bounded-growth insurance for longer horizons, after SWE-agent's
+last-5-observations ablation (18.0 vs 15.0). The other roadmap pieces
+are deferred with evidence: cold-cache pruning (eval requests are
+back-to-back, gap < cache TTL), reasoning clearing (the free eval model
+emits no reasoning traces), and usage-calibrated estimates (bytes÷3
+already tracks billed input within ±20%; median ratios nemotron 0.97,
+deepseek 0.88, large deepseek requests 1.22 — conservative exactly
+where triggers matter).
+
 ## 2026-10-08 — Completion gate (roadmap item 8, phase A)
 
 When the model tries to finish while files changed since the last green
