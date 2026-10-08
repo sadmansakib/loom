@@ -378,6 +378,16 @@ treated as hypotheses until Loom's own eval reproduces them.
     pre-existing failures. Their results enter the transcript as
     ordinary tool results, so replay and pruning need no special case
     (Codebuff's programmatic steps). Seam: the loop's setup phase.
+     **Evidence-based deferral (2026-10-09).** Corpus survey (13 nemotron
+     records, post-items-4-8 stack): task text names a file only twice per
+     suite (read-the-named-file ≈ dead); run/verify calls within the first
+     three calls ≈ 0.85/run (baseline-verify saves ~1 turn); facts already
+     carry the git snapshot and tree, and eval fixtures are fresh workspaces
+     (git-diff opener ≈ no-op). The lever is below the free-model variance
+     floor — B9 spans 6–40 turns on identical config — so an A/B cannot
+     demonstrate benefit, and the suite sits at 13/14 gated. Revisit when a
+     funded low-variance model is wired in or the corpus grows dirty-repo
+     tasks.
 12. **Handoff compaction** (G3). The last resort when non-prunable
     history outgrows the window: instead of recursive in-place
     summarization (which Codex reports degrades accuracy), generate a
