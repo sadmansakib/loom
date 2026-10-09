@@ -9,6 +9,11 @@
 //! hit/miss, prune decisions) is not estimated here; those numbers exist
 //! only in live-run reports, and printing them from a transcript would
 //! be dishonest accounting.
+//!
+//! `--trace DIR` switches the source to exported traces instead: there
+//! the manifests carry the provider's own billed counts and the event
+//! streams carry `context_pruned` reports, so the attribution the
+//! transcript cannot offer is reported directly (see `trace_stats`).
 
 use std::process::ExitCode;
 
@@ -27,6 +32,9 @@ struct Row {
 
 /// Runs `loom stats`.
 pub fn run(args: StatsArgs) -> anyhow::Result<ExitCode> {
+    if let Some(base) = &args.trace {
+        return crate::trace_stats::run(base, args.json);
+    }
     let path = crate::paths::db_path();
     let store = SqliteStore::open(&path).with_context(|| format!("opening {}", path.display()))?;
     let mut ids = store.session_ids()?;

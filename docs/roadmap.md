@@ -474,7 +474,7 @@ also summarized here so this section is the single source of truth.
   and cached tokens / cost / wall time / tool-cache hits, per-task
   aggregates and a gated-pass-rate suite headline; strict and tolerant
   modes.
-- **Verification bar.** 643 tests passing (13 live-API tests ignored by
+- **Verification bar.** 648 tests passing (13 live-API tests ignored by
   default), clippy clean, fmt clean.
 
 ---
@@ -876,8 +876,11 @@ reproduces them.
        `manifest.json`) and **phase 2 shipped** (event schema v3's
        `ContextPruned`: trigger arm + per-call mechanism + estimated
        reclaim, emitted once per checkpoint freeze — mechanism-level
-       attribution from any trace; folding it into `loom stats` still
-       needs events persisted server-side or read from trace dirs);
+       attribution from any trace) and **phase 3 shipped**
+       (`loom stats --trace DIR` aggregates exported traces directly:
+       billed usage from manifests, per-trigger and per-reason prune
+       attribution from `context_pruned` events — no server-side
+       persistence needed);
     2. every tunable — prune trigger and floors, read window, reasoning
        schedule, edit format — moved from constants into one config
        struct, so the replay and live evals can sweep it (this subsumes

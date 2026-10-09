@@ -475,8 +475,12 @@ reasoning to a dim stderr, NDJSON mode for machines; `--trace DIR`
 exports the task's evidence — see below), `loom auth`
 (login/list/set-active/remove), `loom stats` (per-session analytics from
 stored transcripts: turns, per-tool call quality, edit acceptance,
-repeats, repairs, spill savings), and the eval entry points. Exit codes:
-0 success, non-zero failure, 130 cancelled.
+repeats, repairs, spill savings; `--trace DIR` switches the source to
+exported traces, where the manifests carry the provider's own billed
+counts and the event streams carry `context_pruned` reports — per-task
+and per-trigger prune attribution without server-side persistence), and
+the eval entry points. Exit codes: 0 success, non-zero failure, 130
+cancelled.
 
 `loom run --trace DIR` writes one directory per task (roadmap item
 20.1): `events.ndjson` (the numbered event stream, one envelope per
@@ -652,7 +656,7 @@ Compare suites by medians over N ≥ 5; the observed noise floor is ±10%.
 - Blocking work on the blocking pool; hashing never under a lock.
 - Facts scanned once per task; capabilities resolved once per task.
 
-**Testing** — the workspace carries 643 tests (13 live-API tests
+**Testing** — the workspace carries 648 tests (13 live-API tests
 ignored by default): unit tests per module,
 protocol and invariant tests against in-memory seams, security regression
 tests for confinement, canary tests for secrets, integration tests that

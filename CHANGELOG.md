@@ -3,6 +3,19 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — loom stats --trace: attribution over exported traces (item 20.1, phase 3)
+
+`loom stats --trace DIR` aggregates what `loom run --trace DIR` wrote:
+each task directory's `manifest.json` contributes the provider's own
+billed counts (input, output, cached, thinking, cache-write tokens,
+turns, wall time), and each `events.ndjson` contributes its
+`context_pruned` reports — per-trigger (window / age_mask / rescue) and
+per-reason call attribution with estimated reclaimed tokens. Reports in
+both human and `--json` form; corrupt manifests are counted and
+skipped, not fatal. Reclaimed tokens are flagged as estimator-side
+estimates; usage fields are the provider's counts. This closes item
+20.1's attribution loop without server-side event persistence.
+
 ## 2026-10-09 — NVIDIA adapter: NIM hosted inference, free-tier eval path
 
 `--provider nvidia` runs the five verified NIM deployments —

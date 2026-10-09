@@ -28,7 +28,7 @@ pub enum Command {
     Run(Box<RunArgs>),
     /// Manage saved provider credentials (`loom.db` + OS keychain).
     Auth(AuthArgs),
-    /// Transcript analytics over stored sessions.
+    /// Transcript analytics over stored sessions (or exported traces).
     Stats(StatsArgs),
 }
 
@@ -102,6 +102,11 @@ pub struct AuthArgs {
 /// Arguments for `loom stats`.
 #[derive(Debug, Args)]
 pub struct StatsArgs {
+    /// Aggregate exported traces under this directory instead (as
+    /// written by `loom run --trace DIR`).
+    #[arg(long, value_name = "DIR")]
+    pub trace: Option<std::path::PathBuf>,
+
     /// Only sessions whose id contains this substring.
     #[arg(long, short = 's')]
     pub session: Option<String>,
@@ -273,5 +278,24 @@ mod tests {
             panic!("expected `remove`");
         };
         assert_eq!(args.target, "work");
+    }
+
+    #[test]
+    fn stats_parses_the_trace_source() {
+        let cli = parse(&["loom", "stats", "--trace", "traces/demo"]);
+        let Command::Stats(args) = cli.command else {
+            panic!("expected `stats`");
+        };
+        assert_eq!(
+            args.trace.as_deref(),
+            Some(std::path::Path::new("traces/demo"))
+        );
+        assert!(args.session.is_none());
+
+        let cli = parse(&["loom", "stats"]);
+        let Command::Stats(args) = cli.command else {
+            panic!("expected `stats`");
+        };
+        assert!(args.trace.is_none());
     }
 }

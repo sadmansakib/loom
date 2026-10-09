@@ -17,6 +17,7 @@ mod paths;
 mod run;
 mod stats_command;
 mod trace;
+mod trace_stats;
 
 use args::{Cli, Command};
 
