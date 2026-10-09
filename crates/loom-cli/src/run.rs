@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::args::RunArgs;
 use crate::output::{self, Renderer};
-use crate::trace::{Outcome, TraceMeta, TraceWriter};
+use loom_core::engine::trace::{Outcome, TraceMeta, TraceWriter};
 
 /// Runs one task end to end and returns the process exit code.
 ///

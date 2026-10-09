@@ -24,7 +24,7 @@ kernel never links a filesystem store or a CLI, the engine never prints.
 |---|---|---|
 | `loom-core` | Facade re-exporting the public surface for embedders, plus the shared data-dir policy (`paths`) | engine, kernel, providers, store, tools |
 | `loom-kernel` | The agent itself: loop, context compilation, session/transcript model, tool abstraction, tool cache, artifacts, events, budgets | no workspace crates — it defines the side-effect traits (`ModelProvider`, `SessionStore`, `ArtifactStore`, `Tool`, …) itself |
-| `loom-engine` | Composition root: builds a configured `Agent` from paths, auth, a provider factory, tool registry, and stores; repository facts scanner | kernel, store, providers, tools |
+| `loom-engine` | Composition root: builds a configured `Agent` from paths, auth, a provider factory, tool registry, and stores; repository facts scanner; owns the trace export format (`engine::trace`) and its aggregation (`engine::trace_stats`) | kernel, store, providers, tools |
 | `loom-providers` | Model provider adapters (DeepSeek, OpenRouter, GLM, NVIDIA over one shared OpenAI-compatible wire; Anthropic on its own messages-API driver) | kernel model types |
 | `loom-store` | SQLite persistence: sessions, turns, tasks, artifacts, auth accounts | kernel store traits |
 | `loom-tools` | The shipped tool suite (read/search/edit/write/list/run/verify + artifact read) | kernel tool traits |
@@ -480,7 +480,8 @@ repeats, repairs, spill savings; the listing/filter/fold data step is
 identical numbers; `--trace DIR` switches the source to
 exported traces, where the manifests carry the provider's own billed
 counts and the event streams carry `context_pruned` reports — per-task
-and per-trigger prune attribution without server-side persistence), and
+and per-trigger prune attribution without server-side persistence; the
+walk/fold/aggregation is `engine::trace_stats`, the CLI only renders), and
 the eval entry points. The data-dir resolution the frontends share
 (`LOOM_DATA_DIR` → XDG → `~/.local/share`) is `loom_core::paths`, a
 suggested default the engine itself never consults (ADR-008). Exit
@@ -492,10 +493,13 @@ cancelled.
 line), `transcript.json` (the committed session items and task
 records), and `manifest.json` (harness version, event schema version,
 run configuration, outcome with a stable `end_reason` token, the task
-summary counters, and the final context census). The export is
-best-effort by design: write failures are counted into the manifest
-(`events_write_failures`) and warned on stderr, never mapped to a run
-outcome — a trace is an artifact of the run, not a precondition.
+summary counters, and the final context census). The format is owned by
+`engine::trace` (`TraceWriter`) as a data contract: every frontend —
+CLI, TUI, GUI — writes byte-identical traces, so any consumer (the
+`engine::trace_stats` aggregation included) can read any trace. The
+export is best-effort by design: write failures are counted into the
+manifest (`events_write_failures`) and warned on stderr, never mapped to
+a run outcome — a trace is an artifact of the run, not a precondition.
 Mechanism-level attribution ships with event schema v3: a pruning pass
 that freezes a new checkpoint emits one `ContextPruned` event carrying
 the trigger arm (`window` / `age_mask` / `rescue`) plus per-call

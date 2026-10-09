@@ -17,6 +17,10 @@
 //! - **The driving API** ([`Engine::run_task`]) — one task in, events out
 //!   through an in-process [`loom_kernel::event::EventSink`], a terminal
 //!   result returned as data.
+//! - **The trace data contract** ([`trace`], [`trace_stats`]) — the
+//!   on-disk trace format (`events.ndjson` / `manifest.json` /
+//!   `transcript.json`) every frontend must write identically, and the
+//!   pure aggregation that reads it back for attribution.
 //!
 //! A frontend links this crate and calls it directly: there is no IPC and no
 //! serialization on the hot path, so a TUI, GUI, or server reuses the same
@@ -32,6 +36,8 @@ pub mod engine;
 mod estimate;
 mod provider;
 pub mod repo;
+pub mod trace;
+pub mod trace_stats;
 
 pub use engine::{Engine, EngineConfig, EngineError, default_system_prompt};
 pub use estimate::{

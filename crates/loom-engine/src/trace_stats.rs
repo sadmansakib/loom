@@ -1,150 +1,164 @@
-//! `loom stats --trace DIR`: attribution over exported traces (roadmap:
-//! item 20.1, phase 3 — reading what `loom run --trace DIR` wrote).
+//! Attribution over exported traces (roadmap: item 20.1, phase 3 —
+//! reading what the [`crate::trace`] export wrote).
 //!
-//! Each task directory under `DIR` carries `manifest.json` (outcome,
-//! harness, billed usage summary) and `events.ndjson` (the event
-//! stream, including `context_pruned` reports). This module walks those
-//! directories and aggregates them: per-task outcomes and usage, plus
-//! the prune attribution the transcript store cannot offer. Reclaimed
-//! tokens are estimator-side estimates (they were never billed); the
-//! usage fields are the provider's own counts.
+//! Each task directory under a trace root carries `manifest.json`
+//! (outcome, harness, billed usage summary) and `events.ndjson` (the
+//! event stream, including `context_pruned` reports). This module walks
+//! those directories and aggregates them: per-task outcomes and usage,
+//! plus the prune attribution the transcript store cannot offer.
+//! Reclaimed tokens are estimator-side estimates (they were never
+//! billed); the usage fields are the provider's own counts.
+//!
+//! The module is pure aggregation — typed rows in, typed totals and
+//! JSON-value report blocks out, no terminal I/O. Frontends decide
+//! what to print; the CLI's rendering lives in its stats command.
 
 use std::collections::BTreeMap;
+use std::io;
 use std::path::Path;
-use std::process::ExitCode;
 
 use serde_json::Value;
 
-/// Per-trigger and per-reason prune attribution for one task.
-#[derive(Debug, Default)]
-struct PruneStats {
-    by_trigger: BTreeMap<String, PruneAgg>,
-    by_reason: BTreeMap<String, PruneAgg>,
-    malformed_lines: u64,
-}
+use crate::trace::{EVENTS_FILE_NAME, MANIFEST_FILE_NAME};
 
 /// Calls and reclaimed tokens attributed to one trigger or reason key.
 #[derive(Debug, Default)]
-struct PruneAgg {
-    events: u64,
-    calls: u64,
-    reclaimed_tokens: u64,
+pub struct PruneAgg {
+    /// Prune events carrying this key.
+    pub events: u64,
+    /// Tool calls pruned under this key.
+    pub calls: u64,
+    /// Estimator-side reclaimed tokens.
+    pub reclaimed_tokens: u64,
 }
 
-/// One task directory, manifest distilled plus its prune stats.
-#[derive(Debug)]
-struct TaskRow {
-    dir_name: String,
-    /// True when the manifest exists but will not parse.
-    corrupt: bool,
-    task_id: Option<String>,
-    provider: Option<String>,
-    model: Option<String>,
-    status: Option<String>,
-    end_reason: Option<String>,
-    summary: Option<Value>,
-    events_written: u64,
-    events_write_failures: u64,
-    prunes: PruneStats,
-}
-
-/// Totals across every task directory.
+/// Per-trigger and per-reason prune attribution for one task.
 #[derive(Debug, Default)]
-struct Totals {
-    tasks: usize,
-    corrupt: usize,
-    by_status: BTreeMap<String, usize>,
-    turns: u64,
-    model_requests: u64,
-    input_tokens: u64,
-    output_tokens: u64,
-    cached_input_tokens: u64,
-    thinking_tokens: u64,
-    cache_creation_input_tokens: u64,
-    wall_time_millis: u64,
-    summaries_present: usize,
-    events_written: u64,
-    events_write_failures: u64,
-    malformed_event_lines: u64,
-    by_trigger: BTreeMap<String, PruneAgg>,
-    by_reason: BTreeMap<String, PruneAgg>,
+pub struct PruneStats {
+    /// Attribution keyed by prune trigger (`window`, `age_mask`, …).
+    pub by_trigger: BTreeMap<String, PruneAgg>,
+    /// Attribution keyed by per-call reason (`TurnAge`, …).
+    pub by_reason: BTreeMap<String, PruneAgg>,
+    /// `events.ndjson` lines that did not parse as JSON.
+    pub malformed_lines: u64,
 }
 
-/// Runs the trace aggregation and prints the report.
-pub fn run(base: &Path, json: bool) -> anyhow::Result<ExitCode> {
-    let rows = collect(base)?;
-    if rows.is_empty() && !json {
-        eprintln!(
-            "no task traces in {} — run `loom run --trace {}` first",
-            base.display(),
-            base.display()
-        );
-        return Ok(ExitCode::SUCCESS);
-    }
-    let totals = fold_totals(&rows);
-    if json {
-        let report = serde_json::json!({
-            "trace_dir": base.display().to_string(),
-            "tasks": rows.iter().map(task_json).collect::<Vec<_>>(),
-            "totals": totals_json(&totals),
-            "note": "reclaimed tokens are estimator-side estimates; usage fields are the provider's billed counts",
-        });
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        println!("traces in {}:", base.display());
-        for row in &rows {
-            println!("  {}", human_task(row));
-            if row.prunes.by_trigger.is_empty() {
-                continue;
-            }
-            let parts: Vec<String> = row
-                .prunes
-                .by_trigger
-                .iter()
-                .map(|(trigger, agg)| {
-                    format!(
-                        "{trigger}×{} ({} calls, ~{} tok)",
-                        agg.events, agg.calls, agg.reclaimed_tokens
-                    )
-                })
-                .collect();
-            println!("    pruned: {}", parts.join(", "));
-        }
-        println!("totals: {}", human_totals(&totals));
-        println!(
-            "attribution: {}  (estimator-side estimates)",
-            attribution_line(&totals.by_trigger, &totals.by_reason)
-        );
-        if totals.corrupt > 0 {
-            println!("skipped {} unreadable task directories", totals.corrupt);
+/// One task directory: manifest distilled plus its prune stats.
+#[derive(Debug)]
+pub struct TaskRow {
+    /// Directory name under the trace root.
+    pub dir_name: String,
+    /// True when the manifest exists but will not parse.
+    pub corrupt: bool,
+    /// Task id from the manifest, when present.
+    pub task_id: Option<String>,
+    /// Provider name from the manifest, when present.
+    pub provider: Option<String>,
+    /// Model id from the manifest, when present.
+    pub model: Option<String>,
+    /// Outcome status (`completed`, `cancelled`, `failed`), when present.
+    pub status: Option<String>,
+    /// Stable snake_case end-reason token, when present.
+    pub end_reason: Option<String>,
+    /// The manifest's billed-usage summary block, when present.
+    pub summary: Option<Value>,
+    /// Events the writer appended to `events.ndjson`.
+    pub events_written: u64,
+    /// Appends the writer counted as failed.
+    pub events_write_failures: u64,
+    /// Prune attribution from the event stream.
+    pub prunes: PruneStats,
+}
+
+impl TaskRow {
+    /// The placeholder row for a directory whose manifest will not parse.
+    fn corrupt() -> Self {
+        Self {
+            dir_name: String::new(),
+            corrupt: true,
+            task_id: None,
+            provider: None,
+            model: None,
+            status: None,
+            end_reason: None,
+            summary: None,
+            events_written: 0,
+            events_write_failures: 0,
+            prunes: PruneStats::default(),
         }
     }
-    Ok(ExitCode::SUCCESS)
+}
+
+/// Totals across every task directory of one trace root.
+#[derive(Debug, Default)]
+pub struct Totals {
+    /// Task directories seen, corrupt ones included.
+    pub tasks: usize,
+    /// Directories whose manifest would not parse.
+    pub corrupt: usize,
+    /// Tasks per outcome status.
+    pub by_status: BTreeMap<String, usize>,
+    /// Billed turns, summed over manifests carrying a summary.
+    pub turns: u64,
+    /// Billed model requests.
+    pub model_requests: u64,
+    /// Billed input tokens.
+    pub input_tokens: u64,
+    /// Billed output tokens.
+    pub output_tokens: u64,
+    /// Billed cached input tokens.
+    pub cached_input_tokens: u64,
+    /// Billed thinking tokens.
+    pub thinking_tokens: u64,
+    /// Billed cache-creation tokens.
+    pub cache_creation_input_tokens: u64,
+    /// Billed wall time, milliseconds.
+    pub wall_time_millis: u64,
+    /// Manifests that carried a summary block.
+    pub summaries_present: usize,
+    /// Events appended across all tasks.
+    pub events_written: u64,
+    /// Failed event appends across all tasks.
+    pub events_write_failures: u64,
+    /// Malformed `events.ndjson` lines across all tasks.
+    pub malformed_event_lines: u64,
+    /// Prune attribution keyed by trigger.
+    pub by_trigger: BTreeMap<String, PruneAgg>,
+    /// Prune attribution keyed by per-call reason.
+    pub by_reason: BTreeMap<String, PruneAgg>,
 }
 
 /// Reads every task directory under `base`.
-fn collect(base: &Path) -> anyhow::Result<Vec<TaskRow>> {
+///
+/// A directory without a readable `manifest.json` is not a trace and
+/// is skipped; one whose manifest will not parse yields a corrupt row.
+/// Fails only when `base` itself cannot be listed.
+pub fn collect(base: &Path) -> io::Result<Vec<TaskRow>> {
     let mut rows = Vec::new();
-    let entries = std::fs::read_dir(base)
-        .map_err(|error| anyhow::anyhow!("reading {}: {error}", base.display()))?;
+    let entries = std::fs::read_dir(base).map_err(|error| {
+        io::Error::new(error.kind(), format!("reading {}: {error}", base.display()))
+    })?;
     for entry in entries {
-        let entry =
-            entry.map_err(|error| anyhow::anyhow!("listing {}: {error}", base.display()))?;
+        let entry = entry.map_err(|error| {
+            io::Error::new(error.kind(), format!("listing {}: {error}", base.display()))
+        })?;
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
-        let manifest = match std::fs::read_to_string(path.join("manifest.json")) {
+        let manifest = match std::fs::read_to_string(path.join(MANIFEST_FILE_NAME)) {
             Ok(text) => text,
             Err(_) => continue, // not a trace directory
         };
         let manifest: Value = match serde_json::from_str(&manifest) {
             Ok(value) => value,
             Err(_) => {
-                rows.push(TaskRow {
-                    dir_name: corrupt_row_name(&path),
-                    ..TaskRow::corrupt()
-                });
+                let mut row = TaskRow::corrupt();
+                row.dir_name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                rows.push(row);
                 continue;
             }
         };
@@ -169,36 +183,10 @@ fn collect(base: &Path) -> anyhow::Result<Vec<TaskRow>> {
     Ok(rows)
 }
 
-impl TaskRow {
-    /// The placeholder row for a directory whose manifest will not parse.
-    fn corrupt() -> Self {
-        Self {
-            dir_name: String::new(),
-            corrupt: true,
-            task_id: None,
-            provider: None,
-            model: None,
-            status: None,
-            end_reason: None,
-            summary: None,
-            events_written: 0,
-            events_write_failures: 0,
-            prunes: PruneStats::default(),
-        }
-    }
-}
-
-/// Placeholder label for a corrupt directory (filled after construction).
-fn corrupt_row_name(path: &Path) -> String {
-    path.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
 /// Extracts prune attribution from one task's `events.ndjson`.
 fn prune_stats(task_dir: &Path) -> PruneStats {
     let mut stats = PruneStats::default();
-    let Ok(text) = std::fs::read_to_string(task_dir.join("events.ndjson")) else {
+    let Ok(text) = std::fs::read_to_string(task_dir.join(EVENTS_FILE_NAME)) else {
         return stats;
     };
     for line in text.lines() {
@@ -232,8 +220,8 @@ fn prune_stats(task_dir: &Path) -> PruneStats {
     stats
 }
 
-/// Sums every row into one totals value.
-fn fold_totals(rows: &[TaskRow]) -> Totals {
+/// Sums every row into one [`Totals`] value.
+pub fn fold_totals(rows: &[TaskRow]) -> Totals {
     let mut totals = Totals::default();
     for row in rows {
         totals.tasks += 1;
@@ -281,7 +269,7 @@ fn merge_aggmaps(into: &mut BTreeMap<String, PruneAgg>, from: &BTreeMap<String, 
 }
 
 /// The JSON block for one task.
-fn task_json(row: &TaskRow) -> Value {
+pub fn task_json(row: &TaskRow) -> Value {
     serde_json::json!({
         "dir": row.dir_name,
         "corrupt": row.corrupt,
@@ -315,7 +303,7 @@ fn agg_json(agg: &PruneAgg) -> Value {
 }
 
 /// The JSON totals block.
-fn totals_json(totals: &Totals) -> Value {
+pub fn totals_json(totals: &Totals) -> Value {
     serde_json::json!({
         "tasks": totals.tasks,
         "corrupt": totals.corrupt,
@@ -342,7 +330,7 @@ fn totals_json(totals: &Totals) -> Value {
 }
 
 /// One human-readable task line.
-fn human_task(row: &TaskRow) -> String {
+pub fn human_task(row: &TaskRow) -> String {
     let label = row.task_id.clone().unwrap_or_else(|| row.dir_name.clone());
     let harness = match (&row.provider, &row.model) {
         (Some(provider), Some(model)) => format!("{model} via {provider}"),
@@ -370,7 +358,7 @@ fn human_task(row: &TaskRow) -> String {
 }
 
 /// One human-readable totals line.
-fn human_totals(totals: &Totals) -> String {
+pub fn human_totals(totals: &Totals) -> String {
     let statuses: Vec<String> = totals
         .by_status
         .iter()
@@ -397,11 +385,9 @@ fn human_totals(totals: &Totals) -> String {
 }
 
 /// The human attribution summary: triggers first, then reasons.
-fn attribution_line(
-    by_trigger: &BTreeMap<String, PruneAgg>,
-    by_reason: &BTreeMap<String, PruneAgg>,
-) -> String {
-    let mut parts: Vec<String> = by_trigger
+pub fn attribution_line(totals: &Totals) -> String {
+    let mut parts: Vec<String> = totals
+        .by_trigger
         .iter()
         .map(|(trigger, agg)| {
             format!(
@@ -410,7 +396,7 @@ fn attribution_line(
             )
         })
         .collect();
-    parts.extend(by_reason.iter().map(|(reason, agg)| {
+    parts.extend(totals.by_reason.iter().map(|(reason, agg)| {
         format!(
             "{reason}: {} calls, ~{} tok",
             agg.calls, agg.reclaimed_tokens
@@ -442,11 +428,11 @@ mod tests {
         let task = base.join(dir);
         fs::create_dir_all(&task).unwrap();
         fs::write(
-            task.join("manifest.json"),
+            task.join(MANIFEST_FILE_NAME),
             serde_json::to_string_pretty(&manifest).unwrap(),
         )
         .unwrap();
-        fs::write(task.join("events.ndjson"), events).unwrap();
+        fs::write(task.join(EVENTS_FILE_NAME), events).unwrap();
     }
 
     fn completed_manifest() -> serde_json::Value {
@@ -524,7 +510,7 @@ mod tests {
         // A manifest that will not parse counts as corrupt.
         let corrupt = base.join("corrupt-one");
         fs::create_dir_all(&corrupt).unwrap();
-        fs::write(corrupt.join("manifest.json"), "{ not json").unwrap();
+        fs::write(corrupt.join(MANIFEST_FILE_NAME), "{ not json").unwrap();
         base
     }
 
@@ -610,7 +596,7 @@ mod tests {
         let base = fixture("human");
         let rows = collect(&base).unwrap();
         let totals = fold_totals(&rows);
-        assert!(attribution_line(&totals.by_trigger, &totals.by_reason).contains("age_mask"));
+        assert!(attribution_line(&totals).contains("age_mask"));
         assert!(human_totals(&totals).contains("malformed lines"));
         let task_a = rows.iter().find(|row| row.dir_name == "task-a").unwrap();
         assert!(human_task(task_a).contains("deepseek-v4-pro via deepseek"));

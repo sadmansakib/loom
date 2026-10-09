@@ -13,11 +13,15 @@
 //! `--trace DIR` switches the source to exported traces instead: there
 //! the manifests carry the provider's own billed counts and the event
 //! streams carry `context_pruned` reports, so the attribution the
-//! transcript cannot offer is reported directly (see `trace_stats`).
+//! transcript cannot offer is reported directly. The aggregation is
+//! [`loom_core::engine::trace_stats`]; this module renders it.
 
 use std::process::ExitCode;
 
 use anyhow::Context;
+use loom_core::engine::trace_stats::{
+    attribution_line, collect, fold_totals, human_task, human_totals, task_json, totals_json,
+};
 use loom_core::kernel::analytics::{SessionStats, SessionsOverview, Spill, sessions_overview};
 use loom_core::store::SqliteStore;
 
@@ -26,7 +30,7 @@ use crate::args::StatsArgs;
 /// Runs `loom stats`.
 pub fn run(args: StatsArgs) -> anyhow::Result<ExitCode> {
     if let Some(base) = &args.trace {
-        return crate::trace_stats::run(base, args.json);
+        return trace_report(base, args.json);
     }
     let path = loom_core::paths::db_path();
     let store = SqliteStore::open(&path).with_context(|| format!("opening {}", path.display()))?;
@@ -84,6 +88,59 @@ pub fn run(args: StatsArgs) -> anyhow::Result<ExitCode> {
             overview.totals.spills.len(),
             saved_summary(&overview.totals),
         );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Renders the `--trace` report: aggregation from the engine, printing
+/// here.
+fn trace_report(base: &std::path::Path, json: bool) -> anyhow::Result<ExitCode> {
+    let rows = collect(base)?;
+    if rows.is_empty() && !json {
+        eprintln!(
+            "no task traces in {} — run `loom run --trace {}` first",
+            base.display(),
+            base.display()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let totals = fold_totals(&rows);
+    if json {
+        let report = serde_json::json!({
+            "trace_dir": base.display().to_string(),
+            "tasks": rows.iter().map(task_json).collect::<Vec<_>>(),
+            "totals": totals_json(&totals),
+            "note": "reclaimed tokens are estimator-side estimates; usage fields are the provider's billed counts",
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("traces in {}:", base.display());
+        for row in &rows {
+            println!("  {}", human_task(row));
+            if row.prunes.by_trigger.is_empty() {
+                continue;
+            }
+            let parts: Vec<String> = row
+                .prunes
+                .by_trigger
+                .iter()
+                .map(|(trigger, agg)| {
+                    format!(
+                        "{trigger}×{} ({} calls, ~{} tok)",
+                        agg.events, agg.calls, agg.reclaimed_tokens
+                    )
+                })
+                .collect();
+            println!("    pruned: {}", parts.join(", "));
+        }
+        println!("totals: {}", human_totals(&totals));
+        println!(
+            "attribution: {}  (estimator-side estimates)",
+            attribution_line(&totals)
+        );
+        if totals.corrupt > 0 {
+            println!("skipped {} unreadable task directories", totals.corrupt);
+        }
     }
     Ok(ExitCode::SUCCESS)
 }

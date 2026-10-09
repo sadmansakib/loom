@@ -1,8 +1,8 @@
 //! Task trace export (roadmap item 20.1, phase 1).
 //!
-//! `loom run --trace DIR` records everything one task produced, so an
-//! eval sweep can keep the raw evidence next to its reports: one
-//! directory per task holding
+//! `--trace DIR` records everything one task produced, so an eval sweep
+//! can keep the raw evidence next to its reports: one directory per
+//! task holding
 //!
 //! * `events.ndjson` — the [`EventEnvelope`] stream, one JSON object per
 //!   line, exactly as the sink numbered it;
@@ -10,14 +10,17 @@
 //! * `manifest.json` — harness version, run configuration, outcome, the
 //!   [`TaskSummary`] counters, and the final context census.
 //!
+//! This module owns the export *format* so every frontend — CLI, TUI,
+//! GUI — writes byte-identical traces; [`crate::trace_stats`] (and any
+//! other consumer, human or tool) can then read any trace any frontend
+//! produced. The driving loop stays in the frontend: it forwards
+//! envelopes to [`TraceWriter::record`] and calls
+//! [`TraceWriter::finish`] once the task ends.
+//!
 //! The writer is deliberately passive: it never fails the run. Write
 //! errors are counted and surfaced in the manifest (`events_write_failures`)
 //! rather than propagated, because a trace is an artifact of the run, not
 //! a precondition for it.
-//!
-//! Mechanism-level attribution (which pruning decision saved which
-//! tokens) still needs prune-event variants in `EventKind` — a schema v3
-//! bump tracked separately in the roadmap.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -27,19 +30,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use serde_json::json;
 
-use loom_core::ReasoningEffort;
-use loom_core::kernel::agent::TaskSummary;
-use loom_core::kernel::event::{EVENT_SCHEMA_VERSION, EventEnvelope};
-use loom_core::kernel::id::TaskId;
-use loom_core::kernel::session::Session;
+use loom_kernel::agent::TaskSummary;
+use loom_kernel::context::ContextCensus;
+use loom_kernel::event::{EVENT_SCHEMA_VERSION, EventEnvelope};
+use loom_kernel::id::TaskId;
+use loom_kernel::session::Session;
 
-/// Run configuration recorded into the manifest, mirrored from `RunArgs`.
+use crate::ReasoningEffort;
+
+/// Run configuration recorded into the manifest, supplied by the
+/// frontend that drove the task.
 pub struct TraceMeta<'a> {
     /// Provider adapter name (`deepseek`, `anthropic`, `openrouter`).
     pub provider: &'a str,
-    /// Model id as passed on the command line.
+    /// Model id as the frontend resolved it.
     pub model: &'a str,
-    /// Reasoning-effort knob as passed on the command line.
+    /// Reasoning-effort knob the run was configured with.
     pub reasoning_effort: ReasoningEffort,
     /// Turn ceiling configured for the run.
     pub max_turns: u32,
@@ -127,8 +133,8 @@ impl From<&TaskSummary> for SummarySnapshot {
     }
 }
 
-impl From<&loom_core::kernel::context::ContextCensus> for CensusSnapshot {
-    fn from(census: &loom_core::kernel::context::ContextCensus) -> Self {
+impl From<&ContextCensus> for CensusSnapshot {
+    fn from(census: &ContextCensus) -> Self {
         Self {
             system_prompt: census.system_prompt,
             repo_facts: census.repo_facts,
@@ -142,8 +148,17 @@ impl From<&loom_core::kernel::context::ContextCensus> for CensusSnapshot {
     }
 }
 
+/// File names inside a task directory. Public because they are the
+/// data contract: this module writes them, [`crate::trace_stats`]
+/// reads them, and any external tool may rely on them.
+pub const EVENTS_FILE_NAME: &str = "events.ndjson";
+/// Where the manifest lives inside a task directory.
+pub const MANIFEST_FILE_NAME: &str = "manifest.json";
+/// Where the transcript lives inside a task directory.
+pub const TRANSCRIPT_FILE_NAME: &str = "transcript.json";
+
 /// Appends every event of one task to `<base>/<task_id>/events.ndjson`,
-/// then writes `manifest.json` and `transcript.json` on [`finish`].
+/// then writes `manifest.json` and `transcript.json` on [`finish`](Self::finish).
 ///
 /// The task directory is created lazily on the first recorded event, so
 /// a run that emitted nothing leaves no empty directories behind.
@@ -260,11 +275,6 @@ impl TraceWriter {
     }
 }
 
-/// File names inside a task directory.
-const EVENTS_FILE_NAME: &str = "events.ndjson";
-const MANIFEST_FILE_NAME: &str = "manifest.json";
-const TRANSCRIPT_FILE_NAME: &str = "transcript.json";
-
 /// Builds the manifest body.
 fn manifest(
     writer: &TraceWriter,
@@ -334,11 +344,11 @@ fn to_pretty(body: &serde_json::Value) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loom_core::kernel::event::EventKind;
-    use loom_core::kernel::id::SessionId;
-    use loom_core::kernel::model::Usage;
-    use loom_core::kernel::session::{Session, TaskRecord, TaskStatus};
-    use loom_core::kernel::transcript::Item;
+    use loom_kernel::event::EventKind;
+    use loom_kernel::id::SessionId;
+    use loom_kernel::model::Usage;
+    use loom_kernel::session::{Session, TaskRecord, TaskStatus};
+    use loom_kernel::transcript::Item;
 
     fn envelope(sequence: u64, task_id: TaskId, kind: EventKind) -> EventEnvelope {
         EventEnvelope {

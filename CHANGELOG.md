@@ -3,6 +3,19 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — Trace format + attribution move behind the engine
+
+The trace export (`events.ndjson` / `manifest.json` / `transcript.json`)
+and the `--trace` aggregation now live in `loom-engine` as
+`engine::trace` and `engine::trace_stats`. The format is a data
+contract: any frontend — CLI, TUI, GUI — that drives a task writes
+byte-identical traces through `TraceWriter`, so any consumer can read
+them back. The aggregation is pure (typed rows in, totals, JSON blocks,
+and human-readable lines out; zero terminal I/O) and frontends decide
+what to print — the CLI's stats command keeps only the rendering. The
+trace file names are exported as the contract constants. Test counts
+unchanged (651): the eight trace tests moved crates with the modules.
+
 ## 2026-10-09 — Facade completion: stats + data-dir policy behind loom-core
 
 ADR-021 says a frontend depends on `loom-core` and nothing else; the CLI
