@@ -25,6 +25,7 @@
 //! when a [`EventKind::ModelRetry`] fires; only
 //! [`EventKind::ModelCompleted`] is authoritative.
 
+use crate::context::PruneReport;
 use crate::id::TaskId;
 use crate::model::{ModelErrorKind, ModelResponse};
 use crate::transcript::ToolCallId;
@@ -55,7 +56,9 @@ use tokio_util::sync::CancellationToken;
 ///
 /// v2 adds `Usage.cost_usd` (provider-reported charge; `serde(default)`,
 /// so v1 payloads still deserialize).
-pub const EVENT_SCHEMA_VERSION: u16 = 2;
+/// v3 adds `ContextPruned` (prune attribution: trigger arm plus
+/// per-call mechanism and estimated reclaim).
+pub const EVENT_SCHEMA_VERSION: u16 = 3;
 
 /// One observed occurrence during a task, wrapped for the wire.
 ///
@@ -104,6 +107,19 @@ pub enum EventKind {
     TurnStarted {
         /// 1-based turn number within the task.
         turn: u32,
+    },
+    /// A pruning pass froze a **new** checkpoint during this turn's
+    /// compile: from here on, the listed tool results project as stubs.
+    ///
+    /// Emitted once per freeze — turns that merely re-apply the frozen
+    /// stubs stay silent, so consumers can attribute savings per
+    /// mechanism (sum `reclaimed_tokens` across these events,
+    /// deduplicating by `call_id`; roadmap item 20.1).
+    ContextPruned {
+        /// 1-based turn whose compile froze the checkpoint.
+        turn: u32,
+        /// Trigger arm plus per-call attribution.
+        report: PruneReport,
     },
     /// A model request attempt started. `attempt` is 1-based; retries
     /// emit this again with the next attempt number.
@@ -351,6 +367,7 @@ impl<S: EventSink> EventSink for StrictSink<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::{PruneTrigger, PrunedCall, StubReason};
     use crate::model::{StopReason, Usage};
     use crate::transcript::AssistantMessage;
 
@@ -386,6 +403,41 @@ mod tests {
         sink.emit(task, EventKind::TaskCompleted);
 
         assert_eq!(sink.dropped(), 3);
+    }
+
+    /// Schema v3: `ContextPruned` serializes with the snake_case tag and
+    /// a fully-nested report, so an NDJSON consumer can attribute
+    /// savings per mechanism without kernel types.
+    #[test]
+    fn context_pruned_serializes_the_nested_report() {
+        let report = PruneReport {
+            trigger: PruneTrigger::AgeMask,
+            calls: vec![PrunedCall {
+                call_id: "c9".to_owned(),
+                reason: StubReason::TurnAge,
+                reclaimed_tokens: 1_234,
+            }],
+            reclaimed_tokens: 1_234,
+        };
+        let envelope = EventEnvelope {
+            schema_version: EVENT_SCHEMA_VERSION,
+            sequence: 7,
+            task_id: TaskId::new(),
+            kind: EventKind::ContextPruned { turn: 3, report },
+        };
+        let value = serde_json::to_value(&envelope).expect("serializes");
+        assert_eq!(value["kind"]["type"], "context_pruned");
+        assert_eq!(value["kind"]["turn"], 3);
+        assert_eq!(value["kind"]["report"]["trigger"], "age_mask");
+        assert_eq!(value["kind"]["report"]["reclaimed_tokens"], 1_234);
+        assert_eq!(value["kind"]["report"]["calls"][0]["call_id"], "c9");
+        assert_eq!(value["kind"]["report"]["calls"][0]["reason"], "TurnAge");
+        assert_eq!(
+            value["kind"]["report"]["calls"][0]["reclaimed_tokens"],
+            1_234
+        );
+        let round: EventEnvelope = serde_json::from_value(value).expect("round-trips");
+        assert_eq!(round, envelope);
     }
 
     #[test]

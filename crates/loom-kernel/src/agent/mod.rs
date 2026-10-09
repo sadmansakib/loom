@@ -769,6 +769,12 @@ impl Agent {
             // back in on the next turn. Between triggers it is unchanged,
             // so the projection stays byte-stable for prefix caching.
             prune_checkpoint = compiled.prune_checkpoint;
+            // A new freeze is an observable mechanism decision (item
+            // 20.1): attribute it at the moment it happens, not on every
+            // later turn the frozen stubs merely re-apply.
+            if let Some(report) = compiled.prune_report {
+                sink.emit(task_id, EventKind::ContextPruned { turn, report });
+            }
             // Partial move: `request` moves out, `census` (Copy) stays readable
             // for the `EndTurn` return.
             let stubbed_calls = compiled.stubbed_calls;

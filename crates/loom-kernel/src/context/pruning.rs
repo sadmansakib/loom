@@ -153,6 +153,49 @@ pub struct StubDecision {
     pub reason: StubReason,
 }
 
+/// Which arm froze a [`PruneCheckpoint`] (and produced its
+/// [`PruneReport`]) — the attribution dimension for `loom stats` and
+/// trace consumers (item 20.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PruneTrigger {
+    /// The estimated input crossed the window-relative trigger.
+    Window,
+    /// Turn-age masking decided below the window trigger (roadmap
+    /// item 10).
+    AgeMask,
+    /// The budget-exceeded rescue: the unpruned projection could not
+    /// fit, so the wrapper decided stubs ahead of any trigger.
+    Rescue,
+}
+
+/// One stub decision paired with its estimated reclaim — the unit of
+/// per-mechanism attribution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrunedCall {
+    /// The call whose result was stubbed.
+    pub call_id: String,
+    /// Why — the mechanism that took it.
+    pub reason: StubReason,
+    /// Estimated tokens the stub reclaimed versus the full result.
+    pub reclaimed_tokens: u64,
+}
+
+/// Attribution for one checkpoint freeze, reported on the event stream
+/// as `ContextPruned` (event schema v3) exactly once — at the decision
+/// moment. Later compiles that merely re-apply the frozen stubs report
+/// nothing; summing `reclaimed_tokens` across `ContextPruned` events
+/// (deduplicating by `call_id`) attributes savings per mechanism.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneReport {
+    /// The arm that fired.
+    pub trigger: PruneTrigger,
+    /// Per-call attribution, in transcript order.
+    pub calls: Vec<PrunedCall>,
+    /// Sum of `calls`' reclaims, precomputed for cheap consumers.
+    pub reclaimed_tokens: u64,
+}
+
 /// A [`ContextCompiler`] that prunes projected tool results once the
 /// estimated input crosses the window-relative trigger
 /// ([`PruneConfig::trigger_tokens`]): `trigger_percent` of the model's input
@@ -205,6 +248,9 @@ impl ContextCompiler for PruningContextCompiler {
         } = input;
         let facts_text = facts.render();
         let mut checkpoint = prune_checkpoint.cloned();
+        // Attribution for a checkpoint frozen by *this* compile, when one
+        // was; re-applications of an earlier freeze report nothing.
+        let mut report: Option<PruneReport> = None;
         // Call ids whose projected body this compile stubbed, reported so
         // the caller never mistakes a stub for still-visible content.
         let mut stubbed_calls: Vec<String> = Vec::new();
@@ -250,6 +296,12 @@ impl ContextCompiler for PruningContextCompiler {
                         // session the inner compiler projected, so record
                         // the decisions verbatim.
                         stubbed_calls.extend(decisions.iter().map(|d| d.call_id.clone()));
+                        report = Some(prune_report(
+                            PruneTrigger::Rescue,
+                            session,
+                            &decisions,
+                            &*self.estimator,
+                        ));
                         checkpoint = Some(PruneCheckpoint {
                             upto_item: session.transcript.len(),
                             stubs: decisions,
@@ -317,6 +369,16 @@ impl ContextCompiler for PruningContextCompiler {
             if reclaim >= already.saturating_add(u64::from(self.config.min_reclaim_tokens)) {
                 stubbed_calls.extend(apply_stubs(&mut compiled.request, &decisions));
                 compiled.census = census(&compiled.request, facts_tokens, &*self.estimator);
+                report = Some(prune_report(
+                    if window_triggered {
+                        PruneTrigger::Window
+                    } else {
+                        PruneTrigger::AgeMask
+                    },
+                    session,
+                    &decisions,
+                    &*self.estimator,
+                ));
                 checkpoint = Some(PruneCheckpoint {
                     upto_item: session.transcript.len(),
                     stubs: decisions,
@@ -333,6 +395,7 @@ impl ContextCompiler for PruningContextCompiler {
         }
 
         compiled.prune_checkpoint = checkpoint;
+        compiled.prune_report = report;
         compiled.stubbed_calls = stubbed_calls;
         Ok(compiled)
     }
@@ -417,6 +480,43 @@ fn frozen_reclaim(
         );
     }
     reclaim
+}
+
+/// Builds the freeze-time attribution for `stubs` against `session`'s
+/// transcript: per-call estimated reclaim (full item less the stub body)
+/// plus the arm that fired.
+fn prune_report(
+    trigger: PruneTrigger,
+    session: &Session,
+    stubs: &[StubDecision],
+    estimator: &dyn TokenEstimator,
+) -> PruneReport {
+    let by_call: HashMap<&str, StubReason> = stubs
+        .iter()
+        .map(|stub| (stub.call_id.as_str(), stub.reason))
+        .collect();
+    let mut calls = Vec::new();
+    for item in &session.transcript {
+        let Item::ToolResult(result) = item else {
+            continue;
+        };
+        let Some(&reason) = by_call.get(result.call_id.as_str()) else {
+            continue;
+        };
+        let full = estimate_serialized(estimator, item);
+        let stub = stub_tokens(&result.call_id, &result.status, reason, estimator);
+        calls.push(PrunedCall {
+            call_id: result.call_id.as_str().to_owned(),
+            reason,
+            reclaimed_tokens: u64::from(full.saturating_sub(stub)),
+        });
+    }
+    let reclaimed_tokens = calls.iter().map(|call| call.reclaimed_tokens).sum();
+    PruneReport {
+        trigger,
+        calls,
+        reclaimed_tokens,
+    }
 }
 
 /// Facts gathered from the transcript for the decision pass.
@@ -1145,6 +1245,118 @@ mod tests {
                 .contains("older than the kept turn window")
         );
         assert_eq!(second.prune_checkpoint.as_ref(), Some(&checkpoint));
+    }
+
+    /// Item 20.1 attribution: the freeze moment reports the arm, the
+    /// per-call mechanism, and the estimated reclaim; a later compile
+    /// that only re-applies the frozen stubs reports nothing (sums
+    /// across events must not double-count).
+    #[test]
+    fn an_age_mask_freeze_reports_per_call_attribution_once() {
+        let mut items = vec![
+            Item::User {
+                text: "go".to_owned(),
+            },
+            assistant_calls("reading", vec![read_call("c1", "src/a.rs")]),
+            result("c1", &big("content", 100)),
+            assistant_text("filler one"),
+            assistant_text("filler two"),
+            assistant_text("filler three"),
+            assistant_calls("later bulk", vec![read_call("c2", "src/b.rs")]),
+            result("c2", &big("bulk", 60)),
+        ];
+        for turn in 4..=9 {
+            items.push(assistant_text(&format!("filler {turn}")));
+        }
+        let session = session_with(items.clone());
+        let first = compiler(PruneConfig::default())
+            .compile(input(&session, None))
+            .expect("compiles");
+        let report = first.prune_report.as_ref().expect("freeze reported");
+        assert_eq!(report.trigger, PruneTrigger::AgeMask);
+        assert_eq!(
+            report.calls,
+            vec![PrunedCall {
+                call_id: "c1".to_owned(),
+                reason: StubReason::TurnAge,
+                reclaimed_tokens: report.reclaimed_tokens,
+            }]
+        );
+        assert!(report.reclaimed_tokens > 0);
+        // The next turn re-applies the frozen stub: still stubbed, but
+        // no new attribution.
+        items.push(assistant_text("one more turn"));
+        let session = session_with(items);
+        let checkpoint = first.prune_checkpoint.clone().expect("fired");
+        let second = compiler(PruneConfig::default())
+            .compile(input(&session, Some(&checkpoint)))
+            .expect("compiles");
+        assert!(second.prune_report.is_none());
+    }
+
+    /// A window-triggered freeze reports `Window` even when turn-age
+    /// masking is also configured (the window arm is the primary cause).
+    #[test]
+    fn a_window_freeze_reports_the_window_trigger() {
+        let items = vec![
+            Item::User {
+                text: "go".to_owned(),
+            },
+            assistant_calls("reading", vec![read_call("c1", "src/a.rs")]),
+            result("c1", &big("content", 120)),
+            assistant_text("filler one"),
+            assistant_text("filler two"),
+            assistant_calls("later bulk", vec![read_call("c2", "src/b.rs")]),
+            result("c2", &big("bulk", 80)),
+            assistant_text("done"),
+        ];
+        let session = session_with(items);
+        let compiled = compiler(firing())
+            .compile(input(&session, None))
+            .expect("compiles");
+        let report = compiled.prune_report.as_ref().expect("freeze reported");
+        assert_eq!(report.trigger, PruneTrigger::Window);
+        assert!(
+            report
+                .calls
+                .iter()
+                .any(|call| call.call_id == "c1" && call.reclaimed_tokens > 0)
+        );
+        assert_eq!(
+            report.reclaimed_tokens,
+            report
+                .calls
+                .iter()
+                .map(|call| call.reclaimed_tokens)
+                .sum::<u64>()
+        );
+    }
+
+    /// The budget-exceeded rescue attributes like any other freeze, with
+    /// its own trigger arm.
+    #[test]
+    fn a_rescue_reports_the_rescue_trigger() {
+        let items = vec![
+            Item::User {
+                text: "go".to_owned(),
+            },
+            assistant_calls("reading", vec![read_call("c1", "src/a.rs")]),
+            result("c1", &big("content", 300)),
+            assistant_text("filler one"),
+            assistant_text("filler two"),
+            assistant_calls("reading again", vec![read_call("c2", "src/b.rs")]),
+            result("c2", &big("tail", 70)),
+            assistant_text("done"),
+        ];
+        let session = session_with(items);
+        let compiled = compiler(PruneConfig::default())
+            .compile(input_with(&session, None, tight()))
+            .expect("rescued compile");
+        let report = compiled.prune_report.as_ref().expect("rescue reported");
+        assert_eq!(report.trigger, PruneTrigger::Rescue);
+        assert!(report.calls.iter().any(|call| call.call_id == "c1"));
+        assert!(!report.calls.iter().any(|call| call.call_id == "c2"));
+        assert!(report.reclaimed_tokens > 0);
     }
 
     /// A budget tight enough that the *inner* compiler refuses the

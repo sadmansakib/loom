@@ -85,6 +85,15 @@ impl Renderer {
                 self.close_all();
                 self.notice(&format!("tool: {name} done"));
             }
+            EventKind::ContextPruned { report, .. } => {
+                self.close_all();
+                self.notice(&format!(
+                    "context pruned: {} call(s) via {:?}, ~{} tokens reclaimed",
+                    report.calls.len(),
+                    report.trigger,
+                    report.reclaimed_tokens
+                ));
+            }
             EventKind::ModelCompleted { .. } => {
                 self.close_all();
             }

@@ -487,8 +487,13 @@ summary counters, and the final context census). The export is
 best-effort by design: write failures are counted into the manifest
 (`events_write_failures`) and warned on stderr, never mapped to a run
 outcome — a trace is an artifact of the run, not a precondition.
-Mechanism-level attribution (which pruning decision saved which tokens)
-still needs prune-event variants in `EventKind`, a schema v3 bump.
+Mechanism-level attribution ships with event schema v3: a pruning pass
+that freezes a new checkpoint emits one `ContextPruned` event carrying
+the trigger arm (`window` / `age_mask` / `rescue`) plus per-call
+mechanism and estimated reclaim, so a trace consumer can attribute
+savings per mechanism by summing `reclaimed_tokens` across those events
+(deduplicating by `call_id` — turns that merely re-apply a frozen
+checkpoint emit nothing).
 
 ## 10. Providers
 
@@ -634,7 +639,7 @@ Compare suites by medians over N ≥ 5; the observed noise floor is ±10%.
 - Blocking work on the blocking pool; hashing never under a lock.
 - Facts scanned once per task; capabilities resolved once per task.
 
-**Testing** — the workspace carries 598 tests (13 live-API tests
+**Testing** — the workspace carries 629 tests (13 live-API tests
 ignored by default): unit tests per module,
 protocol and invariant tests against in-memory seams, security regression
 tests for confinement, canary tests for secrets, integration tests that

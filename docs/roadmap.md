@@ -470,7 +470,7 @@ also summarized here so this section is the single source of truth.
   and cached tokens / cost / wall time / tool-cache hits, per-task
   aggregates and a gated-pass-rate suite headline; strict and tolerant
   modes.
-- **Verification bar.** 598 tests passing (13 live-API tests ignored by
+- **Verification bar.** 629 tests passing (13 live-API tests ignored by
   default), clippy clean, fmt clean.
 
 ---
@@ -863,8 +863,11 @@ reproduces them.
     1. trace export: one directory per task with transcript, events,
        census, harness version, and outcome — **phase 1 shipped**
        (`loom run --trace DIR`: `events.ndjson`, `transcript.json`,
-       `manifest.json`; mechanism-level attribution still needs prune
-       events, schema v3);
+       `manifest.json`) and **phase 2 shipped** (event schema v3's
+       `ContextPruned`: trigger arm + per-call mechanism + estimated
+       reclaim, emitted once per checkpoint freeze — mechanism-level
+       attribution from any trace; folding it into `loom stats` still
+       needs events persisted server-side or read from trace dirs);
     2. every tunable — prune trigger and floors, read window, reasoning
        schedule, edit format — moved from constants into one config
        struct, so the replay and live evals can sweep it (this subsumes

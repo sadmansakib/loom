@@ -87,6 +87,9 @@ impl super::ContextCompiler for DefaultContextCompiler {
             request,
             census,
             prune_checkpoint: None,
+            // The default compiler never decides stubs, so it never
+            // freezes a checkpoint and has nothing to attribute.
+            prune_report: None,
             // This compiler never stubs: every projected result carries
             // its full content, so no call id is pruned away.
             stubbed_calls: Vec::new(),

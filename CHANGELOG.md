@@ -3,6 +3,20 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — Prune attribution on the event stream (item 20.1, phase 2)
+
+Event schema v3 adds `ContextPruned`: when a pruning pass freezes a new
+checkpoint, the agent loop emits one event carrying the trigger arm —
+`window`, `age_mask`, or `rescue` — plus per-call mechanism
+(`duplicate_read` / `superseded_read` / `stale_error` / `aged_out` /
+`turn_age`) and estimated reclaimed tokens. Turns that merely re-apply a
+frozen checkpoint emit nothing, so summing `reclaimed_tokens` across
+`ContextPruned` events (deduplicating by `call_id`) attributes savings
+per mechanism from any `--trace` export. `CompiledContext` gains the
+matching `prune_report`; the human renderer prints a one-line notice.
+`loom stats` integration still needs events persisted server-side or
+read from trace directories.
+
 ## 2026-10-09 — GLM adapter on Z.ai's metered API; usage dialects move to their adapters
 
 `--provider glm` targets `api.z.ai/api/paas/v4` (never the Coding Plan

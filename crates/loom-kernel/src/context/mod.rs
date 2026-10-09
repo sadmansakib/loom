@@ -26,7 +26,10 @@ mod pruning;
 
 pub use default::DefaultContextCompiler;
 pub use facts::{FactsSource, GitState, InstructionFile, KnownFacts, NoFacts, StaticFacts};
-pub use pruning::{PruneConfig, PruningContextCompiler, StubDecision, StubReason};
+pub use pruning::{
+    PruneConfig, PruneReport, PruneTrigger, PrunedCall, PruningContextCompiler, StubDecision,
+    StubReason,
+};
 
 use crate::model::{Message, ModelCapabilities, ModelRequest};
 use crate::session::{Session, TaskRecord};
@@ -270,6 +273,12 @@ pub struct CompiledContext {
     /// pruning compiler produced one (ADR-011). `None` for the default
     /// compiler and for a pruning compiler that has not triggered.
     pub prune_checkpoint: Option<PruneCheckpoint>,
+    /// Attribution for a checkpoint frozen by *this* compile: the
+    /// trigger arm plus per-call mechanism and estimated reclaim
+    /// (item 20.1). `None` on compiles that only re-applied frozen
+    /// stubs — the decision moment is what gets attributed, not every
+    /// turn the freeze stays in force. `None` for the default compiler.
+    pub prune_report: Option<PruneReport>,
     /// Call ids whose projected result body a pruning pass replaced with
     /// a [`crate::context::pruning::StubReason`] stub.
     ///
