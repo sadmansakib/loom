@@ -1,4 +1,4 @@
-//! Live DeepSeek API verification (research.md §4.1 UNVERIFIED list).
+//! Live DeepSeek API verification (pinned by the live tests in this file).
 //!
 //! These tests hit `https://api.deepseek.com` and spend real tokens
 //! (bounded by small `max_tokens`). Every test is `#[ignore]`d, so the
@@ -9,7 +9,7 @@
 //!     --test deepseek_live -- --ignored --nocapture
 //! ```
 //!
-//! Observations are recorded as sanitized facts in `docs/research.md`;
+//! Observations are recorded as sanitized facts in this file's comments;
 //! never commit API keys or recorded output containing secrets. Never
 //! point these at the GLM Coding Plan endpoint.
 
@@ -113,7 +113,7 @@ async fn plain_roundtrip_default_effort() {
 #[tokio::test]
 #[ignore = "live API: costs tokens; requires DEEPSEEK_API_KEY"]
 async fn effort_none_plain_roundtrip() {
-    // Pins the none + thinking:enabled pairing (research.md §4.1):
+    // Pins the none + thinking:enabled pairing (live verification):
     // research says the fields are independent; if the API rejects the
     // pair this fails with the 400 body in the error message.
     let provider = provider(ReasoningEffort::None);
@@ -127,7 +127,7 @@ async fn effort_none_plain_roundtrip() {
 #[tokio::test]
 #[ignore = "live API: costs tokens; requires DEEPSEEK_API_KEY"]
 async fn effort_none_tools_two_turns() {
-    // Pins two UNVERIFIED replay questions at once (research.md §4.1):
+    // Pins two UNVERIFIED replay questions at once (live verification):
     // 1. a no-reasoning assistant turn replayed WITHOUT reasoning_content
     //    (current build_request_body omits the field) — 400 would fail
     //    here with the body in the error message;
@@ -147,7 +147,7 @@ async fn effort_none_tools_two_turns() {
     let first = expect_completed(events);
     assert_eq!(first.message.stop_reason, StopReason::ToolCalls);
     assert_eq!(first.message.tool_calls.len(), 1);
-    // Live observation (research.md §4.1): `reasoning_effort: "none"`
+    // Live observation (live verification): `reasoning_effort: "none"`
     // does NOT suppress reasoning while thinking stays enabled — the
     // model emitted ~76 bytes of reasoning anyway. So the replay below
     // carries reasoning (the normal path), and this test pins the
@@ -213,7 +213,7 @@ async fn effort_none_tools_two_turns() {
 #[tokio::test]
 #[ignore = "live API: costs tokens; requires DEEPSEEK_API_KEY"]
 async fn thinking_disabled_plain_roundtrip() {
-    // Pins the real off switch (research.md §4.1): `thinking: disabled`
+    // Pins the real off switch (live verification): `thinking: disabled`
     // is the separate non-thinking mode, and this request pairs it with
     // an explicit `reasoning_effort` to probe whether the two fields are
     // truly independent. If the API rejects the pair, this fails with
@@ -320,7 +320,7 @@ async fn parallel_calls_replay_roundtrip() {
 #[tokio::test]
 #[ignore = "live API: costs tokens; requires DEEPSEEK_API_KEY"]
 async fn invalid_model_error_body() {
-    // Records the 4xx error-body shape (research.md §4.1 UNVERIFIED):
+    // Records the 4xx error-body shape (previously unverified):
     // run with --nocapture and read the printed error message.
     let provider = provider(ReasoningEffort::default());
     let request = ModelRequest {

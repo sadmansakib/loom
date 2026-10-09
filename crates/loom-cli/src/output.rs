@@ -3,7 +3,7 @@
 //! stdout carries the **result** (assistant text, or NDJSON events); stderr
 //! carries diagnostics (reasoning, tool/retry notices, the summary). Logs go
 //! to stderr too, so a pipeline can redirect stdout to a file and still see
-//! progress (§11, research.md §2).
+//! progress.
 //!
 //! Iteration 1 records API usage only; it does **not** download prices or
 //! compute cost (architecture §14 defers that to the benchmark harness), so

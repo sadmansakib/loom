@@ -17,7 +17,7 @@
 //! Override the target with `LOOM_BENCH_TARGET` and the model with
 //! `LOOM_BENCH_MODEL` (any id in the capability table).
 //!
-//! **Never point this at the GLM Coding Plan** (research.md §4): it is not an
+//! **Never point this at the GLM Coding Plan** (docs/roadmap.md, "Current state"): it is not an
 //! API endpoint and using it from a custom harness risks an account ban.
 
 // A test harness: panicking on a setup failure is the intended behavior.
@@ -74,7 +74,7 @@ impl EventSink for CountingSink {
     }
 }
 
-/// Peak / off-peak prices in USD per 1M tokens (research.md §8).
+/// Peak / off-peak prices in USD per 1M tokens (docs/roadmap.md, item 1).
 struct Prices {
     input_miss: f64,
     input_hit: f64,
@@ -269,7 +269,7 @@ fn assistant_chars(session: &Session) -> usize {
 /// Returns (multiplier, window) for the peak/off-peak DeepSeek price.
 ///
 /// Peak hours are 01:00–04:00 and 06:00–10:00 UTC, Monday–Friday; off-peak is
-/// 50 % of the peak price (research.md §8).
+/// 50 % of the peak price (docs/roadmap.md, item 1).
 fn price_multiplier(now: SystemTime) -> (f64, &'static str) {
     let seconds = now
         .duration_since(UNIX_EPOCH)

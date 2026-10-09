@@ -67,7 +67,7 @@
 //! and `report-<task>-<model>.json`. When recording a baseline, copy the
 //! report into `docs/benchmarks/`.
 //!
-//! **Never point this at the GLM Coding Plan** (research.md §4).
+//! **Never point this at the GLM Coding Plan** (docs/roadmap.md, "Current state").
 
 // A test harness: panicking on a setup failure is the intended behavior.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -590,7 +590,7 @@ impl EventSink for CountingSink {
     }
 }
 
-/// Peak prices in USD per 1M tokens (research.md §8); duplicates
+/// Peak prices in USD per 1M tokens (docs/roadmap.md, item 1); duplicates
 /// benchmark.rs — test binaries cannot share modules across files.
 struct Prices {
     input_miss: f64,

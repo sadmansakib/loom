@@ -96,14 +96,14 @@ impl std::str::FromStr for ReasoningEffort {
     }
 }
 
-/// The independent `thinking` request field (research.md §4.1).
+/// The independent `thinking` request field (live verification).
 ///
 /// `Disabled` selects the separate non-thinking mode — the actual
 /// reasoning off switch (8 KiB default `max_tokens`, no
 /// `reasoning_content` in responses). This is distinct from
 /// [`ReasoningEffort::None`], which the live API accepts without
 /// complaint but which does **not** suppress reasoning while thinking
-/// stays enabled (verified live, research.md §4.1).
+/// stays enabled (verified live).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ThinkingMode {
     /// `{"type": "enabled"}` — thinking mode, the API default.
@@ -231,7 +231,7 @@ impl DeepSeekProvider {
 /// Capability table mirroring the published DeepSeek "Models & Pricing"
 /// page (fetched 2026-10-03): both current models are 1M context /
 /// 384K (393,216) max output with tools and thinking. Verified live
-/// (research.md §4.1): the API enumerates exactly these two ids — the
+/// (live verification): the API enumerates exactly these two ids — the
 /// legacy `deepseek-v4-flash` is rejected with a 400, so it maps to
 /// `None` (loud unknown-model failure, not a silently wrong row).
 pub fn model_capabilities(model: &str) -> Option<ModelCapabilities> {
@@ -314,7 +314,7 @@ impl WireEndpoint for DeepSeekProvider {
             _ => ModelErrorKind::Server,
         };
         // Body text is included best-effort; the shape is verified live
-        // (research.md §4.1: OpenAI-style error object) and needs no
+        // (live-verified: OpenAI-style error object) and needs no
         // parsing — the excerpt carries error.message for logs/CLI.
         ModelError::new(kind, format!("HTTP {status}: {}", body_excerpt(body)))
     }

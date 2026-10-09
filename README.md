@@ -27,28 +27,37 @@ Capabilities move from model to software over time, never the reverse.
 
 | Crate | Purpose |
 |---|---|
-| `loom-core` | Domain + orchestration. No HTTP, no provider/tool specifics. |
-| `loom-providers` | Model provider adapters (DeepSeek via OpenAI-compatible wire format). |
-| `loom-tools` | Built-in deterministic tools (`read_file`, `list_dir`, `search`). |
-| `loom-cli` | `loom` binary: config, tracing, signals, output. |
+| `loom-kernel` | Domain model and traits (session, turns, tools, providers). No workspace dependencies. |
+| `loom-providers` | Provider adapters: DeepSeek and OpenRouter (OpenAI-compatible wire format) and Anthropic. |
+| `loom-store` | SQLite persistence for sessions and events. |
+| `loom-tools` | Built-in deterministic tools: file read/write/edit, search, listing, sandboxed command execution. |
+| `loom-engine` | The deterministic turn loop: context compilation, token estimation, pruning, repo intelligence, completion gate. |
+| `loom-core` | Facade re-exporting the public API for embedders. |
+| `loom-cli` | `loom` binary: config, tracing, signals, output, `loom stats`. |
 
-Dependency direction is enforced: `loom-core` cannot depend on provider or
-tool crates, so provider- or tool-specific behavior cannot leak into
-orchestration.
+Dependency direction is enforced: `loom-kernel` depends on no workspace
+crate, so provider- or tool-specific behavior cannot leak into the domain.
+`loom-engine` builds on kernel, store, providers, and tools; `loom-core`
+and `loom-cli` sit on top.
 
 ## Status
 
-Iteration 1 — smallest foundation that can run a task end to end:
+Iteration 2 — the loop runs end to end with real providers:
 
 ```
-Task → Session → ContextCompiler → ModelProvider (DeepSeek) → tool calls
-     → deterministic tool execution → tool results → model → completion
+Task → Session → engine turn loop → provider (DeepSeek / OpenRouter / Anthropic)
+     → tool calls → deterministic execution (incl. sandboxed shell)
+     → tool results → pruning/estimation → completion gate → done
 ```
 
-Implemented so far: workspace scaffold, time-ordered session/task IDs,
-transcript types, session aggregate with atomic turn commits, model
-request/stream/error abstractions, tool trait + registry, task event
-stream, DeepSeek streaming adapter.
+Shipped so far: time-ordered session/task IDs, transcript types, session
+aggregate with atomic turn commits, streaming adapters for three providers,
+per-provider token estimators (o200k-based; Anthropic-scaled), context
+pruning with turn-age masking and one-line stubs, bootstrap repo facts
+(tree, toolchains, AGENTS.md), sandboxed command execution (Seatbelt on
+macOS, bubblewrap on Linux), `edit_file` batch edits with region echo and
+whitespace-trim repair, a completion gate that refuses premature end turns,
+and `loom stats`. 594 tests.
 
 ## Development
 
@@ -66,7 +75,8 @@ Workspace lints: `unsafe_code` forbidden; `missing_docs`, `unwrap_used`,
 
 Documentation: [`docs/architecture.md`](docs/architecture.md) (design),
 [`docs/eval.md`](docs/eval.md) (eval suite protocol),
-[`docs/roadmap.md`](docs/roadmap.md) (iterations).
+[`docs/roadmap.md`](docs/roadmap.md) (vision, iterations, evidence
+backlog).
 
 ## License
 

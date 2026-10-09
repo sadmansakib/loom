@@ -3,6 +3,51 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — Evidence refresh (web research) and architecture.md drift fixes
+
+`docs/architecture.md` corrected against the code: §1 dependency table
+(kernel depends on no workspace crate; engine also links tools), §2/§12
+"no model-reachable shell" restated accurately (sandboxed shell is
+model-reachable and confined; the unsandboxed `sh -c` is the
+user-configured credential command only), §5.2 bootstrap facts, §5.3
+injected per-provider estimators (o200k / Anthropic-scaled; kernel
+keeps bytes÷3 default), §5.4 turn-age masking, §4 completion gate,
+§6.2 `edit_file` batch/echo/trim-repair, §6.7 `unchanged since call`
+stub, §9 `loom stats`, test count 594.
+
+`(docs/roadmap.md` evidence base refreshed from the 2026 literature:
+backlog preamble now cites Terminal-Bench 2.x same-model harness
+spreads (13–24 points), the controlled harness-vs-model variance grid
+(7.8×), and the 40× tokens-per-solved cost spread; item 1 names funded
+eval-model candidates with pricing (GLM-5.3 metered, DeepSeek V4 Pro)
+and sweep budget; item 2 carries the task-shape × model-tier nuance on
+shell-vs-tools; item 9 records the Opus 5.5 adaptive-thinking mechanics
+(effort steering, cache-bust rules, per-turn effort form); item 12
+records Anthropic's native `compact_20260112` and the CliffCompaction /
+AutoCompact results.
+
+`README.md` rewritten against the current code: seven-crate table with
+the kernel dependency invariant, three providers, iteration-2 status,
+sandboxed shell and shipped-feature list. All 14 dangling
+`research.md` references (a file that never existed in the repo) are
+repointed or replaced with inline facts: the two harness warnings now
+cite `docs/roadmap.md`, and the DeepSeek wire-format notes in
+`loom-providers` cite their own live verification tests.
+
+## 2026-10-09 — Roadmap: product vision merged with the evidence backlog
+
+`docs/roadmap.md` now carries the restated goals (G1–G10, renumbered:
+practical capability per model tier and workflow adaptation are new
+G4/G5), core principles, and the nine-iteration sequence, with a table
+mapping every backlog item to its iteration. Status corrected against the
+code: crate dependency direction, sandboxed shell replacing the
+cargo-only default, three providers, o200k/Anthropic estimators,
+bootstrap facts, edit batches/echo/trim repair, completion gate,
+turn-age masking, `loom stats`, 594 tests. Item 9's revisit trigger
+(item 14) is marked fired; item 1 gains the funded eval model, N ≥ 5
+re-runs of the N=1 claims, and a bare-loop × model-tier baseline. GLM is
+planned via the metered Z.ai API only, never the Coding Plan.
+
 ## 2026-10-09 — Anthropic: 5.5-family models and full engine/CLI wiring
 
 `--provider anthropic` now works end to end. The adapter shipped earlier

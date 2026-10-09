@@ -23,8 +23,8 @@ kernel never links a filesystem store or a CLI, the engine never prints.
 | Crate | Role | Depends on |
 |---|---|---|
 | `loom-core` | Facade re-exporting the public surface for embedders | engine, kernel, providers, tools |
-| `loom-kernel` | The agent itself: loop, context compilation, session/transcript model, tool abstraction, tool cache, artifacts, events, budgets | providers (traits only), nothing I/O-bearing |
-| `loom-engine` | Composition root: builds a configured `Agent` from paths, auth, a provider factory, and stores; repository facts scanner | kernel, store, providers |
+| `loom-kernel` | The agent itself: loop, context compilation, session/transcript model, tool abstraction, tool cache, artifacts, events, budgets | no workspace crates — it defines the side-effect traits (`ModelProvider`, `SessionStore`, `ArtifactStore`, `Tool`, …) itself |
+| `loom-engine` | Composition root: builds a configured `Agent` from paths, auth, a provider factory, tool registry, and stores; repository facts scanner | kernel, store, providers, tools |
 | `loom-providers` | Model provider adapters (DeepSeek, OpenRouter over one shared OpenAI-compatible wire; Anthropic on its own messages-API driver) | kernel model types |
 | `loom-store` | SQLite persistence: sessions, turns, tasks, artifacts, auth accounts | kernel store traits |
 | `loom-tools` | The shipped tool suite (read/search/edit/write/list/run/verify + artifact read) | kernel tool traits |
@@ -60,15 +60,16 @@ property.
   mutex-guarded connection — they are called at turn boundaries (persist
   once per turn) where the cost is bounded and the transactionality is
   worth more than async purity. This is documented at each call site.
-- **No shell for model-driven work.** The subprocesses Loom launches
-  for tools are `git` (repository facts, with `-c core.quotepath=false`),
-  bare programs from `run_command` (§6.8), each wrapped in an OS sandbox,
-  and the fixed per-ecosystem commands of `verify` (§6.2), which never
-  come from model input. The one `sh -c` is the user-configured
-  credential command (§8), never model-reachable. Program names must
-  be bare — a path-qualified name is rejected before any process exists.
-  Every child has provider credential variables scrubbed from its
-  environment.
+- **Sandboxed subprocesses for model-driven work.** The subprocesses Loom
+  launches for tools are `git` (repository facts, with
+  `-c core.quotepath=false`), `run_command` programs (§6.8) — each wrapped
+  in an OS sandbox, where the model *may* run a shell (`bash -c …`)
+  that inherits the confinement — and the fixed per-ecosystem commands
+  of `verify` (§6.2), which never come from model input. The one
+  unsandboxed `sh -c` is the user-configured credential command (§8),
+  never model-reachable. `run_command` program names must be bare — a
+  path-qualified name is rejected before any process exists. Every child
+  has provider credential variables scrubbed from its environment.
   Children are spawned with `kill_on_drop(true)` in their own process
   group; a timeout kills the whole group, so grandchildren (`rustc` under
   `cargo`) cannot outlive the kill.
@@ -151,7 +152,11 @@ serde_json's sorted-key serialization (BTreeMap ordering — no crate in the
 workspace enables `preserve_order`; the eval harness's byte-identical
 request check would catch it first if one ever did).
 
-**Terminal states**: `EndTurn` returns the reply; `UnrecoverableStop`
+**Terminal states**: `EndTurn` returns the reply — after the
+**completion gate** (roadmap item 8): if files changed since the last
+green check, the loop refuses once with the diff summary and the original
+instruction instead of accepting the end turn.
+`UnrecoverableStop`
 (max_tokens / context_limit / content_filter) commits the truncated or
 filtered reply first, so it stays inspectable; `MaxTurns` at the ceiling
 with tool calls pending; budget exhaustion; cancellation.
@@ -192,19 +197,30 @@ notable config files, and git state (branch via `rev-parse --abbrev-ref`,
 changed files via `status --porcelain` — C-quoted paths are unquoted,
 including octal byte escapes). The walk is depth-4, entry-capped at
 20,000, hidden/gitignored dirs excluded. Everything degrades: no git, no
-readable tree → fewer facts, never a failed task. The snapshot is frozen
+readable tree → fewer facts, never a failed task). The snapshot is frozen
 for the task, so the facts block never churns the cached prefix mid-task.
+
+Bootstrap facts (roadmap item 4) extend the same block: a depth-4 /
+200-line file tree, toolchain probes (`cargo`/`rustc`, `node`/`npm`,
+`python3`, `go`), and the head (4 KiB) of `AGENTS.md`, falling back to
+`CLAUDE.md` — project instructions enter the cached prefix once, not as
+per-turn context.
 
 ### 5.3 Census
 
 Every compiled request carries a `ContextCensus`: estimated tokens per
 source (system, facts, user history, assistant history, tool results,
-reasoning) plus an authoritative total. The estimate is
-serialized-bytes ÷ 3 with one token of framing per message — crude but
-conservative and, critically, deterministic. Attribution is careful to
-avoid double counting (reasoning is counted once, facts are subtracted
-from system). The census is how the loop, the pruning trigger, and the
-eval reporting all see the same numbers.
+reasoning) plus an authoritative total. Estimation is an injected
+`TokenEstimator`, chosen per provider at setup: `O200kEstimator` (real
+o200k BPE via tiktoken-rs) for the OpenAI-compatible providers, and
+`AnthropicEstimator` — the same o200k count scaled 1.25× and rounded up,
+because the 4.7+ tokenizer bills more tokens for the same text — for
+Anthropic. The kernel itself keeps only the conservative
+bytes÷3 `HeuristicEstimator` as the default, so the kernel stays
+tokenizer-free. Attribution is careful to avoid double counting
+(reasoning is counted once, facts are subtracted from system). The census
+is how the loop, the pruning trigger, and the eval reporting all see the
+same numbers.
 
 ### 5.4 Pruning (`PruningContextCompiler`)
 
@@ -231,6 +247,10 @@ never assistant content or reasoning.
   miss; a parked session costs zero.
 - Stubbed results keep their call id and carry a deterministic stub body
   telling the model how to recover the content (re-run the call).
+- **Turn-age masking** (roadmap item 10, default K=8): read-only results
+  older than 8 turns are stubbed *below* the window trigger, through the
+  same checkpoint/reclaim gate — bounded growth insurance for long
+  sessions on large windows.
 - **Forced prune.** A projection that overruns the budget outright —
   before the trigger has frozen anything that covers it — is rescued by
   deciding stubs on the spot and recompiling a stubbed view of the same
@@ -271,7 +291,7 @@ uses to link failures to the change that likely caused them.
 | `read_artifact` | read | paged read of a spilled artifact (§6.4) |
 | `run_command` | mutating | any bare program inside an OS sandbox (§6.8; writes confined to workspace + temp + cargo home, network off), manifest rules escalate; no shell, both pipes drained concurrently, head+tail bounded capture with explicit omission markers |
 | `verify` | mutating | `check`/`test` scope for the ecosystem detected from root markers (cargo > npm > python > go > make) or an explicit `ecosystem` argument; the command comes from a fixed per-ecosystem table, never from model input; ecosystems without a build-agnostic scope (npm `check`) refuse rather than guess; success → the pass summary line; failure → structured evidence (§6.5) |
-| `edit_file` | mutating | exact old-text match, must be unique (0 or ≥2 matches = invalid input), 8 MiB file cap; optional `verify` runs the detected ecosystem's check/test inside the same call (action fusion), skipping with a note when the scope is unsupported |
+| `edit_file` | mutating | exact old-text match, must be unique (0 or ≥2 matches = invalid input), 8 MiB file cap; atomic `edits: [...]` batch form across files (all-or-nothing, in order); every result echoes the edited region (±3 numbered lines, 8 KiB cap) so no re-read is needed; a whitespace-trim repair fires when exactly one trimmed match exists (recorded in `effects.repairs`); optional `verify` runs the detected ecosystem's check/test inside the same call (action fusion), skipping with a note when the scope is unsupported |
 | `write_file` | mutating | create/overwrite, parents created; optional `verify` as above |
 
 ### 6.3 Confinement
@@ -326,7 +346,9 @@ with identical arguments is a hit only if all signatures still match; any
 write to an overlapping path invalidates the entry. Signature computation
 is blocking work and runs on the blocking pool — never under the cache
 mutex, never on an async worker. A cheap `has_entry` probe lets the
-common first-read path skip hashing entirely.
+common first-read path skip hashing entirely. A hit while the original
+result is still in the projection unpruned returns
+`unchanged since call <id>` — one line instead of the content again.
 
 ### 6.8 Sandboxed shell and command policy
 
@@ -450,8 +472,10 @@ is the frontend's decision, passed in as `EngineConfig::db_path`.
 
 The CLI is thin: `loom run` (interactive render — text to stdout,
 reasoning to a dim stderr, NDJSON mode for machines), `loom auth`
-(login/list/set-active/remove), and the eval entry points. Exit codes: 0
-success, non-zero failure, 130 cancelled.
+(login/list/set-active/remove), `loom stats` (per-session analytics from
+stored transcripts: turns, per-tool call quality, edit acceptance,
+repeats, repairs, spill savings), and the eval entry points. Exit codes:
+0 success, non-zero failure, 130 cancelled.
 
 ## 10. Providers
 
@@ -551,9 +575,11 @@ Compare suites by medians over N ≥ 5; the observed noise floor is ±10%.
 **Security**
 - Path confinement on every tool path, symlink-hardened, regression-tested
   against escapes.
-- No model-reachable shell; every model-run subprocess is a bare name
-  inside an OS sandbox (writes confined, network off), process-group
-  kill, credential env scrub floor on every child.
+- No unsandboxed model-reachable subprocess: every model-run program
+  (a shell included) is a bare name inside the OS sandbox (writes
+  confined, network off), with process-group kill and a credential env
+  scrub floor on every child; the one `sh -c` is the user-configured
+  credential command, never model-reachable.
 - Secrets only in the OS keychain; canary-tested.
 - `unsafe_code = "forbid"` in kernel and tools.
 
@@ -566,7 +592,7 @@ Compare suites by medians over N ≥ 5; the observed noise floor is ±10%.
 - Blocking work on the blocking pool; hashing never under a lock.
 - Facts scanned once per task; capabilities resolved once per task.
 
-**Testing** — the workspace carries ~515 tests (13 live-API tests
+**Testing** — the workspace carries 594 tests (13 live-API tests
 ignored by default): unit tests per module,
 protocol and invariant tests against in-memory seams, security regression
 tests for confinement, canary tests for secrets, integration tests that
