@@ -81,6 +81,7 @@ fn plain_request(prompt: &str) -> ModelRequest {
         tools: vec![],
         max_tokens: Some(512),
         temperature: None,
+        stable_prefix_messages: None,
     }
 }
 
@@ -140,6 +141,7 @@ async fn effort_none_tools_two_turns() {
         tools: vec![list_files_tool()],
         max_tokens: Some(512),
         temperature: None,
+        stable_prefix_messages: None,
     };
     let events = collect(provider.stream(&turn1)).await;
     let first = expect_completed(events);
@@ -174,6 +176,7 @@ async fn effort_none_tools_two_turns() {
         tools: vec![list_files_tool()],
         max_tokens: Some(512),
         temperature: None,
+        stable_prefix_messages: None,
     };
     let events = collect(provider.stream(&turn2)).await;
     let second = expect_completed(events);
@@ -199,6 +202,7 @@ async fn effort_none_tools_two_turns() {
         tools: vec![list_files_tool()],
         max_tokens: Some(512),
         temperature: None,
+        stable_prefix_messages: None,
     };
     let events = collect(provider.stream(&turn3)).await;
     let third = expect_completed(events);
@@ -270,6 +274,7 @@ async fn parallel_calls_replay_roundtrip() {
         tools: vec![list_files_tool()],
         max_tokens: Some(512),
         temperature: None,
+        stable_prefix_messages: None,
     };
     let events = collect(provider.stream(&turn1)).await;
     let first = expect_completed(events);
@@ -304,6 +309,7 @@ async fn parallel_calls_replay_roundtrip() {
         tools: vec![list_files_tool()],
         max_tokens: Some(512),
         temperature: None,
+        stable_prefix_messages: None,
     };
     let events = collect(provider.stream(&turn2)).await;
     let second = expect_completed(events);
@@ -323,6 +329,7 @@ async fn invalid_model_error_body() {
         tools: vec![],
         max_tokens: Some(8),
         temperature: None,
+        stable_prefix_messages: None,
     };
     let events = collect(provider.stream(&request)).await;
     let error = events

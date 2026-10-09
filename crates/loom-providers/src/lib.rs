@@ -12,6 +12,8 @@
 //! serves none) and OpenRouter (capabilities and pricing resolved from
 //! the provider's model catalog, which the frontend fetches and caches).
 
+mod anthropic;
+mod anthropic_wire;
 mod deepseek;
 mod http;
 mod openai_wire;
@@ -20,6 +22,10 @@ mod secret;
 mod sse;
 mod wire_stream;
 
+pub use anthropic::{
+    AnthropicConfig, AnthropicProvider, DEFAULT_BASE_URL as ANTHROPIC_DEFAULT_BASE_URL,
+};
+pub use anthropic_wire::ANTHROPIC_VERSION as ANTHROPIC_API_VERSION;
 pub use deepseek::PROVIDER_NAME as DEEPSEEK_PROVIDER_NAME;
 pub use deepseek::{
     DeepSeekConfig, DeepSeekProvider, ParseReasoningEffortError, ReasoningEffort, ThinkingMode,

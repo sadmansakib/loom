@@ -189,6 +189,15 @@ pub struct ModelRequest {
     pub max_tokens: Option<u32>,
     /// Sampling temperature, if the caller overrides the provider default.
     pub temperature: Option<f32>,
+    /// Provider-agnostic cache hint: the number of leading `messages`
+    /// the compiler guarantees byte-identical in every subsequent
+    /// request of the same task (a lower bound on the stable prefix).
+    ///
+    /// The kernel stays provider-blind — adapters **may** use this to
+    /// place provider cache breakpoints (e.g. Anthropic `cache_control`);
+    /// `None` makes no promise. Old serialized requests default to it.
+    #[serde(default)]
+    pub stable_prefix_messages: Option<usize>,
 }
 
 /// What a model is capable of — descriptive facts, not policy (§3).
@@ -571,10 +580,24 @@ mod tests {
             }],
             max_tokens: Some(1_024),
             temperature: None,
+            stable_prefix_messages: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         let back: ModelRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(request, back);
+    }
+
+    #[test]
+    fn old_requests_without_the_prefix_hint_deserialize_to_none() {
+        let legacy = r#"{
+            "model": "deepseek-flash",
+            "messages": [{"role": "user", "text": "hi"}],
+            "tools": [],
+            "max_tokens": 1024,
+            "temperature": null
+        }"#;
+        let back: ModelRequest = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.stable_prefix_messages, None);
     }
 
     #[test]

@@ -109,6 +109,7 @@ fn plain_request(model: &str, prompt: &str) -> ModelRequest {
         tools: vec![],
         max_tokens: Some(512),
         temperature: None,
+        stable_prefix_messages: None,
     }
 }
 

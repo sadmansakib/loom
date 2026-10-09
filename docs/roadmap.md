@@ -427,6 +427,21 @@ treated as hypotheses until Loom's own eval reproduces them.
     **segments marked cacheable or volatile**, so cache breakpoints are
     placed by the adapter and the kernel stays provider-blind (OpenDev).
     Capability discovery copies the OpenRouter catalog pattern.
+    **Shipped 2026-10-09.** `AnthropicProvider` (+ pure
+    `anthropic_wire` translation and wiremock tests) speaks the
+    messages API: system as a top-level param, tool_use/tool_result
+    blocks, thinking-delta reasoning capture, Anthropic error
+    taxonomy, and `cache_control` breakpoints derived from the new
+    provider-agnostic `ModelRequest.stable_prefix_messages` hint
+    (`#[serde(default)]`; the default compiler sets it to the whole
+    projection, pruning inherits the guarantee). It runs its own
+    streaming state machine rather than refactoring the OpenAI wire
+    driver (drift risk over ~100 duplicated lines, noted in the
+    module docs). Capabilities come from a small static table
+    (claude-opus-4-1, claude-sonnet-4-5, claude-haiku-4-5; unknown
+    ids fail loud) because Anthropic's /v1/models exposes no
+    capability fields to reduce. Verified offline (wiremock) — no
+    live key; engine/CLI wiring is deferred with items 15+.
 15. **CLI session resume.** Listing, selection, continuation, and
     transcript export (also the input for item 19).
 16. **Search parity.** Adopt the `ignore` crate's matcher for chained

@@ -3,6 +3,38 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — Anthropic messages adapter (roadmap item 14)
+
+`loom-providers` gained an Anthropic adapter that speaks the messages
+API rather than the OpenAI wire: system text as a top-level `system`
+param, `tool_use`/`tool_result` content blocks (failed results carry
+`is_error`), `thinking_delta` reasoning capture, Anthropic's error
+taxonomy (429 → rate-limited, 529 → overloaded, 413 → context
+overflow), and stop-reason mapping incl. the same calls-beat-reason
+normalization the OpenAI wire uses. It streams through its own state
+machine — deliberately not the shared OpenAI driver, since refactoring
+that delicate path could not be re-verified live without a funded key.
+
+The kernel stays provider-blind: `ModelRequest` grew a
+`stable_prefix_messages` hint (`#[serde(default)]`, so old eval
+records still deserialize) — the count of leading messages the
+compiler guarantees byte-identical across requests. The default
+compiler sets it to the whole projection (append-only transcript,
+frozen facts); the adapter places an Anthropic
+`cache_control: ephemeral` breakpoint at the end of that region.
+
+Capabilities resolve from a small static table
+(claude-opus-4-1 200K/32K, claude-sonnet-4-5 200K/64K,
+claude-haiku-4-5 200K/32K; unknown ids return None, fail loud) —
+Anthropic's models endpoint exposes no capability fields, so there is
+nothing to reduce catalog-style. Engine/CLI provider selection stays
+deferred until the multi-provider CLI work (roadmap items 15+).
+
+Verified offline with wiremock: request wire shape, auth headers
+(`x-api-key` + `anthropic-version`), cache-breakpoint placement,
+tool-call assembly from partial `input_json_delta` chunks, truncated
+streams reporting `length` without calls, and error classification.
+
 ## 2026-10-09 — Pruning phase 2: turn-age masking (roadmap item 10)
 
 Read-only results older than 8 turns (configurable via `PruneConfig::

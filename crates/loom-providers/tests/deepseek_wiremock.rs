@@ -45,6 +45,7 @@ fn plain_request() -> ModelRequest {
         tools: vec![],
         max_tokens: None,
         temperature: None,
+        stable_prefix_messages: None,
     }
 }
 

@@ -86,6 +86,7 @@ fn request_buildable_and_streamable_outside_core() {
         }],
         max_tokens: None,
         temperature: None,
+        stable_prefix_messages: None,
     };
 
     let stream = provider.stream(&request);
