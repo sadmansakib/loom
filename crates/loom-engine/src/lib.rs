@@ -43,7 +43,7 @@ pub mod repo;
 pub mod trace;
 pub mod trace_stats;
 
-pub use engine::{Engine, EngineConfig, EngineError, default_system_prompt};
+pub use engine::{Continuation, Engine, EngineConfig, EngineError, default_system_prompt};
 pub use estimate::{
     ANTHROPIC_TOKEN_SCALE_PER_MILLE, AnthropicEstimator, O200kEstimator, estimator_for,
 };

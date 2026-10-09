@@ -108,10 +108,12 @@ Invariants the session layer enforces (and tests):
    type; a second finish attempt cannot overwrite the recorded end reason.
 
 **Events** (`event.rs`) are the observation stream: `EventEnvelope`
-(`schema_version: 3`, per-sink monotonically increasing `sequence`,
+(`schema_version: 4`, per-sink monotonically increasing `sequence`,
 snake_case `type` tag). Version 2 adds `Usage.cost_usd`, the
 provider-reported charge; version 3 adds `ContextPruned` (prune
-attribution). Both new fields are additive, so older payloads still
+attribution); version 4 adds `AwaitingInput` (engine idle marker after a
+task ends, naming the session — the signal a resume loop keys on). All
+new fields are additive, so older payloads still
 deserialize. A lock spans numbering and send, so arrival order
 equals sequence order even with concurrent emitters. The channel sink is
 unbounded — a slow consumer queues rather than back-pressures the agent;
@@ -471,6 +473,18 @@ catalog` (fetch with the provider's own credential, cache beside the
 database, stale-cache fallback) when the config does not already carry
 one — so no frontend re-implements that sequencing.
 
+The driving API is resume-first: besides `run_task` on a live session
+handle, `Engine::continue_session(id, input, …)` loads a persisted
+session and runs the next task on it, returning the advanced `Session`
+and the task outcome together in a `Continuation` — a failed or
+cancelled task still advances the session, so only load errors are
+`Err` (`SessionNotFound` when the id does not resolve). After every
+task's terminal event the engine emits `AwaitingInput` naming the idle
+session: a stream-only frontend keys its resume loop on that marker
+without polling. Kernel-level drivers emit no such marker — it is an
+engine concept, so hand-rolled loops (the eval harness) see no new
+events.
+
 Provider selection lives in one private engine module
 (`provider.rs`), the only place that names concrete adapters. It matches
 the configured provider name against the adapters' `PROVIDER_NAME`
@@ -683,7 +697,7 @@ Compare suites by medians over N ≥ 5; the observed noise floor is ±10%.
 - Blocking work on the blocking pool; hashing never under a lock.
 - Facts scanned once per task; capabilities resolved once per task.
 
-**Testing** — the workspace carries 657 tests (13 live-API tests
+**Testing** — the workspace carries 661 tests (13 live-API tests
 ignored by default): unit tests per module,
 protocol and invariant tests against in-memory seams, security regression
 tests for confinement, canary tests for secrets, integration tests that

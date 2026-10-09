@@ -13,7 +13,7 @@ use loom_kernel::agent::{Agent, TaskError, TaskSummary};
 use loom_kernel::context::{
     AgentConfig, DefaultContextCompiler, PruneConfig, PruningContextCompiler,
 };
-use loom_kernel::event::EventSink;
+use loom_kernel::event::{EventKind, EventSink};
 use loom_kernel::id::SessionId;
 use loom_kernel::session::Session;
 use loom_kernel::store::StoreError;
@@ -246,6 +246,12 @@ impl Engine {
     /// [`TaskSummary`]; every other terminal state — including cancellation —
     /// returns a [`TaskError`], and the persisted [`Session`] carries the same
     /// outcome.
+    ///
+    /// After the task's terminal event the engine emits
+    /// [`EventKind::AwaitingInput`] naming `session`: the session is idle and
+    /// accepts more input, whether through another `run_task` call or
+    /// [`Engine::continue_session`]. Stream-only frontends key their resume
+    /// loop on it.
     pub async fn run_task(
         &self,
         session: &mut Session,
@@ -253,9 +259,51 @@ impl Engine {
         sink: &dyn EventSink,
         cancellation: &CancellationToken,
     ) -> Result<TaskSummary, TaskError> {
-        self.agent
+        let outcome = self
+            .agent
             .run_task(session, input, sink, cancellation)
-            .await
+            .await;
+        // The engine is idle again once the task's terminal event has been
+        // emitted. The marker carries the ended task's id (envelope shape)
+        // and the session (payload); a session whose very first user item
+        // failed to persist has no task record, and no marker either.
+        if let Some(record) = session.tasks.last() {
+            sink.emit(
+                record.id,
+                EventKind::AwaitingInput {
+                    session_id: session.id,
+                },
+            );
+        }
+        outcome
+    }
+
+    /// Continues a persisted session: loads it, appends `input` as its
+    /// next user item, and runs the task loop to the next stopping point.
+    ///
+    /// The first-class resume flow (the core seam of roadmap item 15): the
+    /// advanced [`Session`] and the task's outcome travel back together in a
+    /// [`Continuation`]. A failed or cancelled task is **not** an `Err` here
+    /// — the session has still advanced (input committed, partial turns
+    /// persisted) and the caller can continue again — only loading problems
+    /// are errors: an unknown id (or no persistence) is
+    /// [`EngineError::SessionNotFound`], a store failure
+    /// [`EngineError::Session`].
+    ///
+    /// Blocking up front (SQLite load); same call-off-thread guidance as
+    /// [`Self::load_session`].
+    pub async fn continue_session(
+        &self,
+        id: &SessionId,
+        input: impl Into<String>,
+        sink: &dyn EventSink,
+        cancellation: &CancellationToken,
+    ) -> Result<Continuation, EngineError> {
+        let mut session = self
+            .load_session(id)?
+            .ok_or(EngineError::SessionNotFound { id: *id })?;
+        let outcome = self.run_task(&mut session, input, sink, cancellation).await;
+        Ok(Continuation { session, outcome })
     }
 
     /// Loads a persisted session so a frontend can resume it.
@@ -279,6 +327,22 @@ impl Engine {
     pub fn session_ids(&self) -> Result<Vec<SessionId>, EngineError> {
         self.agent.session_ids().map_err(EngineError::Session)
     }
+}
+
+/// A continued session: the advanced transcript plus the task's outcome.
+///
+/// [`Engine::continue_session`] returns this even when the task failed or
+/// was cancelled — the session is the durable artifact; the outcome is
+/// what the frontend renders.
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct Continuation {
+    /// The session after the task ran: input committed, turns persisted,
+    /// ready for another continuation.
+    pub session: Session,
+    /// The task's terminal outcome. `Err` here is a task-level result
+    /// ([`TaskError`]), not a load error — the load already succeeded.
+    pub outcome: Result<TaskSummary, TaskError>,
 }
 
 /// Registers the built-in tools (§9) in their stable exposure order.
@@ -416,11 +480,195 @@ pub enum EngineError {
     /// The session store could not be opened, read, or written.
     #[error("session store: {0}")]
     Session(#[source] StoreError),
+    /// The session to continue does not exist (or persistence is off).
+    #[error("session {id} was not found: nothing to continue")]
+    SessionNotFound {
+        /// The id that did not resolve.
+        id: SessionId,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::stream;
+    use loom_kernel::context::{AgentConfig, DefaultContextCompiler};
+    use loom_kernel::model::{
+        ModelCapabilities, ModelError, ModelErrorKind, ModelEvent, ModelProvider, ModelRequest,
+        ModelResponse, ModelStream, StopReason, Usage,
+    };
+    use loom_kernel::session::TaskStatus;
+    use loom_kernel::store::MemorySessionStore;
+    use loom_kernel::transcript::AssistantMessage;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// A provider that replays one scripted event list per `stream()` call.
+    /// Enough engine coverage for the driving layer: the kernel loop's own
+    /// behaviour is pinned in `loom-kernel`'s `agent_loop` tests.
+    struct FakeProvider {
+        scripts: Mutex<VecDeque<Vec<Result<ModelEvent, ModelError>>>>,
+    }
+
+    impl FakeProvider {
+        /// A provider replaying the given scripts, one per `stream()` call.
+        fn scripted(scripts: Vec<Vec<Result<ModelEvent, ModelError>>>) -> Self {
+            Self {
+                scripts: Mutex::new(VecDeque::from(scripts)),
+            }
+        }
+
+        /// One script: a single response that answers with `text` and ends
+        /// its turn.
+        fn end_turn_script(text: &str) -> Vec<Result<ModelEvent, ModelError>> {
+            vec![Ok(ModelEvent::Completed(ModelResponse {
+                message: AssistantMessage {
+                    content: text.to_owned(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    stop_reason: StopReason::EndTurn,
+                },
+                usage: Usage::default(),
+            }))]
+        }
+
+        /// Scripts for two tasks: the first ends its turn, the second fails
+        /// hard with `error`.
+        fn end_turn_then_error(text: &str, error: ModelError) -> Self {
+            Self::scripted(vec![Self::end_turn_script(text), vec![Err(error)]])
+        }
+    }
+
+    impl ModelProvider for FakeProvider {
+        fn name(&self) -> &str {
+            "fake"
+        }
+
+        fn capabilities(&self, _model: &str) -> Option<ModelCapabilities> {
+            Some(ModelCapabilities::new(8192))
+        }
+
+        fn stream<'a>(&'a self, _request: &'a ModelRequest) -> ModelStream<'a> {
+            let script = self.scripts.lock().unwrap().pop_front().unwrap_or_default();
+            Box::pin(stream::iter(script))
+        }
+    }
+
+    /// An engine around a fake provider with an in-memory store — the
+    /// session-lifecycle seams without credentials, network, or files.
+    fn fake_engine(provider: FakeProvider) -> Engine {
+        let agent = Agent::new(
+            Box::new(provider),
+            Box::new(DefaultContextCompiler::default()),
+            loom_kernel::tool::ToolRegistry::new(),
+            AgentConfig::new(PathBuf::from("."), "test agent"),
+            "fake-model",
+        )
+        .with_store(Box::new(MemorySessionStore::new()));
+        Engine { agent }
+    }
+
+    #[tokio::test]
+    async fn continue_session_resumes_a_persisted_session() {
+        let engine = fake_engine(FakeProvider::scripted(vec![
+            FakeProvider::end_turn_script("first"),
+            FakeProvider::end_turn_script("second"),
+        ]));
+        let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
+        let mut session = engine.new_session();
+
+        engine
+            .run_task(
+                &mut session,
+                "do the first thing",
+                &sink,
+                &Default::default(),
+            )
+            .await
+            .expect("first task");
+
+        // Resume through the first-class flow: the id alone must suffice.
+        let continuation = engine
+            .continue_session(&session.id, "now the second", &sink, &Default::default())
+            .await
+            .expect("continue");
+
+        let summary = continuation.outcome.expect("second task completed");
+        assert_eq!(summary.turns, 1);
+        assert_eq!(continuation.session.tasks.len(), 2);
+        // The store is the authority: reloading the id sees both tasks.
+        let reloaded = engine
+            .load_session(&session.id)
+            .expect("load")
+            .expect("persisted");
+        assert_eq!(reloaded.tasks.len(), 2);
+
+        // Idle markers: one per task end, each naming the session, always
+        // after the terminal event.
+        let kinds = drain(&mut receiver);
+        let idle: Vec<_> = kinds
+            .iter()
+            .filter(|kind| matches!(kind, EventKind::AwaitingInput { .. }))
+            .collect();
+        assert_eq!(idle.len(), 2, "kinds: {kinds:?}");
+        assert!(matches!(
+            kinds.last(),
+            Some(EventKind::AwaitingInput { session_id }) if *session_id == session.id
+        ));
+    }
+
+    #[tokio::test]
+    async fn continue_session_reports_unknown_ids() {
+        let engine = fake_engine(FakeProvider::scripted(vec![FakeProvider::end_turn_script(
+            "unused",
+        )]));
+        let (sink, _receiver) = loom_kernel::event::ChannelEventSink::new();
+        let error = engine
+            .continue_session(&SessionId::new(), "anything", &sink, &Default::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, EngineError::SessionNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn continue_session_returns_the_advanced_session_on_task_failure() {
+        // First task fine, second task a hard model failure: the
+        // continuation still carries the advanced session.
+        let engine = fake_engine(FakeProvider::end_turn_then_error(
+            "first",
+            ModelError::new(ModelErrorKind::Auth, "key rejected"),
+        ));
+        let mut session = engine.new_session();
+        let (sink, _receiver) = loom_kernel::event::ChannelEventSink::new();
+        engine
+            .run_task(&mut session, "first", &sink, &Default::default())
+            .await
+            .expect("first task");
+
+        let continuation = engine
+            .continue_session(&session.id, "second", &sink, &Default::default())
+            .await
+            .expect("continuation is not a load error");
+
+        assert!(continuation.outcome.is_err(), "task failed");
+        assert_eq!(continuation.session.tasks.len(), 2);
+        // The failed task is persisted with its terminal status, so a
+        // later continuation starts from honest state.
+        assert_eq!(continuation.session.tasks[1].status, TaskStatus::Failed);
+        // Idle is still signalled after a failed task; the marker itself
+        // is pinned in the resume test above.
+    }
+
+    /// Drains every pending event kind from the channel.
+    fn drain(
+        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<loom_kernel::event::EventEnvelope>,
+    ) -> Vec<EventKind> {
+        let mut kinds = Vec::new();
+        while let Ok(envelope) = receiver.try_recv() {
+            kinds.push(envelope.kind);
+        }
+        kinds
+    }
 
     #[tokio::test]
     async fn open_async_resolves_the_credential_before_fetching() {

@@ -26,7 +26,7 @@
 //! [`EventKind::ModelCompleted`] is authoritative.
 
 use crate::context::PruneReport;
-use crate::id::TaskId;
+use crate::id::{SessionId, TaskId};
 use crate::model::{ModelErrorKind, ModelResponse};
 use crate::transcript::ToolCallId;
 use serde::{Deserialize, Serialize};
@@ -58,7 +58,8 @@ use tokio_util::sync::CancellationToken;
 /// so v1 payloads still deserialize).
 /// v3 adds `ContextPruned` (prune attribution: trigger arm plus
 /// per-call mechanism and estimated reclaim).
-pub const EVENT_SCHEMA_VERSION: u16 = 3;
+/// v4 adds `AwaitingInput` (engine idle marker after a task ends).
+pub const EVENT_SCHEMA_VERSION: u16 = 4;
 
 /// One observed occurrence during a task, wrapped for the wire.
 ///
@@ -194,6 +195,27 @@ pub enum EventKind {
     },
     /// The task was cancelled (cooperative cancellation won).
     TaskCancelled,
+    /// The driving engine is idle: the task ended, and its session now
+    /// awaits the next user input.
+    ///
+    /// Emitted by the engine's driving layer right after the terminal
+    /// task event ([`EventKind::TaskCompleted`],
+    /// [`EventKind::TaskFailed`], or [`EventKind::TaskCancelled`]), so
+    /// consumers that render only the event stream learn when more
+    /// input can be sent — the signal a GUI or TUI resume loop keys on.
+    /// The envelope's `task_id` is the task that just ended; the payload
+    /// names the idle session. Being engine-level (not task loop)
+    /// observability, it sits outside the task's `events_dropped`
+    /// accounting: it is the last event of the burst, and its loss
+    /// costs nothing downstream.
+    ///
+    /// Kernel-level drivers ([`Agent::run_task`](crate::agent::Agent))
+    /// do not emit it — only engine wrappers do, so hand-rolled loops
+    /// (the eval harness) see no new events.
+    AwaitingInput {
+        /// The idle session, ready for more input.
+        session_id: SessionId,
+    },
 }
 
 /// Best-effort sink for task events.
@@ -493,6 +515,28 @@ mod tests {
         assert_eq!(
             value["kind"]["report"]["calls"][0]["reclaimed_tokens"],
             1_234
+        );
+        let round: EventEnvelope = serde_json::from_value(value).expect("round-trips");
+        assert_eq!(round, envelope);
+    }
+
+    /// Schema v4: `AwaitingInput` serializes with the snake_case tag and
+    /// the idle session's id, so a stream-only consumer can key its resume
+    /// loop on the marker alone.
+    #[test]
+    fn awaiting_input_serializes_the_session_id() {
+        let session_id = SessionId::new();
+        let envelope = EventEnvelope {
+            schema_version: EVENT_SCHEMA_VERSION,
+            sequence: 11,
+            task_id: TaskId::new(),
+            kind: EventKind::AwaitingInput { session_id },
+        };
+        let value = serde_json::to_value(&envelope).expect("serializes");
+        assert_eq!(value["kind"]["type"], "awaiting_input");
+        assert_eq!(
+            value["kind"]["session_id"],
+            serde_json::to_value(session_id).expect("id serializes")
         );
         let round: EventEnvelope = serde_json::from_value(value).expect("round-trips");
         assert_eq!(round, envelope);

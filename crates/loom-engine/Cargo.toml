@@ -29,6 +29,8 @@ tokio-util = { workspace = true }
 tempfile = { workspace = true }
 # `Engine::open_async` tests (rt + macros for #[tokio::test]).
 tokio = { workspace = true, features = ["macros", "rt"] }
+# `continue_session` tests build scripted `ModelStream`s with it.
+futures = { workspace = true }
 
 [lints]
 workspace = true

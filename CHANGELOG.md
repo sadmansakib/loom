@@ -3,6 +3,23 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — Session continuation + the AwaitingInput event (B3)
+
+First-class resume for the driving API: `Engine::continue_session(id,
+input, …)` loads a persisted session and runs the next task on it,
+returning the advanced `Session` and the task outcome together — a
+failed or cancelled task still advances the session (input committed,
+partial turns persisted), so only load errors are `Err`, with a new
+`EngineError::SessionNotFound` for ids that do not resolve. This is
+the core seam roadmap item 15's CLI resume builds on.
+
+Every task end now emits `AwaitingInput` (event schema v4) naming the
+idle session, right after the terminal event — the signal a
+stream-only frontend (GUI/TUI resume loop, roadmap item 22) keys on
+instead of polling. Emitted by the engine's driving layer only;
+kernel-level drivers and the eval harness see no new events, and the
+one-shot CLI renders nothing for it.
+
 ## 2026-10-09 — FanoutSink: multi-consumer event fan-out
 
 `loom_core::kernel::event::FanoutSink` composes several event sinks into

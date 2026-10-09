@@ -1457,6 +1457,7 @@ dependencies = [
 name = "loom-engine"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "ignore",
  "keyring",
  "loom-kernel",

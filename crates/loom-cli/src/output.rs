@@ -102,7 +102,10 @@ impl Renderer {
             | EventKind::ModelRequestStarted { .. }
             | EventKind::TaskCompleted
             | EventKind::TaskFailed { .. }
-            | EventKind::TaskCancelled => {}
+            | EventKind::TaskCancelled
+            // The engine is idle again; a one-shot run just exits, so the
+            // marker needs no output.
+            | EventKind::AwaitingInput { .. } => {}
             // `EventKind` is `#[non_exhaustive]`: a newer core may add
             // variants this iteration does not know how to render.
             _ => {}
