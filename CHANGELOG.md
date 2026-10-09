@@ -3,6 +3,16 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — Complexity pass, cli batch: run's consumer wiring decomposes
+
+The CLI adapter's `run` (lizard CCN 22 → 7) is now the process skeleton
+alone: `spawn_consumers` builds the §11 fan-out (renderer thread always,
+`--trace` writer thread when requested), `ctrl_c_ladder` is the two-stage
+stop signal (pause between turns, then abort), `join_consumers` closes the
+channels and collects the threads (handing back the trace writer), and
+`finish_trace` maps the task outcome to the manifest's terminal shape and
+finishes the best-effort export. 672 tests unchanged.
+
 ## 2026-10-09 — Complexity pass, tools batch: edit, confinement, and evidence hotspots decompose
 
 Tier-1 (CCN ≥ 15) reductions across loom-tools, same treatment as the

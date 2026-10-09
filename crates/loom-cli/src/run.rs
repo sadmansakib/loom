@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use anyhow::Context;
 use loom_core::engine::TaskControl;
+use loom_core::kernel::agent::{TaskError, TaskSummary};
 use loom_core::kernel::event::{ChannelEventSink, FanoutSink};
+use loom_core::kernel::session::Session;
 use loom_core::{Engine, EngineConfig};
 
 use crate::args::RunArgs;
@@ -58,98 +60,21 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let mut session = engine.new_session();
     let input = args.task.join(" ");
 
-    // Two independent consumers fan out from one sink (§11): the
-    // renderer always owns stdout; with `--trace` a second consumer
-    // appends every envelope to the task's `events.ndjson` and hands
-    // the writer back so the main thread can finish the export once
-    // the outcome is known. A stalled disk can delay the trace without
-    // ever delaying the terminal, and vice versa.
-    let (render_sink, mut render_receiver) = ChannelEventSink::new();
-    let json = args.json;
-    let renderer_thread = std::thread::spawn(move || {
-        let mut renderer = Renderer::new(json);
-        while let Some(envelope) = render_receiver.blocking_recv() {
-            renderer.render(&envelope);
-        }
-        renderer.finish();
-    });
+    let (sink, renderer_thread, tracer_thread) = spawn_consumers(args.json, args.trace.clone());
 
-    let (trace_sink, tracer_thread) = match args.trace.clone() {
-        Some(dir) => {
-            let (trace_sink, mut trace_receiver) = ChannelEventSink::new();
-            let mut writer = TraceWriter::new(dir);
-            let thread = std::thread::spawn(move || {
-                while let Some(envelope) = trace_receiver.blocking_recv() {
-                    writer.record(&envelope);
-                }
-                writer
-            });
-            (Some(trace_sink), Some(thread))
-        }
-        None => (None, None),
-    };
-    let sink = match trace_sink {
-        Some(trace_sink) => FanoutSink::new().with(render_sink).with(trace_sink),
-        None => FanoutSink::new().with(render_sink),
-    };
-
-    // Ctrl-C steers the task's stop control: the first press pauses —
-    // the in-flight turn finishes and commits, then the loop stops —
-    // and a second press aborts mid-flight. Either way the session
-    // survives to be resumed. The provider's timeouts need the time
-    // driver the runtime already enables.
+    // The provider's timeouts need the time driver the runtime enables.
     let control = TaskControl::new();
-    let signal_control = control.clone();
-    let signal = runtime.spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            eprintln!("stopping after the current turn (Ctrl-C again to abort)…");
-            signal_control.pause();
-            if tokio::signal::ctrl_c().await.is_ok() {
-                eprintln!("aborting…");
-                signal_control.cancel();
-            }
-        }
-    });
+    let signal = runtime.spawn(ctrl_c_ladder(control.clone()));
 
     let outcome = runtime.block_on(engine.run_task(&mut session, input, &sink, &control));
-    // Dropping the fan-out (and with it both channel senders) closes
-    // the consumers' `blocking_recv` loops.
-    drop(sink);
-    signal.abort();
-    if renderer_thread.join().is_err() {
-        eprintln!("warning: event renderer thread panicked");
-    }
-    let tracer = tracer_thread.and_then(|thread| match thread.join() {
-        Ok(writer) => Some(writer),
-        Err(_) => {
-            eprintln!("warning: trace consumer thread panicked; trace not written");
-            None
-        }
-    });
+    let tracer = join_consumers(sink, signal, renderer_thread, tracer_thread);
 
     // The trace export is best-effort: a failure to write files must not
     // change the run's exit code, only warn.
     if let Some(writer) = tracer {
-        let (trace_outcome, summary) = match &outcome {
-            Ok(summary) => (Outcome::Completed, Some(summary)),
-            Err(error) => {
-                let reason = error.end_reason().to_string();
-                (
-                    Outcome::Ended {
-                        status: if error.is_cancelled() {
-                            "cancelled"
-                        } else if error.is_paused() {
-                            "paused"
-                        } else {
-                            "failed"
-                        },
-                        end_reason: reason,
-                    },
-                    None,
-                )
-            }
-        };
-        match writer.finish(
+        finish_trace(
+            writer,
+            &outcome,
             &session,
             TraceMeta {
                 provider: &trace_provider,
@@ -158,13 +83,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 max_turns: args.max_turns,
                 persisted: !args.no_save,
             },
-            trace_outcome,
-            summary,
-        ) {
-            Ok(Some(dir)) => eprintln!("trace: {}", dir.display()),
-            Ok(None) => {}
-            Err(error) => eprintln!("warning: trace export failed: {error}"),
-        }
+        );
     }
 
     match outcome {
@@ -182,5 +101,125 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 ExitCode::FAILURE
             })
         }
+    }
+}
+
+/// Spawns the run's event consumers (§11): the renderer always owns
+/// stdout; with `--trace` a second consumer appends every envelope to
+/// the task's `events.ndjson` and hands the writer back so the main
+/// thread can finish the export once the outcome is known. A stalled
+/// disk can delay the trace without ever delaying the terminal, and
+/// vice versa.
+fn spawn_consumers(
+    json: bool,
+    trace: Option<std::path::PathBuf>,
+) -> (
+    FanoutSink,
+    std::thread::JoinHandle<()>,
+    Option<std::thread::JoinHandle<TraceWriter>>,
+) {
+    let (render_sink, mut render_receiver) = ChannelEventSink::new();
+    let renderer_thread = std::thread::spawn(move || {
+        let mut renderer = Renderer::new(json);
+        while let Some(envelope) = render_receiver.blocking_recv() {
+            renderer.render(&envelope);
+        }
+        renderer.finish();
+    });
+
+    let (trace_sink, tracer_thread) = match trace {
+        Some(dir) => {
+            let (trace_sink, mut trace_receiver) = ChannelEventSink::new();
+            let mut writer = TraceWriter::new(dir);
+            let thread = std::thread::spawn(move || {
+                while let Some(envelope) = trace_receiver.blocking_recv() {
+                    writer.record(&envelope);
+                }
+                writer
+            });
+            (Some(trace_sink), Some(thread))
+        }
+        None => (None, None),
+    };
+    let sink = match trace_sink {
+        Some(trace_sink) => FanoutSink::new().with(render_sink).with(trace_sink),
+        None => FanoutSink::new().with(render_sink),
+    };
+    (sink, renderer_thread, tracer_thread)
+}
+
+/// The two-stage Ctrl-C ladder: the first press pauses — the in-flight
+/// turn finishes and commits, then the loop stops — and a second press
+/// aborts mid-flight. Either way the session survives to be resumed.
+async fn ctrl_c_ladder(control: TaskControl) {
+    if tokio::signal::ctrl_c().await.is_ok() {
+        eprintln!("stopping after the current turn (Ctrl-C again to abort)…");
+        control.pause();
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("aborting…");
+            control.cancel();
+        }
+    }
+}
+
+/// Closes the consumers' channels and collects their threads: dropping
+/// the fan-out (and with it both channel senders) ends the
+/// `blocking_recv` loops, and the trace writer — when one ran — comes
+/// back for the export below.
+fn join_consumers(
+    sink: FanoutSink,
+    signal: tokio::task::JoinHandle<()>,
+    renderer_thread: std::thread::JoinHandle<()>,
+    tracer_thread: Option<std::thread::JoinHandle<TraceWriter>>,
+) -> Option<TraceWriter> {
+    drop(sink);
+    signal.abort();
+    if renderer_thread.join().is_err() {
+        eprintln!("warning: event renderer thread panicked");
+    }
+    tracer_thread.and_then(|thread| match thread.join() {
+        Ok(writer) => Some(writer),
+        Err(_) => {
+            eprintln!("warning: trace consumer thread panicked; trace not written");
+            None
+        }
+    })
+}
+
+/// Finishes the trace export: maps the task outcome to the manifest's
+/// terminal shape (completed / cancelled / paused / failed) and writes
+/// the manifest and transcript beside the events. Best-effort by
+/// contract — a failure warns and never changes the exit code. The
+/// run-configuration fields arrive as a [`TraceMeta`] assembled where
+/// the config consumed their originals.
+fn finish_trace(
+    writer: TraceWriter,
+    outcome: &Result<TaskSummary, TaskError>,
+    session: &Session,
+    meta: TraceMeta<'_>,
+) {
+    let (trace_outcome, summary) = match outcome {
+        Ok(summary) => (Outcome::Completed, Some(summary)),
+        Err(error) => {
+            let reason = error.end_reason().to_string();
+            (
+                Outcome::Ended {
+                    status: if error.is_cancelled() {
+                        "cancelled"
+                    } else if error.is_paused() {
+                        "paused"
+                    } else {
+                        "failed"
+                    },
+                    end_reason: reason,
+                },
+                None,
+            )
+        }
+    };
+    match writer.finish(session, meta, trace_outcome, summary) {
+        Ok(Some(dir)) => eprintln!("trace: {}", dir.display()),
+        Ok(None) => {}
+        Err(error) => eprintln!("warning: trace export failed: {error}"),
     }
 }
