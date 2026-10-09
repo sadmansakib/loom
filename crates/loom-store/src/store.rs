@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use loom_kernel::id::{ArtifactId, SessionId};
 use loom_kernel::session::{PlannedTurn, Session, TaskRecord};
-use loom_kernel::store::{ArtifactStore, SessionStore, StoreError, StoredArtifact};
+use loom_kernel::store::{ArtifactStat, ArtifactStore, SessionStore, StoreError, StoredArtifact};
 use loom_kernel::transcript::{Item, ItemIndex};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -415,6 +415,46 @@ impl ArtifactStore for SqliteStore {
         };
         let id = raw_id.parse::<ArtifactId>().map_err(corrupt)?;
         Ok(Some(StoredArtifact::new(id, kind, sha256, body)))
+    }
+
+    fn list(&self) -> Result<Vec<ArtifactStat>, StoreError> {
+        let connection = self.lock()?;
+        let mut query = connection
+            .prepare(
+                "SELECT id, kind, bytes, created_at FROM artifacts \
+                 ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(backend)?;
+        let rows = query
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(backend)?;
+        let mut stats = Vec::new();
+        for row in rows {
+            let (raw_id, kind, bytes, created_at) = row.map_err(backend)?;
+            let id = raw_id.parse::<ArtifactId>().map_err(corrupt)?;
+            stats.push(ArtifactStat {
+                id,
+                kind,
+                bytes: bytes.unsigned_abs(),
+                created_at: created_at.unsigned_abs(),
+            });
+        }
+        Ok(stats)
+    }
+
+    fn delete(&self, id: &ArtifactId) -> Result<(), StoreError> {
+        let connection = self.lock()?;
+        connection
+            .execute("DELETE FROM artifacts WHERE id = ?1", [id.to_string()])
+            .map_err(backend)?;
+        Ok(())
     }
 }
 

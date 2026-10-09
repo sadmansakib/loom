@@ -224,6 +224,32 @@ fn artifacts_round_trip_and_are_findable_by_hash() {
 }
 
 #[test]
+fn artifact_listing_is_oldest_first_and_delete_removes_only_that_body() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let older = StoredArtifact::new(ArtifactId::new(), "tool_output", "aa", b"older".to_vec());
+    let newer = StoredArtifact::new(ArtifactId::new(), "tool_output", "bb", b"newer!".to_vec());
+    let older_id = older.id;
+    store.put(&older).unwrap();
+    // created_at has millisecond resolution, so same-tick writes tie and
+    // the secondary key (id ASC) orders them — v7 ids make that insertion
+    // order. Assert the pair rather than which specific tiebreak fired.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    store.put(&newer).unwrap();
+
+    let listed = store.list().unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].id, older_id);
+    assert_eq!(listed[0].bytes, 5);
+    assert_eq!(listed[0].kind, "tool_output");
+    assert!(listed[0].created_at <= listed[1].created_at);
+
+    store.delete(&older_id).unwrap();
+    assert!(store.get(&older_id).unwrap().is_none());
+    assert_eq!(store.list().unwrap().len(), 1);
+    assert!(store.get(&newer.id).unwrap().is_some());
+}
+
+#[test]
 fn a_newer_schema_version_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("loom.db");

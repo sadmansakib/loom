@@ -15,6 +15,8 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
+use serde::{Deserialize, Serialize};
+
 use crate::id::{ArtifactId, SessionId};
 use crate::session::{PlannedTurn, Session, TaskRecord};
 use crate::transcript::{Item, ItemIndex};
@@ -113,6 +115,23 @@ impl StoredArtifact {
     }
 }
 
+/// Metadata for one stored artifact body, without the body itself.
+///
+/// The shape [`ArtifactStore::list`] returns; the GC (2D lifecycle) and the
+/// stats surface consume it, neither of which needs the bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactStat {
+    /// The row key a transcript reference carries.
+    pub id: ArtifactId,
+    /// Artifact kind (e.g. a tool name), for routing and display.
+    pub kind: String,
+    /// Length of the body in bytes.
+    pub bytes: u64,
+    /// First-write time, milliseconds since the Unix epoch. Storing the
+    /// same id again replaces the body but never resets this.
+    pub created_at: u64,
+}
+
 /// Stores artifact bodies addressed by [`ArtifactId`] (ADR-012).
 ///
 /// Kept separate from [`SessionStore`] because the two are written in the same
@@ -128,6 +147,14 @@ pub trait ArtifactStore: Send + Sync {
 
     /// Finds a body by content hash, for deduplication.
     fn find_by_sha256(&self, sha256: &str) -> Result<Option<StoredArtifact>, StoreError>;
+
+    /// Lists every artifact's metadata, oldest first. Bodies are not
+    /// included; this is the GC's and the stats surface's read.
+    fn list(&self) -> Result<Vec<ArtifactStat>, StoreError>;
+
+    /// Deletes a body. Only the GC calls this, and only for ids the
+    /// reference scan proved unreferenced.
+    fn delete(&self, id: &ArtifactId) -> Result<(), StoreError>;
 }
 
 /// In-memory [`SessionStore`] for tests and embedding without a database.
@@ -240,8 +267,11 @@ impl SessionStore for MemorySessionStore {
 /// In-memory [`ArtifactStore`] for tests.
 #[derive(Default)]
 pub struct MemoryArtifactStore {
-    artifacts: Mutex<HashMap<ArtifactId, StoredArtifact>>,
+    artifacts: Mutex<MemoryArtifactMap>,
 }
+
+/// The memory store's rows: body plus first-write time.
+type MemoryArtifactMap = HashMap<ArtifactId, (StoredArtifact, u64)>;
 
 impl MemoryArtifactStore {
     /// Creates an empty store.
@@ -250,7 +280,7 @@ impl MemoryArtifactStore {
         Self::default()
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, HashMap<ArtifactId, StoredArtifact>>, StoreError> {
+    fn lock(&self) -> Result<MutexGuard<'_, MemoryArtifactMap>, StoreError> {
         self.artifacts
             .lock()
             .map_err(|_| StoreError::Backend("artifact store lock poisoned".to_owned()))
@@ -259,20 +289,46 @@ impl MemoryArtifactStore {
 
 impl ArtifactStore for MemoryArtifactStore {
     fn put(&self, artifact: &StoredArtifact) -> Result<(), StoreError> {
-        self.lock()?.insert(artifact.id, artifact.clone());
+        let mut guard = self.lock()?;
+        // An id-storing put replaces the body but keeps the first-write
+        // time, mirroring the SQLite upsert's created_at behavior.
+        let created_at = guard
+            .get(&artifact.id)
+            .map_or_else(crate::artifact_gc::now_millis, |(_, at)| *at);
+        guard.insert(artifact.id, (artifact.clone(), created_at));
         Ok(())
     }
 
     fn get(&self, id: &ArtifactId) -> Result<Option<StoredArtifact>, StoreError> {
-        Ok(self.lock()?.get(id).cloned())
+        Ok(self.lock()?.get(id).map(|(artifact, _)| artifact.clone()))
     }
 
     fn find_by_sha256(&self, sha256: &str) -> Result<Option<StoredArtifact>, StoreError> {
         Ok(self
             .lock()?
             .values()
-            .find(|artifact| artifact.sha256 == sha256)
-            .cloned())
+            .find(|(artifact, _)| artifact.sha256 == sha256)
+            .map(|(artifact, _)| artifact.clone()))
+    }
+
+    fn list(&self) -> Result<Vec<ArtifactStat>, StoreError> {
+        let mut stats: Vec<ArtifactStat> = self
+            .lock()?
+            .iter()
+            .map(|(id, (artifact, created_at))| ArtifactStat {
+                id: *id,
+                kind: artifact.kind.clone(),
+                bytes: artifact.bytes,
+                created_at: *created_at,
+            })
+            .collect();
+        stats.sort_by_key(|stat| (stat.created_at, stat.id));
+        Ok(stats)
+    }
+
+    fn delete(&self, id: &ArtifactId) -> Result<(), StoreError> {
+        self.lock()?.remove(id);
+        Ok(())
     }
 }
 

@@ -123,7 +123,7 @@ iterations may start early where a backlog item is cheap and measured.
 | # | Iteration | Status | Backlog items |
 |---|---|---|---|
 | 1 | Core service | **Done** | — (see Shipped) |
-| 2 | Core efficiency & repository intelligence | **In progress (current)** | 1, 3✓, 4✓, 5✓ᴬ, 6✓, 7✗, 8✓ᴬ, 10✓ᴬ, 11⏸, 12⏸, 16, 17 |
+| 2 | Core efficiency & repository intelligence | **In progress (current)** | 1, 3✓, 4✓, 5✓ᴬ, 6✓, 7✗, 8✓ᴬ, 10✓ᴬ, 11⏸, 12⏸, 16, 17✓ |
 | 3 | Intelligent subagent scheduling | Not started | 19, 21 |
 | 4 | Execution safety & richer tools | **Largely shipped early** | 2✓, 13⏸, 23 |
 | 5 | Skills & contextual knowledge | Partial (AGENTS.md facts) | 4✓ (instructions), 20.4 |
@@ -475,7 +475,7 @@ also summarized here so this section is the single source of truth.
   and cached tokens / cost / wall time / tool-cache hits, per-task
   aggregates and a gated-pass-rate suite headline; strict and tolerant
   modes.
-- **Verification bar.** 686 tests passing (13 live-API tests ignored by
+- **Verification bar.** 694 tests passing (13 live-API tests ignored by
   default), clippy clean, fmt clean.
 
 ---
@@ -870,6 +870,14 @@ reproduces them.
     divergence with real-repository fixtures.
 17. **Artifacts lifecycle.** Reference counting from live transcripts,
     an age/size-bounded GC, and a size-reporting command.
+    **Shipped 2026-10-10** — `ArtifactStore` grew `list`/`delete`
+    (first-write times on both backends); `artifact_gc` walks every
+    stored transcript for the live set, then deletes only orphans past
+    the backstop bounds (30 days age, 256 MiB total, oldest first — a
+    referenced body is never deleted). The engine runs the pass at
+    open, best-effort; `loom stats` reports bodies, live/orphan split,
+    and reclaimable bytes, store-wide (references from any session keep
+    a body alive). 8 tests across the kernel and store crates.
 
 ### Later — structure and self-improvement
 

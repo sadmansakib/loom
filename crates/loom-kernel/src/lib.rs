@@ -10,6 +10,7 @@ pub mod agent;
 
 pub mod analytics;
 pub mod artifact;
+pub mod artifact_gc;
 pub mod context;
 pub mod event;
 pub mod id;

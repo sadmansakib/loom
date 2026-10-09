@@ -280,9 +280,29 @@ impl Engine {
         // store.
         if config.persist {
             let store = SqliteStore::open(config.db_path.clone()).map_err(EngineError::Session)?;
-            agent = agent.with_store(Box::new(store));
             let artifacts =
                 SqliteStore::open(config.db_path.clone()).map_err(EngineError::Session)?;
+
+            // The lifecycle pass (roadmap 2.17), best-effort at open: the
+            // transcript scan marks the live set, then only unreferenced
+            // bodies past the backstop bounds are reclaimed. A scan or
+            // collection failure warns and never blocks the open — and a
+            // failed scan skips the run entirely, because an empty live
+            // set would treat every body as an orphan.
+            let gc =
+                loom_kernel::artifact_gc::referenced_artifacts(&store).and_then(|referenced| {
+                    loom_kernel::artifact_gc::collect(
+                        &artifacts,
+                        &referenced,
+                        loom_kernel::artifact_gc::now_millis(),
+                        loom_kernel::artifact_gc::GcBounds::default(),
+                    )
+                });
+            if let Err(error) = gc {
+                eprintln!("warn: artifact gc skipped: {error}");
+            }
+
+            agent = agent.with_store(Box::new(store));
             agent = agent.with_artifacts(Some(Arc::new(artifacts)));
         }
 

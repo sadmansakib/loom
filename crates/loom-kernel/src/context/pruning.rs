@@ -18,10 +18,34 @@
 //! * Everything is derived from the session transcript with fixed rules —
 //!   no I/O, no clocks, no model calls.
 //!
-//! Never pruned: user items, assistant messages (text and reasoning), and
-//! the protected tail — the last `protected_tail_turns` turns *and* at
-//! least `protected_tail_tokens` estimated tokens of trailing items
-//! (whichever reaches further back).
+//! Never pruned by the result-stubbing strategies: user items,
+//! assistant messages (text and reasoning), and the protected tail —
+//! the last `protected_tail_turns` turns *and* at least
+//! `protected_tail_tokens` estimated tokens of trailing items
+//! (whichever reaches further back). History elision (below) touches
+//! old call arguments and non-first user items; it never touches
+//! assistant text or reasoning.
+//!
+//! # History elision (roadmap item 12, deterministic half)
+//!
+//! Result stubbing alone leaves two buckets stacking verbatim every
+//! turn: tool-call *arguments* (an edit call carries the whole new file
+//! content — 28 % of context tokens on CliffCompaction's Terminal-Bench
+//! unpacking) and old non-first *user items*. When `elide_turns` is
+//! set (default 8), the same episodic machinery reduces them below the
+//! window trigger:
+//!
+//! * old calls keep their signature — name, id, short strings (paths,
+//!   flags) — while every string longer than `elide_arg_chars` in the
+//!   arguments becomes `[pruned N chars]`; the frozen checkpoint stores
+//!   the elided arguments verbatim so re-application is byte-stable.
+//! * user items after the task brief (the first one is never touched)
+//!   become a one-line stub; the brief stays byte-exact.
+//!
+//! Both are deterministic — no model call, no I/O — and run through the
+//! same reclaim gate and checkpoint freeze, so each batch costs exactly
+//! one prefix-cache miss. Assistant text and reasoning are still never
+//! reduced; the LLM-handoff remains the last resort for those
 //!
 //! Budget-exceeded rescue: when the inner compiler's estimate already
 //! overruns the budget — the trigger never got the chance to fire below
@@ -41,7 +65,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::Message;
 use crate::session::Session;
 use crate::tool::{PathAccess, ToolRegistry, paths_overlap};
-use crate::transcript::{Item, ToolCallId, ToolResult, ToolStatus};
+use crate::transcript::{Item, ToolArguments, ToolCallId, ToolResult, ToolStatus};
 
 use super::default::{census, serialized_size};
 use super::{
@@ -74,6 +98,16 @@ pub struct PruneConfig {
     /// full history (18.0 vs 15.0), and a window-relative trigger never
     /// fires on a large context. `None` disables the behavior.
     pub age_mask_turns: Option<usize>,
+    /// History elision window (roadmap item 12, deterministic half):
+    /// tool calls older than this many assistant turns have their
+    /// arguments reduced to a signature (long strings elided), and
+    /// user items after the task brief older than the same window are
+    /// stubbed. `None` disables both.
+    pub elide_turns: Option<usize>,
+    /// Minimum serialized length a string inside old call arguments
+    /// must exceed to be elided; shorter strings (paths, flags, ids)
+    /// always survive so the call keeps a usable signature.
+    pub elide_arg_chars: usize,
 }
 
 impl PruneConfig {
@@ -100,6 +134,8 @@ impl Default for PruneConfig {
             protected_tail_turns: 3,
             stale_error_turns: 4,
             age_mask_turns: Some(8),
+            elide_turns: Some(8),
+            elide_arg_chars: 160,
         }
     }
 }
@@ -118,6 +154,14 @@ pub enum StubReason {
     /// A read-only result older than `age_mask_turns` (turn-age
     /// masking, independent of the window trigger).
     TurnAge,
+    /// A tool call's arguments were reduced to a signature — strings
+    /// longer than `elide_arg_chars` replaced with `[pruned N chars]`
+    /// (history elision). Never used for result bodies; `stub_text`
+    /// exists for exhaustive matches and diagnostics.
+    ElidedArgs,
+    /// A user item after the task brief was replaced with a stub
+    /// (history elision). The brief itself is never elided.
+    ElidedUser,
 }
 
 impl StubReason {
@@ -140,6 +184,12 @@ impl StubReason {
             Self::TurnAge => {
                 "[pruned] read-only result older than the kept turn window; re-run the tool to recover the content"
             }
+            Self::ElidedArgs => {
+                "[pruned] call arguments reduced to their signature; the result body carries the outcome"
+            }
+            Self::ElidedUser => {
+                "[pruned] earlier user message elided by context pruning; the original task brief is preserved"
+            }
         }
     }
 }
@@ -151,6 +201,22 @@ pub struct StubDecision {
     pub call_id: String,
     /// Why — decides the stub text.
     pub reason: StubReason,
+}
+
+/// One frozen argument elision (history elision): the call keeps its
+/// id, name and short argument strings, while every string longer than
+/// `PruneConfig::elide_arg_chars` was replaced with `[pruned N chars]`.
+///
+/// The *elided* arguments are frozen verbatim (not just the call id) so
+/// re-applying a checkpoint never depends on config drift between the
+/// freeze and the re-apply — the projection stays byte-stable by
+/// construction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArgElision {
+    /// The call whose arguments are elided.
+    pub call_id: String,
+    /// The already-elided arguments, projected verbatim on re-apply.
+    pub arguments: ToolArguments,
 }
 
 /// Which arm froze a [`PruneCheckpoint`] (and produced its
@@ -274,7 +340,7 @@ impl ContextCompiler for PruningContextCompiler {
             // worth taking. Fails closed when nothing is prunable or the
             // pruned view still does not fit.
             Err(overrun @ ContextError::BudgetExceeded { .. }) => {
-                let (decisions, _reclaim) =
+                let decisions =
                     decide(session, tools, self.config, &*self.estimator, true);
                 if decisions.is_empty() {
                     return Err(overrun);
@@ -292,10 +358,10 @@ impl ContextCompiler for PruningContextCompiler {
                     prune_checkpoint,
                 }) {
                     Ok(compiled) => {
-                        // The stubs are already baked into the stubbed
-                        // session the inner compiler projected, so record
-                        // the decisions verbatim.
-                        stubbed_calls.extend(decisions.iter().map(|d| d.call_id.clone()));
+                        // The stubs and elisions are already baked into the
+                        // stubbed session the inner compiler projected, so
+                        // record the decisions verbatim.
+                        stubbed_calls.extend(decisions.stubs.iter().map(|d| d.call_id.clone()));
                         report = Some(prune_report(
                             PruneTrigger::Rescue,
                             session,
@@ -304,7 +370,9 @@ impl ContextCompiler for PruningContextCompiler {
                         ));
                         checkpoint = Some(PruneCheckpoint {
                             upto_item: session.transcript.len(),
-                            stubs: decisions,
+                            stubs: decisions.stubs,
+                            elided_args: decisions.elided_args,
+                            elided_users: decisions.elided_users,
                         });
                         compiled
                     }
@@ -325,13 +393,11 @@ impl ContextCompiler for PruningContextCompiler {
         };
 
         // Apply the frozen decisions first: between triggers the projection
-        // must stay byte-stable (ADR-011).
-        if let Some(frozen) = checkpoint
-            .as_ref()
-            .map(|c| c.stubs.clone())
-            .filter(|stubs| !stubs.is_empty())
-        {
-            stubbed_calls.extend(apply_stubs(&mut compiled.request, &frozen));
+        // must stay byte-stable (ADR-011). Result stubs and history
+        // elisions are independent rewrites; both feed the same recount.
+        if let Some(frozen) = checkpoint.as_ref().filter(|c| !c.is_empty()) {
+            stubbed_calls.extend(apply_stubs(&mut compiled.request, &frozen.stubs));
+            apply_elisions(&mut compiled.request, &frozen.elided_args, &frozen.elided_users);
             compiled.census = census(&compiled.request, facts_tokens, &*self.estimator);
         }
 
@@ -341,33 +407,44 @@ impl ContextCompiler for PruningContextCompiler {
         // ADR-011: pruning is episodic — one cache miss per checkpoint, never
         // per turn. A checkpoint that already covers the transcript is only
         // superseded when the new pass reclaims a meaningful amount *beyond*
-        // what the frozen stubs already reclaim; otherwise a session parked
-        // above the trigger would re-decide (and rewrite earlier projected
-        // messages) on every turn.
+        // what the frozen decisions already reclaim; otherwise a session
+        // parked above the trigger would re-decide (and rewrite earlier
+        // projected messages) on every turn.
         //
-        // Turn-age masking (roadmap item 10) adds a second trigger arm:
-        // when configured, the decision pass also runs *below* the window
-        // trigger so old read-only results are masked as they age out. The
-        // same reclaim gate applies — an aging batch is only worth a cache
-        // miss when it reclaims at least `min_reclaim_tokens` beyond the
-        // frozen checkpoint — so the projection stays byte-stable between
+        // Turn-age masking (roadmap item 10) and history elision
+        // (item 12) add below-window arms: when configured, the decision
+        // pass also runs *below* the window trigger so old read-only
+        // results are masked and old call arguments and non-first user
+        // items are elided as they age out. The same reclaim gate
+        // applies — an aging batch is only worth a cache miss when it
+        // reclaims at least `min_reclaim_tokens` beyond the frozen
+        // checkpoint — so the projection stays byte-stable between
         // aging batches.
         let trigger = self.config.trigger_tokens(budget.max_input_tokens);
         let window_triggered = compiled.census.total > trigger;
         let age_masking = self.config.age_mask_turns.is_some();
-        if window_triggered || age_masking {
-            let (decisions, reclaim) = decide(
+        let elision_enabled = self.config.elide_turns.is_some();
+        if window_triggered || age_masking || elision_enabled {
+            let decisions = decide(
                 session,
                 tools,
                 self.config,
                 &*self.estimator,
                 window_triggered,
             );
-            let already = checkpoint.as_ref().map_or(0, |frozen| {
-                frozen_reclaim(session, &frozen.stubs, &*self.estimator)
-            });
-            if reclaim >= already.saturating_add(u64::from(self.config.min_reclaim_tokens)) {
-                stubbed_calls.extend(apply_stubs(&mut compiled.request, &decisions));
+            let already =
+                checkpoint
+                    .as_ref()
+                    .map_or(0, |frozen| frozen_reclaim(session, frozen, &*self.estimator));
+            if decisions.reclaim_tokens
+                >= already.saturating_add(u64::from(self.config.min_reclaim_tokens))
+            {
+                stubbed_calls.extend(apply_stubs(&mut compiled.request, &decisions.stubs));
+                apply_elisions(
+                    &mut compiled.request,
+                    &decisions.elided_args,
+                    &decisions.elided_users,
+                );
                 compiled.census = census(&compiled.request, facts_tokens, &*self.estimator);
                 report = Some(prune_report(
                     if window_triggered {
@@ -381,7 +458,9 @@ impl ContextCompiler for PruningContextCompiler {
                 ));
                 checkpoint = Some(PruneCheckpoint {
                     upto_item: session.transcript.len(),
-                    stubs: decisions,
+                    stubs: decisions.stubs,
+                    elided_args: decisions.elided_args,
+                    elided_users: decisions.elided_users,
                 });
             }
         }
@@ -430,86 +509,224 @@ fn apply_stubs(request: &mut crate::model::ModelRequest, stubs: &[StubDecision])
 /// Clones `session` with the stubbed results rewritten in place, as the
 /// private view the budget-exceeded rescue recompiles. The durable
 /// transcript is never mutated — only this copy's projection changes,
-/// mirroring [`apply_stubs`] item for item.
-fn stubbed_session(session: &Session, stubs: &[StubDecision]) -> Session {
-    let by_call: HashMap<&str, StubReason> = stubs
+/// mirroring [`apply_stubs`] and [`apply_elisions`] item for item.
+fn stubbed_session(session: &Session, decisions: &DecisionSet) -> Session {
+    let by_call: HashMap<&str, StubReason> = decisions
+        .stubs
         .iter()
         .map(|stub| (stub.call_id.as_str(), stub.reason))
         .collect();
+    let elided_calls: HashMap<&str, &ToolArguments> = decisions
+        .elided_args
+        .iter()
+        .map(|elision| (elision.call_id.as_str(), &elision.arguments))
+        .collect();
     let mut stubbed = session.clone();
+    let mut user_ordinal = 0usize;
     for item in &mut stubbed.transcript {
-        let Item::ToolResult(result) = item else {
-            continue;
-        };
-        let Some(reason) = by_call.get(result.call_id.as_str()) else {
-            continue;
-        };
-        result.content = reason.stub_text().to_owned();
-        result.truncated = false;
+        match item {
+            Item::ToolResult(result) => {
+                let Some(reason) = by_call.get(result.call_id.as_str()) else {
+                    continue;
+                };
+                result.content = reason.stub_text().to_owned();
+                result.truncated = false;
+            }
+            Item::Assistant(assistant) => {
+                for call in &mut assistant.tool_calls {
+                    if let Some(args) = elided_calls.get(call.id.as_str()) {
+                        call.arguments = args.clone();
+                    }
+                }
+            }
+            Item::User { text } => {
+                if decisions.elided_users.contains(&user_ordinal) {
+                    *text = StubReason::ElidedUser.stub_text().to_owned();
+                }
+                user_ordinal += 1;
+            }
+        }
     }
     stubbed
 }
 
-/// Tokens the already-frozen stubs reclaim from the *current* transcript, so
-/// `compile` can gate a fresh checkpoint on the reclaim that is genuinely new
-/// (ADR-011: pruning is episodic — one cache miss per checkpoint).
+/// Rewrites projected assistant tool-call arguments and user messages
+/// per the frozen elisions: calls keep their signature (the elided
+/// arguments are stored verbatim in the checkpoint), user items past
+/// the brief become a one-line stub. User items are matched by ordinal
+/// (0-based, transcript order), the same key the checkpoint freezes —
+/// the projection filters `ContentFilter` turns, so transcript indexes
+/// would not line up with request messages.
+fn apply_elisions(
+    request: &mut crate::model::ModelRequest,
+    elided_args: &[ArgElision],
+    elided_users: &[usize],
+) {
+    if elided_args.is_empty() && elided_users.is_empty() {
+        return;
+    }
+    let by_call: HashMap<&str, &ToolArguments> = elided_args
+        .iter()
+        .map(|elision| (elision.call_id.as_str(), &elision.arguments))
+        .collect();
+    let mut user_ordinal = 0usize;
+    for message in &mut request.messages {
+        match message {
+            Message::Assistant(assistant) => {
+                for call in &mut assistant.tool_calls {
+                    if let Some(args) = by_call.get(call.id.as_str()) {
+                        call.arguments = args.clone();
+                    }
+                }
+            }
+            Message::User { text } => {
+                if elided_users.contains(&user_ordinal) {
+                    *text = StubReason::ElidedUser.stub_text().to_owned();
+                }
+                user_ordinal += 1;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Tokens the already-frozen decisions reclaim from the *current*
+/// transcript, so `compile` can gate a fresh checkpoint on the reclaim
+/// that is genuinely new (ADR-011: pruning is episodic — one cache miss
+/// per checkpoint). Covers result stubs, argument elisions, and user
+/// elisions alike: whatever the frozen checkpoint takes off the
+/// transcript's back counts.
 fn frozen_reclaim(
     session: &Session,
-    stubs: &[StubDecision],
+    frozen: &PruneCheckpoint,
     estimator: &dyn TokenEstimator,
 ) -> u64 {
-    let by_call: HashMap<&str, StubReason> = stubs
+    let by_call: HashMap<&str, StubReason> = frozen
+        .stubs
         .iter()
         .map(|stub| (stub.call_id.as_str(), stub.reason))
         .collect();
+    let elided_calls: HashMap<&str, &ToolArguments> = frozen
+        .elided_args
+        .iter()
+        .map(|elision| (elision.call_id.as_str(), &elision.arguments))
+        .collect();
+    let elided_users: HashSet<usize> = frozen.elided_users.iter().copied().collect();
+    let elided_user_stub = Message::User {
+        text: StubReason::ElidedUser.stub_text().to_owned(),
+    };
     let mut reclaim = 0u64;
+    let mut user_ordinal = 0usize;
     for item in &session.transcript {
-        let Item::ToolResult(result) = item else {
-            continue;
-        };
-        let Some(reason) = by_call.get(result.call_id.as_str()) else {
-            continue;
-        };
-        reclaim += u64::from(
-            estimate_serialized(estimator, item).saturating_sub(stub_tokens(
-                &result.call_id,
-                &result.status,
-                *reason,
-                estimator,
-            )),
-        );
+        match item {
+            Item::ToolResult(result) => {
+                let Some(reason) = by_call.get(result.call_id.as_str()) else {
+                    continue;
+                };
+                reclaim += u64::from(
+                    estimate_serialized(estimator, item).saturating_sub(stub_tokens(
+                        &result.call_id,
+                        &result.status,
+                        *reason,
+                        estimator,
+                    )),
+                );
+            }
+            Item::Assistant(assistant) => {
+                for call in &assistant.tool_calls {
+                    let Some(elided) = elided_calls.get(call.id.as_str()) else {
+                        continue;
+                    };
+                    reclaim += u64::from(
+                        estimate_serialized(estimator, &call.arguments)
+                            .saturating_sub(estimate_serialized(estimator, elided)),
+                    );
+                }
+            }
+            Item::User { text } => {
+                if elided_users.contains(&user_ordinal) {
+                    let full = Message::User { text: text.clone() };
+                    reclaim += u64::from(
+                        estimate_serialized(estimator, &full)
+                            .saturating_sub(estimate_serialized(estimator, &elided_user_stub)),
+                    );
+                }
+                user_ordinal += 1;
+            }
+        }
     }
     reclaim
 }
 
-/// Builds the freeze-time attribution for `stubs` against `session`'s
-/// transcript: per-call estimated reclaim (full item less the stub body)
-/// plus the arm that fired.
+/// Builds the freeze-time attribution for `decisions` against
+/// `session`'s transcript — per-call estimated reclaim (full item less
+/// its stub/elided replacement) plus the arm that fired. User elisions
+/// report under the synthetic id `user:{ordinal}`.
 fn prune_report(
     trigger: PruneTrigger,
     session: &Session,
-    stubs: &[StubDecision],
+    decisions: &DecisionSet,
     estimator: &dyn TokenEstimator,
 ) -> PruneReport {
-    let by_call: HashMap<&str, StubReason> = stubs
+    let by_call: HashMap<&str, StubReason> = decisions
+        .stubs
         .iter()
         .map(|stub| (stub.call_id.as_str(), stub.reason))
         .collect();
+    let elided_calls: HashMap<&str, &ToolArguments> = decisions
+        .elided_args
+        .iter()
+        .map(|elision| (elision.call_id.as_str(), &elision.arguments))
+        .collect();
+    let elided_users: HashSet<usize> = decisions.elided_users.iter().copied().collect();
+    let elided_user_stub = Message::User {
+        text: StubReason::ElidedUser.stub_text().to_owned(),
+    };
     let mut calls = Vec::new();
+    let mut user_ordinal = 0usize;
     for item in &session.transcript {
-        let Item::ToolResult(result) = item else {
-            continue;
-        };
-        let Some(&reason) = by_call.get(result.call_id.as_str()) else {
-            continue;
-        };
-        let full = estimate_serialized(estimator, item);
-        let stub = stub_tokens(&result.call_id, &result.status, reason, estimator);
-        calls.push(PrunedCall {
-            call_id: result.call_id.as_str().to_owned(),
-            reason,
-            reclaimed_tokens: u64::from(full.saturating_sub(stub)),
-        });
+        match item {
+            Item::ToolResult(result) => {
+                let Some(&reason) = by_call.get(result.call_id.as_str()) else {
+                    continue;
+                };
+                let full = estimate_serialized(estimator, item);
+                let stub = stub_tokens(&result.call_id, &result.status, reason, estimator);
+                calls.push(PrunedCall {
+                    call_id: result.call_id.as_str().to_owned(),
+                    reason,
+                    reclaimed_tokens: u64::from(full.saturating_sub(stub)),
+                });
+            }
+            Item::Assistant(assistant) => {
+                for call in &assistant.tool_calls {
+                    let Some(elided) = elided_calls.get(call.id.as_str()) else {
+                        continue;
+                    };
+                    let full = estimate_serialized(estimator, &call.arguments);
+                    let elided_tokens = estimate_serialized(estimator, elided);
+                    calls.push(PrunedCall {
+                        call_id: call.id.as_str().to_owned(),
+                        reason: StubReason::ElidedArgs,
+                        reclaimed_tokens: u64::from(full.saturating_sub(elided_tokens)),
+                    });
+                }
+            }
+            Item::User { text } => {
+                if elided_users.contains(&user_ordinal) {
+                    let full = Message::User { text: text.clone() };
+                    let stub = estimate_serialized(estimator, &elided_user_stub);
+                    calls.push(PrunedCall {
+                        call_id: format!("user:{user_ordinal}"),
+                        reason: StubReason::ElidedUser,
+                        reclaimed_tokens: u64::from(
+                            estimate_serialized(estimator, &full).saturating_sub(stub),
+                        ),
+                    });
+                }
+                user_ordinal += 1;
+            }
+        }
     }
     let reclaimed_tokens = calls.iter().map(|call| call.reclaimed_tokens).sum();
     PruneReport {
@@ -535,13 +752,29 @@ struct ResultFacts {
     read_call: Option<(String, String, Vec<String>)>,
 }
 
-/// Everything the five strategy passes reason over, collected in two
-/// transcript scans: per-result facts, assistant turn boundaries, and
-/// the writes that can supersede earlier reads.
+/// Facts about one assistant tool call, for argument elision.
+struct CallFacts {
+    /// Transcript index of the assistant item carrying the call.
+    index: usize,
+    /// Assistant turn the call belongs to (1-based).
+    turn: usize,
+    call_id: ToolCallId,
+    /// The call's arguments — elision runs over a copy of these.
+    arguments: ToolArguments,
+}
+
+/// Everything the strategy passes reason over, collected in two
+/// transcript scans: per-result facts, per-call facts, assistant turn
+/// boundaries, user-item ordinals, and the writes that can supersede
+/// earlier reads.
 struct TranscriptFacts {
     results: Vec<ResultFacts>,
+    calls: Vec<CallFacts>,
     /// Transcript index of every assistant item — the turn boundaries.
     assistant_at: Vec<usize>,
+    /// Transcript indexes of user items, in order — the position in
+    /// this list *is* the ordinal the checkpoint freezes.
+    user_at: Vec<usize>,
     /// `(index, changed paths)` per tool result that wrote or deleted.
     writes: Vec<(usize, Vec<String>)>,
 }
@@ -567,16 +800,27 @@ impl TranscriptFacts {
         }
         let is_read_only = |name: &str| registry.get(name).is_some_and(|tool| tool.is_read_only());
 
-        // Scan 2 — tool-result facts, assistant turn boundaries, later writes.
+        // Scan 2 — tool-result and call facts, assistant turn
+        // boundaries, user ordinals, later writes.
         let mut assistant_at: Vec<usize> = Vec::new();
         let mut results: Vec<ResultFacts> = Vec::new();
+        let mut call_facts: Vec<CallFacts> = Vec::new();
+        let mut user_at: Vec<usize> = Vec::new();
         let mut writes: Vec<(usize, Vec<String>)> = Vec::new();
         let mut turn = 0usize;
         for (index, item) in transcript.iter().enumerate() {
             match item {
-                Item::Assistant(_) => {
+                Item::Assistant(assistant) => {
                     turn += 1;
                     assistant_at.push(index);
+                    for call in &assistant.tool_calls {
+                        call_facts.push(CallFacts {
+                            index,
+                            turn,
+                            call_id: call.id.clone(),
+                            arguments: call.arguments.clone(),
+                        });
+                    }
                 }
                 Item::ToolResult(result) => {
                     let read_call =
@@ -603,12 +847,14 @@ impl TranscriptFacts {
                         read_call,
                     });
                 }
-                Item::User { .. } => {}
+                Item::User { .. } => user_at.push(index),
             }
         }
         Self {
             results,
+            calls: call_facts,
             assistant_at,
+            user_at,
             writes,
         }
     }
@@ -643,18 +889,21 @@ impl TranscriptFacts {
     }
 }
 
-/// Accumulated stub decisions across the five strategy passes, in
-/// ADR-011's fixed order — earlier passes win, later ones skip
-/// already-stubbed calls so each result keeps its most specific reason.
+/// Accumulated stub and elision decisions across the strategy passes,
+/// in ADR-011's fixed order — earlier passes win, later ones skip
+/// already-decided items so each keeps its most specific reason.
 #[derive(Default)]
-struct DecisionPass {
+struct DecisionSet {
     stubbed: Vec<StubDecision>,
     stubbed_ids: HashSet<String>,
+    elided_args: Vec<ArgElision>,
+    elided_arg_ids: HashSet<String>,
+    elided_users: Vec<usize>,
     reclaim_tokens: u64,
 }
 
-impl DecisionPass {
-    /// Records one stub and its estimated reclaim.
+impl DecisionSet {
+    /// Records one result stub and its estimated reclaim.
     fn add(&mut self, facts: &ResultFacts, reason: StubReason, estimator: &dyn TokenEstimator) {
         self.reclaim_tokens += u64::from(facts.tokens.saturating_sub(stub_tokens(
             &facts.call_id,
@@ -667,6 +916,14 @@ impl DecisionPass {
             call_id: facts.call_id.as_str().to_owned(),
             reason,
         });
+    }
+
+    /// Whether every decision list is empty — the rescue's
+    /// nothing-prunable test.
+    fn is_empty(&self) -> bool {
+        self.stubbed.is_empty()
+            && self.elided_args.is_empty()
+            && self.elided_users.is_empty()
     }
 
     /// Whether `facts` is outside the protected region and not already
@@ -801,7 +1058,7 @@ fn mask_aged_reads(
     config: PruneConfig,
     total_turns: usize,
     estimator: &dyn TokenEstimator,
-    pass: &mut DecisionPass,
+    pass: &mut DecisionSet,
 ) {
     let Some(max_age) = config.age_mask_turns else {
         return;
@@ -819,7 +1076,99 @@ fn mask_aged_reads(
     }
 }
 
-/// Computes the stub set from the transcript under ADR-011's fixed
+/// Pass 6 — argument elision: tool calls older than `elide_turns`
+/// assistant turns have their arguments reduced to a signature — every
+/// string longer than `elide_arg_chars` becomes `[pruned N chars]`,
+/// while names, ids, paths and flags survive. The elided arguments are
+/// frozen verbatim, so re-application is byte-stable by construction.
+/// Mutating calls included: their arguments (edit payloads) are the
+/// bucket result stubbing never touches. The protected tail always
+/// wins.
+fn elide_aged_calls(
+    facts: &TranscriptFacts,
+    protected_from: usize,
+    config: PruneConfig,
+    total_turns: usize,
+    estimator: &dyn TokenEstimator,
+    pass: &mut DecisionSet,
+) {
+    let Some(max_age) = config.elide_turns else {
+        return;
+    };
+    for call in &facts.calls {
+        if call.index >= protected_from
+            || total_turns.saturating_sub(call.turn) <= max_age
+            || pass.elided_arg_ids.contains(call.call_id.as_str())
+        {
+            continue;
+        }
+        let Some(elided) = elide_arguments(&call.arguments, config.elide_arg_chars) else {
+            continue;
+        };
+        let reclaim = estimate_serialized(estimator, &call.arguments)
+            .saturating_sub(estimate_serialized(estimator, &elided));
+        if reclaim == 0 {
+            continue;
+        }
+        pass.reclaim_tokens += u64::from(reclaim);
+        pass.elided_arg_ids
+            .insert(call.call_id.as_str().to_owned());
+        pass.elided_args.push(ArgElision {
+            call_id: call.call_id.as_str().to_owned(),
+            arguments: elided,
+        });
+    }
+}
+
+/// Pass 7 — user-item elision: user items after the task brief (the
+/// first, ordinal 0 — never elided) older than `elide_turns` assistant
+/// turns become a one-line stub. Completion-gate refusals and follow-up
+/// prompts age out like any other history instead of stacking verbatim
+/// forever. The protected tail always wins.
+fn elide_aged_users(
+    facts: &TranscriptFacts,
+    transcript: &[Item],
+    protected_from: usize,
+    config: PruneConfig,
+    total_turns: usize,
+    estimator: &dyn TokenEstimator,
+    pass: &mut DecisionSet,
+) {
+    let Some(max_age) = config.elide_turns else {
+        return;
+    };
+    let stub = Message::User {
+        text: StubReason::ElidedUser.stub_text().to_owned(),
+    };
+    let stub_tokens = estimate_serialized(estimator, &stub);
+    for (ordinal, &index) in facts.user_at.iter().enumerate() {
+        if ordinal == 0
+            || pass.elided_users.contains(&ordinal)
+            || index >= protected_from
+            || total_turns.saturating_sub(turn_of(facts, index)) <= max_age
+        {
+            continue;
+        }
+        let Item::User { text } = &transcript[index] else {
+            continue;
+        };
+        let full = Message::User { text: text.clone() };
+        let reclaim = estimate_serialized(estimator, &full).saturating_sub(stub_tokens);
+        if reclaim == 0 {
+            continue;
+        }
+        pass.reclaim_tokens += u64::from(reclaim);
+        pass.elided_users.push(ordinal);
+    }
+}
+
+/// The assistant turn a transcript index belongs to (the count of
+/// assistant items at or before it).
+fn turn_of(facts: &TranscriptFacts, index: usize) -> usize {
+    facts.assistant_at.partition_point(|&at| at <= index)
+}
+
+/// Computes the decision set from the transcript under ADR-011's fixed
 /// strategy order, plus the reclaim estimate (in tokens) against the
 /// *unpruned* projection.
 fn decide(
@@ -828,12 +1177,12 @@ fn decide(
     config: PruneConfig,
     estimator: &dyn TokenEstimator,
     window_triggered: bool,
-) -> (Vec<StubDecision>, u64) {
+) -> DecisionSet {
     let facts = TranscriptFacts::collect(session, registry, estimator);
     let protected_from = facts.protected_from(&session.transcript, config, estimator);
     let total_turns = facts.assistant_at.len();
 
-    let mut pass = DecisionPass::default();
+    let mut pass = DecisionSet::default();
     dedupe_reads(&facts, protected_from, estimator, &mut pass);
     supersede_reads(&facts, protected_from, estimator, &mut pass);
     stub_stale_errors(
@@ -859,8 +1208,63 @@ fn decide(
         estimator,
         &mut pass,
     );
+    elide_aged_calls(
+        &facts,
+        protected_from,
+        config,
+        total_turns,
+        estimator,
+        &mut pass,
+    );
+    elide_aged_users(
+        &facts,
+        &session.transcript,
+        protected_from,
+        config,
+        total_turns,
+        estimator,
+        &mut pass,
+    );
 
-    (pass.stubbed, pass.reclaim_tokens)
+    pass
+}
+
+/// Reduces `args` to its signature: every string longer than
+/// `min_chars` (recursively, in objects and arrays alike) is replaced
+/// with `[pruned N chars]`; shorter strings and all non-string scalars
+/// survive. Returns `None` when nothing changed — the caller treats
+/// that as "nothing to elide" and skips the call entirely.
+fn elide_arguments(args: &ToolArguments, min_chars: usize) -> Option<ToolArguments> {
+    let mut value = serde_json::Value::from(args.clone());
+    if !elide_strings(&mut value, min_chars) {
+        return None;
+    }
+    ToolArguments::try_from(value).ok()
+}
+
+/// Rewrites long strings inside `value` in place; reports whether
+/// anything changed. Deterministic: the replacement names the elided
+/// length, so two runs over the same arguments agree byte for byte.
+fn elide_strings(value: &mut serde_json::Value, min_chars: usize) -> bool {
+    match value {
+        serde_json::Value::String(text) => {
+            if text.len() > min_chars {
+                *text = format!("[pruned {} chars]", text.len());
+                true
+            } else {
+                false
+            }
+        }
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .map(|item| elide_strings(item, min_chars))
+            .fold(false, |changed, item_changed| changed | item_changed),
+        serde_json::Value::Object(fields) => fields
+            .iter_mut()
+            .map(|(_, item)| elide_strings(item, min_chars))
+            .fold(false, |changed, item_changed| changed | item_changed),
+        _ => false,
+    }
 }
 
 /// Estimated tokens of the stub that would replace this result.

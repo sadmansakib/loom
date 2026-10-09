@@ -27,8 +27,8 @@ mod pruning;
 pub use default::DefaultContextCompiler;
 pub use facts::{FactsSource, GitState, InstructionFile, KnownFacts, NoFacts, StaticFacts};
 pub use pruning::{
-    PruneConfig, PruneReport, PruneTrigger, PrunedCall, PruningContextCompiler, StubDecision,
-    StubReason,
+    ArgElision, PruneConfig, PruneReport, PruneTrigger, PrunedCall, PruningContextCompiler,
+    StubDecision, StubReason,
 };
 
 use crate::model::{Message, ModelCapabilities, ModelRequest};
@@ -254,6 +254,26 @@ pub struct PruneCheckpoint {
     pub upto_item: usize,
     /// The frozen stub decisions, in strategy order.
     pub stubs: Vec<StubDecision>,
+    /// Frozen argument elisions with their already-elided arguments
+    /// (history elision); re-applied verbatim so the projection stays
+    /// byte-stable regardless of later config changes.
+    #[serde(default)]
+    pub elided_args: Vec<ArgElision>,
+    /// Ordinals (0-based, in transcript order) of user items after the
+    /// task brief whose text was replaced with a stub. Ordinal 0 — the
+    /// brief — never appears here.
+    #[serde(default)]
+    pub elided_users: Vec<usize>,
+}
+
+impl PruneCheckpoint {
+    /// Whether the checkpoint carries any decision at all — the
+    /// between-triggers re-apply skips empties so a dormant checkpoint
+    /// costs nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.stubs.is_empty() && self.elided_args.is_empty() && self.elided_users.is_empty()
+    }
 }
 
 /// The result of a successful [`ContextCompiler::compile`].

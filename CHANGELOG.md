@@ -3,6 +3,23 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-10 — Artifacts lifecycle (roadmap item 17)
+
+Artifact bodies were immortal: written before the turn that references
+them commits (ADR-012), they could only leak — an orphaned body was
+harmless but permanent, and the item-3 filters tee more of them than
+ever. `ArtifactStore` now carries `list` and `delete` (metadata-only
+listing, oldest first; first-write times on both backends, so a
+re-stored id keeps its original age). `artifact_gc` walks every stored
+transcript for the live set, then deletes only orphans past the
+backstop bounds — 30 days of age, then oldest-first until the store
+fits 256 MiB; a referenced body is never deleted, whatever its age or
+the store's size. The engine runs the pass at open, best-effort (a
+failed scan skips the run entirely — an empty live set would treat
+everything as an orphan). `loom stats` reports the store's lifecycle:
+bodies, bytes, live/orphan split, and reclaimable bytes, always
+store-wide. 694 tests (+8: kernel GC units, SQLite list/delete).
+
 ## 2026-10-10 — Command-aware output filters (roadmap item 3)
 
 `run_command` now compacts well-shaped successful output per command:
