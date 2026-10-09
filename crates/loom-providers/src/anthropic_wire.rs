@@ -345,13 +345,7 @@ impl AnthropicAssembler {
         let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
             "message_start" => {
-                let usage = &event["message"]["usage"];
-                self.input_usage = usage["input_tokens"].as_u64().unwrap_or(0);
-                self.cached_input = usage["cache_read_input_tokens"].as_u64();
-                self.cache_creation = usage["cache_creation_input_tokens"].as_u64();
-                if let Some(cached) = self.cached_input {
-                    self.input_usage = self.input_usage.saturating_sub(cached);
-                }
+                self.ingest_message_start(&event);
                 Ok((Vec::new(), false))
             }
             "content_block_start" => {
@@ -369,46 +363,13 @@ impl AnthropicAssembler {
                 });
                 Ok((Vec::new(), false))
             }
-            "content_block_delta" => {
-                let delta = &event["delta"];
-                match delta["type"].as_str() {
-                    Some("text_delta") => {
-                        let text = delta["text"].as_str().unwrap_or_default();
-                        self.text.push_str(text);
-                        Ok((vec![ModelEvent::TextDelta(text.to_owned())], false))
-                    }
-                    Some("input_json_delta") => {
-                        if let Some(Block::Tool { json, .. }) = self.current.as_mut() {
-                            json.push_str(delta["partial_json"].as_str().unwrap_or_default());
-                        }
-                        Ok((Vec::new(), false))
-                    }
-                    Some("thinking_delta") => {
-                        let text = delta["thinking"].as_str().unwrap_or_default();
-                        self.reasoning
-                            .get_or_insert_with(String::new)
-                            .push_str(text);
-                        Ok((vec![ModelEvent::ReasoningDelta(text.to_owned())], false))
-                    }
-                    _ => Ok((Vec::new(), false)),
-                }
-            }
+            "content_block_delta" => Ok((self.ingest_block_delta(&event["delta"]), false)),
             "content_block_stop" => {
                 self.close_current();
                 Ok((Vec::new(), false))
             }
             "message_delta" => {
-                if let Some(reason) = event["delta"]["stop_reason"].as_str() {
-                    self.stop_reason = Some(map_stop_reason(reason));
-                }
-                if let Some(output) = event["usage"]["output_tokens"].as_u64() {
-                    self.output_usage = Some(output);
-                }
-                if let Some(thinking) =
-                    event["usage"]["output_tokens_details"]["thinking_tokens"].as_u64()
-                {
-                    self.thinking = Some(thinking);
-                }
+                self.ingest_message_delta(&event);
                 Ok((Vec::new(), false))
             }
             "message_stop" => Ok((Vec::new(), true)),
@@ -418,6 +379,62 @@ impl AnthropicAssembler {
                 ModelErrorKind::Protocol,
                 format!("unknown Messages API event type {other:?}"),
             )),
+        }
+    }
+
+    /// `message_start`: the input-side usage snapshot, including the
+    /// cached split (Anthropic reports the cached subset separately, so
+    /// the billable miss count is the difference).
+    fn ingest_message_start(&mut self, event: &Value) {
+        let usage = &event["message"]["usage"];
+        self.input_usage = usage["input_tokens"].as_u64().unwrap_or(0);
+        self.cached_input = usage["cache_read_input_tokens"].as_u64();
+        self.cache_creation = usage["cache_creation_input_tokens"].as_u64();
+        if let Some(cached) = self.cached_input {
+            self.input_usage = self.input_usage.saturating_sub(cached);
+        }
+    }
+
+    /// `content_block_delta`: appends the fragment to whichever buffer
+    /// the open block owns and returns the display delta it produced
+    /// (text and thinking fragments surface; JSON fragments accumulate
+    /// silently).
+    fn ingest_block_delta(&mut self, delta: &Value) -> Vec<ModelEvent> {
+        match delta["type"].as_str() {
+            Some("text_delta") => {
+                let text = delta["text"].as_str().unwrap_or_default();
+                self.text.push_str(text);
+                vec![ModelEvent::TextDelta(text.to_owned())]
+            }
+            Some("input_json_delta") => {
+                if let Some(Block::Tool { json, .. }) = self.current.as_mut() {
+                    json.push_str(delta["partial_json"].as_str().unwrap_or_default());
+                }
+                Vec::new()
+            }
+            Some("thinking_delta") => {
+                let text = delta["thinking"].as_str().unwrap_or_default();
+                self.reasoning
+                    .get_or_insert_with(String::new)
+                    .push_str(text);
+                vec![ModelEvent::ReasoningDelta(text.to_owned())]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// `message_delta`: the output-side usage snapshot and the stop
+    /// reason, either of which the event may omit.
+    fn ingest_message_delta(&mut self, event: &Value) {
+        if let Some(reason) = event["delta"]["stop_reason"].as_str() {
+            self.stop_reason = Some(map_stop_reason(reason));
+        }
+        if let Some(output) = event["usage"]["output_tokens"].as_u64() {
+            self.output_usage = Some(output);
+        }
+        if let Some(thinking) = event["usage"]["output_tokens_details"]["thinking_tokens"].as_u64()
+        {
+            self.thinking = Some(thinking);
         }
     }
 

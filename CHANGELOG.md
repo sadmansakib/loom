@@ -3,6 +3,24 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — Complexity pass, providers batch: the wire hotspots decompose
+
+Tier 1 of the complexity audit (lizard CCN ≥ 15), provider batch. The
+SSE driver's `step` split into named helpers — `send_request` (header
+timeout vs builder-vs-transport mapping), `non_success_error` (status
+classification with `Retry-After`), `sse_body` (the non-SSE 200
+refusal), `eof_is_done` (the narrow unterminated-`[DONE]` tolerance),
+and `ingest_chunk` (decode + parse + accumulate one body chunk) —
+24 → 14. The OpenAI accumulator's `ingest`/`finalize` split into
+`merge_tool_fragment`, `terminal_error` (the guard ladder), and
+`normalized_stop` (the §5.1 table): 18 → 11 and 18 → 8. The Anthropic
+assembler's `ingest` moved its fat arms into
+`ingest_message_start`/`ingest_block_delta`/`ingest_message_delta`:
+19 → 11. The Messages API driver now shares the wire driver's send
+helpers (auth travels as a header so both protocols' wire bytes stay
+their own): `step` 18 → 15. Wire parsers stay match-heavy by contract;
+the goal was ≤ 15, not single digits.
+
 ## 2026-10-09 — Complexity pass, kernel batch: the hotspots decompose
 
 Tier 1 of the cyclomatic-complexity audit (lizard, CCN ≥ 15) starts with

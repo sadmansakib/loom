@@ -412,43 +412,93 @@ impl ChunkAccumulator {
             deltas.push(ModelEvent::ReasoningDelta(fragment));
         }
         for fragment in choice.delta.tool_calls {
-            let index = match fragment.index {
-                Some(index) => index,
-                None => match self.route_indexless(&fragment) {
-                    Some(index) => index,
-                    None => {
-                        // Ambiguous continuation (several calls pending,
-                        // no index, no id): merging into a guess would
-                        // glue unrelated arguments together.
-                        self.correlation_failed = true;
-                        continue;
-                    }
-                },
-            };
-            let call = self.tool_calls.entry(index).or_default();
-            if let Some(id) = fragment.id
-                && !id.is_empty()
-            {
-                call.id = Some(id);
-            }
-            if let Some(function) = fragment.function {
-                if let Some(name) = function.name
-                    && !name.is_empty()
-                {
-                    call.name = Some(name);
-                }
-                if let Some(args) = function.arguments {
-                    call.arguments.push_str(&args);
-                }
+            if !self.merge_tool_fragment(fragment) {
+                self.correlation_failed = true;
             }
         }
         deltas
+    }
+
+    /// Merges one streamed [`ToolCallDelta`] into the accumulator,
+    /// correlating it to a call by its `index` — or, when the provider
+    /// omitted the index, by routing. Returns `false` when the fragment
+    /// cannot be correlated (ambiguous continuation: several calls
+    /// pending, no index, no id) — merging into a guess would glue
+    /// unrelated arguments together, so the caller marks the stream and
+    /// `finalize` fails it.
+    fn merge_tool_fragment(&mut self, fragment: ToolCallDelta) -> bool {
+        let index = match fragment.index {
+            Some(index) => index,
+            None => match self.route_indexless(&fragment) {
+                Some(index) => index,
+                None => return false,
+            },
+        };
+        let call = self.tool_calls.entry(index).or_default();
+        if let Some(id) = fragment.id
+            && !id.is_empty()
+        {
+            call.id = Some(id);
+        }
+        if let Some(function) = fragment.function {
+            if let Some(name) = function.name
+                && !name.is_empty()
+            {
+                call.name = Some(name);
+            }
+            if let Some(args) = function.arguments {
+                call.arguments.push_str(&args);
+            }
+        }
+        true
     }
 
     /// The raw wire `finish_reason` seen so far, for tracing (§5.1:
     /// recorded, never acted on directly).
     pub(crate) fn raw_finish_reason(&self) -> Option<&str> {
         self.finish_reason.as_deref()
+    }
+
+    /// The classified terminal error for this stream, if any. A
+    /// mid-stream error object is classified before any stop-reason
+    /// interpretation (the stream may still carry a misleading
+    /// finish_reason, or end without `[DONE]`); a failure finish_reason
+    /// is classified before the early-close check so a connection that
+    /// dies after one keeps the sharper classification.
+    fn terminal_error(&self, saw_done: bool, policy: &FinalizePolicy<'_>) -> Option<ModelError> {
+        if self.correlation_failed {
+            return Some(ModelError::new(
+                ModelErrorKind::Protocol,
+                "tool-call fragment without index could not be correlated to a call",
+            ));
+        }
+        if let Some(error) = &self.wire_error {
+            let kind = (policy.classify_wire_error)(error.status(), &error.excerpt());
+            return Some(ModelError::new(
+                kind,
+                format!("provider reported a mid-stream error: {}", error.excerpt()),
+            ));
+        }
+        if let Some(kind) = self
+            .finish_reason
+            .as_deref()
+            .and_then(policy.classify_in_stream)
+        {
+            return Some(ModelError::new(
+                kind,
+                format!(
+                    "model stopped with failure finish_reason {:?}",
+                    self.finish_reason
+                ),
+            ));
+        }
+        if !saw_done {
+            return Some(ModelError::new(
+                ModelErrorKind::Transport,
+                "connection closed before [DONE]",
+            ));
+        }
+        None
     }
 
     /// Assembles the authoritative [`ModelResponse`] or the classified
@@ -461,37 +511,8 @@ impl ChunkAccumulator {
         saw_done: bool,
         policy: &FinalizePolicy<'_>,
     ) -> Result<ModelResponse, ModelError> {
-        if self.correlation_failed {
-            return Err(ModelError::new(
-                ModelErrorKind::Protocol,
-                "tool-call fragment without index could not be correlated to a call",
-            ));
-        }
-        if let Some(error) = &self.wire_error {
-            // A mid-stream error is definitive: classify it before any
-            // stop-reason interpretation (the stream may still carry a
-            // misleading finish_reason, or end without [DONE]).
-            let kind = (policy.classify_wire_error)(error.status(), &error.excerpt());
-            return Err(ModelError::new(
-                kind,
-                format!("provider reported a mid-stream error: {}", error.excerpt()),
-            ));
-        }
-        let raw_finish = self.finish_reason.as_deref();
-        if let Some(kind) = raw_finish.and_then(policy.classify_in_stream) {
-            // Classified before the early-close check so a connection
-            // that dies after a failure finish_reason keeps the sharper
-            // classification.
-            return Err(ModelError::new(
-                kind,
-                format!("model stopped with failure finish_reason {raw_finish:?}"),
-            ));
-        }
-        if !saw_done {
-            return Err(ModelError::new(
-                ModelErrorKind::Transport,
-                "connection closed before [DONE]",
-            ));
+        if let Some(error) = self.terminal_error(saw_done, policy) {
+            return Err(error);
         }
 
         // Try to assemble every call; remember whether any failed so
@@ -506,60 +527,7 @@ impl ChunkAccumulator {
             }
         }
 
-        let stop_reason = match raw_finish {
-            Some("stop") | None => {
-                if any_bad {
-                    // Without `length` there is no truncation excuse:
-                    // unparseable arguments are a protocol violation,
-                    // never a silent EndTurn with the call dropped.
-                    return Err(ModelError::new(
-                        ModelErrorKind::Protocol,
-                        "tool call with unparseable or non-object arguments",
-                    ));
-                }
-                if calls.is_empty() {
-                    StopReason::EndTurn
-                } else {
-                    StopReason::ToolCalls
-                }
-            }
-            Some("tool_calls") => {
-                if any_bad {
-                    return Err(ModelError::new(
-                        ModelErrorKind::Protocol,
-                        "tool call with unparseable or non-object arguments",
-                    ));
-                }
-                if calls.is_empty() {
-                    return Err(ModelError::new(
-                        ModelErrorKind::Protocol,
-                        "finish_reason \"tool_calls\" with zero assembled calls",
-                    ));
-                }
-                StopReason::ToolCalls
-            }
-            Some("length") => {
-                // Invariant 22: calls from a truncated (length)
-                // response are never executed — nor replayed (§context
-                // rule 2: MaxTokens items project as plain text).
-                // Truncation can land after a short complete call, so
-                // clear unconditionally, not only when assembly failed.
-                calls.clear();
-                StopReason::MaxTokens
-            }
-            Some("content_filter") => {
-                // Consistent with `length`: a message the model was not
-                // allowed to finish must not carry calls into replay.
-                calls.clear();
-                StopReason::ContentFilter
-            }
-            Some(other) => {
-                return Err(ModelError::new(
-                    ModelErrorKind::Protocol,
-                    format!("unexpected finish_reason {other:?}"),
-                ));
-            }
-        };
+        let stop_reason = normalized_stop(self.finish_reason.as_deref(), &mut calls, any_bad)?;
 
         let message = AssistantMessage {
             content: self.text,
@@ -605,6 +573,68 @@ impl ChunkAccumulator {
             }
         };
         Ok(ModelResponse { message, usage })
+    }
+}
+
+/// The §5.1 stop-reason normalization table for a completed stream.
+///
+/// Maps the raw wire `finish_reason` to [`StopReason`], discarding
+/// calls when the message was truncated or filtered (Invariant 22:
+/// calls from a truncated response are never executed — nor replayed;
+/// truncation can land after a short complete call, so they clear
+/// unconditionally, not only when assembly failed). `any_bad` marks
+/// that some call's arguments failed to assemble.
+fn normalized_stop(
+    raw_finish: Option<&str>,
+    calls: &mut Vec<ToolCall>,
+    any_bad: bool,
+) -> Result<StopReason, ModelError> {
+    match raw_finish {
+        Some("stop") | None => {
+            if any_bad {
+                // Without `length` there is no truncation excuse:
+                // unparseable arguments are a protocol violation,
+                // never a silent EndTurn with the call dropped.
+                return Err(ModelError::new(
+                    ModelErrorKind::Protocol,
+                    "tool call with unparseable or non-object arguments",
+                ));
+            }
+            Ok(if calls.is_empty() {
+                StopReason::EndTurn
+            } else {
+                StopReason::ToolCalls
+            })
+        }
+        Some("tool_calls") => {
+            if any_bad {
+                return Err(ModelError::new(
+                    ModelErrorKind::Protocol,
+                    "tool call with unparseable or non-object arguments",
+                ));
+            }
+            if calls.is_empty() {
+                return Err(ModelError::new(
+                    ModelErrorKind::Protocol,
+                    "finish_reason \"tool_calls\" with zero assembled calls",
+                ));
+            }
+            Ok(StopReason::ToolCalls)
+        }
+        Some("length") => {
+            calls.clear();
+            Ok(StopReason::MaxTokens)
+        }
+        Some("content_filter") => {
+            // Consistent with `length`: a message the model was not
+            // allowed to finish must not carry calls into replay.
+            calls.clear();
+            Ok(StopReason::ContentFilter)
+        }
+        Some(other) => Err(ModelError::new(
+            ModelErrorKind::Protocol,
+            format!("unexpected finish_reason {other:?}"),
+        )),
     }
 }
 

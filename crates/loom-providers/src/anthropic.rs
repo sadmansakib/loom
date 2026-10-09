@@ -195,69 +195,49 @@ async fn step(state: State) -> Option<(Result<Option<ModelEvent>, ModelError>, S
     match state {
         State::Send { provider, body } => {
             let timeouts = provider.config.timeouts;
-            let send = provider
-                .client
-                .post(format!("{}/v1/messages", provider.config.base_url))
-                .header("x-api-key", provider.config.api_key.expose())
-                .header("anthropic-version", ANTHROPIC_VERSION)
-                .json(&body)
-                .send();
-            let response = match tokio::time::timeout(timeouts.header, send).await {
-                Err(_) => {
-                    return Some((
-                        Err(ModelError::new(
-                            ModelErrorKind::Transport,
-                            "timed out waiting for response headers",
-                        )),
-                        State::Done,
-                    ));
-                }
-                Ok(Err(error)) => {
-                    let kind = if error.is_builder() {
-                        ModelErrorKind::InvalidRequest
-                    } else {
-                        ModelErrorKind::Transport
-                    };
-                    return Some((
-                        Err(ModelError::new(kind, format!("request failed: {error}"))),
-                        State::Done,
-                    ));
-                }
-                Ok(Ok(response)) => response,
+            let headers = vec![
+                (
+                    reqwest::header::HeaderName::from_static("x-api-key"),
+                    provider.config.api_key.expose().to_owned(),
+                ),
+                (
+                    reqwest::header::HeaderName::from_static("anthropic-version"),
+                    ANTHROPIC_VERSION.to_owned(),
+                ),
+            ];
+            let url = format!("{}/v1/messages", provider.config.base_url);
+            let response = match crate::wire_stream::send_request(
+                &provider.client,
+                url,
+                timeouts,
+                headers,
+                body,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => return Some((Err(error), State::Done)),
             };
-            let status = response.status();
-            if !status.is_success() {
-                let retry_after = crate::http::retry_after(&response);
-                let body = crate::http::read_error_body(response, timeouts.idle).await;
-                let mut error = classify_status(status, &body);
-                if let Some(delay) = retry_after {
-                    error = error.with_retry_after(delay);
-                }
-                return Some((Err(error), State::Done));
-            }
-            let content_type = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("");
-            let is_sse = content_type
-                .get(.."text/event-stream".len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("text/event-stream"));
-            if !is_sse {
+            if !response.status().is_success() {
                 return Some((
-                    Err(ModelError::new(
-                        ModelErrorKind::Protocol,
-                        format!("expected text/event-stream, got {content_type:?}"),
-                    )),
+                    Err(crate::wire_stream::non_success_error(
+                        response,
+                        timeouts.idle,
+                        classify_status,
+                    )
+                    .await),
                     State::Done,
                 ));
             }
-            let body_stream = response.bytes_stream();
+            let body_stream = match crate::wire_stream::sse_body(response) {
+                Ok(body_stream) => body_stream,
+                Err(error) => return Some((Err(error), State::Done)),
+            };
             Some((
                 Ok(None),
                 State::Body {
                     provider,
-                    body_stream: Box::pin(body_stream),
+                    body_stream,
                     decoder: SseDecoder::new(),
                     assembler: Box::default(),
                     pending: VecDeque::new(),

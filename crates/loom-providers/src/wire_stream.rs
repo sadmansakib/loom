@@ -160,6 +160,157 @@ fn is_unterminated_done_line(line: &[u8]) -> bool {
     line == b"data: [DONE]" || line == b"data:[DONE]"
 }
 
+/// Sends the request and awaits response headers, mapping the two
+/// send-phase failures: a header timeout is retryable transport, a
+/// reqwest builder failure is a configuration mistake (non-retryable),
+/// anything else is transport. Authentication travels in `headers` —
+/// the OpenAI-compatible endpoints as `Authorization: Bearer`, the
+/// Messages API as `x-api-key` — so the wire bytes stay each
+/// protocol's own.
+pub(crate) async fn send_request(
+    client: &reqwest::Client,
+    url: String,
+    timeouts: TimeoutConfig,
+    headers: Vec<(reqwest::header::HeaderName, String)>,
+    body: Value,
+) -> Result<reqwest::Response, ModelError> {
+    let mut request = client.post(url).json(&body);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    match tokio::time::timeout(timeouts.header, request.send()).await {
+        Err(_) => Err(ModelError::new(
+            ModelErrorKind::Transport,
+            "timed out waiting for response headers",
+        )),
+        Ok(Err(error)) => {
+            // Builder failures (malformed base URL, bad options) are
+            // configuration mistakes, not transport faults: retrying
+            // cannot fix them.
+            let kind = if error.is_builder() {
+                ModelErrorKind::InvalidRequest
+            } else {
+                ModelErrorKind::Transport
+            };
+            Err(ModelError::new(kind, format!("request failed: {error}")))
+        }
+        Ok(Ok(response)) => Ok(response),
+    }
+}
+
+/// Classifies a non-success status into `classify`'s error, with any
+/// `Retry-After` header attached and a bounded body excerpt read.
+pub(crate) async fn non_success_error(
+    response: reqwest::Response,
+    idle: std::time::Duration,
+    classify: impl Fn(reqwest::StatusCode, &str) -> ModelError,
+) -> ModelError {
+    let status = response.status();
+    let retry_after = crate::http::retry_after(&response);
+    let body = crate::http::read_error_body(response, idle).await;
+    let mut error = classify(status, &body);
+    if let Some(delay) = retry_after {
+        error = error.with_retry_after(delay);
+    }
+    error
+}
+
+/// Takes apart a success response into its SSE body stream, refusing a
+/// 200 that is not `text/event-stream` (captive portal, HTML error page
+/// from a proxy): such a body contains no `data:` lines and would
+/// otherwise surface as retryable Transport forever. MIME types are
+/// case-insensitive (RFC 9110 §8.3); prefix compare keeps a trailing
+/// `;charset=utf-8` parameter accepted.
+pub(crate) fn sse_body(
+    response: reqwest::Response,
+) -> Result<futures::stream::BoxStream<'static, reqwest::Result<bytes::Bytes>>, ModelError> {
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let is_sse = content_type
+        .get(.."text/event-stream".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("text/event-stream"));
+    if is_sse {
+        Ok(Box::pin(response.bytes_stream()))
+    } else {
+        Err(ModelError::new(
+            ModelErrorKind::Protocol,
+            format!("expected text/event-stream, got {content_type:?}"),
+        ))
+    }
+}
+
+/// Whether EOF on the connection still counts as a deliberate `[DONE]`.
+///
+/// Narrow EOF tolerance: gateways may close right after `data: [DONE]`
+/// without the closing blank line, which the decoder (spec-correctly)
+/// never dispatches — a complete response would otherwise fail as
+/// retryable Transport on every retry. Accept exactly that pending
+/// event: the terminator is the server's deliberate end signal, so it
+/// cannot hide truncated content. A terminator with no newline at all
+/// (`data: [DONE]` then EOF — a gateway close) is equally deliberate,
+/// matched on the raw trailing bytes too — but only when nothing else is
+/// pending: an undispatched data event (blank-line-less gateway) plus
+/// the terminator must NOT pass as a complete response, because that
+/// event was never accumulated. Dropping it silently would be exactly
+/// the truncated-response takeover the no-flush rule exists to prevent.
+/// Any other pending bytes at EOF still error (and retry) — deliberately
+/// no flush: accepting a half-received event would silently take
+/// truncated responses (e.g. a proxy cut mid-event), and error-and-retry
+/// is the safe direction.
+fn eof_is_done(saw_done: bool, decoder: &SseDecoder) -> bool {
+    saw_done
+        || decoder
+            .pending_event()
+            .is_some_and(|event| event.data == "[DONE]")
+        || (decoder.pending_event().is_none() && is_unterminated_done_line(decoder.pending_line()))
+}
+
+/// Ingests one body chunk: decodes SSE events, parses each data chunk
+/// into the accumulator, and extends `pending` with the display deltas.
+/// Returns the updated `saw_done`; decode failures and unparseable
+/// chunks are non-retryable protocol errors.
+fn ingest_chunk(
+    decoder: &mut SseDecoder,
+    accumulator: &mut ChunkAccumulator,
+    pending: &mut VecDeque<ModelEvent>,
+    saw_done: bool,
+    chunk: &[u8],
+) -> Result<bool, ModelError> {
+    let events = match decoder.push_bytes(chunk) {
+        Ok(events) => events,
+        // Oversized pending event: misbehaving or hostile endpoint,
+        // not a transient fault.
+        Err(error) => {
+            return Err(ModelError::new(
+                ModelErrorKind::Protocol,
+                format!("SSE decode failed: {error:?}"),
+            ));
+        }
+    };
+    for event in events {
+        if event.data == DONE_MARKER {
+            // Anything after [DONE] in the same body read is trailing
+            // junk (some proxies append it); the response is final,
+            // stop ingesting.
+            return Ok(true);
+        }
+        let parsed: ChatChunk = match serde_json::from_str(&event.data) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return Err(ModelError::new(
+                    ModelErrorKind::Protocol,
+                    format!("unparseable SSE data chunk: {error}"),
+                ));
+            }
+        };
+        pending.extend(accumulator.ingest(parsed));
+    }
+    Ok(saw_done)
+}
+
 /// One unfold step: `Ok((None, next))` transitions without emitting,
 /// `Ok((Some(event), next))` emits, `Err` ends the stream with a
 /// failure after which the state is `Done`.
@@ -173,85 +324,44 @@ async fn step<P: WireEndpoint>(
             headers,
             body,
         } => {
-            let timeouts = provider.timeouts();
-            let mut request = provider
-                .client()
-                .post(url)
-                .bearer_auth(provider.api_key())
-                .json(&body);
-            for (name, value) in headers {
-                request = request.header(name, value);
-            }
-            let send = request.send();
-            let response = match tokio::time::timeout(timeouts.header, send).await {
-                Err(_) => {
-                    return Some((
-                        Err(ModelError::new(
-                            ModelErrorKind::Transport,
-                            "timed out waiting for response headers",
-                        )),
-                        State::Done,
-                    ));
-                }
-                Ok(Err(error)) => {
-                    // Builder failures (malformed base URL, bad options)
-                    // are configuration mistakes, not transport faults:
-                    // retrying cannot fix them.
-                    let kind = if error.is_builder() {
-                        ModelErrorKind::InvalidRequest
-                    } else {
-                        ModelErrorKind::Transport
-                    };
-                    return Some((
-                        Err(ModelError::new(kind, format!("request failed: {error}"))),
-                        State::Done,
-                    ));
-                }
-                Ok(Ok(response)) => response,
+            // Auth travels as a header so the shared send path stays
+            // protocol-neutral (the Messages API sends x-api-key).
+            let mut headers = headers;
+            headers.insert(
+                0,
+                (
+                    reqwest::header::AUTHORIZATION,
+                    format!("Bearer {}", provider.api_key()),
+                ),
+            );
+            let response = match send_request(
+                provider.client(),
+                url,
+                provider.timeouts(),
+                headers,
+                body,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => return Some((Err(error), State::Done)),
             };
-            let status = response.status();
-            if !status.is_success() {
-                let retry_after = crate::http::retry_after(&response);
-                let body = crate::http::read_error_body(response, timeouts.idle).await;
-                let mut error = P::classify_status(status, &body);
-                if let Some(delay) = retry_after {
-                    error = error.with_retry_after(delay);
-                }
-                return Some((Err(error), State::Done));
-            }
-            // A 200 with a non-SSE body (captive portal, HTML error
-            // page from a proxy) contains no `data:` lines: it would
-            // surface as "stream ended without [DONE]" — a retryable
-            // Transport error — and be re-sent forever. Fail fast,
-            // non-retryably. OpenAI-compatible endpoints answer
-            // `text/event-stream` (possibly with a charset parameter).
-            // MIME types are case-insensitive (RFC 9110 §8.3): a proxy
-            // rewriting the header to `Text/Event-Stream` is still a
-            // valid SSE response. Prefix compare keeps a trailing
-            // `;charset=utf-8` parameter accepted.
-            let content_type = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("");
-            let is_sse = content_type
-                .get(.."text/event-stream".len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("text/event-stream"));
-            if !is_sse {
+            if !response.status().is_success() {
+                let idle = provider.timeouts().idle;
                 return Some((
-                    Err(ModelError::new(
-                        ModelErrorKind::Protocol,
-                        format!("expected text/event-stream, got {content_type:?}"),
-                    )),
+                    Err(non_success_error(response, idle, P::classify_status).await),
                     State::Done,
                 ));
             }
-            let body_stream = response.bytes_stream();
+            let body_stream = match sse_body(response) {
+                Ok(body_stream) => body_stream,
+                Err(error) => return Some((Err(error), State::Done)),
+            };
             Some((
                 Ok(None),
                 State::Body {
                     provider,
-                    body_stream: Box::pin(body_stream),
+                    body_stream,
                     decoder: SseDecoder::new(),
                     accumulator: Box::new(ChunkAccumulator::default()),
                     pending: VecDeque::new(),
@@ -301,36 +411,7 @@ async fn step<P: WireEndpoint>(
                     ))
                 }
                 Ok(None) => {
-                    // Connection closed without a dispatched [DONE].
-                    // Narrow EOF tolerance: gateways may close right
-                    // after `data: [DONE]` without the closing blank
-                    // line, which the decoder (spec-correctly) never
-                    // dispatches — a complete response would otherwise
-                    // fail as retryable Transport on every retry. Accept
-                    // exactly that pending event: the terminator is the
-                    // server's deliberate end signal, so it cannot hide
-                    // truncated content. A terminator with no newline
-                    // at all (`data: [DONE]` then EOF — a gateway
-                    // close) is equally deliberate, so it is matched
-                    // on the raw trailing bytes too — but only when
-                    // nothing else is pending: an undispatched data
-                    // event (blank-line-less gateway) plus the
-                    // terminator must NOT pass as a complete response,
-                    // because that event was never accumulated.
-                    // Dropping it silently would be exactly the
-                    // truncated-response takeover the no-flush rule
-                    // exists to prevent. Any other pending bytes at
-                    // EOF still error (and retry) — deliberately no
-                    // flush: accepting a half-received event would
-                    // silently take truncated responses (e.g. a proxy
-                    // cut mid-event), and error-and-retry is the safe
-                    // direction.
-                    let saw_done = saw_done
-                        || decoder
-                            .pending_event()
-                            .is_some_and(|event| event.data == "[DONE]")
-                        || (decoder.pending_event().is_none()
-                            && is_unterminated_done_line(decoder.pending_line()));
+                    let saw_done = eof_is_done(saw_done, &decoder);
                     log_finish_reason(&accumulator);
                     let result = accumulator.finalize(saw_done, &policy(&provider));
                     if saw_done {
@@ -363,43 +444,18 @@ async fn step<P: WireEndpoint>(
                     ))
                 }
                 Ok(Some(Ok(chunk))) => {
-                    let events = match decoder.push_bytes(&chunk) {
-                        Ok(events) => events,
+                    match ingest_chunk(
+                        &mut decoder,
+                        &mut accumulator,
+                        &mut pending,
+                        saw_done,
+                        &chunk,
+                    ) {
+                        Ok(updated) => saw_done = updated,
                         Err(error) => {
-                            // Oversized pending event: misbehaving or
-                            // hostile endpoint, not a transient fault.
                             log_finish_reason(&accumulator);
-                            return Some((
-                                Err(ModelError::new(
-                                    ModelErrorKind::Protocol,
-                                    format!("SSE decode failed: {error:?}"),
-                                )),
-                                State::Done,
-                            ));
+                            return Some((Err(error), State::Done));
                         }
-                    };
-                    for event in events {
-                        if event.data == DONE_MARKER {
-                            // Anything after [DONE] in the same body read
-                            // is trailing junk (some proxies append it);
-                            // the response is final, stop ingesting.
-                            saw_done = true;
-                            break;
-                        }
-                        let parsed: ChatChunk = match serde_json::from_str(&event.data) {
-                            Ok(parsed) => parsed,
-                            Err(error) => {
-                                log_finish_reason(&accumulator);
-                                return Some((
-                                    Err(ModelError::new(
-                                        ModelErrorKind::Protocol,
-                                        format!("unparseable SSE data chunk: {error}"),
-                                    )),
-                                    State::Done,
-                                ));
-                            }
-                        };
-                        pending.extend(accumulator.ingest(parsed));
                     }
                     Some((
                         Ok(None),
