@@ -161,7 +161,7 @@ Shipped semantics that later iterations must preserve:
 Planned GLM support differs from the original plan: Loom targets the
 **metered Z.ai API**, never the GLM Coding Plan subscription endpoint
 (a non-API product; custom-harness use risks an account ban — see the
-warnings in `crates/loom-cli/tests/eval.rs`). Shipped adapters are
+warnings in the loom-eval harness). Shipped adapters are
 DeepSeek, OpenRouter, Anthropic, GLM, and NVIDIA (wiremock-verified against the
 Z.ai spec; no funded key yet for live runs).
 
@@ -282,7 +282,7 @@ orchestration — downstream of a strong core.
 
 ```text
 Current iteration:     2 (core efficiency), with iteration 4 tools shipped early
-Language:              Rust (stable), 7 crates, unsafe forbidden
+Language:              Rust (stable), 8 crates, unsafe forbidden
 Shipped providers:     DeepSeek, OpenRouter (free + paid), Anthropic, GLM,
                       NVIDIA (NIM hosted inference)
 GLM status:            metered Z.ai API, wiremock-verified (no funded key)
@@ -475,7 +475,7 @@ also summarized here so this section is the single source of truth.
   and cached tokens / cost / wall time / tool-cache hits, per-task
   aggregates and a gated-pass-rate suite headline; strict and tolerant
   modes.
-- **Verification bar.** 669 tests passing (13 live-API tests ignored by
+- **Verification bar.** 671 tests passing (13 live-API tests ignored by
   default), clippy clean, fmt clean.
 
 ---

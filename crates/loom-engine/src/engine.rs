@@ -11,10 +11,11 @@ use std::sync::Arc;
 
 use loom_kernel::agent::{Agent, TaskControl, TaskError, TaskSummary};
 use loom_kernel::context::{
-    AgentConfig, DefaultContextCompiler, PruneConfig, PruningContextCompiler,
+    AgentConfig, ContextCompiler, DefaultContextCompiler, PruneConfig, PruningContextCompiler,
 };
 use loom_kernel::event::{EventKind, EventSink};
 use loom_kernel::id::SessionId;
+use loom_kernel::model::ModelProvider;
 use loom_kernel::session::Session;
 use loom_kernel::store::StoreError;
 use loom_kernel::tool::ToolRegistry;
@@ -104,6 +105,70 @@ pub struct Engine {
     agent: Agent,
 }
 
+/// A function that wraps the provider an open produced — built from
+/// credentials or handed in via [`EngineOverrides::provider`] — so an
+/// embedder can record or shadow model traffic without duplicating the
+/// build path.
+pub type ProviderHook = Arc<dyn Fn(Box<dyn ModelProvider>) -> Box<dyn ModelProvider> + Send + Sync>;
+
+/// Composition overrides for embedders that need to swap one production
+/// choice without re-wiring the whole agent (loom-eval's harness is the
+/// first consumer; a GUI with per-view toolsets will be the second).
+///
+/// Every field is optional: `None` keeps [`Engine::open`]'s production
+/// choice, so an override only ever narrows the gap between an embedder
+/// and the real frontend path — the drift risk the overrides exist to
+/// remove. Fields that are set replace the production choice entirely;
+/// the embedder owns what it replaces (an overridden compiler picks its
+/// own estimator, for example).
+#[derive(Default)]
+pub struct EngineOverrides {
+    /// A provider handed in as a boxed trait object, replacing the
+    /// credential → adapter build entirely. Offline replay uses this
+    /// (no secret is resolved, no network client is built).
+    pub provider: Option<Box<dyn ModelProvider>>,
+    /// Wraps whichever provider results — built from credentials, or
+    /// supplied via [`Self::provider`] — so an embedder can record or
+    /// shadow the model traffic without duplicating the build path.
+    pub provider_hook: Option<ProviderHook>,
+    /// A tool registry built by the embedder, replacing the
+    /// manifest-driven built-in set.
+    pub registry: Option<ToolRegistry>,
+    /// A context compiler built by the embedder, replacing the default
+    /// pruning chain.
+    pub compiler: Option<Box<dyn ContextCompiler>>,
+}
+
+impl EngineOverrides {
+    /// Sets a provider that replaces the credential-driven build.
+    #[must_use]
+    pub fn with_provider(mut self, provider: Box<dyn ModelProvider>) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
+    /// Sets a hook that wraps the resulting provider.
+    #[must_use]
+    pub fn with_provider_hook(mut self, hook: ProviderHook) -> Self {
+        self.provider_hook = Some(hook);
+        self
+    }
+
+    /// Sets a registry that replaces the built-in tools.
+    #[must_use]
+    pub fn with_registry(mut self, registry: ToolRegistry) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    /// Sets a compiler that replaces the default pruning chain.
+    #[must_use]
+    pub fn with_compiler(mut self, compiler: Box<dyn ContextCompiler>) -> Self {
+        self.compiler = Some(compiler);
+        self
+    }
+}
+
 impl Engine {
     /// Opens the engine: resolves the credential, builds the provider, and
     /// assembles the built-in tools.
@@ -117,58 +182,91 @@ impl Engine {
     /// credential command) — so a frontend that runs an event loop should call
     /// it off its render thread.
     pub fn open(config: EngineConfig) -> Result<Self, EngineError> {
+        Self::open_with(config, EngineOverrides::default())
+    }
+
+    /// [`Engine::open`] with embedder overrides
+    /// ([`EngineOverrides`]): a handed-in provider, a provider-wrapping
+    /// hook, a custom tool registry, or a custom context compiler. Every
+    /// `None` field keeps the production choice; see the overrides type
+    /// for the exact semantics of each.
+    pub fn open_with(
+        config: EngineConfig,
+        overrides: EngineOverrides,
+    ) -> Result<Self, EngineError> {
         let workspace =
             std::fs::canonicalize(&config.workspace).map_err(|source| EngineError::Workspace {
                 path: config.workspace.clone(),
                 source,
             })?;
 
-        // Credential resolution: --account → active saved account → env
-        // (§18.3). The secret never leaves a `SecretString` wrapper.
-        let store = SqliteAuthStore::open(&config.db_path).map_err(EngineError::Store)?;
-        let secrets = KeychainBackend::default();
-        let credential = auth::resolve(
-            &store,
-            &secrets,
-            &config.provider,
-            config.account.as_deref(),
-            |name| std::env::var(name).ok(),
-        )?;
-        tracing::debug!(
-            source = credential.source.as_str(),
-            account = credential
-                .account
-                .as_ref()
-                .map(|account| account.label.as_str())
-                .unwrap_or("-"),
-            "credential resolved"
-        );
+        // Provider: an overridden provider skips the credential build
+        // entirely (offline replay needs no secret); a hook then wraps
+        // whichever provider resulted, so traffic capture composes with
+        // both paths.
+        let provider: Box<dyn ModelProvider> = match overrides.provider {
+            Some(provider) => provider,
+            None => {
+                // Credential resolution: --account → active saved account →
+                // env (§18.3). The secret never leaves a `SecretString`.
+                let store = SqliteAuthStore::open(&config.db_path).map_err(EngineError::Store)?;
+                let secrets = KeychainBackend::default();
+                let credential = auth::resolve(
+                    &store,
+                    &secrets,
+                    &config.provider,
+                    config.account.as_deref(),
+                    |name| std::env::var(name).ok(),
+                )?;
+                tracing::debug!(
+                    source = credential.source.as_str(),
+                    account = credential
+                        .account
+                        .as_ref()
+                        .map(|account| account.label.as_str())
+                        .unwrap_or("-"),
+                    "credential resolved"
+                );
+                // Provider construction and loud capability validation: all
+                // adapter-specific knowledge lives in `provider`.
+                crate::provider::build(&config, credential.secret.expose())?.provider
+            }
+        };
+        let provider = match overrides.provider_hook {
+            Some(hook) => hook(provider),
+            None => provider,
+        };
 
-        // Provider construction and loud capability validation: all
-        // adapter-specific knowledge lives in `provider`.
-        let handle = crate::provider::build(&config, credential.secret.expose())?;
-
-        let registry = build_registry(&CommandPolicy::from_manifest(&workspace)?)?;
+        let registry = match overrides.registry {
+            Some(registry) => registry,
+            None => build_registry(&CommandPolicy::from_manifest(&workspace)?)?,
+        };
         let system_prompt = config.system_prompt.unwrap_or_else(default_system_prompt);
         // Stage-1 repository facts (2E, ADR-015): the composition root owns the
         // I/O; the loop scans once per task through this source.
         let facts = crate::repo::FsFactsSource::new(workspace.clone());
-        // Token estimates use a real tokenizer — the same estimator feeds
-        // the census, the budget check, and the pruning math. The family
-        // follows the provider: Anthropic counts tokens differently from
-        // the OpenAI-vocabulary backends, and its 1M window only holds if
-        // the estimate errs high.
-        let estimator: Arc<dyn loom_kernel::context::TokenEstimator> =
-            crate::estimate::estimator_for(&config.provider);
-        let mut agent = Agent::new(
-            handle.provider,
-            Box::new(
-                PruningContextCompiler::new(
-                    Box::new(DefaultContextCompiler::with_estimator(estimator.clone())),
-                    PruneConfig::default(),
+        let compiler: Box<dyn ContextCompiler> = match overrides.compiler {
+            Some(compiler) => compiler,
+            None => {
+                // Token estimates use a real tokenizer — the same estimator
+                // feeds the census, the budget check, and the pruning math.
+                // The family follows the provider: Anthropic counts tokens
+                // differently from the OpenAI-vocabulary backends, and its
+                // 1M window only holds if the estimate errs high.
+                let estimator: Arc<dyn loom_kernel::context::TokenEstimator> =
+                    crate::estimate::estimator_for(&config.provider);
+                Box::new(
+                    PruningContextCompiler::new(
+                        Box::new(DefaultContextCompiler::with_estimator(estimator.clone())),
+                        PruneConfig::default(),
+                    )
+                    .with_estimator(estimator),
                 )
-                .with_estimator(estimator),
-            ),
+            }
+        };
+        let mut agent = Agent::new(
+            provider,
+            compiler,
             registry,
             AgentConfig::new(workspace, system_prompt),
             config.model,
@@ -206,6 +304,16 @@ impl Engine {
     /// Await this from the frontend's async context; everything after the
     /// optional fetch is the same blocking work [`Engine::open`] documents.
     pub async fn open_async(config: EngineConfig) -> Result<Self, EngineError> {
+        Self::open_async_with(config, EngineOverrides::default()).await
+    }
+
+    /// [`Engine::open_async`] with embedder overrides
+    /// ([`EngineOverrides`]) — the catalog sequencing of the async open
+    /// composed with the substitution points of [`Engine::open_with`].
+    pub async fn open_async_with(
+        config: EngineConfig,
+        overrides: EngineOverrides,
+    ) -> Result<Self, EngineError> {
         let config = if config.catalog.is_none() && config.provider == OPENROUTER_PROVIDER_NAME {
             let auth = crate::auth::Auth::open(&config.db_path)?;
             let catalog = crate::catalog::load(
@@ -223,7 +331,7 @@ impl Engine {
         } else {
             config
         };
-        Engine::open(config)
+        Engine::open_with(config, overrides)
     }
 
     /// Creates a fresh session handle for one run.
@@ -727,5 +835,71 @@ mod tests {
             ),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn open_with_skips_credential_resolution_for_an_overridden_provider() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = base.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let mut config = test_config();
+        config.provider = "replay".to_owned(); // no adapter, no credential
+        config.workspace = workspace;
+        config.db_path = base.path().join("loom.db");
+
+        // Only the override path can succeed here: building "replay"
+        // would fail with UnknownProvider before any credential work.
+        let engine = Engine::open_with(
+            config,
+            EngineOverrides::default().with_provider(Box::new(FakeProvider::scripted(vec![
+                FakeProvider::end_turn_script("overridden"),
+            ]))),
+        )
+        .expect("no credential is resolved when the provider is overridden");
+        let mut session = engine.new_session();
+        let (sink, _receiver) = loom_kernel::event::ChannelEventSink::new();
+        let summary = engine
+            .run_task(&mut session, "task", &sink, &Default::default())
+            .await
+            .expect("task runs on the overridden provider");
+        assert_eq!(summary.turns, 1);
+    }
+
+    #[tokio::test]
+    async fn a_provider_hook_wraps_whichever_provider_results() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = base.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let mut config = test_config();
+        config.provider = "replay".to_owned();
+        config.workspace = workspace;
+        config.db_path = base.path().join("loom.db");
+
+        let engine = Engine::open_with(
+            config,
+            EngineOverrides::default()
+                .with_provider(Box::new(FakeProvider::scripted(vec![
+                    FakeProvider::end_turn_script("original"),
+                ])))
+                .with_provider_hook(Arc::new(|_built: Box<dyn ModelProvider>| {
+                    // The hook decides what runs: a different scripted
+                    // answer proves the replacement took effect.
+                    Box::new(FakeProvider::scripted(vec![FakeProvider::end_turn_script(
+                        "hooked",
+                    )]))
+                })),
+        )
+        .expect("open");
+        let mut session = engine.new_session();
+        let (sink, _receiver) = loom_kernel::event::ChannelEventSink::new();
+        engine
+            .run_task(&mut session, "task", &sink, &Default::default())
+            .await
+            .expect("task runs on the hooked provider");
+        let answer = session.transcript.iter().rev().find_map(|item| match item {
+            loom_kernel::transcript::Item::Assistant(message) => Some(message.content.clone()),
+            _ => None,
+        });
+        assert_eq!(answer.as_deref(), Some("hooked"));
     }
 }

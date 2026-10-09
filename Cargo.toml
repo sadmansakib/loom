@@ -7,6 +7,7 @@ members = [
     "crates/loom-tools",
     "crates/loom-engine",
     "crates/loom-core",
+    "crates/loom-eval",
     "crates/loom-cli",
 ]
 

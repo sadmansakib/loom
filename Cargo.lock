@@ -1430,10 +1430,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "futures",
  "loom-core",
  "rpassword",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1474,6 +1472,17 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "loom-eval"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "loom-core",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

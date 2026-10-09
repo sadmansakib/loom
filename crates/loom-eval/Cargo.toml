@@ -1,0 +1,16 @@
+[package]
+name = "loom-eval"
+description = "Loom eval harness: task fixtures, record/replay providers, gates, and suite reports, driven through the Engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+loom-core = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

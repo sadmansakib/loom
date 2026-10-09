@@ -16,7 +16,7 @@ the code is the source of truth for details.
 
 ## 1. Workspace layout
 
-Seven crates in one Cargo workspace, edition 2024, `unsafe_code = "forbid"`
+Eight crates in one Cargo workspace, edition 2024, `unsafe_code = "forbid"`
 in the crates that matter most. Dependencies point strictly downward — the
 kernel never links a filesystem store or a CLI, the engine never prints.
 
@@ -28,7 +28,8 @@ kernel never links a filesystem store or a CLI, the engine never prints.
 | `loom-providers` | Model provider adapters (DeepSeek, OpenRouter, GLM, NVIDIA over one shared OpenAI-compatible wire; Anthropic on its own messages-API driver) | kernel model types |
 | `loom-store` | SQLite persistence: sessions, turns, tasks, artifacts, auth accounts | kernel store traits |
 | `loom-tools` | The shipped tool suite (read/search/edit/write/list/run/verify + artifact read) | kernel tool traits |
-| `loom-cli` | Binary: argument parsing, output rendering, run/eval/auth commands | `loom-core` only (ADR-021) |
+| `loom-eval` | The eval harness: task corpus (`tests/eval-tasks`), record/replay providers, outcome and bugfix gates, suite reports, live benchmarks — every arm opens the engine through `EngineOverrides`, never a hand-wired `Agent` | `loom-core` only |
+| `loom-cli` | Binary: argument parsing, output rendering, run/auth/stats commands | `loom-core` only (ADR-021) |
 
 The kernel defines traits for everything with side effects
 (`SessionStore`, `ArtifactStore`, `ModelProvider`, `FactsSource`,
@@ -484,6 +485,17 @@ catalog` (fetch with the provider's own credential, cache beside the
 database, stale-cache fallback) when the config does not already carry
 one — so no frontend re-implements that sequencing.
 
+Both opens take `EngineOverrides` (via `open_with`/`open_async_with`;
+the plain forms pass an empty one): every field is optional and `None`
+keeps the production choice — a prebuilt `provider` (replaying a
+recording, no credential involved), a `provider_hook` wrapping
+whichever provider results (recording, shadowing), a `registry`, a
+`compiler`. The eval harness (`loom-eval`) is the canonical embedder:
+its live arm opens `open_async_with` plus a recording hook, its replay
+arm overrides the provider outright, and both run through the exact
+engine wiring the CLI gets — the harness no longer hand-assembles an
+`Agent`, so it cannot drift from production composition.
+
 The driving API is resume-first: besides `run_task` on a live session
 handle, `Engine::continue_session(id, input, …)` loads a persisted
 session and runs the next task on it, returning the advanced `Session`
@@ -493,8 +505,9 @@ or paused task still advances the session, so only load errors are
 task's terminal event the engine emits `AwaitingInput` naming the idle
 session: a stream-only frontend keys its resume loop on that marker
 without polling. Kernel-level drivers emit no such marker — it is an
-engine concept, so hand-rolled loops (the eval harness) see no new
-events.
+engine concept, so a hand-rolled kernel loop sees no new events (the
+engine-driven eval harness does see the marker; its per-run event tally
+counts it).
 
 Stopping is two-granularity: `TaskControl` (the `run_task`/
 `continue_session` parameter) offers `cancel` — the hard stop that
@@ -728,7 +741,7 @@ Compare suites by medians over N ≥ 5; the observed noise floor is ±10%.
 - Blocking work on the blocking pool; hashing never under a lock.
 - Facts scanned once per task; capabilities resolved once per task.
 
-**Testing** — the workspace carries 669 tests (13 live-API tests
+**Testing** — the workspace carries 671 tests (13 live-API tests
 ignored by default): unit tests per module,
 protocol and invariant tests against in-memory seams, security regression
 tests for confinement, canary tests for secrets, integration tests that

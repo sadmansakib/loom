@@ -3,6 +3,26 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — loom-eval: the eval harness becomes a crate, driven by the engine (C1)
+
+The eval harness moved out of `loom-cli`'s test directory into an eighth
+workspace crate, `loom-eval`, and stopped hand-wiring an `Agent`: every
+arm now opens the real `Engine`, so harness wiring cannot drift from
+production composition. The enabler is a new overrides seam on the
+engine — `Engine::open_with`/`open_async_with` take an
+`EngineOverrides` (a prebuilt provider for offline replay, a provider
+hook for recording, an optional registry and compiler; every `None`
+keeps the production choice). The live arm resolves credentials through
+the engine exactly like the CLI (keychain or env), warms the OpenRouter
+catalog cache, and records through a hook that wraps whatever the
+engine built; the replay arm injects the recorded script as the
+provider. NVIDIA's free tier prices at $0 in the cost table, and the
+pinned compiler now derives its estimator from the provider
+(`estimator_for`) instead of hardcoding o200k. `loom-cli` lost its
+last direct dev-dependencies beyond tempfile. One behavioral note:
+runs now include the engine's `AwaitingInput` marker, so per-run event
+tallies count one more event than recordings made before this change.
+
 ## 2026-10-09 — StatusRecorder: pollable progress snapshots (B5)
 
 Frontends polling "where is this task right now?" no longer need to

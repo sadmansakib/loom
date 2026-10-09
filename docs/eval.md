@@ -8,7 +8,7 @@ bug, miniatured into a self-contained crate.
 ## Layout
 
 ```
-crates/loom-cli/tests/eval-tasks/<ID>/
+crates/loom-eval/tests/eval-tasks/<ID>/
   task.json          # id, prompt, tools, heavy, gate, notes
   system-prompt.txt  # optional pinned prompt (lab tasks only)
   workspace/         # the miniature crate the agent works on
@@ -35,7 +35,7 @@ fail the gate.
 
 ## Offline proofs (run on every commit)
 
-`cargo test -p loom-cli --test eval` enforces the corpus invariants
+`cargo test -p loom-eval` enforces the corpus invariants
 without spending tokens:
 
 - `bugfix_seeds_fail_their_gates` — every seed fails **exactly** its F2P
@@ -51,13 +51,14 @@ without spending tokens:
 LOOM_EVAL_TASKS=B1,B16,B17        # subset; unset = all non-heavy tasks
 LOOM_EVAL_RUNS=5                  # runs per task (default 5)
 LOOM_EVAL_TOLERATE_FAILURES=1     # measurement mode; default strict
-DEEPSEEK_API_KEY=... cargo test -p loom-cli --test eval -- --ignored --nocapture
+cargo test -p loom-eval eval::eval_live -- --ignored --nocapture
 ```
 
 The provider is DeepSeek by default. `LOOM_EVAL_PROVIDER=openrouter`
-switches the live arm to OpenRouter: the key comes from
-`OPENROUTER_API_KEY`, the model catalog is fetched before the runs
-(capabilities come from it, like the CLI), and `LOOM_EVAL_MODEL` takes a
+switches the live arm to OpenRouter: credentials resolve through the
+engine exactly like the CLI (keychain account or `OPENROUTER_API_KEY`),
+the model catalog is fetched before the runs (capabilities come from
+it, like the CLI), and `LOOM_EVAL_MODEL` takes a
 full OpenRouter id — `nvidia/nemotron-3-super-120b-a12b:free`,
 `google/gemma-4-31b-it:free`. Report and record filenames slug the model
 id (`/` and `:` become `-`). Provider-reported charges (the `cost_usd`
@@ -65,6 +66,9 @@ the account actually pays, `cost_source: "provider-reported"`) win over
 the DeepSeek price table, which stays the fallback; free-tier ids price
 at $0 either way. The free tier is rate-limited (requests/day, not
 dollars) — check the dashboard before a full-suite run.
+`LOOM_EVAL_PROVIDER=nvidia` targets NVIDIA NIM's free-trial tier the
+same way (keychain account or `NVIDIA_API_KEY`; prices at $0 by
+construction), which is roadmap item 1's zero-cost candidate.
 
 - **Strict mode** (default): asserts every run green and every gate
   solved — the CI contract.

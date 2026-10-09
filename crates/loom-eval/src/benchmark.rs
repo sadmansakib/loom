@@ -2,16 +2,17 @@
 //!
 //! B1 asks the model to inspect this repository read-only: find the
 //! implementation of a feature, explain it, and name the relevant files. The
-//! harness runs one real task against the DeepSeek API and records the
-//! efficiency metrics the plan asks for (turns, requests, tokens, tool calls
-//! by failure kind, retries, wall time, and a peak/off-peak cost estimate).
+//! harness runs one real task through the engine (credential resolution and
+//! wiring identical to the CLI) and records the efficiency metrics the plan
+//! asks for (turns, requests, tokens, tool calls by failure kind, retries,
+//! wall time, and a peak/off-peak cost estimate).
 //!
-//! It is `#[ignore]`d so it never runs under a plain `cargo test`; it needs
-//! `DEEPSEEK_API_KEY` and spends real tokens. Run it deliberately:
+//! It is `#[ignore]`d so it never runs under a plain `cargo test`; it spends
+//! real tokens once a credential resolves (keychain or `DEEPSEEK_API_KEY`).
+//! Run it deliberately:
 //!
 //! ```text
-//! DEEPSEEK_API_KEY=... cargo test -p loom-cli --test benchmark \
-//!     -- --ignored --nocapture
+//! cargo test -p loom-eval benchmark::b1 -- --ignored --nocapture
 //! ```
 //!
 //! Override the target with `LOOM_BENCH_TARGET` and the model with
@@ -26,19 +27,16 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime};
 
-use loom_core::engine::repo::FsFactsSource;
-use loom_core::kernel::agent::{Agent, TaskControl};
-use loom_core::kernel::context::{AgentConfig, DefaultContextCompiler};
+use loom_core::engine::{Engine, EngineError, EngineOverrides};
+use loom_core::kernel::agent::TaskControl;
 use loom_core::kernel::event::{EventKind, EventSink};
 use loom_core::kernel::id::{SessionId, TaskId};
-use loom_core::kernel::model::ModelProvider;
 use loom_core::kernel::session::Session;
-use loom_core::kernel::tool::ToolRegistry;
 use loom_core::kernel::transcript::{Item, ToolFailure, ToolStatus};
-use loom_core::providers::{DeepSeekConfig, DeepSeekProvider, ReasoningEffort};
-use loom_core::tools::{ListDirTool, ReadFileTool, SearchTool};
+
+use super::eval::{ToolSet, cost_usd, eval_compiler, eval_config, price_multiplier, registry_for};
 
 /// A provider tally built from the event stream: retries and the
 /// `response_started` split that measures the cost of retrying after output.
@@ -73,33 +71,9 @@ impl EventSink for CountingSink {
     }
 }
 
-/// Peak / off-peak prices in USD per 1M tokens (docs/roadmap.md, item 1).
-struct Prices {
-    input_miss: f64,
-    input_hit: f64,
-    output: f64,
-}
-
-const FLASH: Prices = Prices {
-    input_miss: 0.30,
-    input_hit: 0.006,
-    output: 1.20,
-};
-
-const PRO: Prices = Prices {
-    input_miss: 1.32,
-    input_hit: 0.044,
-    output: 3.96,
-};
-
 #[tokio::test]
-#[ignore = "live: needs DEEPSEEK_API_KEY; spends real tokens"]
+#[ignore = "live: spends real tokens once a credential resolves"]
 async fn b1_read_only_repository_inspection() {
-    let Ok(api_key) = std::env::var("DEEPSEEK_API_KEY") else {
-        eprintln!("skipping B1: DEEPSEEK_API_KEY is not set");
-        return;
-    };
-
     let model =
         std::env::var("LOOM_BENCH_MODEL").unwrap_or_else(|_| String::from("deepseek-flash"));
     let target = std::env::var("LOOM_BENCH_TARGET")
@@ -111,7 +85,7 @@ async fn b1_read_only_repository_inspection() {
     eprintln!("B1 target: {target}");
     eprintln!("B1 model:  {model}");
 
-    // The workspace is the repository root (this crate lives in crates/loom-cli).
+    // The workspace is the repository root (this crate lives in crates/loom-eval).
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -119,43 +93,36 @@ async fn b1_read_only_repository_inspection() {
         .unwrap()
         .to_path_buf();
 
-    let provider = DeepSeekProvider::new(
-        DeepSeekConfig::new(api_key).with_reasoning_effort(ReasoningEffort::High),
-    )
-    .unwrap();
-    assert!(
-        provider.capabilities(&model).is_some(),
-        "model `{model}` is not in the capability table"
-    );
-
-    let mut registry = ToolRegistry::new();
-    registry.register(Box::new(ReadFileTool)).unwrap();
-    registry.register(Box::new(ListDirTool)).unwrap();
-    registry.register(Box::new(SearchTool)).unwrap();
-
     let system_prompt = String::from(
         "You are Loom, a minimal coding agent working read-only inside one workspace. \
          Use the provided tools to inspect the workspace: list directories and search \
          before reading large files, and prefer reading the smallest relevant range. \
          When you answer, be concise and name the workspace-relative paths you relied on.",
     );
-    let agent = Agent::new(
-        Box::new(provider),
-        Box::new(DefaultContextCompiler::with_estimator(std::sync::Arc::new(
-            loom_core::engine::O200kEstimator,
-        ))),
-        registry,
-        AgentConfig::new(workspace.clone(), system_prompt),
-        model.clone(),
-    )
-    .with_facts_source(Box::new(FsFactsSource::new(workspace)));
+
+    // Same wiring the CLI gets: the engine resolves the credential and
+    // validates the model against the capability table; the harness only
+    // pins the read-only registry and the bare compiler.
+    let engine = match Engine::open_with(
+        eval_config(workspace, "deepseek", &model, Some(system_prompt)),
+        EngineOverrides::default()
+            .with_registry(registry_for(ToolSet::ReadOnly))
+            .with_compiler(eval_compiler("deepseek")),
+    ) {
+        Ok(engine) => engine,
+        Err(EngineError::Auth(loom_core::engine::auth::AuthError::NoCredential { .. })) => {
+            eprintln!("skipping B1: no credential resolved for deepseek");
+            return;
+        }
+        Err(error) => panic!("opening the B1 engine: {error}"),
+    };
 
     let mut session = Session::new(SessionId::new());
     let sink = CountingSink(Mutex::new(Tally::default()));
     let control = TaskControl::new();
 
     let started = Instant::now();
-    let outcome = agent.run_task(&mut session, prompt, &sink, &control).await;
+    let outcome = engine.run_task(&mut session, prompt, &sink, &control).await;
     let wall_time = started.elapsed();
 
     let tally = sink.0.into_inner().unwrap();
@@ -164,12 +131,14 @@ async fn b1_read_only_repository_inspection() {
         Ok(summary) => {
             let (hit, miss) = cache_split(summary);
             let (multiplier, window) = price_multiplier(SystemTime::now());
-            let prices = match model.as_str() {
-                "deepseek-flash" => &FLASH,
-                "deepseek-v4-pro" => &PRO,
-                other => panic!("no price table for model `{other}`; add it to benchmark.rs"),
-            };
-            let cost = cost_usd(prices, hit, miss, summary.output_tokens) * multiplier;
+            let cost = cost_usd(
+                &model,
+                "deepseek",
+                hit,
+                miss,
+                summary.output_tokens,
+                multiplier,
+            );
             serde_json::json!({
                 "benchmark": "B1",
                 "model": model,
@@ -261,34 +230,4 @@ fn assistant_chars(session: &Session) -> usize {
             _ => None,
         })
         .sum()
-}
-
-/// Returns (multiplier, window) for the peak/off-peak DeepSeek price.
-///
-/// Peak hours are 01:00–04:00 and 06:00–10:00 UTC, Monday–Friday; off-peak is
-/// 50 % of the peak price (docs/roadmap.md, item 1).
-fn price_multiplier(now: SystemTime) -> (f64, &'static str) {
-    let seconds = now
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs();
-    let days = seconds / 86_400;
-    // 1970-01-01 was a Thursday; 0 = Sunday … 6 = Saturday.
-    let weekday = (days + 4) % 7;
-    let hour = (seconds % 86_400) / 3_600;
-    let weekday_peak = (1..=5).contains(&weekday);
-    let hour_peak = (1..4).contains(&hour) || (6..10).contains(&hour);
-    if weekday_peak && hour_peak {
-        (1.0, "peak")
-    } else {
-        (0.5, "off-peak")
-    }
-}
-
-/// Estimated USD cost at peak prices for the token counts.
-fn cost_usd(prices: &Prices, hit: u64, miss: u64, output: u64) -> f64 {
-    let per_million = |tokens: u64, price: f64| tokens as f64 / 1_000_000.0 * price;
-    per_million(miss, prices.input_miss)
-        + per_million(hit, prices.input_hit)
-        + per_million(output, prices.output)
 }

@@ -46,15 +46,15 @@
 //! Running:
 //!
 //! ```text
-//! # live (spends tokens, needs DEEPSEEK_API_KEY; free models cost $0):
-//! DEEPSEEK_API_KEY=... cargo test -p loom-cli --test eval \
-//!     -- --ignored --nocapture
+//! # live (spends tokens; resolves credentials like the CLI —
+//! # keychain or DEEPSEEK_API_KEY; free models cost $0):
+//! cargo test -p loom-eval eval::eval_live -- --ignored --nocapture
 //! # live on OpenRouter (free-tier models cost nothing but are rate-limited):
-//! LOOM_EVAL_PROVIDER=openrouter OPENROUTER_API_KEY=... \
+//! LOOM_EVAL_PROVIDER=openrouter \
 //!     LOOM_EVAL_MODEL=deepseek/deepseek-chat-v3-0324:free \
-//!     cargo test -p loom-cli --test eval -- --ignored --nocapture
+//!     cargo test -p loom-eval eval::eval_live -- --ignored --nocapture
 //! # offline replay of whatever recordings exist (always safe):
-//! cargo test -p loom-cli --test eval -- --nocapture
+//! cargo test -p loom-eval -- --nocapture
 //! ```
 //!
 //! Knobs: `LOOM_EVAL_PROVIDER` (`deepseek` default, or `openrouter`),
@@ -73,17 +73,20 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
-use loom_core::engine::repo::FsFactsSource;
-use loom_core::kernel::agent::{Agent, TaskControl};
+use loom_core::engine::auth::AuthError;
+use loom_core::engine::{
+    Engine, EngineConfig, EngineError, EngineOverrides, ProviderHook, estimator_for,
+};
+use loom_core::kernel::agent::{DEFAULT_MAX_TURNS, TaskControl};
 use loom_core::kernel::context::{
-    AgentConfig, ContextCompiler, DefaultContextCompiler, PruneConfig, PruningContextCompiler,
-    TokenEstimator,
+    ContextCompiler, DefaultContextCompiler, PruneConfig, PruningContextCompiler,
 };
 use loom_core::kernel::event::{EventKind, EventSink, StrictSink};
 use loom_core::kernel::id::{SessionId, TaskId};
@@ -94,10 +97,7 @@ use loom_core::kernel::model::{
 use loom_core::kernel::session::Session;
 use loom_core::kernel::tool::ToolRegistry;
 use loom_core::kernel::transcript::{AssistantMessage, Item, ToolArguments, ToolCall, ToolCallId};
-use loom_core::providers::{
-    DeepSeekConfig, DeepSeekProvider, OPENROUTER_DEFAULT_BASE_URL, OpenRouterConfig,
-    OpenRouterProvider, ReasoningEffort, TimeoutConfig, fetch_catalog, model_capabilities,
-};
+use loom_core::providers::{ReasoningEffort, model_capabilities};
 use loom_core::tools::{
     EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool, VerifyTool, WriteFileTool,
 };
@@ -108,7 +108,7 @@ use serde::{Deserialize, Serialize};
 /// The tools a task may call. Deliberately coarse: the point is to pin
 /// which capabilities a baseline exercised, not to configure the agent.
 #[derive(Debug, Clone, Copy)]
-enum ToolSet {
+pub(crate) enum ToolSet {
     /// `read_file`, `list_dir`, `search` (B1's 2026-10-06 baseline).
     ReadOnly,
     /// Read-only set plus `write_file`, `edit_file`, `run_command`,
@@ -435,18 +435,20 @@ struct Exchange {
     response: ModelResponse,
 }
 
-/// Wraps a live provider and records every completed exchange.
-struct RecordingProvider<P: ModelProvider> {
-    inner: Arc<P>,
+/// Wraps a live provider (the engine's own build, via
+/// `EngineOverrides::with_provider_hook`) and records every completed
+/// exchange.
+struct RecordingProvider {
+    inner: Box<dyn ModelProvider>,
     exchanges: Arc<Mutex<Vec<Exchange>>>,
 }
 
-impl<P: ModelProvider> RecordingProvider<P> {
-    fn new(inner: P) -> (Self, Arc<Mutex<Vec<Exchange>>>) {
+impl RecordingProvider {
+    fn new(inner: Box<dyn ModelProvider>) -> (Self, Arc<Mutex<Vec<Exchange>>>) {
         let exchanges = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
-                inner: Arc::new(inner),
+                inner,
                 exchanges: Arc::clone(&exchanges),
             },
             exchanges,
@@ -454,9 +456,11 @@ impl<P: ModelProvider> RecordingProvider<P> {
     }
 }
 
-impl<P: ModelProvider> ModelProvider for RecordingProvider<P> {
+impl ModelProvider for RecordingProvider {
     fn name(&self) -> &str {
-        "record"
+        // The label that reaches reports and billing attribution: the
+        // wrapped provider, not "record".
+        self.inner.name()
     }
 
     fn capabilities(&self, model: &str) -> Option<ModelCapabilities> {
@@ -609,7 +613,19 @@ const PRO: Prices = Prices {
     output: 3.96,
 };
 
-fn cost_usd(model: &str, hit: u64, miss: u64, output: u64, multiplier: f64) -> f64 {
+pub(crate) fn cost_usd(
+    model: &str,
+    provider: &str,
+    hit: u64,
+    miss: u64,
+    output: u64,
+    multiplier: f64,
+) -> f64 {
+    // NVIDIA NIM's free trial tier bills nothing (roadmap item 1's
+    // zero-cost candidate); the price table only prices metered models.
+    if provider == "nvidia" {
+        return 0.0;
+    }
     let prices = match model {
         "deepseek-flash" => &FLASH,
         "deepseek-v4-pro" => &PRO,
@@ -633,7 +649,7 @@ fn slug(model: &str) -> String {
 }
 
 /// Peak Mon–Fri 01:00–04:00 & 06:00–10:00 UTC; else off-peak (0.5×).
-fn price_multiplier(now: SystemTime) -> (f64, &'static str) {
+pub(crate) fn price_multiplier(now: SystemTime) -> (f64, &'static str) {
     let seconds = now
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
@@ -690,17 +706,17 @@ fn aggregate_f64(values: &[f64]) -> serde_json::Value {
 
 // ------------------------------------------------------------ run loop ---
 
-fn registry(task: &EvalTask) -> ToolRegistry {
+pub(crate) fn registry_for(tools: ToolSet) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ReadFileTool)).unwrap();
     registry.register(Box::new(ListDirTool)).unwrap();
-    if !matches!(task.tools, ToolSet::ReadEdit) {
+    if !matches!(tools, ToolSet::ReadEdit) {
         registry.register(Box::new(SearchTool)).unwrap();
     }
-    if matches!(task.tools, ToolSet::Coding | ToolSet::ReadEdit) {
+    if matches!(tools, ToolSet::Coding | ToolSet::ReadEdit) {
         registry.register(Box::new(EditFileTool)).unwrap();
     }
-    if matches!(task.tools, ToolSet::Coding) {
+    if matches!(tools, ToolSet::Coding) {
         registry.register(Box::new(WriteFileTool)).unwrap();
         registry.register(Box::new(RunCommandTool::new())).unwrap();
         registry.register(Box::new(VerifyTool::new())).unwrap();
@@ -722,6 +738,60 @@ fn prune_config() -> PruneConfig {
             ..PruneConfig::default()
         },
         None => PruneConfig::default(),
+    }
+}
+
+/// 2L/ADR-011: pruning is OFF by default so baseline numbers stay
+/// comparable; set `LOOM_EVAL_PRUNE=1` (or on/true) for the pruning arm.
+fn prune_enabled() -> bool {
+    std::env::var("LOOM_EVAL_PRUNE").is_ok_and(|value| {
+        let value = value.to_ascii_lowercase();
+        value != "0" && value != "off" && value != "false"
+    })
+}
+
+/// The eval's engine configuration for one run root. Everything the
+/// harness pins explicitly (model, workspace, no persistence, no
+/// per-account targeting); credentials resolve exactly like the CLI
+/// (keychain first, then provider env vars) because the db path is the
+/// shared one the CLI uses.
+pub(crate) fn eval_config(
+    root: PathBuf,
+    provider: &str,
+    model: &str,
+    system_prompt: Option<String>,
+) -> EngineConfig {
+    EngineConfig {
+        provider: provider.to_owned(),
+        model: model.to_owned(),
+        base_url: None,
+        reasoning_effort: ReasoningEffort::default(),
+        account: None,
+        workspace: root,
+        system_prompt,
+        max_turns: DEFAULT_MAX_TURNS,
+        db_path: loom_core::paths::db_path(),
+        persist: false,
+        catalog: None,
+    }
+}
+
+/// The compiler the eval pins per provider — the same estimator choice
+/// `Engine::open` makes for that provider (`estimator_for`), so offline
+/// arms can no longer drift from the live wire on token accounting.
+/// The pruning arm is the 2L measurement hook.
+pub(crate) fn eval_compiler(provider: &str) -> Box<dyn ContextCompiler> {
+    let estimator = estimator_for(provider);
+    if prune_enabled() {
+        Box::new(
+            PruningContextCompiler::new(
+                Box::new(DefaultContextCompiler::with_estimator(estimator.clone())),
+                prune_config(),
+            )
+            .with_estimator(estimator),
+        )
+    } else {
+        Box::new(DefaultContextCompiler::with_estimator(estimator))
     }
 }
 
@@ -898,18 +968,27 @@ fn count_tests_passed(output: &str) -> u64 {
         .sum()
 }
 
-/// Runs one task against a provider and returns the 1H-schema report plus
-/// the recorded exchanges and the finished session. `provider_label` names
-/// the concrete backend the run used, so billed-token figures in the report
-/// are attributable ("deepseek", "replay", …) and never read as
-/// provider-agnostic.
-async fn run_once(
+/// Runs one task against an engine and returns the 1H-schema report plus
+/// the recorded exchanges and the finished session. `provider_label`
+/// names the concrete backend the run used, so billed-token figures in
+/// the report are attributable ("deepseek", "openrouter", "replay", …)
+/// and never read as provider-agnostic.
+///
+/// The engine arrives through `open`: the caller decides whether it is
+/// built live (`open_async_with`, credential-resolved) or replayed
+/// (`open_with`, a scripted provider override) — this function only
+/// owns the run root, the strict sink, the session, and the report.
+async fn run_once<F, O>(
     task: &EvalTask,
     model: &str,
     provider_label: &str,
-    provider: Box<dyn ModelProvider>,
     exchanges: Option<Arc<Mutex<Vec<Exchange>>>>,
-) -> (serde_json::Value, Vec<Exchange>, Session) {
+    open: F,
+) -> (serde_json::Value, Vec<Exchange>, Session)
+where
+    F: FnOnce(PathBuf, Option<String>) -> O,
+    O: Future<Output = Result<Engine, EngineError>>,
+{
     let root = match &task.workspace {
         TaskWorkspace::Repo => workspace_root(),
         TaskWorkspace::Copy(src) => {
@@ -938,39 +1017,9 @@ async fn run_once(
         ),
         _ => None,
     };
-    // 2L/ADR-011: pruning is OFF by default so baseline numbers stay
-    // comparable; set LOOM_EVAL_PRUNE=1 (or on/true) for the pruning arm.
-    let pruning = std::env::var("LOOM_EVAL_PRUNE").is_ok_and(|value| {
-        let value = value.to_ascii_lowercase();
-        value != "0" && value != "off" && value != "false"
-    });
-    // Parity with `Engine::open`: the eval counts tokens with the same
-    // o200k estimator the engine injects, never the byte heuristic.
-    let estimator: std::sync::Arc<dyn TokenEstimator> =
-        std::sync::Arc::new(loom_core::engine::O200kEstimator);
-    let compiler: Box<dyn ContextCompiler> = if pruning {
-        Box::new(
-            PruningContextCompiler::new(
-                Box::new(DefaultContextCompiler::with_estimator(estimator.clone())),
-                prune_config(),
-            )
-            .with_estimator(estimator),
-        )
-    } else {
-        Box::new(DefaultContextCompiler::with_estimator(estimator))
-    };
-    let system_prompt = task
-        .system_prompt
-        .clone()
-        .unwrap_or_else(loom_core::engine::default_system_prompt);
-    let agent = Agent::new(
-        provider,
-        compiler,
-        registry(task),
-        AgentConfig::new(root.clone(), system_prompt),
-        model.to_owned(),
-    )
-    .with_facts_source(Box::new(FsFactsSource::new(root.clone())));
+    let engine = open(root.clone(), task.system_prompt.clone())
+        .await
+        .expect("opening the eval engine");
     let mut session = Session::new(SessionId::new());
     let control = TaskControl::new();
     // V21: strict evaluation sink — a run that loses events fails rather than
@@ -980,7 +1029,7 @@ async fn run_once(
     let sink = StrictSink::new(CountingSink(Arc::clone(&tally_state)), control.hard_token());
 
     let started = Instant::now();
-    let outcome = agent
+    let outcome = engine
         .run_task(&mut session, task.prompt.clone(), &sink, &control)
         .await;
     let observed_ms = started.elapsed().as_millis() as u64;
@@ -1090,8 +1139,9 @@ async fn run_once(
                 "wall_time_ms": summary.wall_time.as_millis() as u64,
                 "observed_wall_time_ms": observed_ms,
                 "price_window": window,
-                "cost_usd": reported_cost
-                    .unwrap_or_else(|| cost_usd(model, hit, miss, summary.output_tokens, multiplier)),
+                "cost_usd": reported_cost.unwrap_or_else(|| {
+                    cost_usd(model, provider_label, hit, miss, summary.output_tokens, multiplier)
+                }),
                 "cost_source": if reported_cost.is_some() {
                     "provider-reported"
                 } else {
@@ -1148,25 +1198,25 @@ async fn run_once(
 async fn eval_live() {
     let provider_name =
         std::env::var("LOOM_EVAL_PROVIDER").unwrap_or_else(|_| String::from("deepseek"));
-    let api_key = match provider_name.as_str() {
-        "openrouter" => {
-            let Ok(key) = std::env::var("OPENROUTER_API_KEY") else {
-                eprintln!(
-                    "skipping eval_live: OPENROUTER_API_KEY is not set (LOOM_EVAL_PROVIDER=openrouter)"
-                );
-                return;
-            };
-            key
-        }
-        _ => {
-            let Ok(key) = std::env::var("DEEPSEEK_API_KEY") else {
-                eprintln!("skipping eval_live: DEEPSEEK_API_KEY is not set");
-                return;
-            };
-            key
-        }
-    };
     let model = std::env::var("LOOM_EVAL_MODEL").unwrap_or_else(|_| String::from("deepseek-flash"));
+    // Credential probe, through the engine: resolve exactly like the CLI
+    // (keychain account, then provider env vars). No credential → the
+    // old skip UX; any other failure is a harness bug and panics. The
+    // probe also warms the OpenRouter catalog cache (engine::catalog)
+    // when the openrouter arm runs, so per-run opens stay offline.
+    match Engine::open_async_with(
+        eval_config(workspace_root(), &provider_name, &model, None),
+        EngineOverrides::default(),
+    )
+    .await
+    {
+        Err(EngineError::Auth(AuthError::NoCredential { .. })) => {
+            eprintln!("skipping eval_live: no credential resolved for {provider_name}");
+            return;
+        }
+        Err(error) => panic!("opening the {provider_name} engine: {error}"),
+        Ok(_) => {}
+    }
     let runs: usize = std::env::var("LOOM_EVAL_RUNS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1193,21 +1243,6 @@ async fn eval_live() {
         .map(|raw| raw.split(',').map(|id| id.trim().to_owned()).collect());
 
     let all_tasks = tasks();
-    // The OpenRouter arm resolves capabilities from the live catalog —
-    // parity with the CLI, which fetches it before the engine opens.
-    let openrouter_catalog = if provider_name == "openrouter" {
-        Some(
-            fetch_catalog(
-                OPENROUTER_DEFAULT_BASE_URL,
-                &api_key,
-                TimeoutConfig::default(),
-            )
-            .await
-            .expect("fetching the OpenRouter catalog"),
-        )
-    } else {
-        None
-    };
     // OpenRouter model ids carry `/` and `:` — every artifact filename
     // embeds the model, so files use this slug instead.
     let file_model = slug(&model);
@@ -1225,37 +1260,32 @@ async fn eval_live() {
         }
         let mut reports = Vec::new();
         for run in 1..=runs {
-            let (provider, exchanges, provider_label) = if provider_name == "openrouter" {
-                let openrouter = OpenRouterProvider::new(
-                    OpenRouterConfig::new(api_key.clone()),
-                    openrouter_catalog
-                        .clone()
-                        .expect("catalog fetched for the openrouter arm"),
+            // The recording hook wraps whichever provider the engine
+            // builds (credential-resolved, catalog-aware) — the eval
+            // observes production wiring instead of reproducing it.
+            let exchanges = Arc::new(Mutex::new(Vec::new()));
+            let hook_exchanges = Arc::clone(&exchanges);
+            let overrides = EngineOverrides::default()
+                .with_provider_hook(Arc::new(move |built| {
+                    Box::new(RecordingProvider {
+                        inner: built,
+                        exchanges: Arc::clone(&hook_exchanges),
+                    }) as Box<dyn ModelProvider>
+                }) as ProviderHook)
+                .with_registry(registry_for(task.tools))
+                .with_compiler(eval_compiler(&provider_name));
+            let provider_label = provider_name.clone();
+            let open_provider = provider_name.clone();
+            let open_model = model.clone();
+            let open = |root: PathBuf, system_prompt: Option<String>| async move {
+                Engine::open_async_with(
+                    eval_config(root, &open_provider, &open_model, system_prompt),
+                    overrides,
                 )
-                .expect("openrouter provider");
-                let label = openrouter.name().to_owned();
-                let (provider, exchanges) = RecordingProvider::new(openrouter);
-                (
-                    Box::new(provider) as Box<dyn ModelProvider>,
-                    exchanges,
-                    label,
-                )
-            } else {
-                let deepseek = DeepSeekProvider::new(
-                    DeepSeekConfig::new(api_key.clone())
-                        .with_reasoning_effort(ReasoningEffort::High),
-                )
-                .expect("deepseek provider");
-                let label = deepseek.name().to_owned();
-                let (provider, exchanges) = RecordingProvider::new(deepseek);
-                (
-                    Box::new(provider) as Box<dyn ModelProvider>,
-                    exchanges,
-                    label,
-                )
+                .await
             };
             let (report, recorded, session) =
-                run_once(task, &model, &provider_label, provider, Some(exchanges)).await;
+                run_once(task, &model, &provider_label, Some(exchanges), open).await;
             eprintln!(
                 "{} run {}/{}: success={} bug_fixed={}",
                 task.id, run, runs, report["success"], report["gate"]["bug_fixed"]
@@ -1749,13 +1779,20 @@ async fn outcome_gates_reject_an_untouched_workspace() {
 }
 
 /// The invariant under test (V3, Invariant 10): replaying recorded
-/// responses through the real agent + real tools reproduces the recorded
+/// responses through the real engine + real tools reproduces the recorded
 /// assistant turns verbatim in the transcript.
 async fn assert_replay_equivalence(task: &EvalTask, model: &str, exchanges: &[Exchange]) {
     let replay = ReplayProvider::new(model, exchanges);
     let overruns = replay.overruns_handle();
-    let (report, _recorded, session) =
-        run_once(task, model, "replay", Box::new(replay), None).await;
+    let tools = task.tools;
+    let open = |root: PathBuf, system_prompt: Option<String>| async move {
+        let overrides = EngineOverrides::default()
+            .with_provider(Box::new(replay))
+            .with_registry(registry_for(tools))
+            .with_compiler(eval_compiler("replay"));
+        Engine::open_with(eval_config(root, "replay", model, system_prompt), overrides)
+    };
+    let (report, _recorded, session) = run_once(task, model, "replay", None, open).await;
     assert!(
         report["success"].as_bool().unwrap(),
         "replay of {} failed: {report}",
@@ -1795,9 +1832,16 @@ async fn assert_replay_equivalence(task: &EvalTask, model: &str, exchanges: &[Ex
 /// the compiler produced on a deterministic path (no network, no clock).
 async fn replay_capturing(task: &EvalTask, model: &str, exchanges: &[Exchange]) -> Vec<Exchange> {
     let replay = ReplayProvider::new(model, exchanges);
-    let (provider, captured) = RecordingProvider::new(replay);
-    let (_report, recorded, _session) =
-        run_once(task, model, "replay", Box::new(provider), Some(captured)).await;
+    let (provider, captured) = RecordingProvider::new(Box::new(replay));
+    let tools = task.tools;
+    let open = |root: PathBuf, system_prompt: Option<String>| async move {
+        let overrides = EngineOverrides::default()
+            .with_provider(Box::new(provider))
+            .with_registry(registry_for(tools))
+            .with_compiler(eval_compiler("replay"));
+        Engine::open_with(eval_config(root, "replay", model, system_prompt), overrides)
+    };
+    let (_report, recorded, _session) = run_once(task, model, "replay", Some(captured), open).await;
     recorded
 }
 
