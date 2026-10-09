@@ -64,6 +64,7 @@ impl super::ContextCompiler for DefaultContextCompiler {
         let (messages, facts_tokens) =
             project_messages(input.session, input.config, input.facts, &*self.estimator);
         let tools = exposed_tools(input.tools, input.capabilities);
+        let stable_prefix_messages = Some(messages.len());
         let request = ModelRequest {
             model: input.model.to_owned(),
             messages,
@@ -73,6 +74,7 @@ impl super::ContextCompiler for DefaultContextCompiler {
                 .max_output_tokens
                 .map(|tokens| tokens.min(input.budget.reserved_output_tokens)),
             temperature: None,
+            stable_prefix_messages,
         };
         let census = census(&request, facts_tokens, &*self.estimator);
         if census.total > input.budget.max_input_tokens {
@@ -85,6 +87,9 @@ impl super::ContextCompiler for DefaultContextCompiler {
             request,
             census,
             prune_checkpoint: None,
+            // This compiler never stubs: every projected result carries
+            // its full content, so no call id is pruned away.
+            stubbed_calls: Vec::new(),
         })
     }
 }

@@ -205,6 +205,9 @@ impl ContextCompiler for PruningContextCompiler {
         } = input;
         let facts_text = facts.render();
         let mut checkpoint = prune_checkpoint.cloned();
+        // Call ids whose projected body this compile stubbed, reported so
+        // the caller never mistakes a stub for still-visible content.
+        let mut stubbed_calls: Vec<String> = Vec::new();
         let mut compiled = match self.inner.compile(ContextInput {
             session,
             tools,
@@ -243,6 +246,10 @@ impl ContextCompiler for PruningContextCompiler {
                     prune_checkpoint,
                 }) {
                     Ok(compiled) => {
+                        // The stubs are already baked into the stubbed
+                        // session the inner compiler projected, so record
+                        // the decisions verbatim.
+                        stubbed_calls.extend(decisions.iter().map(|d| d.call_id.clone()));
                         checkpoint = Some(PruneCheckpoint {
                             upto_item: session.transcript.len(),
                             stubs: decisions,
@@ -272,7 +279,7 @@ impl ContextCompiler for PruningContextCompiler {
             .map(|c| c.stubs.clone())
             .filter(|stubs| !stubs.is_empty())
         {
-            apply_stubs(&mut compiled.request, &frozen);
+            stubbed_calls.extend(apply_stubs(&mut compiled.request, &frozen));
             compiled.census = census(&compiled.request, facts_tokens, &*self.estimator);
         }
 
@@ -308,7 +315,7 @@ impl ContextCompiler for PruningContextCompiler {
                 frozen_reclaim(session, &frozen.stubs, &*self.estimator)
             });
             if reclaim >= already.saturating_add(u64::from(self.config.min_reclaim_tokens)) {
-                apply_stubs(&mut compiled.request, &decisions);
+                stubbed_calls.extend(apply_stubs(&mut compiled.request, &decisions));
                 compiled.census = census(&compiled.request, facts_tokens, &*self.estimator);
                 checkpoint = Some(PruneCheckpoint {
                     upto_item: session.transcript.len(),
@@ -326,17 +333,23 @@ impl ContextCompiler for PruningContextCompiler {
         }
 
         compiled.prune_checkpoint = checkpoint;
+        compiled.stubbed_calls = stubbed_calls;
         Ok(compiled)
     }
 }
 
 /// Rewrites projected `ToolResult` messages whose `call_id` is stubbed,
 /// leaving every other message (and the call/result pairing) untouched.
-fn apply_stubs(request: &mut crate::model::ModelRequest, stubs: &[StubDecision]) {
+///
+/// Returns the call ids whose bodies were actually rewritten, so the
+/// caller can report them as [`CompiledContext::stubbed_calls`]: a stub
+/// body is not content the model can still be pointed at.
+fn apply_stubs(request: &mut crate::model::ModelRequest, stubs: &[StubDecision]) -> Vec<String> {
     let by_call: HashMap<&str, StubReason> = stubs
         .iter()
         .map(|stub| (stub.call_id.as_str(), stub.reason))
         .collect();
+    let mut rewritten = Vec::new();
     for message in &mut request.messages {
         let Message::ToolResult(result) = message else {
             continue;
@@ -346,7 +359,9 @@ fn apply_stubs(request: &mut crate::model::ModelRequest, stubs: &[StubDecision])
         };
         result.content = reason.stub_text().to_owned();
         result.truncated = false;
+        rewritten.push(result.call_id.as_str().to_owned());
     }
+    rewritten
 }
 
 /// Clones `session` with the stubbed results rewritten in place, as the
@@ -985,6 +1000,26 @@ mod tests {
             messages_serialized(&compiled.request.messages)
                 .contains("older than the kept turn window")
         );
+        // The rewritten ids are reported so callers never mistake a stub
+        // for content the model can still be pointed at (the item-6
+        // cache stub consults this).
+        assert_eq!(compiled.stubbed_calls, vec!["c1".to_owned()]);
+    }
+
+    #[test]
+    fn a_compile_below_every_trigger_reports_no_stubbed_calls() {
+        let session = session_with(vec![
+            Item::User {
+                text: "go".to_owned(),
+            },
+            assistant_calls("reading", vec![read_call("c3", "src/c.rs")]),
+            result("c3", &big("content", 5)),
+        ]);
+        let compiled = compiler(PruneConfig::default())
+            .compile(input(&session, None))
+            .expect("compiles");
+        assert!(compiled.prune_checkpoint.is_none());
+        assert!(compiled.stubbed_calls.is_empty());
     }
 
     /// A tiny old read reclaims less than `min_reclaim_tokens`, so the

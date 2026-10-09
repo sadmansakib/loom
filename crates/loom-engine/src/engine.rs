@@ -39,7 +39,8 @@ use crate::auth::{self, KeychainBackend, SqliteAuthStore};
 /// consults the environment for it.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    /// Provider adapter to use. Iteration 1 ships `deepseek`.
+    /// Provider adapter to use — `deepseek` or `openrouter`. Adding one
+    /// is a new match arm in [`crate::provider`], nowhere else.
     pub provider: String,
     /// Model identifier, validated against the provider's capability table.
     pub model: String,

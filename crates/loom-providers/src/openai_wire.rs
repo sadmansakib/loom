@@ -92,6 +92,10 @@ pub(crate) fn build_request_body(request: &ModelRequest, options: &WireOptions) 
     let mut body = json!({
         "model": request.model,
         "messages": messages,
+        // Exactly one choice is wanted and the response is read from
+        // `choices[0]` alone, so say so on the wire: a provider that
+        // sent several would have all but the first silently dropped.
+        "n": 1,
         "stream": true,
         "stream_options": {"include_usage": true},
     });
@@ -658,6 +662,7 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             temperature: None,
+            stable_prefix_messages: None,
         }
     }
 
@@ -693,6 +698,7 @@ mod tests {
                 }],
                 max_tokens: Some(1024),
                 temperature: Some(0.2),
+                stable_prefix_messages: None,
                 ..request()
             },
             &wire_options(),

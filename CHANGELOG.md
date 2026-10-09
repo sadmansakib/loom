@@ -99,6 +99,14 @@ Verified offline with wiremock: request wire shape, auth headers
 tool-call assembly from partial `input_json_delta` chunks, truncated
 streams reporting `length` without calls, and error classification.
 
+Riding along: `CompiledContext.stubbed_calls` — the pruning compiler
+now reports which projected call ids it rewrote to stubs this compile.
+The tool loop excludes those from the cache-stub shortcut (roadmap
+item 6), so a repeat read whose original body was pruned gets its full
+re-bounded content back instead of a misleading
+`unchanged since call <id>` pointing at a body the model can no longer
+see.
+
 ## 2026-10-09 — Pruning phase 2: turn-age masking (roadmap item 10)
 
 Read-only results older than 8 turns (configurable via `PruneConfig::

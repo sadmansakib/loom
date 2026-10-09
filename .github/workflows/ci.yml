@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      # The workspace lints (`unsafe_code = forbid`, `missing_docs`,
+      # `unwrap_used`, `expect_used`) are warnings, so nothing but this
+      # job actually enforces them.
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux is the platform both Linux-only sandbox defects shipped
+        # green on: the suite only ever ran on macOS. Run both, always.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      # `rust-version` is the floor the suite must stay green on. It was
+      # 1.88 until `uuid` 1.27 (v7 ids) declared 1.89, which made the
+      # declared floor unsatisfiable; the workspace now builds on 1.89.
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+
+      # Every run_command/verify invocation on Linux is wrapped in bwrap,
+      # so without it installed the loom-tools suite fails at spawn time
+      # instead of exercising the code it is about.
+      - name: install the Linux sandbox wrapper
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap
+          bwrap --version
+
+      # Ubuntu 24.04 runners restrict unprivileged user namespaces through
+      # AppArmor, which is precisely what bwrap needs to build the sandbox's
+      # namespaces. Without this the wrapper cannot start at all and the
+      # Linux job fails for an environmental reason rather than a real one.
+      - name: allow unprivileged user namespaces
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      # Fail fast and legibly: if the sandbox still cannot be built here,
+      # every command-execution test below would fail with a spawn error
+      # and say nothing about why.
+      - name: prove the sandbox builds and runs
+        if: runner.os == 'Linux'
+        run: |
+          bwrap --die-with-parent --new-session --unshare-pid --unshare-net \
+            --ro-bind-try /usr /usr --proc /proc --tmpfs /tmp -- true
+
+      - name: test
+        run: cargo test --workspace

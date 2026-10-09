@@ -771,6 +771,7 @@ impl Agent {
             prune_checkpoint = compiled.prune_checkpoint;
             // Partial move: `request` moves out, `census` (Copy) stays readable
             // for the `EndTurn` return.
+            let stubbed_calls = compiled.stubbed_calls;
             let request = compiled.request;
 
             // b. Stream with bounded retry (§6.3). Only a `Completed` event
@@ -829,6 +830,7 @@ impl Agent {
                         .execute_batch(
                             &assistant.tool_calls,
                             &request,
+                            &stubbed_calls,
                             task_id,
                             sink,
                             cancellation,
@@ -1027,6 +1029,7 @@ impl Agent {
         &self,
         calls: &[ToolCall],
         request: &ModelRequest,
+        stubbed: &[String],
         task_id: TaskId,
         sink: &dyn EventSink,
         cancellation: &CancellationToken,
@@ -1063,15 +1066,9 @@ impl Agent {
         // Call ids whose results the model still sees in this request
         // (post-projection). The tool engine serves a cache hit for one of
         // these as a cheap `unchanged since call <id>` stub (roadmap
-        // item 6): the full content is already in view.
-        let projected_calls: HashSet<String> = request
-            .messages
-            .iter()
-            .filter_map(|message| match message {
-                Message::ToolResult(result) => Some(result.call_id.as_str().to_owned()),
-                _ => None,
-            })
-            .collect();
+        // item 6): the full content is already in view. `visible_call_ids`
+        // excludes any id whose body a pruning pass replaced with a stub.
+        let projected_calls = visible_call_ids(request, stubbed);
 
         let context = ToolContext::new(
             self.config.workspace_root.clone(),
@@ -1330,6 +1327,33 @@ fn repeated_call_result(call: &ToolCall) -> ToolResult {
     )
 }
 
+/// Call ids whose results the model still sees in `request`, post-projection.
+///
+/// The tool engine serves a cache hit for one of these as a cheap
+/// `unchanged since call <id>` stub (roadmap item 6): the full content is
+/// already in view, so re-serving a bounded duplicate spends context twice.
+///
+/// A pruned result is the exception, and it is why `stubbed` is subtracted.
+/// Pruning rewrites a result's body to a one-line "re-run the tool" note
+/// while **keeping its call id** (`context::pruning::apply_stubs`), so the
+/// id still appears in the projection even though its content is gone.
+/// Serving `unchanged since call X` for such an id points the model at a
+/// body it can no longer read — it would be told the content is available
+/// at a call whose body is a stub. Excluding those ids makes a repeat read
+/// fall through to the full, re-bounded cached content, which is exactly
+/// what the model needs to recover what pruning took away.
+fn visible_call_ids(request: &ModelRequest, stubbed: &[String]) -> HashSet<String> {
+    request
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::ToolResult(result) => Some(result.call_id.as_str().to_owned()),
+            _ => None,
+        })
+        .filter(|call_id| !stubbed.iter().any(|stubbed| stubbed == call_id))
+        .collect()
+}
+
 /// Appends a deterministic next-step hint to a failure the model will see.
 /// The engine (`execute_call`) is untouched, so its content contract is
 /// unchanged; the loop layers guidance on top.
@@ -1438,10 +1462,12 @@ mod tests {
     use super::{
         CompletionGate, DEFAULT_RESERVED_OUTPUT_TOKENS, MAX_RESERVED_OUTPUT_TOKENS,
         OutputReservation, completion_refusal, derive_reserved_output_tokens, green_check,
+        visible_call_ids,
     };
-    use crate::model::ModelCapabilities;
+    use crate::model::{Message, ModelCapabilities, ModelRequest, StopReason};
     use crate::session::Session;
     use crate::transcript::{Item, ToolResult, ToolStatus};
+    use std::collections::HashSet;
 
     #[test]
     fn auto_honors_a_declared_output_maximum_up_to_the_hard_cap() {
@@ -1485,6 +1511,90 @@ mod tests {
         assert_eq!(
             derive_reserved_output_tokens(&caps, OutputReservation::Fixed(60_000)),
             5_000,
+        );
+    }
+
+    fn result(call_id: &str, content: &str) -> Message {
+        Message::ToolResult(ToolResult::new(
+            crate::transcript::ToolCallId::try_from(call_id.to_owned()).unwrap(),
+            ToolStatus::Success,
+            content.to_owned(),
+            false,
+        ))
+    }
+
+    fn request(messages: Vec<Message>) -> ModelRequest {
+        ModelRequest {
+            model: "m".into(),
+            messages,
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            stable_prefix_messages: None,
+        }
+    }
+
+    #[test]
+    fn visible_call_ids_keeps_unstubbed_results() {
+        let req = request(vec![result("call-a", "body"), result("call-b", "body")]);
+        let ids = visible_call_ids(&req, &[]);
+        assert_eq!(
+            ids,
+            ["call-a".to_owned(), "call-b".to_owned()]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            "every projected result is still visible when nothing is stubbed"
+        );
+    }
+
+    #[test]
+    fn visible_call_ids_drops_a_pruned_result() {
+        // Pruning keeps the call id but rewrites the body to a stub, so the
+        // id is in the projection while the content is gone. Serving
+        // `unchanged since call <id>` for it would point the model at a
+        // body it can no longer read.
+        let req = request(vec![
+            result("call-a", "[pruned] aged out; re-run the tool"),
+            result("call-b", "body"),
+        ]);
+        let ids = visible_call_ids(&req, &["call-a".to_owned()]);
+        assert_eq!(
+            ids,
+            ["call-b".to_owned()].into_iter().collect::<HashSet<_>>(),
+            "a stubbed call id must not be treated as still-visible"
+        );
+    }
+
+    #[test]
+    fn visible_call_ids_ignores_unmatched_stub_ids() {
+        // A stub for a call that is no longer projected must not suppress
+        // an unstubbed result that happens to share the projection.
+        let req = request(vec![result("call-b", "body")]);
+        let ids = visible_call_ids(&req, &["call-gone".to_owned()]);
+        assert_eq!(
+            ids,
+            ["call-b".to_owned()].into_iter().collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn visible_call_ids_skips_non_tool_result_messages() {
+        let req = request(vec![
+            Message::User {
+                text: "task".to_owned(),
+            },
+            result("call-a", "body"),
+            Message::Assistant(crate::transcript::AssistantMessage {
+                content: "done".into(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                stop_reason: StopReason::EndTurn,
+            }),
+        ]);
+        let ids = visible_call_ids(&req, &[]);
+        assert_eq!(
+            ids,
+            ["call-a".to_owned()].into_iter().collect::<HashSet<_>>()
         );
     }
 

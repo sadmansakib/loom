@@ -270,6 +270,16 @@ pub struct CompiledContext {
     /// pruning compiler produced one (ADR-011). `None` for the default
     /// compiler and for a pruning compiler that has not triggered.
     pub prune_checkpoint: Option<PruneCheckpoint>,
+    /// Call ids whose projected result body a pruning pass replaced with
+    /// a [`crate::context::pruning::StubReason`] stub.
+    ///
+    /// These results are **not** still-visible to the model: their
+    /// content is a one-line "re-run the tool" note. A caller that
+    /// treats a projected call id as "content the model can still see"
+    /// must exclude these, or it will point the model at a body that has
+    /// already been pruned away. Empty for the default compiler and for
+    /// a pruning compiler that has not stubbed anything.
+    pub stubbed_calls: Vec<String>,
 }
 
 /// Why [`ContextCompiler::compile`] failed.

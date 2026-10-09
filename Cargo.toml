@@ -14,8 +14,11 @@ members = [
 version = "0.1.0"
 edition = "2024"
 # Raised from 1.85 for `keyring` 4.x (1.88), the CLI's OS-keychain backend
-# (ADR-009). Everything else still builds on 1.85.
-rust-version = "1.88"
+# (ADR-009). Raised again from 1.88 because `uuid` 1.27 (v7 ids) declares
+# rust-version 1.89, so the floor was unsatisfiable: a 1.88 toolchain failed
+# at dependency resolution, not at compilation. Verified by building the
+# workspace on 1.89.
+rust-version = "1.89"
 
 [workspace.dependencies]
 # internal crates

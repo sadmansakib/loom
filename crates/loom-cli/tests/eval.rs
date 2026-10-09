@@ -2007,6 +2007,7 @@ async fn eval_replay_synthetic() {
                 tools: Vec::new(),
                 max_tokens: None,
                 temperature: None,
+                stable_prefix_messages: None,
             },
             response: ModelResponse {
                 message,
