@@ -84,6 +84,11 @@ pub struct RunArgs {
     /// Do not persist the session to the state database (`--no-save`).
     #[arg(long)]
     pub no_save: bool,
+
+    /// Export this task's events, transcript, and a manifest under
+    /// `DIR/<task-id>/` (roadmap item 20.1).
+    #[arg(long, value_name = "DIR")]
+    pub trace: Option<std::path::PathBuf>,
 }
 
 /// Arguments for `loom auth`.

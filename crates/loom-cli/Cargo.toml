@@ -23,6 +23,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "si
 tokio-util = { workspace = true }
 # Hidden secret prompt for `loom auth login` (no echo in a terminal).
 rpassword = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

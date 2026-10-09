@@ -467,7 +467,7 @@ also summarized here so this section is the single source of truth.
   and cached tokens / cost / wall time / tool-cache hits, per-task
   aggregates and a gated-pass-rate suite headline; strict and tolerant
   modes.
-- **Verification bar.** 594 tests passing (13 live-API tests ignored by
+- **Verification bar.** 598 tests passing (13 live-API tests ignored by
   default), clippy clean, fmt clean.
 
 ---
@@ -851,7 +851,10 @@ reproduces them.
     exist.
 20. **Self-optimization** (G10). In order:
     1. trace export: one directory per task with transcript, events,
-       census, harness version, and outcome;
+       census, harness version, and outcome — **phase 1 shipped**
+       (`loom run --trace DIR`: `events.ndjson`, `transcript.json`,
+       `manifest.json`; mechanism-level attribution still needs prune
+       events, schema v3);
     2. every tunable — prune trigger and floors, read window, reasoning
        schedule, edit format — moved from constants into one config
        struct, so the replay and live evals can sweep it (this subsumes

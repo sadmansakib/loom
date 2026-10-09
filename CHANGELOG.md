@@ -3,6 +3,19 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — Trace export: `loom run --trace DIR` (item 20.1, phase 1)
+
+One directory per task with three files: `events.ndjson` (the numbered
+event stream exactly as the sink ordered it), `transcript.json`
+(committed session items and task records), and `manifest.json`
+(harness version, event schema version, run configuration, outcome with
+a stable `end_reason` token, summary counters, and the final context
+census). The export is best-effort: write failures are counted in the
+manifest and warned on stderr, never mapped to a run outcome. Runs
+without `--trace` are unchanged. Mechanism-level attribution (which
+pruning decision saved which tokens) still needs prune-event variants
+in `EventKind` — a schema v3 bump, kept as a follow-up. 598 tests.
+
 ## 2026-10-09 — Evidence refresh (web research) and architecture.md drift fixes
 
 `docs/architecture.md` corrected against the code: §1 dependency table

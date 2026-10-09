@@ -471,11 +471,24 @@ for credentials but never consults it for the database location — that
 is the frontend's decision, passed in as `EngineConfig::db_path`.
 
 The CLI is thin: `loom run` (interactive render — text to stdout,
-reasoning to a dim stderr, NDJSON mode for machines), `loom auth`
+reasoning to a dim stderr, NDJSON mode for machines; `--trace DIR`
+exports the task's evidence — see below), `loom auth`
 (login/list/set-active/remove), `loom stats` (per-session analytics from
 stored transcripts: turns, per-tool call quality, edit acceptance,
 repeats, repairs, spill savings), and the eval entry points. Exit codes:
 0 success, non-zero failure, 130 cancelled.
+
+`loom run --trace DIR` writes one directory per task (roadmap item
+20.1): `events.ndjson` (the numbered event stream, one envelope per
+line), `transcript.json` (the committed session items and task
+records), and `manifest.json` (harness version, event schema version,
+run configuration, outcome with a stable `end_reason` token, the task
+summary counters, and the final context census). The export is
+best-effort by design: write failures are counted into the manifest
+(`events_write_failures`) and warned on stderr, never mapped to a run
+outcome — a trace is an artifact of the run, not a precondition.
+Mechanism-level attribution (which pruning decision saved which tokens)
+still needs prune-event variants in `EventKind`, a schema v3 bump.
 
 ## 10. Providers
 
@@ -592,7 +605,7 @@ Compare suites by medians over N ≥ 5; the observed noise floor is ±10%.
 - Blocking work on the blocking pool; hashing never under a lock.
 - Facts scanned once per task; capabilities resolved once per task.
 
-**Testing** — the workspace carries 594 tests (13 live-API tests
+**Testing** — the workspace carries 598 tests (13 live-API tests
 ignored by default): unit tests per module,
 protocol and invariant tests against in-memory seams, security regression
 tests for confinement, canary tests for secrets, integration tests that

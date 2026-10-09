@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::args::RunArgs;
 use crate::output::{self, Renderer};
 use crate::paths;
+use crate::trace::{Outcome, TraceMeta, TraceWriter};
 
 /// Runs one task end to end and returns the process exit code.
 ///
@@ -42,6 +43,11 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         None
     };
 
+    // Captured before `EngineConfig` consumes the strings: the trace
+    // manifest needs the run configuration after the task ended.
+    let trace_provider = args.provider.clone();
+    let trace_model = args.model.clone();
+
     let engine = Engine::open(EngineConfig {
         provider: args.provider,
         model: args.model,
@@ -60,14 +66,23 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let input = args.task.join(" ");
 
     // The consumer owns stdout/stderr; the sink only numbers and sends (§11).
+    // With `--trace` it also appends every envelope to the task's
+    // `events.ndjson` and hands the writer back so the main thread can
+    // finish the export once the outcome is known.
     let (sink, mut receiver) = ChannelEventSink::new();
     let json = args.json;
+    let tracer = args.trace.clone().map(TraceWriter::new);
     let consumer = std::thread::spawn(move || {
         let mut renderer = Renderer::new(json);
+        let mut tracer = tracer;
         while let Some(envelope) = receiver.blocking_recv() {
+            if let Some(writer) = tracer.as_mut() {
+                writer.record(&envelope);
+            }
             renderer.render(&envelope);
         }
         renderer.finish();
+        tracer
     });
 
     // Ctrl-C cancels the task token; the provider's timeouts need the time
@@ -83,7 +98,48 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let outcome = runtime.block_on(engine.run_task(&mut session, input, &sink, &cancellation));
     drop(sink);
     signal.abort();
-    let _ = consumer.join();
+    let tracer = consumer.join().unwrap_or_else(|_| {
+        eprintln!("warning: event consumer thread panicked; trace not written");
+        None
+    });
+
+    // The trace export is best-effort: a failure to write files must not
+    // change the run's exit code, only warn.
+    if let Some(writer) = tracer {
+        let (trace_outcome, summary) = match &outcome {
+            Ok(summary) => (Outcome::Completed, Some(summary)),
+            Err(error) => {
+                let reason = error.end_reason().to_string();
+                (
+                    Outcome::Ended {
+                        status: if error.is_cancelled() {
+                            "cancelled"
+                        } else {
+                            "failed"
+                        },
+                        end_reason: reason,
+                    },
+                    None,
+                )
+            }
+        };
+        match writer.finish(
+            &session,
+            TraceMeta {
+                provider: &trace_provider,
+                model: &trace_model,
+                reasoning_effort: args.reasoning_effort,
+                max_turns: args.max_turns,
+                persisted: !args.no_save,
+            },
+            trace_outcome,
+            summary,
+        ) {
+            Ok(Some(dir)) => eprintln!("trace: {}", dir.display()),
+            Ok(None) => {}
+            Err(error) => eprintln!("warning: trace export failed: {error}"),
+        }
+    }
 
     match outcome {
         Ok(summary) => {
