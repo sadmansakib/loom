@@ -22,9 +22,12 @@ use loom_tools::{
 /// any-program semantics must state the sandbox contract. Multi-edit
 /// (roadmap item 5) gives `edit_file` a nested `edits` array schema,
 /// ~+790 B: the batch contract has to be legible in the spec. The
-/// budget rose to 6,150 B with that; per-tool budgets keep every other
-/// tool honest.
-const TOTAL_SPEC_BUDGET_BYTES: usize = 6_150;
+/// output filters (roadmap item 3) add a compacting note to
+/// `run_command`'s description, ~+100 B — the model must know
+/// well-shaped output may arrive reduced with an artifact refetch.
+/// The budget rose to 6,250 B with that; per-tool budgets keep every
+/// other tool honest.
+const TOTAL_SPEC_BUDGET_BYTES: usize = 6_250;
 /// No single tool's serialized spec may exceed this, except those with
 /// an explicit entry in [`SPEC_BUDGETS`].
 const PER_SPEC_BUDGET_BYTES: usize = 840;

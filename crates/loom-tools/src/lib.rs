@@ -17,6 +17,7 @@ mod fusion;
 mod list_dir;
 pub mod policy;
 mod read_file;
+mod reduce;
 mod run_command;
 mod sandbox;
 mod schema;

@@ -24,10 +24,22 @@
 //! [`CommandEffect`](loom_kernel::tool::CommandEffect) in the session
 //! transcript; escalation grants and rule timeouts land as the call's
 //! error status, so the session is the audit log.
+//!
+//! Output filters (roadmap item 3): successful output from a few
+//! well-shaped commands (`git status`/`diff`/`log`, `ls`, `tree`,
+//! `grep`, `cargo test`) is reduced at the command's own unit
+//! boundaries — a counted marker replaces whole commits, entries,
+//! matches, or passing-test lines instead of a byte cut — and the
+//! unreduced stream is teed to the artifact store so nothing is lost.
+//! The failure path tees the raw log its evidence block replaced, for
+//! the same reason. Both tees are best-effort: without an artifact
+//! store the output is the bounded raw form it always was.
 
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
+use loom_kernel::artifact::{ArtifactRef, store_artifact};
 use loom_kernel::tool::{
     CommandEffect, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec,
 };
@@ -38,6 +50,7 @@ use serde_json::Value;
 use crate::budget;
 use crate::evidence::{Evidence, cargo_diagnostics, libtest_failures, nextest_junit};
 use crate::policy::CommandPolicy;
+use crate::reduce;
 
 /// Runs a program in the workspace root inside an OS sandbox and
 /// returns its combined output and exit status.
@@ -69,8 +82,10 @@ impl RunCommandTool {
              (writes confined to the workspace, network off); returns \
              combined stdout/stderr and exit status. No shell: pass the \
              program and each argument separately (`bash` is fine — its \
-             children stay sandboxed). Escalated, grants beyond the \
-             sandbox default: {escalated}."
+             children stay sandboxed). Well-shaped command output (git, \
+             ls, tree, grep, cargo test) is compacted; the full stream is \
+             stored as an artifact (artifact_read). Escalated, \
+             grants beyond the sandbox default: {escalated}."
         );
         Self {
             spec: ToolSpec {
@@ -182,6 +197,7 @@ impl Tool for RunCommandTool {
                 &input.args,
                 &output,
                 &recent_changes,
+                ctx,
             ))
         })
     }
@@ -192,52 +208,29 @@ impl Tool for RunCommandTool {
 /// tool call: the command ran and the model must see the failure, so it
 /// is never mapped to [`ToolError::Execution`].
 ///
-/// A **failed** run whose output parses into structured evidence —
-/// compiler diagnostics, libtest failures, nextest JUnit, the same
-/// parsers `verify` uses — is shaped into that compact block instead of
-/// the raw log (ADR-014, ADR-017 decision 3): the failing test, its
-/// assertion, its location, and the recent change it links to. A
-/// successful run keeps its bounded streams: `run_command` is
-/// general-purpose, so its output may itself be the answer the model
-/// asked for. A failed run with nothing parseable falls back to the
-/// bounded raw output, so a failure is never hidden, only capped.
-/// Resolves a bare program name against `PATH`, mirroring the search the
-/// OS would perform — used to fail fast (and legibly) before the program
-/// enters the sandbox wrapper, which cannot report a missing binary.
+/// Three body shapes, best-fit first (the output filters, roadmap
+/// item 3):
+/// - a **failed** run whose output parses into structured evidence —
+///   compiler diagnostics, libtest failures, nextest JUnit, the same
+///   parsers `verify` uses — is shaped into that compact block
+///   (ADR-014, ADR-017 decision 3), and the raw log it replaced is
+///   teed to `ctx`'s artifact store for refetch, so nothing is lost;
+/// - a **successful** well-shaped command (see [`crate::reduce`]) with
+///   a store attached — the reducer's compact stdout, raw stderr, and
+///   the unreduced stdout teed;
+/// - anything else — the bounded raw streams. `run_command` is
+///   general-purpose, so its output may itself be the answer the
+///   model asked for, and a failure is never hidden, only capped.
 ///
-/// A candidate must be a regular file the user may execute, which is what
-/// the kernel itself requires. Without the check a non-executable file
-/// sitting early on `PATH` passes here, shadows a later entry that would
-/// have worked, and the failure then surfaces from the spawn as a
-/// permissions error rather than the legible "not found on PATH".
-fn resolve_in_path(program: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(program))
-        .find(|candidate| is_executable_file(candidate))
-}
-
-/// Whether `candidate` is a regular file with an execute bit, the way
-/// the kernel decides when exec'ing a `PATH` entry.
-#[cfg(unix)]
-fn is_executable_file(candidate: &std::path::Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(candidate)
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-}
-
-/// Windows has no execute bit; a regular file is the best available
-/// approximation.
-#[cfg(not(unix))]
-fn is_executable_file(candidate: &std::path::Path) -> bool {
-    candidate.is_file()
-}
-
+/// Tees are best-effort: without an artifact store, or if the store
+/// refuses the write, the result is the bounded raw output it would
+/// have been before filters existed.
 fn render(
     program: &str,
     args: &[String],
     output: &std::process::Output,
     recent_changes: &[String],
+    ctx: &ToolContext,
 ) -> ToolOutput {
     let effects = ToolEffects::none().with_command(CommandEffect::new(
         program,
@@ -270,19 +263,17 @@ fn render(
     }
     text.push('\n');
     text.push_str(&status_line(output.status));
-    if !output.status.success() && !evidence.is_empty() {
-        text.push('\n');
-        text.push_str(&evidence.render());
+
+    let artifact = if !output.status.success() {
+        failure_body(&mut text, ctx, &evidence, &raw, &stderr)
+    } else if ctx.artifacts.is_some()
+        && let Some(reduction) = reduce::reduce(program, args, &raw)
+    {
+        reduced_body(&mut text, ctx, &raw, &stderr, &reduction.text)
     } else {
-        if !raw.is_empty() {
-            text.push_str("\n--- stdout ---\n");
-            text.push_str(&raw);
-        }
-        if !stderr.is_empty() {
-            text.push_str("\n--- stderr ---\n");
-            text.push_str(&stderr);
-        }
-    }
+        push_streams(&mut text, &raw, &stderr);
+        None
+    };
     // Errors live at the tail, so keep both ends (ADR-014). The status line and
     // early output survive at the head; the last lines of stderr survive at the
     // tail; the explicit marker names what was dropped.
@@ -291,12 +282,117 @@ fn render(
         budget::COMMAND_HEAD_BYTES,
         budget::COMMAND_TAIL_BYTES,
     );
-    let rendered = if cut {
+    let mut rendered = if cut {
         ToolOutput::new(text).with_truncated()
     } else {
         ToolOutput::new(text)
     };
+    if let Some(reference) = artifact {
+        rendered = rendered.with_artifact(reference);
+    }
     rendered.with_effects(effects)
+}
+
+/// The failure path: when the output parses into structured evidence
+/// (2F, ADR-017) the compact block replaces the raw log — and the
+/// replaced log is teed to the artifact store so the elided detail stays
+/// refetchable (roadmap item 3's "nothing is lost"). Nothing parseable
+/// keeps the bounded raw streams, so a failure is never hidden.
+fn failure_body(
+    text: &mut String,
+    ctx: &ToolContext,
+    evidence: &Evidence,
+    raw: &str,
+    stderr: &str,
+) -> Option<ArtifactRef> {
+    if evidence.is_empty() {
+        push_streams(text, raw, stderr);
+        return None;
+    }
+    text.push('\n');
+    text.push_str(&evidence.render());
+    let mut body = String::from("--- stdout ---\n");
+    body.push_str(raw);
+    body.push_str("\n--- stderr ---\n");
+    body.push_str(stderr);
+    tee(text, ctx, &body)
+}
+
+/// The reduced-success path: the reducer's compact stdout inline, the
+/// raw stderr verbatim beside it, and the unreduced stdout teed to the
+/// artifact store for refetch.
+fn reduced_body(
+    text: &mut String,
+    ctx: &ToolContext,
+    raw: &str,
+    stderr: &str,
+    reduced: &str,
+) -> Option<ArtifactRef> {
+    push_streams(text, reduced, stderr);
+    tee(text, ctx, raw)
+}
+
+/// The raw path: both bounded streams inline, nothing teed.
+fn push_streams(text: &mut String, raw: &str, stderr: &str) {
+    if !raw.is_empty() {
+        text.push_str("\n--- stdout ---\n");
+        text.push_str(raw);
+    }
+    if !stderr.is_empty() {
+        text.push_str("\n--- stderr ---\n");
+        text.push_str(stderr);
+    }
+}
+
+/// The `kind` recorded on teed command output — the same kind the
+/// engine's oversized-output spill uses, so `artifact_read` serves both.
+const ARTIFACT_KIND: &str = "tool_output";
+
+/// Stores `body` as an artifact and appends the refetch note, mirroring
+/// the engine's spill note (ADR-012 decision 3, ADR-014). Best-effort:
+/// without a store, or when the store refuses the write, the caller's
+/// inline text is all there is.
+fn tee(text: &mut String, ctx: &ToolContext, body: &str) -> Option<ArtifactRef> {
+    let store = ctx.artifacts.as_ref()?;
+    let reference = store_artifact(store.as_ref(), ARTIFACT_KIND, body.as_bytes()).ok()?;
+    let _ = writeln!(
+        text,
+        "\n... [full output stored as artifact {} ({} bytes); read it with artifact_read]",
+        reference.id, reference.bytes
+    );
+    Some(reference)
+}
+
+/// Resolves a bare program name against `PATH`, mirroring the search the
+/// OS would perform — used to fail fast (and legibly) before the program
+/// enters the sandbox wrapper, which cannot report a missing binary.
+///
+/// A candidate must be a regular file the user may execute, which is what
+/// the kernel itself requires. Without the check a non-executable file
+/// sitting early on `PATH` passes here, shadows a later entry that would
+/// have worked, and the failure then surfaces from the spawn as a
+/// permissions error rather than the legible "not found on PATH".
+fn resolve_in_path(program: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(program))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+/// Whether `candidate` is a regular file with an execute bit, the way
+/// the kernel decides when exec'ing a `PATH` entry.
+#[cfg(unix)]
+fn is_executable_file(candidate: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(candidate)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+/// Windows has no execute bit; a regular file is the best available
+/// approximation.
+#[cfg(not(unix))]
+fn is_executable_file(candidate: &std::path::Path) -> bool {
+    candidate.is_file()
 }
 
 /// `exit status: N`, or a signal note when the platform reports none.
@@ -311,11 +407,13 @@ fn status_line(status: std::process::ExitStatus) -> String {
 mod tests {
     use super::*;
     use loom_kernel::agent::tools::MAX_TOOL_OUTPUT_BYTES;
+    use loom_kernel::store::{ArtifactStore, MemoryArtifactStore};
     use loom_kernel::tool::Tool;
     use serde_json::json;
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::process::{ExitStatus, Output};
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
@@ -331,6 +429,24 @@ mod tests {
             CancellationToken::new(),
             Duration::from_secs(30),
         )
+    }
+
+    /// A context with no artifact store: the render paths keep the raw
+    /// behavior they had before output filters existed.
+    fn plain_ctx() -> ToolContext {
+        ToolContext::new(
+            PathBuf::from("/tmp"),
+            CancellationToken::new(),
+            Duration::from_secs(30),
+        )
+    }
+
+    /// A context with an in-memory artifact store attached, plus the store
+    /// itself so a test can assert on the teed body.
+    fn stored_ctx() -> (ToolContext, Arc<MemoryArtifactStore>) {
+        let store = Arc::new(MemoryArtifactStore::new());
+        let ctx = plain_ctx().with_artifacts(Some(store.clone()));
+        (ctx, store)
     }
 
     async fn run(tool: &RunCommandTool, root: &Path, args: Value) -> Result<ToolOutput, ToolError> {
@@ -476,7 +592,7 @@ mod tests {
             stdout,
             stderr: Vec::new(),
         };
-        let rendered = render("echo", &[], &output, &[]);
+        let rendered = render("echo", &[], &output, &[], &plain_ctx());
         assert!(rendered.truncated);
         assert!(
             rendered.content.contains("bytes omitted"),
@@ -499,7 +615,7 @@ mod tests {
             stdout: b"out".to_vec(),
             stderr: b"err".to_vec(),
         };
-        let rendered = render("cargo", &["test".to_owned()], &output, &[]);
+        let rendered = render("cargo", &["test".to_owned()], &output, &[], &plain_ctx());
         assert_eq!(
             rendered.content,
             "$ cargo test\nexit status: 2\n--- stdout ---\nout\n--- stderr ---\nerr"
@@ -547,6 +663,7 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured
             &["test".to_owned()],
             &output,
             &["src/lib.rs".to_owned()],
+            &plain_ctx(),
         );
         assert!(
             rendered.content.contains("failure evidence:"),
@@ -590,7 +707,7 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured
             stdout: libtest_failure_stdout(),
             stderr: Vec::new(),
         };
-        let rendered = render("cargo", &["test".to_owned()], &output, &[]);
+        let rendered = render("cargo", &["test".to_owned()], &output, &[], &plain_ctx());
         assert!(
             rendered.content.contains("--- stdout ---"),
             "{}",
@@ -601,6 +718,121 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured
             "{}",
             rendered.content
         );
+    }
+
+    /// 30 default-format `git log` commit blocks: the reducer keeps the
+    /// first 25, marks the rest, and the unreduced stdout is teed.
+    #[test]
+    fn successful_well_shaped_output_is_reduced_and_teed() {
+        let mut stdout = String::new();
+        for index in 0..30 {
+            let _ = write!(
+                stdout,
+                "commit 00000000000000000000000000000000000000{index:02}\n\
+                 Author: A <a@example.com>\n    subject {index}\n"
+            );
+        }
+        let output = Output {
+            status: ExitStatus::from_raw(0),
+            stdout: stdout.clone().into_bytes(),
+            stderr: Vec::new(),
+        };
+        let (ctx, store) = stored_ctx();
+        let rendered = render("git", &["log".to_owned()], &output, &[], &ctx);
+        assert!(
+            rendered.content.contains("subject 24"),
+            "{}",
+            rendered.content
+        );
+        assert!(
+            !rendered.content.contains("subject 25"),
+            "{}",
+            rendered.content
+        );
+        assert!(
+            rendered.content.contains("[... 5 more commits omitted]"),
+            "{}",
+            rendered.content
+        );
+        assert!(rendered.content.contains("read it with artifact_read"));
+        let reference = rendered.artifact.expect("the raw must be teed");
+        let stored = store.get(&reference.id).expect("get").expect("present");
+        assert_eq!(
+            stored.body,
+            stdout.as_bytes(),
+            "the teed body is the raw stream"
+        );
+        // The command effect and the exit status survive the reduction.
+        assert_eq!(
+            rendered.effects.commands_run,
+            vec![CommandEffect::new("git", vec!["log".to_string()], Some(0))]
+        );
+        assert!(rendered.content.contains("exit status: 0"));
+    }
+
+    #[test]
+    fn reduction_needs_a_store() {
+        // Without an artifact store the raw stream stands: reducing would
+        // drop bytes with no way to refetch them.
+        let mut stdout = String::new();
+        for index in 0..30 {
+            let _ = write!(stdout, "commit {index:040x}\n    subject {index}\n");
+        }
+        let output = Output {
+            status: ExitStatus::from_raw(0),
+            stdout: stdout.into_bytes(),
+            stderr: Vec::new(),
+        };
+        let rendered = render("git", &["log".to_owned()], &output, &[], &plain_ctx());
+        assert!(
+            rendered.content.contains("subject 29"),
+            "{}",
+            rendered.content
+        );
+        assert!(rendered.artifact.is_none());
+        assert!(!rendered.content.contains("artifact_read"));
+    }
+
+    #[test]
+    fn evidence_failure_tees_the_replaced_log() {
+        let output = Output {
+            status: ExitStatus::from_raw(1),
+            stdout: libtest_failure_stdout(),
+            stderr: Vec::new(),
+        };
+        let (ctx, store) = stored_ctx();
+        let rendered = render("cargo", &["test".to_owned()], &output, &[], &ctx);
+        assert!(
+            rendered.content.contains("failure evidence:"),
+            "{}",
+            rendered.content
+        );
+        assert!(rendered.content.contains("read it with artifact_read"));
+        let reference = rendered.artifact.expect("the replaced log must be teed");
+        let stored = store.get(&reference.id).expect("get").expect("present");
+        let body = String::from_utf8(stored.body).expect("utf8 body");
+        assert!(
+            body.contains("---- tests::b stdout ----"),
+            "the teed body carries the raw the evidence replaced: {body}"
+        );
+    }
+
+    #[test]
+    fn evidence_failure_without_a_store_is_unchanged() {
+        // Pre-filter behavior: the evidence block alone, no refetch note.
+        let output = Output {
+            status: ExitStatus::from_raw(1),
+            stdout: libtest_failure_stdout(),
+            stderr: Vec::new(),
+        };
+        let rendered = render("cargo", &["test".to_owned()], &output, &[], &plain_ctx());
+        assert!(
+            rendered.content.contains("failure evidence:"),
+            "{}",
+            rendered.content
+        );
+        assert!(rendered.artifact.is_none());
+        assert!(!rendered.content.contains("artifact_read"));
     }
 
     #[test]

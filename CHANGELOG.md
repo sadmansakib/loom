@@ -3,6 +3,22 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-10 — Command-aware output filters (roadmap item 3)
+
+`run_command` now compacts well-shaped successful output per command:
+git log (whole commit blocks), git diff, git status, ls/tree, grep,
+and cargo test's passing-test runs each reduce at their own unit
+boundaries with counted omission markers — never a byte cut mid-line.
+Nothing is lost: reductions apply only when an artifact store is
+attached, and the raw stream is teed there on both paths (the reduced
+success stream and the failure-shaped evidence it replaced), each
+with a refetch note mirroring the engine's spill note. Without a
+store, output is raw, pre-filter behavior. New `reduce` module (10
+unit tests) plus 4 store/tee round-trip tests — 686 tests total, all
+green. The spec budget rose 6,150 → 6,250 B: run_command's
+description now tells the model well-shaped output may arrive reduced
+with an artifact refetch.
+
 ## 2026-10-09 — Complexity pass, eval batch: grade_gate's arms split
 
 Tier-1 close-out (lizard CCN ≥ 15): `eval::grade_gate` 17 → 6. The

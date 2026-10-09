@@ -123,7 +123,7 @@ iterations may start early where a backlog item is cheap and measured.
 | # | Iteration | Status | Backlog items |
 |---|---|---|---|
 | 1 | Core service | **Done** | — (see Shipped) |
-| 2 | Core efficiency & repository intelligence | **In progress (current)** | 1, 3, 4✓, 5✓ᴬ, 6✓, 7✗, 8✓ᴬ, 10✓ᴬ, 11⏸, 12⏸, 16, 17 |
+| 2 | Core efficiency & repository intelligence | **In progress (current)** | 1, 3✓, 4✓, 5✓ᴬ, 6✓, 7✗, 8✓ᴬ, 10✓ᴬ, 11⏸, 12⏸, 16, 17 |
 | 3 | Intelligent subagent scheduling | Not started | 19, 21 |
 | 4 | Execution safety & richer tools | **Largely shipped early** | 2✓, 13⏸, 23 |
 | 5 | Skills & contextual knowledge | Partial (AGENTS.md facts) | 4✓ (instructions), 20.4 |
@@ -475,7 +475,7 @@ also summarized here so this section is the single source of truth.
   and cached tokens / cost / wall time / tool-cache hits, per-task
   aggregates and a gated-pass-rate suite headline; strict and tolerant
   modes.
-- **Verification bar.** 672 tests passing (13 live-API tests ignored by
+- **Verification bar.** 686 tests passing (13 live-API tests ignored by
   default), clippy clean, fmt clean.
 
 ---
@@ -592,6 +592,15 @@ reproduces them.
    with the full output teed to an artifact on failure so nothing is
    lost. Evidence shaping already does this for failed builds; this
    generalizes it. Seam: `loom-tools` render tables, the artifact store.
+   **Shipped 2026-10-10** — `run_command` only (verify already owned
+   green runs): git status/diff/log, ls/tree, grep, and cargo-test
+   pass lists reduce at the command's own unit boundaries (commit
+   blocks, lines, passing-test runs) with counted omission markers —
+   never byte cuts mid-line. Reductions apply only when an artifact
+   store is attached; the raw stream is teed there on both paths
+   (success-reduced and failure-shaped evidence) with a refetch note,
+   so nothing is lost. No store → raw output, pre-filter behavior.
+   14 tests (reducer units + store/tee round-trips).
 4. **Bootstrap facts** (G2, G3, G4). Extend the facts block with a
    project instruction file (`AGENTS.md`, falling back to `CLAUDE.md`;
    bounded), a depth-limited file tree, and toolchain/package-manager
