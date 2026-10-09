@@ -48,7 +48,7 @@ pub struct RunArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// Provider adapter to use.
+    /// Provider adapter to use (`deepseek`, `anthropic`, `openrouter`).
     #[arg(long, default_value = "deepseek")]
     pub provider: String,
 
@@ -60,7 +60,8 @@ pub struct RunArgs {
     #[arg(long)]
     pub base_url: Option<String>,
 
-    /// Reasoning effort, sent explicitly on every request.
+    /// Reasoning effort, sent explicitly on every request by providers
+    /// that accept one (DeepSeek); ignored elsewhere.
     #[arg(long, default_value = "high")]
     pub reasoning_effort: ReasoningEffort,
 

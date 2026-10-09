@@ -28,7 +28,9 @@ use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use loom_providers::{DEEPSEEK_PROVIDER_NAME, OPENROUTER_PROVIDER_NAME, SecretString};
+use loom_providers::{
+    ANTHROPIC_PROVIDER_NAME, DEEPSEEK_PROVIDER_NAME, OPENROUTER_PROVIDER_NAME, SecretString,
+};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +47,7 @@ pub const DEFAULT_PROVIDER: &str = DEEPSEEK_PROVIDER_NAME;
 pub fn provider_env_names(provider: &str) -> &'static [&'static str] {
     match provider {
         DEEPSEEK_PROVIDER_NAME => &["DEEPSEEK_API_KEY"],
+        ANTHROPIC_PROVIDER_NAME => &["ANTHROPIC_API_KEY"],
         OPENROUTER_PROVIDER_NAME => &["OPENROUTER_API_KEY"],
         _ => &[],
     }
@@ -1062,6 +1065,14 @@ mod tests {
         store.insert(&newer, false).unwrap();
 
         assert_eq!(store.newest("deepseek").unwrap().unwrap().label, "new");
+    }
+
+    #[test]
+    fn env_var_names_cover_every_shipped_provider() {
+        assert_eq!(provider_env_names("deepseek"), &["DEEPSEEK_API_KEY"]);
+        assert_eq!(provider_env_names("anthropic"), &["ANTHROPIC_API_KEY"]);
+        assert_eq!(provider_env_names("openrouter"), &["OPENROUTER_API_KEY"]);
+        assert!(provider_env_names("nope").is_empty());
     }
 
     #[test]

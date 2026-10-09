@@ -19,6 +19,12 @@
 //! purpose: Anthropic's models endpoint exposes no capability fields,
 //! so a static table stands in until live verification is possible.
 //!
+//! The table is the whole story for model support: an id missing from
+//! [`capabilities`] resolves to `None`, and the engine turns that into
+//! `UnknownModel` at construction time — a wrong window is never
+//! guessed. Keep it current (verified against
+//! `platform.claude.com/docs/en/models/overview`, 2026-10-09).
+//!
 //! No live key exists for this provider — verification is offline
 //! (unit + wiremock tests).
 
@@ -39,6 +45,9 @@ use crate::sse::SseDecoder;
 
 /// Default Messages API base URL.
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+
+/// The provider name the engine matches on (`--provider anthropic`).
+pub const PROVIDER_NAME: &str = "anthropic";
 
 /// Configuration for [`AnthropicProvider`].
 #[derive(Debug, Clone)]
@@ -97,7 +106,7 @@ impl AnthropicProvider {
 
 impl ModelProvider for AnthropicProvider {
     fn name(&self) -> &str {
-        "anthropic"
+        PROVIDER_NAME
     }
 
     fn capabilities(&self, model: &str) -> Option<ModelCapabilities> {
@@ -127,9 +136,23 @@ impl ModelProvider for AnthropicProvider {
 /// is nothing to reduce a catalog from (the deliberate deviation from
 /// the OpenRouter pattern). Unknown models resolve to `None` — the
 /// core fails loud rather than guessing a window.
+///
+/// Every entry is a pinned Claude API id, so dateless aliases
+/// (`claude-opus-5`) do *not* resolve. Windows are per the model cards:
+/// the 4.5 generation and older bill 200K, the 4.7-and-later
+/// tokenizer models bill 1M with a 128K output cap. `reasoning` is
+/// `true` for everything here — adaptive thinking ships on the whole
+/// current lineup, Haiku included.
 fn capabilities(model: &str) -> Option<ModelCapabilities> {
     let (context, output, reasoning) = match model {
-        // Long-context Claude models; output caps per the model cards.
+        // Claude 5.5 family (2026): 1M context, 128K output, adaptive
+        // thinking. Opus 5.5 and Fable 5.1 additionally always think
+        // (thinking cannot be disabled) and reject forced tool use.
+        "claude-fable-5-1" => (1_000_000, 128_000, true),
+        "claude-opus-5-5" => (1_000_000, 128_000, true),
+        "claude-sonnet-5-5" => (1_000_000, 128_000, true),
+        "claude-haiku-5-5" => (1_000_000, 128_000, true),
+        // Claude 4.x long-context models; output caps per the model cards.
         "claude-opus-4-1" => (200_000, 32_000, true),
         "claude-sonnet-4-5" => (200_000, 64_000, true),
         "claude-haiku-4-5" => (200_000, 32_000, false),
@@ -339,5 +362,56 @@ async fn step(state: State) -> Option<(Result<Option<ModelEvent>, ModelError>, S
             }
         }
         State::Done => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use loom_kernel::model::ModelProvider;
+
+    #[test]
+    fn provider_name_matches_the_engine_arm() {
+        assert_eq!(PROVIDER_NAME, "anthropic");
+        let provider = AnthropicProvider::new(AnthropicConfig::new("k")).unwrap();
+        assert_eq!(provider.name(), PROVIDER_NAME);
+    }
+
+    #[test]
+    fn the_55_family_resolves_with_one_million_token_windows() {
+        for model in [
+            "claude-fable-5-1",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+        ] {
+            let caps = capabilities(model).unwrap_or_else(|| panic!("{model} must resolve"));
+            assert_eq!(caps.max_context_tokens, 1_000_000, "{model}");
+            assert_eq!(caps.max_output_tokens, Some(128_000), "{model}");
+            assert!(caps.reasoning, "{model}: adaptive thinking");
+            assert!(caps.tool_calls && caps.parallel_tool_calls, "{model}");
+        }
+    }
+
+    #[test]
+    fn legacy_models_keep_their_windows() {
+        assert_eq!(
+            capabilities("claude-opus-4-1").unwrap().max_context_tokens,
+            200_000
+        );
+        assert_eq!(
+            capabilities("claude-sonnet-4-5").unwrap().max_output_tokens,
+            Some(64_000)
+        );
+        assert!(!capabilities("claude-haiku-4-5").unwrap().reasoning);
+    }
+
+    #[test]
+    fn unknown_and_dateless_ids_fail_loud() {
+        // Dateless aliases float to new snapshots with different windows;
+        // resolving them would be a guess.
+        for model in ["claude-opus-5", "claude-sonnet", "gpt-5", ""] {
+            assert!(capabilities(model).is_none(), "{model:?} must not resolve");
+        }
     }
 }

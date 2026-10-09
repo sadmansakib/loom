@@ -9,8 +9,10 @@
 //! provider specifics leak into the core.
 //!
 //! Shipped adapters: DeepSeek (built-in capability table, since its API
-//! serves none) and OpenRouter (capabilities and pricing resolved from
-//! the provider's model catalog, which the frontend fetches and caches).
+//! serves none), OpenRouter (capabilities and pricing resolved from
+//! the provider's model catalog, which the frontend fetches and caches),
+//! and Anthropic (its own Messages API driver — see [`anthropic`] for
+//! why it does not share the OpenAI wire machine).
 
 mod anthropic;
 mod anthropic_wire;
@@ -24,6 +26,7 @@ mod wire_stream;
 
 pub use anthropic::{
     AnthropicConfig, AnthropicProvider, DEFAULT_BASE_URL as ANTHROPIC_DEFAULT_BASE_URL,
+    PROVIDER_NAME as ANTHROPIC_PROVIDER_NAME,
 };
 pub use anthropic_wire::ANTHROPIC_VERSION as ANTHROPIC_API_VERSION;
 pub use deepseek::PROVIDER_NAME as DEEPSEEK_PROVIDER_NAME;

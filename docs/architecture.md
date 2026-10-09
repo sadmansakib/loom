@@ -475,11 +475,22 @@ Three adapters ship:
   paths without a funded key to re-verify DeepSeek/OpenRouter live was
   judged higher-risk than ~100 duplicated lines (the module docs carry
   the rationale). Capabilities come from a small static table because
-  Anthropic's models endpoint exposes no capability fields. Cache
+  Anthropic's models endpoint exposes no capability fields; the table
+  carries the current pinned ids (`claude-fable-5-1`,
+  `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` at
+  1M/128K, plus the 4.x legacy entries), unknown ids fail loud, and
+  dateless aliases are refused on purpose — they float to new
+  snapshots with different windows. `temperature` is never sent:
+  Claude 4.7 and later reject a non-default value with a 400. Cache
   breakpoints are placed from the kernel's provider-agnostic
   `stable_prefix_messages` hint: the compiler promises how many leading
   messages are byte-stable across requests, and the adapter marks the
-  end of that region `cache_control: ephemeral`.
+  end of that region `cache_control: ephemeral`. Token estimation for
+  Anthropic models is scaled up from the o200k count (see
+  `loom-engine::estimate`): the 4.7+ tokenizer bills more tokens for
+  the same text and Anthropic publishes no local vocabulary, so the
+  estimate errs high — pruning a little early beats a request the
+  provider rejects.
 
 The shared layer is deliberate, not incidental. `http` owns transport
 plumbing (liveness timeouts, bounded error-body reads, `Retry-After`);

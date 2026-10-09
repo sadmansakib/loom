@@ -3,6 +3,38 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — Anthropic: 5.5-family models and full engine/CLI wiring
+
+`--provider anthropic` now works end to end. The adapter shipped earlier
+as a wiremock-verified component but the engine had no `anthropic` arm
+and `ANTHROPIC_API_KEY` was never consulted — three changes close that
+and bring the model table current:
+
+* **Capability table** — `claude-fable-5-1`, `claude-opus-5-5`,
+  `claude-sonnet-5-5`, `claude-haiku-5-5` at 1M context / 128K output /
+  adaptive reasoning, alongside the retained 4.x entries. Dateless
+  aliases (`claude-opus-5`) are refused on purpose: they float to new
+  snapshots with different windows, and the fail-loud contract is the
+  point of the table.
+* **Engine + auth wiring** — `build()` gained the `anthropic` arm (no
+  reasoning requirement: the adapter sends no reasoning parameter, so a
+  non-thinking model is configuration, not error), and the credential
+  ladder resolves `ANTHROPIC_API_KEY` like the other providers'
+  variables.
+* **Per-provider token estimation** — Anthropic models bill text
+  differently (the 4.7+ tokenizer counts ~30 % more for the same text)
+  and publish no local vocabulary, so `AnthropicEstimator` scales the
+  o200k count 1.25×, rounded up. Under-estimating a 1M window turns
+  into a mid-task provider rejection; over-estimating just prunes a
+  little sooner.
+* **`temperature` is never sent** — Claude 4.7 and later answer a
+  non-default `temperature`/`top_p`/`top_k` with a 400. No Loom surface
+  sets one; the wire now drops it instead of faithfully forwarding a
+  field the API rejects. Preserved thinking (thinking blocks bound to
+  the producing model/conversation) was also audited: Loom never
+  re-emits thinking blocks, so the 5.5 contract changes are satisfied
+  by construction — documented in `anthropic_wire`'s module docs.
+
 ## 2026-10-09 — Linux sandbox: complete the kill cascade, tolerate absent dirs
 
 Two Linux-only defects in the `bubblewrap` wrapper, both invisible on a

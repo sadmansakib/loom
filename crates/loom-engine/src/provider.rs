@@ -9,8 +9,9 @@
 
 use loom_kernel::model::{ModelCapabilities, ModelProvider};
 use loom_providers::{
-    DEEPSEEK_PROVIDER_NAME, DeepSeekConfig, DeepSeekProvider, OPENROUTER_PROVIDER_NAME,
-    OpenRouterConfig, OpenRouterProvider, ProviderCatalog,
+    ANTHROPIC_PROVIDER_NAME, AnthropicConfig, AnthropicProvider, DEEPSEEK_PROVIDER_NAME,
+    DeepSeekConfig, DeepSeekProvider, OPENROUTER_PROVIDER_NAME, OpenRouterConfig,
+    OpenRouterProvider, ProviderCatalog,
 };
 
 use crate::engine::{EngineConfig, EngineError};
@@ -49,6 +50,7 @@ impl std::fmt::Debug for ProviderHandle {
 pub(crate) fn build(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, EngineError> {
     match config.provider.as_str() {
         DEEPSEEK_PROVIDER_NAME => build_deepseek(config, api_key),
+        ANTHROPIC_PROVIDER_NAME => build_anthropic(config, api_key),
         OPENROUTER_PROVIDER_NAME => build_openrouter(config, api_key),
         other => Err(EngineError::UnknownProvider(other.to_owned())),
     }
@@ -76,6 +78,30 @@ fn build_deepseek(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle
             model: config.model.clone(),
         });
     }
+    check_window(config, &capabilities)?;
+    Ok(ProviderHandle {
+        provider: Box::new(provider),
+        capabilities,
+    })
+}
+
+/// Builds the Anthropic Messages API adapter.
+///
+/// The static table in the adapter is the authority (no capability
+/// document exists to reduce). No reasoning requirement: unlike
+/// DeepSeek, this adapter never sends a reasoning parameter, so a model
+/// that ignores thinking costs nothing. `reasoning_effort` is likewise
+/// ignored — Anthropic takes `effort`, which this adapter does not send.
+fn build_anthropic(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, EngineError> {
+    let mut provider_config = AnthropicConfig::new(api_key);
+    if let Some(base_url) = &config.base_url {
+        provider_config = provider_config.with_base_url(base_url.clone());
+    }
+    let provider = AnthropicProvider::new(provider_config)
+        .map_err(|error| EngineError::Provider(Box::new(error)))?;
+    let capabilities = provider
+        .capabilities(&config.model)
+        .ok_or_else(|| unknown_model(config))?;
     check_window(config, &capabilities)?;
     Ok(ProviderHandle {
         provider: Box::new(provider),
@@ -140,6 +166,39 @@ fn check_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anthropic_resolves_a_current_model() {
+        let mut config = crate::engine::test_config();
+        config.provider = "anthropic".to_owned();
+        config.model = "claude-opus-5-5".to_owned();
+        let handle = build(&config, "key").expect("builds");
+        assert_eq!(handle.capabilities.max_context_tokens, 1_000_000);
+        assert_eq!(handle.capabilities.max_output_tokens, Some(128_000));
+        assert!(handle.capabilities.reasoning);
+        assert!(handle.capabilities.tool_calls);
+    }
+
+    #[test]
+    fn anthropic_accepts_models_without_reasoning() {
+        // Unlike DeepSeek, the adapter sends no reasoning parameter, so a
+        // non-thinking entry is a configuration choice, not an error.
+        let mut config = crate::engine::test_config();
+        config.provider = "anthropic".to_owned();
+        config.model = "claude-haiku-4-5".to_owned();
+        let handle = build(&config, "key").expect("builds");
+        assert!(!handle.capabilities.reasoning);
+        assert_eq!(handle.capabilities.max_context_tokens, 200_000);
+    }
+
+    #[test]
+    fn anthropic_model_outside_the_table_is_unknown() {
+        let mut config = crate::engine::test_config();
+        config.provider = "anthropic".to_owned();
+        config.model = "claude-opus-5".to_owned(); // dateless alias
+        let error = build(&config, "key").expect_err("must reject");
+        assert!(matches!(error, EngineError::UnknownModel { .. }));
+    }
 
     #[test]
     fn unknown_provider_is_rejected() {

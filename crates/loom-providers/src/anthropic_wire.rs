@@ -23,12 +23,29 @@
 //! Deviations from the OpenAI wire that matter here:
 //!
 //! - `max_tokens` is **required** — defaulted when the request omits it;
+//! - `temperature` is **never sent**: Claude 4.7 and later (the whole
+//!   5.5 family, Fable 5.1 included) reject a non-default value with a
+//!   400, and adaptive thinking makes it moot on the current lineup.
+//!   Loom has no surface that sets one; see [`build_request_body`];
 //! - assistant `reasoning` traces are not forwardable (Anthropic has no
 //!   replay field for foreign reasoning), so they are dropped on
 //!   translation — only reasoning *received* from Anthropic is replayed,
 //!   via its own blocks in later requests' assistant messages;
 //! - failures can arrive as `error` events *inside* an otherwise-200
 //!   SSE stream, not only as HTTP statuses.
+//!
+//! Consequences of the 5.5-generation changes that are *already*
+//! satisfied here, and must stay satisfied:
+//!
+//! - **preserved thinking** — thinking blocks are bound to the model and
+//!   the conversation that produced them, and replaying hand-edited ones
+//!   is an API error. Loom never re-emits thinking blocks (reasoning is
+//!   replayed as plain text, if at all), so it cannot violate this;
+//! - **thinking cannot be disabled** on Opus 5.5 / Fable 5.1 — nothing
+//!   to do, since the adapter never sends a `thinking` parameter and
+//!   the table reports `reasoning: true` for every model;
+//! - **forced tool use is an error** — the adapter never sends
+//!   `tool_choice`, so `tool_choice: any` is simply unavailable.
 
 use loom_kernel::model::{
     Message, ModelError, ModelErrorKind, ModelEvent, ModelRequest, ModelResponse, StopReason, Usage,
@@ -52,6 +69,12 @@ pub(crate) const DEFAULT_MAX_TOKENS: u32 = 8_192;
 /// [`ModelRequest::stable_prefix_messages`]: the canonical
 /// incremental-prompting breakpoint. When the prefix covers only the
 /// system prompt, the marker lands on the system parameter instead.
+///
+/// `request.temperature` is deliberately ignored: Claude 4.7 and later
+/// answer a non-default value with a 400 (`temperature`, `top_p`, and
+/// `top_k` are unsupported), and no Loom surface sets one. Sending the
+/// provider default and staying compatible beats honoring a field the
+/// API rejects.
 pub(crate) fn build_request_body(request: &ModelRequest) -> Value {
     let mut system_parts: Vec<String> = Vec::new();
     let mut turns: Vec<Value> = Vec::new();
@@ -121,9 +144,9 @@ pub(crate) fn build_request_body(request: &ModelRequest) -> Value {
             body["system"] = json!(system_parts.join("\n\n"));
         }
     }
-    if let Some(temperature) = request.temperature {
-        body["temperature"] = json!(temperature);
-    }
+    // `request.temperature` is intentionally dropped: Claude 4.7 and
+    // later answer a non-default `temperature`/`top_p`/`top_k` with a
+    // 400, and no Loom surface sets one.
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(
             request
@@ -530,6 +553,16 @@ mod tests {
     fn max_tokens_is_required_so_it_defaults() {
         let body = build_request_body(&request(vec![Message::User { text: "hi".into() }]));
         assert_eq!(body["max_tokens"], json!(DEFAULT_MAX_TOKENS));
+    }
+
+    #[test]
+    fn temperature_is_never_forwarded() {
+        // Claude 4.7+ answer a non-default temperature with a 400, so
+        // the adapter drops the field even when the caller set one.
+        let mut req = request(vec![Message::User { text: "hi".into() }]);
+        req.temperature = Some(0.2);
+        let body = build_request_body(&req);
+        assert!(body.get("temperature").is_none());
     }
 
     #[test]

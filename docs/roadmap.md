@@ -439,11 +439,22 @@ treated as hypotheses until Loom's own eval reproduces them.
     projection, pruning inherits the guarantee). It runs its own
     streaming state machine rather than refactoring the OpenAI wire
     driver (drift risk over ~100 duplicated lines, noted in the
-    module docs). Capabilities come from a small static table
-    (claude-opus-4-1, claude-sonnet-4-5, claude-haiku-4-5; unknown
-    ids fail loud) because Anthropic's /v1/models exposes no
-    capability fields to reduce. Verified offline (wiremock) — no
-    live key; engine/CLI wiring is deferred with items 15+.
+    module docs). Capabilities come from a small static table because
+    Anthropic's /v1/models exposes no capability fields to reduce.
+    Verified offline (wiremock) — no live key. **Engine/CLI wiring
+    shipped 2026-10-09** (same day, second pass): `--provider
+    anthropic` resolves `ANTHROPIC_API_KEY` through the same
+    account/env ladder as the other providers, and the capability
+    table carries the current lineup — `claude-fable-5-1`,
+    `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`
+    (1M context, 128K output, adaptive reasoning) alongside the 4.x
+    legacy entries; dateless aliases are refused (they float).
+    `temperature` is never forwarded (4.7+ models 400 on non-default
+    values), and preserved thinking is a non-issue because Loom never
+    re-emits thinking blocks. Anthropic token estimation is scaled
+    1.25× over o200k, rounded up (`AnthropicEstimator`), so the 1M
+    window's budget math errs toward pruning early rather than
+    sending an over-window request.
 15. **CLI session resume.** Listing, selection, continuation, and
     transcript export (also the input for item 19).
 16. **Search parity.** Adopt the `ignore` crate's matcher for chained

@@ -9,7 +9,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::estimate::O200kEstimator;
 use loom_kernel::agent::{Agent, TaskError, TaskSummary};
 use loom_kernel::context::{
     AgentConfig, DefaultContextCompiler, PruneConfig, PruningContextCompiler,
@@ -155,9 +154,13 @@ impl Engine {
         // Stage-1 repository facts (2E, ADR-015): the composition root owns the
         // I/O; the loop scans once per task through this source.
         let facts = crate::repo::FsFactsSource::new(workspace.clone());
-        // Token estimates use a real tokenizer (o200k) — the same estimator
-        // feeds the census, the budget check, and the pruning math.
-        let estimator: Arc<dyn loom_kernel::context::TokenEstimator> = Arc::new(O200kEstimator);
+        // Token estimates use a real tokenizer — the same estimator feeds
+        // the census, the budget check, and the pruning math. The family
+        // follows the provider: Anthropic counts tokens differently from
+        // the OpenAI-vocabulary backends, and its 1M window only holds if
+        // the estimate errs high.
+        let estimator: Arc<dyn loom_kernel::context::TokenEstimator> =
+            crate::estimate::estimator_for(&config.provider);
         let mut agent = Agent::new(
             handle.provider,
             Box::new(
