@@ -204,11 +204,33 @@ impl Tool for RunCommandTool {
 /// Resolves a bare program name against `PATH`, mirroring the search the
 /// OS would perform — used to fail fast (and legibly) before the program
 /// enters the sandbox wrapper, which cannot report a missing binary.
+///
+/// A candidate must be a regular file the user may execute, which is what
+/// the kernel itself requires. Without the check a non-executable file
+/// sitting early on `PATH` passes here, shadows a later entry that would
+/// have worked, and the failure then surfaces from the spawn as a
+/// permissions error rather than the legible "not found on PATH".
 fn resolve_in_path(program: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| is_executable_file(candidate))
+}
+
+/// Whether `candidate` is a regular file with an execute bit, the way
+/// the kernel decides when exec'ing a `PATH` entry.
+#[cfg(unix)]
+fn is_executable_file(candidate: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(candidate)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+/// Windows has no execute bit; a regular file is the best available
+/// approximation.
+#[cfg(not(unix))]
+fn is_executable_file(candidate: &std::path::Path) -> bool {
+    candidate.is_file()
 }
 
 fn render(
@@ -734,6 +756,30 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured
                 && tool.spec().description.contains("`git`"),
             "{}",
             tool.spec().description
+        );
+    }
+
+    /// The execute bit is what the kernel requires of a `PATH` entry, so
+    /// a data file shadowing a real program must not resolve.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_candidate_must_be_an_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_guard, root) = temp_root();
+        let executable = root.join("exe");
+        std::fs::write(&executable, b"#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        assert!(is_executable_file(&executable));
+
+        let data = root.join("data.txt");
+        std::fs::write(&data, b"notes").expect("write");
+        assert!(!is_executable_file(&data), "a data file is not a program");
+        assert!(!is_executable_file(&root), "a directory is not a program");
+        assert!(
+            !is_executable_file(&root.join("absent")),
+            "a missing candidate is not a program"
         );
     }
 }

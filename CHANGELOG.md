@@ -3,6 +3,70 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — Linux sandbox: complete the kill cascade, tolerate absent dirs
+
+Two Linux-only defects in the `bubblewrap` wrapper, both invisible on a
+macOS dev box because the two wrappers behave differently — and there
+was no CI to run the suite anywhere else:
+
+* `--new-session` makes bwrap `setsid()` the COMMAND, moving it out of
+  the process group loom placed the wrapper in. `GroupKillOnDrop`'s
+  `killpg` could therefore only ever reach bwrap itself, so a policy
+  timeout or cancellation leaked the whole command tree — `cargo` and
+  every `rustc` under it, which is exactly what architecture.md §2
+  promises a timeout prevents. `--unshare-pid` is the missing half of
+  the cascade: bwrap's PID 1 carries `PR_SET_PDEATHSIG`, so killing the
+  wrapper tears the namespace down and SIGKILLs everything inside it.
+  `--die-with-parent` was already passed; alone it only helps when
+  bwrap's *parent* dies, never on the timeout path.
+* `--bind` aborts the whole sandbox when its source is absent, and the
+  cargo home was bound with it on a directory that need not exist. On a
+  Linux host with no `~/.cargo` and no `CARGO_HOME` (containers, CI,
+  rustup installed elsewhere) *every* `run_command` and `verify`
+  invocation failed at sandbox setup. The workspace keeps the strict
+  bind — a missing workspace is a misconfiguration and should fail
+  loudly — while cargo home, granted writable dirs, and `TMPDIR` moved
+  to `--bind-try`, which skips a missing source and still binds a
+  present one read-write.
+
+The bwrap argv is now produced by a platform-independent
+`bubblewrap_argv` and unit-tested on every platform: it was previously
+compiled only on Linux, so on the machine it was written nothing ever
+inspected the argv that carries both flags.
+
+First CI in the repo: `fmt` + `clippy -D warnings`, and
+`cargo test --workspace` on both Ubuntu and macOS. The Ubuntu job
+installs `bubblewrap` and relaxes
+`kernel.apparmor_restrict_unprivileged_userns`; without that the
+wrapper cannot build its namespaces on a hosted runner at all, and the
+Linux path stays untested — which is how both defects shipped.
+
+The MSRV floor was a lie: `rust-version = "1.88"` while `uuid` 1.27
+(the v7 id source, pinned in `Cargo.lock`) declares `rust-version
+1.89`, so a 1.88 toolchain failed at dependency *resolution* rather
+than at compilation. It cannot be pinned down — the manifest requires
+`^1.27` — so the floor is now 1.89 and the CI job pins that exact
+toolchain. Found by attempting the build in a Docker container, which
+is the only way this repo gets compiled anywhere but the author's
+machine.
+
+Both Linux fixes were then reproduced in a container (Debian 12,
+bubblewrap 0.8.0, aarch64): the exact argv loom emits is accepted, a
+plain `--bind` on an absent source aborts while `--bind-try` skips it,
+and the full `loom-tools` suite is green — including the
+dropping-the-future cascade test and the fused cargo-check paths, which
+macOS alone never proves. Note that a container needs `--privileged`
+(or at least `CAP_SYS_ADMIN` + `CAP_NET_ADMIN`) for bwrap to bring up
+loopback in its own network namespace; without it every sandboxed
+command dies with `loopback: Failed RTM_NEWADDR`. GitHub's Ubuntu
+runners are full VMs and do not need it.
+
+Riding along: `resolve_in_path` now requires the execute bit, so a
+non-executable file on `PATH` no longer shadows a later working entry
+and then fails at spawn as a permissions error instead of the legible
+"not found on PATH". The OpenAI-compatible request body sends `"n": 1`,
+matching the `choices[0]`-only read of the response.
+
 ## 2026-10-09 — Anthropic messages adapter (roadmap item 14)
 
 `loom-providers` gained an Anthropic adapter that speaks the messages

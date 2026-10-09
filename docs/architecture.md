@@ -25,7 +25,7 @@ kernel never links a filesystem store or a CLI, the engine never prints.
 | `loom-core` | Facade re-exporting the public surface for embedders | engine, kernel, providers, tools |
 | `loom-kernel` | The agent itself: loop, context compilation, session/transcript model, tool abstraction, tool cache, artifacts, events, budgets | providers (traits only), nothing I/O-bearing |
 | `loom-engine` | Composition root: builds a configured `Agent` from paths, auth, a provider factory, and stores; repository facts scanner | kernel, store, providers |
-| `loom-providers` | Model provider adapters (DeepSeek, OpenRouter) over one shared OpenAI-compatible wire and SSE driver | kernel model types |
+| `loom-providers` | Model provider adapters (DeepSeek, OpenRouter over one shared OpenAI-compatible wire; Anthropic on its own messages-API driver) | kernel model types |
 | `loom-store` | SQLite persistence: sessions, turns, tasks, artifacts, auth accounts | kernel store traits |
 | `loom-tools` | The shipped tool suite (read/search/edit/write/list/run/verify + artifact read) | kernel tool traits |
 | `loom-cli` | Binary: argument parsing, output rendering, run/eval/auth commands | engine |
@@ -342,12 +342,27 @@ resolved once at `Engine::open`, is the *escalation* layer on top.
 - File writes denied by default; granted only to the canonical
   workspace, the system temp dir, and the cargo home
   (`CARGO_HOME` or `~/.cargo`, kept writable so builds work
-  offline). Everything else stays readable.
+  offline). Everything else stays readable. The workspace is the one
+  bind that must exist (a missing workspace is a misconfiguration and
+  fails loudly); every other writable grant is bound tolerantly, so a
+  host with no `~/.cargo` and no `CARGO_HOME` — containers, CI —
+  still gets a sandbox instead of a failed spawn.
 - Network denied by default.
 - The wrapper leads the process group (existing bounded capture and
   group kill unchanged), and the confinement is inherited by every
   child — a model-run `bash -c` pipeline cannot escape what its
-  parent was granted.
+  parent was granted. How the group survives differs by platform, and
+  it is not symmetric: `sandbox-exec` `exec`s in place, so on macOS the
+  child keeps the wrapper's pgid and `killpg` reaches the whole tree.
+  `bwrap --new-session` calls `setsid()` in its sandboxed child, which
+  moves the COMMAND into a new session and pgid where `killpg` on the
+  wrapper's group cannot follow it. Linux therefore relies on
+  `--unshare-pid`: the COMMAND becomes pidns init, `--die-with-parent`
+  gives it `PR_SET_PDEATHSIG`, so killing the wrapper (timeout,
+  cancellation) tears the namespace down and SIGKILLs every process
+  inside it. Dropping either flag re-opens the leak; `sandbox.rs`
+  unit-tests the argv on every platform so a macOS box cannot stay
+  green while the Linux flags are missing.
 - Bare names are resolved on `PATH` before wrapping, so a missing
   program fails with the same legible error as before.
 
@@ -440,7 +455,7 @@ success, non-zero failure, 130 cancelled.
 
 ## 10. Providers
 
-Two adapters ship, over one shared wire implementation:
+Three adapters ship:
 
 - **DeepSeek** — a built-in capability table, because its API serves no
   capability metadata; reasoning effort and a thinking on/off switch are
@@ -452,6 +467,19 @@ Two adapters ship, over one shared wire implementation:
   to the engine as `EngineConfig::catalog`, so the engine
   stays synchronous and offline-capable. Attribution headers are
   optional configuration.
+- **Anthropic** — the messages API, not the OpenAI wire: system as a
+  top-level param, `tool_use`/`tool_result` content blocks,
+  `thinking_delta` reasoning capture, and Anthropic's error taxonomy.
+  It deliberately runs its own streaming state machine instead of the
+  shared `WireEndpoint` driver: refactoring the OpenAI wire's delicate
+  paths without a funded key to re-verify DeepSeek/OpenRouter live was
+  judged higher-risk than ~100 duplicated lines (the module docs carry
+  the rationale). Capabilities come from a small static table because
+  Anthropic's models endpoint exposes no capability fields. Cache
+  breakpoints are placed from the kernel's provider-agnostic
+  `stable_prefix_messages` hint: the compiler promises how many leading
+  messages are byte-stable across requests, and the adapter marks the
+  end of that region `cache_control: ephemeral`.
 
 The shared layer is deliberate, not incidental. `http` owns transport
 plumbing (liveness timeouts, bounded error-body reads, `Retry-After`);

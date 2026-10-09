@@ -107,7 +107,9 @@ serves none of them does not ship.
   paged read tool to recover it. Command streams keep a 64 KiB head
   *and* tail — errors live at the tail. A command timeout kills the
   entire process group, so grandchildren (`rustc` under `cargo`)
-  cannot outlive the kill.
+  cannot outlive the kill (macOS: the wrapper `exec`s in place and
+  `killpg` covers the tree; Linux: `--unshare-pid` + `--die-with-parent`
+  tear down the pid namespace — see architecture.md §6.8).
 - **Multi-ecosystem verification.** `verify` detects the workspace's
   build system from root marker files (cargo > npm > python > go >
   make) or takes an explicit `ecosystem` argument; the command comes
