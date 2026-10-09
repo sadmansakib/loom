@@ -12,8 +12,10 @@
 //!   to Z.ai's first-party API);
 //! * the GLM-5.3 deployments' forced thinking — an absent effort
 //!   clamps to `low`;
-//! * the DeepSeek V4 deployments' non-think mode — `none` passes
-//!   through as `none`;
+//! * the non-forced wire path — `none` passes through unchanged for
+//!   any deployment without forced thinking (the end-of-life
+//!   DeepSeek V4 ids stand in as inert strings; the wire layer is
+//!   id-agnostic here);
 //! * usage accounting through the OpenAI-style details objects;
 //! * tool-call fragment assembly with nvidia-prefixed synthesized ids;
 //! * bearer authentication against `/v1/chat/completions`.
@@ -166,7 +168,10 @@ async fn nvidia_glm_deployments_clamp_none_to_low() {
 }
 
 #[tokio::test]
-async fn nvidia_deepseek_deployments_pass_none_through() {
+async fn nvidia_non_forced_deployments_pass_none_through() {
+    // The DeepSeek V4 ids are end-of-life on NIM (HTTP 410,
+    // live-verified) but stand in for any future non-forced
+    // deployment: the wire body carries `none` through unchanged.
     let server = MockServer::start().await;
     mount_sse(
         &server,
@@ -188,7 +193,7 @@ async fn nvidia_deepseek_deployments_pass_none_through() {
 }
 
 #[tokio::test]
-async fn nvidia_deepseek_deployments_map_max() {
+async fn nvidia_non_forced_deployments_map_max() {
     let server = MockServer::start().await;
     mount_sse(
         &server,
@@ -276,7 +281,7 @@ async fn tool_call_fragments_assemble_with_nvidia_prefixed_ids() {
     .await;
 
     let provider = provider_at(&server.uri());
-    let request = request_for("deepseek-ai/deepseek-v4-pro");
+    let request = request_for("z-ai/glm-5.3");
     let events: Vec<Result<ModelEvent, ModelError>> = provider.stream(&request).collect().await;
     match events.into_iter().last() {
         Some(Ok(ModelEvent::Completed(response))) => {
@@ -324,7 +329,7 @@ async fn tool_results_round_trip_through_the_wire_body() {
         arguments: ToolArguments::try_from(json!({"path": "x.rs"})).unwrap(),
     };
     let request = ModelRequest {
-        model: "deepseek-ai/deepseek-v4-flash".into(),
+        model: "z-ai/glm-5.3".into(),
         messages: vec![
             M::System { text: "sys".into() },
             M::Assistant(AssistantMessage {

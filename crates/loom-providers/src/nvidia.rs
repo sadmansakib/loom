@@ -6,14 +6,18 @@
 //! /v1/chat/completions` at [`DEFAULT_BASE_URL`] with Bearer
 //! `NVIDIA_API_KEY`, streamed `reasoning_content` and tool-call
 //! fragments, usage on the final chunk, `data: [DONE]` terminator,
-//! OpenAI-style error objects. Verified by wiremock, not live: the
-//! hosted catalog moves too fast to pin against a live listing.
+//! OpenAI-style error objects. Live-verified 2026-10-09 against
+//! `z-ai/glm-5.3` (real streaming session, tool call, usage, cache
+//! writes); the rest stays wiremock-pinned because the hosted catalog
+//! moves too fast to pin against a live listing.
 //!
 //! **Why this adapter exists.** The hosted free-trial tier carries the
 //! exact open models the eval backlog wants (roadmap, item 1): GLM-5.3
-//! and DeepSeek V4 at 1M context, no credit card. Free-tier rate limits
-//! apply per model, so N ≥ 5 sweeps must pace themselves, but the
-//! funding blocker for measured claims is gone.
+//! at 1M context, no credit card. Free-tier rate limits apply per
+//! model, so N ≥ 5 sweeps must pace themselves, but the funding
+//! blocker for measured claims is gone. The DeepSeek V4 deployments
+//! that shared the catalog have since hit end-of-life (HTTP 410 on
+//! live verification, 2026-08/2026-09) and are gone from the table.
 //!
 //! Model ids follow the catalog's `publisher/model` scheme (`z-ai/…`,
 //! `deepseek-ai/…`); the live `/v1/models` listing is authoritative and
@@ -26,18 +30,18 @@
 //! - GLM-5.3 family: thinking is always on; `low`/`high`/`max` with a
 //!   `max` default, so Loom's `none` clamps to `low` (the closest
 //!   available depth; there is no off switch to map onto).
-//! - DeepSeek V4 family: `none`/`low`/`high`/`max`, with `none`
-//!   disabling thinking — all four of Loom's efforts pass through.
+//! - Any non-forced deployment (the DeepSeek V4 rows, before their
+//!   end-of-life, were the case study): `none`/`low`/`high`/`max`,
+//!   with `none` disabling thinking — all four of Loom's efforts pass
+//!   through unchanged.
 //!
 //! NIM's chat template defaults `clear_thinking` to `false` (preserved
 //! thinking): prior-turn `reasoning_content` stays in context, which
 //! suits agent loops — and the shared wire already echoes it back
 //! verbatim, so the default is used as-is.
 //!
-//! Output caps for the DeepSeek rows are conservative (the reference
-//! lists no explicit maximum); the GLM rows carry Z.ai's documented
-//! 131,072. Parallel tool calls are undocumented, so calls serialize
-//! (the safe default).
+//! Output caps carry Z.ai's documented 131,072. Parallel tool calls
+//! are not documented, so calls serialize (the safe default).
 
 use std::sync::Arc;
 
@@ -141,23 +145,18 @@ impl NvidiaProvider {
     }
 }
 
-/// Capability table from the NIM model pages (fetched 2026-10-09):
-/// every pinned row is 1M context with tools and reasoning. GLM output
-/// carries Z.ai's documented 131,072; DeepSeek rows take a conservative
-/// 65,536 because the reference lists no explicit cap. Parallel tool
-/// calls are not documented, so calls serialize. Unknown ids resolve
-/// to `None` (loud unknown-model failure, not a silently wrong row).
+/// Capability table from the NIM model pages (fetched 2026-10-09,
+/// live-checked the same day): every pinned row is 1M context with
+/// tools and reasoning, output capped at Z.ai's documented 131,072.
+/// Parallel tool calls are not documented, so calls serialize. The
+/// DeepSeek V4 deployments that once shared the catalog returned
+/// HTTP 410 (end-of-life 2026-08/2026-09) on live verification and
+/// are deliberately absent. Unknown ids resolve to `None` (loud
+/// unknown-model failure, not a silently wrong row).
 pub fn model_capabilities(model: &str) -> Option<ModelCapabilities> {
     let limits = match model {
         "z-ai/glm-5.3" | "z-ai/glm-5.3-flash" => ModelCapabilities::new(1_048_576)
             .with_max_output_tokens(131_072)
-            .with_tool_calls(true)
-            .with_parallel_tool_calls(false)
-            .with_reasoning(true),
-        "deepseek-ai/deepseek-v4-pro"
-        | "deepseek-ai/deepseek-v4-pro-0813"
-        | "deepseek-ai/deepseek-v4-flash" => ModelCapabilities::new(1_048_576)
-            .with_max_output_tokens(65_536)
             .with_tool_calls(true)
             .with_parallel_tool_calls(false)
             .with_reasoning(true),
@@ -273,31 +272,14 @@ mod tests {
 
     #[test]
     fn capability_table_current_models() {
-        for model in [
-            "z-ai/glm-5.3",
-            "z-ai/glm-5.3-flash",
-            "deepseek-ai/deepseek-v4-pro",
-            "deepseek-ai/deepseek-v4-pro-0813",
-            "deepseek-ai/deepseek-v4-flash",
-        ] {
+        for model in ["z-ai/glm-5.3", "z-ai/glm-5.3-flash"] {
             let caps = model_capabilities(model).expect("known model");
             assert_eq!(caps.max_context_tokens, 1_048_576, "{model}");
             assert!(caps.tool_calls && caps.reasoning, "{model}");
             // Undocumented: serialize rather than guess parallel support.
             assert!(!caps.parallel_tool_calls, "{model}");
+            assert_eq!(caps.max_output_tokens, Some(131_072), "{model}");
         }
-        assert_eq!(
-            model_capabilities("z-ai/glm-5.3")
-                .expect("glm")
-                .max_output_tokens,
-            Some(131_072)
-        );
-        assert_eq!(
-            model_capabilities("deepseek-ai/deepseek-v4-pro")
-                .expect("dsv4")
-                .max_output_tokens,
-            Some(65_536)
-        );
     }
 
     #[test]
@@ -309,6 +291,18 @@ mod tests {
         );
         assert!(model_capabilities("gpt-5").is_none());
         assert!(model_capabilities("").is_none());
+        // Live-verified 2026-10-09: the DeepSeek V4 deployments are
+        // end-of-life on NIM (HTTP 410) and must not resolve.
+        for model in [
+            "deepseek-ai/deepseek-v4-pro",
+            "deepseek-ai/deepseek-v4-pro-0813",
+            "deepseek-ai/deepseek-v4-flash",
+        ] {
+            assert!(
+                model_capabilities(model).is_none(),
+                "end-of-life deployment {model}"
+            );
+        }
     }
 
     #[test]
@@ -322,7 +316,10 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_models_pass_every_effort_through() {
+    fn non_forced_deployments_pass_every_effort_through() {
+        // The DeepSeek V4 ids are end-of-life on NIM but stand in for
+        // any future non-forced deployment: `effort_for`'s else branch
+        // passes every effort through, `none` included.
         for model in [
             "deepseek-ai/deepseek-v4-pro",
             "deepseek-ai/deepseek-v4-pro-0813",

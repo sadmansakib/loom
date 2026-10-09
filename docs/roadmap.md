@@ -286,9 +286,10 @@ Language:              Rust (stable), 7 crates, unsafe forbidden
 Shipped providers:     DeepSeek, OpenRouter (free + paid), Anthropic, GLM,
                       NVIDIA (NIM hosted inference)
 GLM status:            metered Z.ai API, wiremock-verified (no funded key)
-NVIDIA status:         NIM free-trial tier (no credit card), wiremock-verified
+NVIDIA status:         NIM free-trial tier (no credit card), live-verified against
+                      z-ai/glm-5.3 (2026-10-09); DeepSeek V4 NIM rows EOL'd
 Eval models in use:    OpenRouter free tier (high variance); DeepSeek key drained;
-                      NVIDIA NIM free tier (wired, wiremock-verified, not yet live-run)
+                      NVIDIA NIM free tier (live-verified, ready for N≥5 sweeps)
 Primary target:        successful work per model invocation
 Biggest open risk:     N=1 measurements below the noise floor (see item 1)
 ```
@@ -548,11 +549,12 @@ reproduces them.
       full sweep lands in the tens of dollars — the blocker was never
       the price, it is having a metered key wired into the eval at all.
       A third candidate costs nothing at all: NVIDIA's NIM free-trial
-      tier (no credit card) hosts both z-ai/glm-5.3 and
-      deepseek-ai/deepseek-v4-pro at 1M context, so a free
-      `NVIDIA_API_KEY` may satisfy this prerequisite within its
-      per-model rate limits — the N≥5 sweep then paces itself instead
-      of paying.
+      tier (no credit card) hosts z-ai/glm-5.3 at 1M context —
+      live-verified 2026-10-09 with a real streaming session — so a
+      free `NVIDIA_API_KEY` may satisfy this prerequisite within its
+      per-model rate limits, and the N≥5 sweep then paces itself
+      instead of paying. (The NIM catalog's DeepSeek V4 deployments
+      hit end-of-life 2026-08/2026-09 and are no longer candidates.)
    - **Basic-harness baseline and model tiers** (G4, G5, G9). Add a
      "bare loop" configuration (read/edit/shell only; no facts, pruning,
      evidence shaping, completion gate) and run the same suite on at

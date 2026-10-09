@@ -528,17 +528,21 @@ Five adapters ship:
   code at all. Verified by wiremock, not live: no funded key.
 - **NVIDIA** — NIM hosted inference (`integrate.api.nvidia.com/v1`),
   OpenAI-compatible. Model ids are `publisher/model` (`z-ai/glm-5.3`,
-  `deepseek-ai/deepseek-v4-pro`, …); a built-in capability table covers
-  the five verified deployments. Reasoning depth rides the top-level
+  `z-ai/glm-5.3-flash`); a built-in capability table covers the live
+  GLM-5.3 deployments — the DeepSeek V4 rows that shared the catalog
+  hit end-of-life (HTTP 410, live-checked 2026-10-09) and are
+  deliberately absent. Reasoning depth rides the top-level
   `reasoning_effort` field: GLM-5.3 deployments clamp an effort of
-  "none" to `low` (thinking is always on there too), while DeepSeek V4
-  deployments pass `none` through as real non-think mode. No `thinking`
-  object — that is Z.ai first-party dialect. NIM's chat template
-  defaults `clear_thinking` to false (preserved thinking), which the
-  wire layer already satisfies by replaying `reasoning_content`
-  verbatim. Like GLM, no usage-dialect code. Verified by wiremock, not
-  live; the free trial tier requires no credit card and is the
-  standing zero-cost candidate for the eval backlog (roadmap item 1).
+  "none" to `low` (thinking is always on there too); any future
+  non-forced deployment passes `none` through as real non-think mode.
+  No `thinking` object — that is Z.ai first-party dialect. NIM's chat
+  template defaults `clear_thinking` to false (preserved thinking),
+  which the wire layer already satisfies by replaying
+  `reasoning_content` verbatim. Like GLM, no usage-dialect code.
+  Live-verified 2026-10-09 against `z-ai/glm-5.3` (two-turn session:
+  tool call, reasoning stream, usage, cache-write accounting); the
+  free trial tier requires no credit card and is the standing
+  zero-cost candidate for the eval backlog (roadmap item 1).
 - **Anthropic** — the messages API, not the OpenAI wire: system as a
   top-level param, `tool_use`/`tool_result` content blocks,
   `thinking_delta` reasoning capture, and Anthropic's error taxonomy.

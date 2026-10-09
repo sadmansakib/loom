@@ -3,6 +3,23 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — NVIDIA live verification; DeepSeek V4 NIM rows end-of-life
+
+First live run against NIM with a real free-tier key: a two-turn
+session on `z-ai/glm-5.3` (read the repo README, answer its first
+heading) completed with a tool call, streamed reasoning, and honest
+accounting — 6,306 in / 2,624 cached / 17 out, wall 36.5 s. The same
+run exercised the trace pipeline end to end: `--trace` wrote the task
+directory, `loom stats --trace` read it back.
+
+Live probing also showed the catalog moved: all three
+`deepseek-ai/deepseek-v4-*` deployments return HTTP 410 (end-of-life
+2026-08-07 / 2026-09-14) and are removed from the capability table —
+unknown-model is the loud, correct answer for dead ids. The GLM-5.3
+rows stay (one live-verified, one catalog-pinned); the non-forced
+`reasoning_effort` pass-through keeps its wire and unit coverage with
+the EOL'd ids as inert stand-ins for any future non-forced deployment.
+
 ## 2026-10-09 — loom stats --trace: attribution over exported traces (item 20.1, phase 3)
 
 `loom stats --trace DIR` aggregates what `loom run --trace DIR` wrote:
