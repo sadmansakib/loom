@@ -14,8 +14,11 @@ sha2 = { workspace = true }
 # Event channel (ModelStream); declared here rather than relying on
 # tokio-util transitively enabling tokio/sync. The tool engine adds
 # `time` for ToolContext::timeout enforcement; the agent loop adds
-# `macros` for `tokio::select!` (cancellation races).
-tokio = { workspace = true, features = ["sync", "time", "macros"] }
+# `macros` for `tokio::select!` (cancellation races); `rt` for
+# `spawn_blocking` (facts scan, tool caches) — lib code the kernel
+# needs even without dev-dependencies, which a lone
+# `cargo build -p loom-kernel` exposes.
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }

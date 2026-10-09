@@ -141,59 +141,11 @@ pub async fn execute_call(
     // reads are unchanged (ADR-018, V14); a hit is re-bounded exactly as a
     // fresh call would be. `cacheable` is `None` for anything the cache
     // must not serve (mutating tools, wildcards, write-declaring reads).
-    // The signature walk is file I/O + SHA-256, so it runs on a blocking
-    // thread, and the cache lock is taken only for the in-memory map
-    // operations (ADR-018: hashing never runs on an async worker or under
-    // the lock).
     let cacheable = cacheable_reads(tool, &call.arguments);
-    if let (Some(reads), Some(cache)) = (&cacheable, ctx.cache.as_ref()) {
-        // Cheap existence probe first: a key never stored skips the
-        // signature walk entirely (the common first-read case).
-        let has_entry = cache
-            .lock()
-            .map(|cache| cache.has_entry(&call.name, &call.arguments))
-            .unwrap_or(false);
-        if has_entry {
-            let root = ctx.workspace_root.clone();
-            let reads = reads.clone();
-            let current = tokio::task::spawn_blocking(move || {
-                crate::tool_cache::compute_signature(&root, &reads)
-            })
-            .await
-            .ok()
-            .flatten();
-            let hit = cache
-                .lock()
-                .ok()
-                .and_then(|mut cache| cache.lookup(&call.name, &call.arguments, current));
-            if let Some((output, original_id)) = hit {
-                // Roadmap item 6: when the original result is still in the
-                // projected request, a repeat is served as a cheap stub —
-                // the full content is already visible to the model, so
-                // re-serving a bounded duplicate spends context twice.
-                // When compaction dropped the original, the full (re-
-                // bounded) content is served as before.
-                if ctx.projected_calls.contains(&original_id) {
-                    return finish(
-                        call,
-                        ToolStatus::Success,
-                        format!("unchanged since call {original_id}"),
-                        false,
-                        ToolEffects::none(),
-                        None,
-                    );
-                }
-                let (content, truncated, effects, artifact) = bound(output, ctx);
-                return finish(
-                    call,
-                    ToolStatus::Success,
-                    content,
-                    truncated,
-                    effects,
-                    artifact,
-                );
-            }
-        }
+    if let Some(reads) = &cacheable
+        && let Some(result) = cached_result(reads, call, ctx).await
+    {
+        return result;
     }
 
     let mut timed = std::pin::pin!(timeout(
@@ -209,24 +161,8 @@ pub async fn execute_call(
             // a later hit is re-bounded exactly like a fresh call (ADR-018,
             // V14). `store` itself refuses outputs with effects, and the
             // signature is computed on a blocking thread, outside the lock.
-            if let (Some(reads), Some(cache)) = (&cacheable, ctx.cache.as_ref()) {
-                let root = ctx.workspace_root.clone();
-                let reads = reads.clone();
-                let signature = tokio::task::spawn_blocking(move || {
-                    crate::tool_cache::compute_signature(&root, &reads)
-                })
-                .await
-                .ok()
-                .flatten();
-                if let Ok(mut cache) = cache.lock() {
-                    cache.store(
-                        &call.name,
-                        &call.arguments,
-                        signature,
-                        call.id.as_str(),
-                        &output,
-                    );
-                }
+            if let Some(reads) = &cacheable {
+                cache_result(reads, call, &output, ctx).await;
             }
             let (content, truncated, effects, artifact) = bound(output, ctx);
             finish(
@@ -279,6 +215,89 @@ fn unknown_tool_content(registry: &ToolRegistry, name: &str) -> String {
             "error: unknown tool \"{name}\"; available: {}",
             names.join(", ")
         )
+    }
+}
+
+/// Serves a repeat read-only call from the cache (ADR-018, V14).
+///
+/// Cheap existence probe first — a key never stored skips the signature
+/// walk entirely (the common first-read case). The signature walk is
+/// file I/O + SHA-256, so it runs on a blocking thread, and the cache
+/// lock is taken only for the in-memory map operations (ADR-018:
+/// hashing never runs on an async worker or under the lock).
+///
+/// Roadmap item 6: when the original result is still in the projected
+/// request, a repeat is served as a cheap stub — the full content is
+/// already visible to the model, so re-serving a bounded duplicate
+/// spends context twice. When compaction dropped the original, the full
+/// (re-bounded) content is served as before. `None` means no hit; the
+/// call runs for real.
+async fn cached_result(reads: &[String], call: &ToolCall, ctx: &ToolContext) -> Option<ToolResult> {
+    let cache = ctx.cache.as_ref()?;
+    if !cache
+        .lock()
+        .map(|cache| cache.has_entry(&call.name, &call.arguments))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let root = ctx.workspace_root.clone();
+    let reads = reads.to_vec();
+    let current =
+        tokio::task::spawn_blocking(move || crate::tool_cache::compute_signature(&root, &reads))
+            .await
+            .ok()
+            .flatten();
+    let (output, original_id) = cache
+        .lock()
+        .ok()
+        .and_then(|mut cache| cache.lookup(&call.name, &call.arguments, current))?;
+    Some(if ctx.projected_calls.contains(&original_id) {
+        finish(
+            call,
+            ToolStatus::Success,
+            format!("unchanged since call {original_id}"),
+            false,
+            ToolEffects::none(),
+            None,
+        )
+    } else {
+        let (content, truncated, effects, artifact) = bound(output, ctx);
+        finish(
+            call,
+            ToolStatus::Success,
+            content,
+            truncated,
+            effects,
+            artifact,
+        )
+    })
+}
+
+/// Caches a fresh read-only, side-effect-free output (ADR-018, V14):
+/// `store` itself refuses outputs with effects, and the signature walk
+/// runs on the blocking pool, outside the lock. A missing cache or a
+/// poisoned lock is a silent skip — caching is an optimization, never
+/// a side channel for failures.
+async fn cache_result(reads: &[String], call: &ToolCall, output: &ToolOutput, ctx: &ToolContext) {
+    let Some(cache) = ctx.cache.as_ref() else {
+        return;
+    };
+    let root = ctx.workspace_root.clone();
+    let reads = reads.to_vec();
+    let signature =
+        tokio::task::spawn_blocking(move || crate::tool_cache::compute_signature(&root, &reads))
+            .await
+            .ok()
+            .flatten();
+    if let Ok(mut cache) = cache.lock() {
+        cache.store(
+            &call.name,
+            &call.arguments,
+            signature,
+            call.id.as_str(),
+            output,
+        );
     }
 }
 

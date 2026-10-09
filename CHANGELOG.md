@@ -3,6 +3,33 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — Complexity pass, kernel batch: the hotspots decompose
+
+Tier 1 of the cyclomatic-complexity audit (lizard, CCN ≥ 15) starts with
+the kernel's five hottest functions, each decomposed into named,
+documented helpers with zero behavior change (672 tests green):
+
+- `pruning::decide` 38 → 1: the transcript scans live in
+  `TranscriptFacts::collect`/`protected_from`, and each pruning pass
+  (`dedupe_reads`, `supersede_reads`, `stub_stale_errors`,
+  `age_out_large_reads`, `mask_aged_reads`) is a small function over a
+  shared `DecisionPass`; `decide` is now the policy order, nothing else.
+- `agent::run_turns` 33 → 25: budget derivation, the facts scan, turn
+  compilation, and the completion gate's refusal half
+  (`refuse_completion_once`) each moved out; what remains is the
+  stop-reason dispatch itself.
+- `agent::run_task` 20 → 6: the epilogue is `finalize_task`.
+- `facts::render` 16 → 7: per-section renderers
+  (`render_listed`, `render_instructions`, `render_git`).
+- `agent::tools::execute_call` 15 → 10: the tool cache's read and write
+  halves are `cached_result`/`cache_result`.
+
+Also fixed a latent build bug: `loom-kernel` uses
+`tokio::task::spawn_blocking` in library code but only declared the
+`sync`/`time`/`macros` features — workspace-wide feature unification
+masked it, so a lone `cargo build -p loom-kernel` failed. `rt` is now
+declared.
+
 ## 2026-10-09 — Facade boundary guarded: loom-cli depends on loom-core alone
 
 The ADR-021 rule is now enforced by the suite, not by review vigilance:

@@ -700,9 +700,24 @@ impl Agent {
             .run_turns(session, task_id, sink, control, &mut accounting, started)
             .await;
 
-        // 4. Finalize: record the outcome, emit the terminal event, and
-        //    build the summary. The record is finished before the summary is
-        //    returned so callers can read either.
+        // 4. Finalize and summarize.
+        self.finalize_task(session, task_id, &accounting, outcome, started, sink)
+    }
+
+    /// Finalizes a finished task: finish + persist the record, emit the
+    /// terminal event, and build the [`TaskSummary`]. The record is
+    /// finished before the summary is returned so callers can read
+    /// either; `events_dropped` is sampled after the terminal emit so a
+    /// closed sink's drop of that event is counted too (§11).
+    fn finalize_task(
+        &self,
+        session: &mut Session,
+        task_id: TaskId,
+        accounting: &Accounting,
+        outcome: Result<ContextCensus, TaskError>,
+        started: Instant,
+        sink: &dyn EventSink,
+    ) -> Result<TaskSummary, TaskError> {
         let wall_time = started.elapsed();
         let status = match &outcome {
             Ok(_) => TerminalTaskStatus::Completed,
@@ -741,8 +756,6 @@ impl Agent {
                 },
             ),
         }
-        // Sampled after the terminal emit so a closed sink's drop of that
-        // event is counted too (§11).
         let events_dropped = sink.dropped();
         let last_context_census = outcome.as_ref().ok().copied().unwrap_or_default();
 
@@ -757,7 +770,7 @@ impl Agent {
             failed_tool_calls: accounting.failed_tool_calls,
             wall_time,
             events_dropped,
-            remaining_budget: self.budget.remaining(&accounting, wall_time),
+            remaining_budget: self.budget.remaining(accounting, wall_time),
             last_context_census,
         };
 
@@ -784,22 +797,12 @@ impl Agent {
                 .ok_or_else(|| TaskError::UnknownModel {
                     model: self.model.clone(),
                 })?;
-        let reserved_output_tokens =
-            derive_reserved_output_tokens(&capabilities, self.output_reservation);
-        let budget =
-            ContextBudget::from_window(capabilities.max_context_tokens, reserved_output_tokens)?;
+        let budget = self.task_budget(&capabilities)?;
 
         // Repository facts for this task (2E, ADR-015): captured exactly once,
         // before the first compile, so the projected block is byte-stable for
         // the whole task (§8.1.1) and "what changed" never costs a model turn.
-        // The scan walks the tree and shells out to git — blocking work — so
-        // it runs on the blocking pool, never on this async worker.
-        let facts = {
-            let source = Arc::clone(&self.facts);
-            tokio::task::spawn_blocking(move || source.scan())
-                .await
-                .map_err(|_| TaskError::Internal("facts scan panicked".to_owned()))?
-        };
+        let facts = self.scan_facts().await?;
 
         // Pruning checkpoint for this task's turn loop (ADR-011): the
         // compiler returns a frozen decision set when its trigger fires,
@@ -845,24 +848,14 @@ impl Agent {
             // a. Compile the model request from durable state (§8). The
             //    compiler owns every context decision; the loop only passes
             //    it the inputs.
-            let compiled: CompiledContext = {
-                let task = session
-                    .tasks
-                    .iter()
-                    .find(|task| task.id == task_id)
-                    .ok_or_else(|| TaskError::Protocol("task record missing".to_owned()))?;
-                self.compiler.compile(ContextInput {
-                    session,
-                    tools: &self.registry,
-                    task,
-                    budget,
-                    capabilities: &capabilities,
-                    model: &self.model,
-                    config: &self.config,
-                    facts: &facts,
-                    prune_checkpoint: prune_checkpoint.as_ref(),
-                })?
-            };
+            let compiled = self.compile_turn(
+                session,
+                task_id,
+                budget,
+                &capabilities,
+                &facts,
+                &prune_checkpoint,
+            )?;
             // Carry the pruning checkpoint forward (ADR-011): it is task
             // state, not request state, so it lives on the loop and is fed
             // back in on the next turn. Between triggers it is unchanged,
@@ -898,26 +891,18 @@ impl Agent {
                     }
                     // Completion gate (roadmap item 8): refuse the finish
                     // once when files changed since the last green check,
-                    // quoting the changed paths and the original task. The
-                    // refusal is a normal user item — persisted, projected,
-                    // and answered like any other turn. One refusal only:
-                    // the model may insist, and the loop never deadlocks
-                    // with a task that cannot be verified.
-                    if completion.pending() && !completion.refused && turn < self.max_turns {
-                        completion.refused = true;
-                        self.commit(session, assistant, Vec::new())?;
-                        let text = completion_refusal(session);
-                        let reminder = Item::User { text };
-                        if let Some(store) = &self.store {
-                            store
-                                .append_item(&session.id, session.next_index(), &reminder)
-                                .map_err(persistence)?;
-                        }
-                        session
-                            .push_item(reminder)
-                            .map_err(|error| TaskError::Internal(error.to_string()))?;
-                        accounting.turns = turn;
-                        accounting.sync(session, task_id);
+                    // quoting the changed paths and the original task.
+                    // One refusal only: the model may insist, and the
+                    // loop never deadlocks with a task that cannot be
+                    // verified.
+                    if self.refuse_completion_once(
+                        session,
+                        task_id,
+                        turn,
+                        &mut completion,
+                        accounting,
+                        &assistant,
+                    )? {
                         continue;
                     }
                     self.commit(session, assistant, Vec::new())?;
@@ -999,6 +984,96 @@ impl Agent {
         Err(TaskError::MaxTurns {
             max_turns: self.max_turns,
         })
+    }
+
+    /// The task's input budget: the window less the reserved output
+    /// (§6.4), derived once per task.
+    fn task_budget(&self, capabilities: &ModelCapabilities) -> Result<ContextBudget, TaskError> {
+        let reserved_output_tokens =
+            derive_reserved_output_tokens(capabilities, self.output_reservation);
+        Ok(ContextBudget::from_window(
+            capabilities.max_context_tokens,
+            reserved_output_tokens,
+        )?)
+    }
+
+    /// Scans repository facts on the blocking pool (2E, ADR-015): the
+    /// scan walks the tree and shells out to git — blocking work, never
+    /// on this async worker.
+    async fn scan_facts(&self) -> Result<crate::context::KnownFacts, TaskError> {
+        let source = Arc::clone(&self.facts);
+        tokio::task::spawn_blocking(move || source.scan())
+            .await
+            .map_err(|_| TaskError::Internal("facts scan panicked".to_owned()))
+    }
+
+    /// Compiles one turn's model request from durable state (§8): the
+    /// compiler owns every context decision; the loop only passes it
+    /// the inputs.
+    fn compile_turn(
+        &self,
+        session: &Session,
+        task_id: TaskId,
+        budget: ContextBudget,
+        capabilities: &ModelCapabilities,
+        facts: &crate::context::KnownFacts,
+        prune_checkpoint: &Option<PruneCheckpoint>,
+    ) -> Result<CompiledContext, TaskError> {
+        let task = session
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .ok_or_else(|| TaskError::Protocol("task record missing".to_owned()))?;
+        self.compiler
+            .compile(ContextInput {
+                session,
+                tools: &self.registry,
+                task,
+                budget,
+                capabilities,
+                model: &self.model,
+                config: &self.config,
+                facts,
+                prune_checkpoint: prune_checkpoint.as_ref(),
+            })
+            .map_err(|error| error.into())
+    }
+
+    /// The refusal half of the completion gate (roadmap item 8): when
+    /// files changed since the last green check and nothing was refused
+    /// yet, commit the assistant's reply, append a refusal as a normal
+    /// user item — persisted, projected, and answered like any other
+    /// turn, quoting the changed paths and the original task — and let
+    /// the loop take one more turn. Returns `true` when the refusal
+    /// fired; the caller then continues instead of finishing.
+    fn refuse_completion_once(
+        &self,
+        session: &mut Session,
+        task_id: TaskId,
+        turn: u32,
+        completion: &mut CompletionGate,
+        accounting: &mut Accounting,
+        assistant: &AssistantMessage,
+    ) -> Result<bool, TaskError> {
+        if !(completion.pending() && !completion.refused && turn < self.max_turns) {
+            return Ok(false);
+        }
+        completion.refused = true;
+        self.commit(session, assistant.clone(), Vec::new())?;
+        let reminder = Item::User {
+            text: completion_refusal(session),
+        };
+        if let Some(store) = &self.store {
+            store
+                .append_item(&session.id, session.next_index(), &reminder)
+                .map_err(persistence)?;
+        }
+        session
+            .push_item(reminder)
+            .map_err(|error| TaskError::Internal(error.to_string()))?;
+        accounting.turns = turn;
+        accounting.sync(session, task_id);
+        Ok(true)
     }
 
     /// Streams one model request with bounded retries, emitting provisional

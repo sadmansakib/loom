@@ -194,58 +194,26 @@ impl KnownFacts {
         if !self.root.as_os_str().is_empty() {
             let _ = writeln!(out, "root: {}", self.root.display());
         }
-        if !self.languages.is_empty() {
-            let _ = writeln!(
-                out,
-                "languages: {}",
-                render_list(&self.languages, RENDER_LANGUAGE_CAP)
-            );
-        }
-        if !self.build_systems.is_empty() {
-            let _ = writeln!(
-                out,
-                "build systems: {}",
-                render_list(&self.build_systems, RENDER_LIST_CAP)
-            );
-        }
-        if !self.source_dirs.is_empty() {
-            let _ = writeln!(
-                out,
-                "source dirs: {}",
-                render_list(&self.source_dirs, RENDER_LIST_CAP)
-            );
-        }
-        if !self.test_dirs.is_empty() {
-            let _ = writeln!(
-                out,
-                "test dirs: {}",
-                render_list(&self.test_dirs, RENDER_LIST_CAP)
-            );
-        }
-        if !self.config_files.is_empty() {
-            let _ = writeln!(
-                out,
-                "config files: {}",
-                render_list(&self.config_files, RENDER_LIST_CAP)
-            );
-        }
+        render_listed(&mut out, "languages", &self.languages, RENDER_LANGUAGE_CAP);
+        render_listed(
+            &mut out,
+            "build systems",
+            &self.build_systems,
+            RENDER_LIST_CAP,
+        );
+        render_listed(&mut out, "source dirs", &self.source_dirs, RENDER_LIST_CAP);
+        render_listed(&mut out, "test dirs", &self.test_dirs, RENDER_LIST_CAP);
+        render_listed(
+            &mut out,
+            "config files",
+            &self.config_files,
+            RENDER_LIST_CAP,
+        );
         if !self.toolchains.is_empty() {
             let _ = writeln!(out, "toolchains: {}", self.toolchains.join(", "));
         }
         if let Some(instructions) = &self.instructions {
-            if instructions.total_bytes > instructions.text.len() {
-                let _ = writeln!(
-                    out,
-                    "project instructions ({}; first {} of {} bytes):",
-                    instructions.path,
-                    instructions.text.len(),
-                    instructions.total_bytes
-                );
-            } else {
-                let _ = writeln!(out, "project instructions ({}):", instructions.path);
-            }
-            let _ = writeln!(out, "{}", instructions.text);
-            let _ = writeln!(out, "(end of project instructions)");
+            render_instructions(&mut out, instructions);
         }
         if !self.tree.is_empty() {
             let _ = writeln!(out, "file tree:");
@@ -253,29 +221,61 @@ impl KnownFacts {
                 let _ = writeln!(out, "{line}");
             }
         }
-        match (&self.git.branch, self.git.changed_files.is_empty()) {
-            // No branch and no changes: no repository was observed.
-            (None, true) => {
-                let _ = writeln!(out, "git: no repository detected");
-            }
-            (branch, _) => {
-                if let Some(branch) = branch {
-                    let _ = writeln!(out, "git branch: {branch}");
-                }
-                if self.git.changed_files.is_empty() {
-                    let _ = writeln!(out, "changed files: none");
-                } else {
-                    let _ = writeln!(
-                        out,
-                        "changed files: {}",
-                        render_list(&self.git.changed_files, RENDER_LIST_CAP)
-                    );
-                }
-            }
-        }
+        render_git(&mut out, &self.git);
         // Drop the trailing newline so the block is exactly its lines.
         out.pop();
         out
+    }
+}
+
+/// Emits one `label: a, b, (+N more)` line for a non-empty capped list.
+fn render_listed(out: &mut String, label: &str, items: &[String], cap: usize) {
+    if items.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "{label}: {}", render_list(items, cap));
+}
+
+/// Emits the project-instructions block: a header noting any truncation,
+/// the text verbatim, and an end marker the model can anchor on.
+fn render_instructions(out: &mut String, instructions: &InstructionFile) {
+    if instructions.total_bytes > instructions.text.len() {
+        let _ = writeln!(
+            out,
+            "project instructions ({}; first {} of {} bytes):",
+            instructions.path,
+            instructions.text.len(),
+            instructions.total_bytes
+        );
+    } else {
+        let _ = writeln!(out, "project instructions ({}):", instructions.path);
+    }
+    let _ = writeln!(out, "{}", instructions.text);
+    let _ = writeln!(out, "(end of project instructions)");
+}
+
+/// Emits the git footer: branch when observed, then the changed-file
+/// state — nothing at all when no repository was detected.
+fn render_git(out: &mut String, git: &GitState) {
+    match (&git.branch, git.changed_files.is_empty()) {
+        // No branch and no changes: no repository was observed.
+        (None, true) => {
+            let _ = writeln!(out, "git: no repository detected");
+        }
+        (branch, _) => {
+            if let Some(branch) = branch {
+                let _ = writeln!(out, "git branch: {branch}");
+            }
+            if git.changed_files.is_empty() {
+                let _ = writeln!(out, "changed files: none");
+            } else {
+                let _ = writeln!(
+                    out,
+                    "changed files: {}",
+                    render_list(&git.changed_files, RENDER_LIST_CAP)
+                );
+            }
+        }
     }
 }
 

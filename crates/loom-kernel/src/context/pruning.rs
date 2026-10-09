@@ -535,133 +535,167 @@ struct ResultFacts {
     read_call: Option<(String, String, Vec<String>)>,
 }
 
-/// Computes the stub set from the transcript under ADR-011's fixed
-/// strategy order, plus the reclaim estimate (in tokens) against the
-/// *unpruned* projection.
-fn decide(
-    session: &Session,
-    registry: &ToolRegistry,
-    config: PruneConfig,
-    estimator: &dyn TokenEstimator,
-    window_triggered: bool,
-) -> (Vec<StubDecision>, u64) {
-    let transcript: &[Item] = &session.transcript;
+/// Everything the five strategy passes reason over, collected in two
+/// transcript scans: per-result facts, assistant turn boundaries, and
+/// the writes that can supersede earlier reads.
+struct TranscriptFacts {
+    results: Vec<ResultFacts>,
+    /// Transcript index of every assistant item — the turn boundaries.
+    assistant_at: Vec<usize>,
+    /// `(index, changed paths)` per tool result that wrote or deleted.
+    writes: Vec<(usize, Vec<String>)>,
+}
 
-    // Pass 1 — call metadata (name, canonical args, declared reads) from
-    // assistant tool_calls, keyed by call id for O(1) lookup in pass 2.
-    let mut calls: HashMap<&str, (String, String, Vec<String>)> = HashMap::new();
-    for item in transcript {
-        if let Item::Assistant(assistant) = item {
-            for call in &assistant.tool_calls {
-                let reads = read_paths(registry, &call.name, &call.arguments);
-                calls.insert(
-                    call.id.as_str(),
-                    (call.name.clone(), call.arguments.to_string(), reads),
-                );
-            }
-        }
-    }
-    let is_read_only = |name: &str| registry.get(name).is_some_and(|tool| tool.is_read_only());
+impl TranscriptFacts {
+    /// The two fact-gathering scans behind [`decide`].
+    fn collect(session: &Session, registry: &ToolRegistry, estimator: &dyn TokenEstimator) -> Self {
+        let transcript: &[Item] = &session.transcript;
 
-    // Pass 2 — tool-result facts, assistant turn boundaries, later writes.
-    let mut assistant_at: Vec<usize> = Vec::new();
-    let mut results: Vec<ResultFacts> = Vec::new();
-    let mut writes: Vec<(usize, Vec<String>)> = Vec::new();
-    let mut turn = 0usize;
-    for (index, item) in transcript.iter().enumerate() {
-        match item {
-            Item::Assistant(_) => {
-                turn += 1;
-                assistant_at.push(index);
-            }
-            Item::ToolResult(result) => {
-                let read_call =
-                    calls
-                        .get(result.call_id.as_str())
-                        .and_then(|(name, args, reads)| {
-                            is_read_only(name).then(|| (name.clone(), args.clone(), reads.clone()))
-                        });
-                if !result.effects.files_written.is_empty()
-                    || !result.effects.files_deleted.is_empty()
-                {
-                    let mut changed = result.effects.files_written.clone();
-                    changed.extend(result.effects.files_deleted.iter().cloned());
-                    writes.push((index, changed));
+        // Scan 1 — call metadata (name, canonical args, declared reads)
+        // from assistant tool_calls, keyed by call id for O(1) lookup.
+        let mut calls: HashMap<&str, (String, String, Vec<String>)> = HashMap::new();
+        for item in transcript {
+            if let Item::Assistant(assistant) = item {
+                for call in &assistant.tool_calls {
+                    let reads = read_paths(registry, &call.name, &call.arguments);
+                    calls.insert(
+                        call.id.as_str(),
+                        (call.name.clone(), call.arguments.to_string(), reads),
+                    );
                 }
-                results.push(ResultFacts {
-                    index,
-                    turn,
-                    call_id: result.call_id.clone(),
-                    status: result.status,
-                    bytes: serialized_size(item),
-                    tokens: estimate_serialized(estimator, item),
-                    read_call,
-                });
             }
-            Item::User { .. } => {}
+        }
+        let is_read_only = |name: &str| registry.get(name).is_some_and(|tool| tool.is_read_only());
+
+        // Scan 2 — tool-result facts, assistant turn boundaries, later writes.
+        let mut assistant_at: Vec<usize> = Vec::new();
+        let mut results: Vec<ResultFacts> = Vec::new();
+        let mut writes: Vec<(usize, Vec<String>)> = Vec::new();
+        let mut turn = 0usize;
+        for (index, item) in transcript.iter().enumerate() {
+            match item {
+                Item::Assistant(_) => {
+                    turn += 1;
+                    assistant_at.push(index);
+                }
+                Item::ToolResult(result) => {
+                    let read_call =
+                        calls
+                            .get(result.call_id.as_str())
+                            .and_then(|(name, args, reads)| {
+                                is_read_only(name)
+                                    .then(|| (name.clone(), args.clone(), reads.clone()))
+                            });
+                    if !result.effects.files_written.is_empty()
+                        || !result.effects.files_deleted.is_empty()
+                    {
+                        let mut changed = result.effects.files_written.clone();
+                        changed.extend(result.effects.files_deleted.iter().cloned());
+                        writes.push((index, changed));
+                    }
+                    results.push(ResultFacts {
+                        index,
+                        turn,
+                        call_id: result.call_id.clone(),
+                        status: result.status,
+                        bytes: serialized_size(item),
+                        tokens: estimate_serialized(estimator, item),
+                        read_call,
+                    });
+                }
+                Item::User { .. } => {}
+            }
+        }
+        Self {
+            results,
+            assistant_at,
+            writes,
         }
     }
 
-    // Protected tail: last `protected_tail_turns` turns AND trailing
-    // `protected_tail_tokens` tokens — whichever reaches further back.
-    let turn_cut = assistant_at
-        .len()
-        .checked_sub(config.protected_tail_turns)
-        .and_then(|from| assistant_at.get(from))
-        .copied()
-        .unwrap_or(0);
-    let mut trailing = 0u64;
-    let mut token_cut = transcript.len();
-    for (index, item) in transcript.iter().enumerate().rev() {
-        trailing += u64::from(estimate_serialized(estimator, item));
-        if trailing >= u64::from(config.protected_tail_tokens) {
-            token_cut = index;
-            break;
-        }
-    }
-    let protected_from = turn_cut.min(token_cut);
-
-    let total_turns = assistant_at.len();
-    let mut stubbed: Vec<StubDecision> = Vec::new();
-    let mut stubbed_ids: HashSet<&str> = HashSet::new();
-    let mut reclaim_tokens = 0u64;
-
-    fn add_stub<'a>(
-        facts: &'a ResultFacts,
-        reason: StubReason,
-        stubbed: &mut Vec<StubDecision>,
-        stubbed_ids: &mut HashSet<&'a str>,
-        reclaim_tokens: &mut u64,
+    /// Index of the first unprotected item: the protected tail reaches
+    /// back over the last `protected_tail_turns` turns AND at least
+    /// `protected_tail_tokens` estimated trailing tokens — whichever
+    /// reaches further back.
+    fn protected_from(
+        &self,
+        transcript: &[Item],
+        config: PruneConfig,
         estimator: &dyn TokenEstimator,
-    ) {
-        *reclaim_tokens += u64::from(facts.tokens.saturating_sub(stub_tokens(
+    ) -> usize {
+        let turn_cut = self
+            .assistant_at
+            .len()
+            .checked_sub(config.protected_tail_turns)
+            .and_then(|from| self.assistant_at.get(from))
+            .copied()
+            .unwrap_or(0);
+        let mut trailing = 0u64;
+        let mut token_cut = transcript.len();
+        for (index, item) in transcript.iter().enumerate().rev() {
+            trailing += u64::from(estimate_serialized(estimator, item));
+            if trailing >= u64::from(config.protected_tail_tokens) {
+                token_cut = index;
+                break;
+            }
+        }
+        turn_cut.min(token_cut)
+    }
+}
+
+/// Accumulated stub decisions across the five strategy passes, in
+/// ADR-011's fixed order — earlier passes win, later ones skip
+/// already-stubbed calls so each result keeps its most specific reason.
+#[derive(Default)]
+struct DecisionPass {
+    stubbed: Vec<StubDecision>,
+    stubbed_ids: HashSet<String>,
+    reclaim_tokens: u64,
+}
+
+impl DecisionPass {
+    /// Records one stub and its estimated reclaim.
+    fn add(&mut self, facts: &ResultFacts, reason: StubReason, estimator: &dyn TokenEstimator) {
+        self.reclaim_tokens += u64::from(facts.tokens.saturating_sub(stub_tokens(
             &facts.call_id,
             &facts.status,
             reason,
             estimator,
         )));
-        stubbed_ids.insert(facts.call_id.as_str());
-        stubbed.push(StubDecision {
+        self.stubbed_ids.insert(facts.call_id.as_str().to_owned());
+        self.stubbed.push(StubDecision {
             call_id: facts.call_id.as_str().to_owned(),
             reason,
         });
     }
 
-    // Index of the newest call per (name, canonical args): one pass instead
-    // of scanning every later result per candidate.
+    /// Whether `facts` is outside the protected region and not already
+    /// stubbed by an earlier pass — the shared guard of passes 2–5.
+    fn eligible(&self, facts: &ResultFacts, protected_from: usize) -> bool {
+        facts.index < protected_from && !self.stubbed_ids.contains(facts.call_id.as_str())
+    }
+}
+
+/// Pass 1 — dedupe identical read-only calls, keeping the newest.
+fn dedupe_reads(
+    facts: &TranscriptFacts,
+    protected_from: usize,
+    estimator: &dyn TokenEstimator,
+    pass: &mut DecisionPass,
+) {
+    // Index of the newest call per (name, canonical args): one pass
+    // instead of scanning every later result per candidate.
     let mut newest_by_call: HashMap<(&str, &str), usize> = HashMap::new();
-    for facts in &results {
-        let Some((name, args, _)) = facts.read_call.as_ref() else {
+    for result in &facts.results {
+        let Some((name, args, _)) = result.read_call.as_ref() else {
             continue;
         };
         newest_by_call
             .entry((name.as_str(), args.as_str()))
-            .and_modify(|index| *index = (*index).max(facts.index))
-            .or_insert(facts.index);
+            .and_modify(|index| *index = (*index).max(result.index))
+            .or_insert(result.index);
     }
-
-    // (1) Dedupe identical read-only calls, keeping the newest.
-    for earlier in &results {
+    for earlier in &facts.results {
         if earlier.index >= protected_from {
             continue;
         }
@@ -672,119 +706,161 @@ fn decide(
             .get(&(name.as_str(), args.as_str()))
             .is_some_and(|index| *index == earlier.index);
         if !is_newest {
-            add_stub(
-                earlier,
-                StubReason::DuplicateRead,
-                &mut stubbed,
-                &mut stubbed_ids,
-                &mut reclaim_tokens,
-                estimator,
-            );
+            pass.add(earlier, StubReason::DuplicateRead, estimator);
         }
     }
+}
 
-    // (2) Supersede reads of later-modified paths.
-    for earlier in &results {
-        if earlier.index >= protected_from || stubbed_ids.contains(earlier.call_id.as_str()) {
+/// Pass 2 — supersede reads of later-modified paths.
+fn supersede_reads(
+    facts: &TranscriptFacts,
+    protected_from: usize,
+    estimator: &dyn TokenEstimator,
+    pass: &mut DecisionPass,
+) {
+    for earlier in &facts.results {
+        if !pass.eligible(earlier, protected_from) {
             continue;
         }
         let Some((_, _, reads)) = earlier.read_call.as_ref() else {
             continue;
         };
-        let superseded = writes.iter().any(|(index, changed)| {
+        let superseded = facts.writes.iter().any(|(index, changed)| {
             *index > earlier.index
                 && reads
                     .iter()
                     .any(|read| changed.iter().any(|path| paths_overlap(read, path)))
         });
         if superseded {
-            add_stub(
-                earlier,
-                StubReason::SupersededRead,
-                &mut stubbed,
-                &mut stubbed_ids,
-                &mut reclaim_tokens,
-                estimator,
-            );
+            pass.add(earlier, StubReason::SupersededRead, estimator);
         }
     }
+}
 
-    // (3) Stale errors.
-    for earlier in &results {
-        if earlier.index >= protected_from || stubbed_ids.contains(earlier.call_id.as_str()) {
+/// Pass 3 — stub error results older than `stale_error_turns`.
+fn stub_stale_errors(
+    facts: &TranscriptFacts,
+    protected_from: usize,
+    config: PruneConfig,
+    total_turns: usize,
+    estimator: &dyn TokenEstimator,
+    pass: &mut DecisionPass,
+) {
+    for earlier in &facts.results {
+        if !pass.eligible(earlier, protected_from) {
             continue;
         }
         if earlier.status != ToolStatus::Success
             && total_turns.saturating_sub(earlier.turn) > config.stale_error_turns
         {
-            add_stub(
-                earlier,
-                StubReason::StaleError,
-                &mut stubbed,
-                &mut stubbed_ids,
-                &mut reclaim_tokens,
-                estimator,
-            );
+            pass.add(earlier, StubReason::StaleError, estimator);
         }
     }
+}
 
-    // (4) Age out large read-only results outside the protected tail.
-    // `min_reclaim_tokens` is a *gate* on whether the prune runs at all
-    // (checked in `compile`), never a cap: every unprotected read-only
-    // result is stubbed, so the projection cannot grow without bound once
-    // the trigger is crossed. Sorted largest-first for a deterministic,
-    // size-prioritised order. Window-triggered (or budget-rescue) passes
-    // only: turn-age masking alone must not nuke the whole history.
-    let mut aged: Vec<&ResultFacts> = results
+/// Pass 4 — age out large read-only results outside the protected tail.
+/// `min_reclaim_tokens` is a *gate* on whether the prune runs at all
+/// (checked in `compile`), never a cap: every unprotected read-only
+/// result is stubbed, so the projection cannot grow without bound once
+/// the trigger is crossed. Sorted largest-first for a deterministic,
+/// size-prioritised order. Window-triggered (or budget-rescue) passes
+/// only: turn-age masking alone must not nuke the whole history.
+fn age_out_large_reads(
+    facts: &TranscriptFacts,
+    protected_from: usize,
+    window_triggered: bool,
+    estimator: &dyn TokenEstimator,
+    pass: &mut DecisionPass,
+) {
+    let mut aged: Vec<&ResultFacts> = facts
+        .results
         .iter()
-        .filter(|facts| {
+        .filter(|result| {
             window_triggered
-                && facts.index < protected_from
-                && facts.status == ToolStatus::Success
-                && facts.read_call.is_some()
-                && !stubbed_ids.contains(facts.call_id.as_str())
+                && result.index < protected_from
+                && result.status == ToolStatus::Success
+                && result.read_call.is_some()
+                && !pass.stubbed_ids.contains(result.call_id.as_str())
         })
         .collect();
     aged.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.index.cmp(&b.index)));
-    for facts in aged {
-        add_stub(
-            facts,
-            StubReason::AgedOut,
-            &mut stubbed,
-            &mut stubbed_ids,
-            &mut reclaim_tokens,
-            estimator,
-        );
+    for result in aged {
+        pass.add(result, StubReason::AgedOut, estimator);
     }
+}
 
-    // (5) Turn-age masking: stub successful read-only results older than
-    // `age_mask_turns` assistant turns, independent of the window
-    // trigger — the transcript replay is capped at a rolling window, so
-    // a long task's request size plateaus instead of growing without
-    // bound. Runs after the other passes so already-stubbed calls keep
-    // their more specific reasons; the protected tail always wins.
-    if let Some(max_age) = config.age_mask_turns {
-        for earlier in &results {
-            if earlier.index >= protected_from || stubbed_ids.contains(earlier.call_id.as_str()) {
-                continue;
-            }
-            if earlier.status == ToolStatus::Success
-                && earlier.read_call.is_some()
-                && total_turns.saturating_sub(earlier.turn) > max_age
-            {
-                add_stub(
-                    earlier,
-                    StubReason::TurnAge,
-                    &mut stubbed,
-                    &mut stubbed_ids,
-                    &mut reclaim_tokens,
-                    estimator,
-                );
-            }
+/// Pass 5 — turn-age masking: stub successful read-only results older
+/// than `age_mask_turns` assistant turns, independent of the window
+/// trigger — the transcript replay is capped at a rolling window, so a
+/// long task's request size plateaus instead of growing without bound.
+/// Runs after the other passes so already-stubbed calls keep their more
+/// specific reasons; the protected tail always wins.
+fn mask_aged_reads(
+    facts: &TranscriptFacts,
+    protected_from: usize,
+    config: PruneConfig,
+    total_turns: usize,
+    estimator: &dyn TokenEstimator,
+    pass: &mut DecisionPass,
+) {
+    let Some(max_age) = config.age_mask_turns else {
+        return;
+    };
+    for earlier in &facts.results {
+        if !pass.eligible(earlier, protected_from) {
+            continue;
+        }
+        if earlier.status == ToolStatus::Success
+            && earlier.read_call.is_some()
+            && total_turns.saturating_sub(earlier.turn) > max_age
+        {
+            pass.add(earlier, StubReason::TurnAge, estimator);
         }
     }
+}
 
-    (stubbed, reclaim_tokens)
+/// Computes the stub set from the transcript under ADR-011's fixed
+/// strategy order, plus the reclaim estimate (in tokens) against the
+/// *unpruned* projection.
+fn decide(
+    session: &Session,
+    registry: &ToolRegistry,
+    config: PruneConfig,
+    estimator: &dyn TokenEstimator,
+    window_triggered: bool,
+) -> (Vec<StubDecision>, u64) {
+    let facts = TranscriptFacts::collect(session, registry, estimator);
+    let protected_from = facts.protected_from(&session.transcript, config, estimator);
+    let total_turns = facts.assistant_at.len();
+
+    let mut pass = DecisionPass::default();
+    dedupe_reads(&facts, protected_from, estimator, &mut pass);
+    supersede_reads(&facts, protected_from, estimator, &mut pass);
+    stub_stale_errors(
+        &facts,
+        protected_from,
+        config,
+        total_turns,
+        estimator,
+        &mut pass,
+    );
+    age_out_large_reads(
+        &facts,
+        protected_from,
+        window_triggered,
+        estimator,
+        &mut pass,
+    );
+    mask_aged_reads(
+        &facts,
+        protected_from,
+        config,
+        total_turns,
+        estimator,
+        &mut pass,
+    );
+
+    (pass.stubbed, pass.reclaim_tokens)
 }
 
 /// Estimated tokens of the stub that would replace this result.
