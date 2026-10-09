@@ -123,7 +123,13 @@ unbounded — a slow consumer queues rather than back-pressures the agent;
 only a closed receiver drops (counted, warned once). `FanoutSink`
 composes several sinks into one so multi-consumer frontends (the CLI's
 renderer + trace writer, future GUI/TUI) each get their own numbered
-stream; its drop count sums the children. `StrictSink` wraps a
+stream; its drop count sums the children. `StatusRecorder` is a sink
+that folds the stream into a pollable `StatusSnapshot` — current turn,
+in-flight tools (correlated by call id), running request attempt, task
+phase, and the idle session after `AwaitingInput` — the progress
+surface a GUI or TUI polls while a task runs; clones share one
+snapshot, so the driving API and the poller hold the same state.
+`StrictSink` wraps a
 sink and cancels the task on first drop; the eval harness requires zero
  dropped events.
 
@@ -500,6 +506,16 @@ and tool batch) commits in full, then the loop ends with
 The session survives either stop; the CLI maps one Ctrl-C to pause and
 a second to cancel.
 
+Progress polling follows the same stream-first shape — there is no
+separate status channel to keep coherent. `kernel::event::StatusRecorder`
+is a sink that folds the events a task already emits (`TurnStarted`,
+`ModelRequestStarted`/`ModelCompleted`, `ToolStarted`/`ToolCompleted`,
+the terminal events, `AwaitingInput`) into a pollable `StatusSnapshot`:
+current turn, in-flight tools, running attempt, phase, and the idle
+session id. Frontends clone the recorder, fan one clone out next to
+their rendering sink, and poll the retained handle on their own cadence;
+one recorder tracks one task, so concurrent runs each get their own.
+
 Provider selection lives in one private engine module
 (`provider.rs`), the only place that names concrete adapters. It matches
 the configured provider name against the adapters' `PROVIDER_NAME`
@@ -712,7 +728,7 @@ Compare suites by medians over N ≥ 5; the observed noise floor is ±10%.
 - Blocking work on the blocking pool; hashing never under a lock.
 - Facts scanned once per task; capabilities resolved once per task.
 
-**Testing** — the workspace carries 664 tests (13 live-API tests
+**Testing** — the workspace carries 669 tests (13 live-API tests
 ignored by default): unit tests per module,
 protocol and invariant tests against in-memory seams, security regression
 tests for confinement, canary tests for secrets, integration tests that

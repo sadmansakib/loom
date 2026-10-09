@@ -400,6 +400,157 @@ impl EventSink for FanoutSink {
     }
 }
 
+/// Coarse task phase for [`StatusSnapshot`], folded from terminal events.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPhase {
+    /// No task observed yet, or the engine went idle awaiting input.
+    #[default]
+    Idle,
+    /// Between `TaskStarted` and a terminal event.
+    Running,
+    /// Terminal success (`TaskCompleted`).
+    Completed,
+    /// Terminal failure (`TaskFailed`).
+    Failed,
+    /// Cancelled mid-flight (`TaskCancelled`).
+    Cancelled,
+    /// Paused between turns (`TaskPaused`); the session is resumable.
+    Paused,
+}
+
+/// A pollable progress picture of one task, folded from the event stream.
+///
+/// Derived state, never the source of truth (ADR-004 — the transcript
+/// is): rebuild it at any time by replaying events. Maintained by
+/// [`StatusRecorder`]; frontends poll
+/// [`snapshot`](StatusRecorder::snapshot) on their own cadence (a TUI
+/// status line, a GUI progress pane). The fields answer "where is this
+/// task right now": which turn, which tools are executing, which
+/// request attempt, and what phase the task ended in.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusSnapshot {
+    /// The task this snapshot describes, from the latest envelope seen.
+    pub task_id: Option<TaskId>,
+    /// The idle session after [`EventKind::AwaitingInput`], once
+    /// observed — the id a resume loop sends the next input to.
+    pub session_id: Option<SessionId>,
+    /// 1-based turn now running (the latest `TurnStarted`).
+    pub turn: Option<u32>,
+    /// Names of tool calls started but not yet completed, in start
+    /// order — usually one; more when a batch runs concurrently.
+    pub in_flight_tools: Vec<String>,
+    /// The running model-request attempt (the latest
+    /// `ModelRequestStarted`), cleared on `ModelCompleted`.
+    pub attempt: Option<u32>,
+    /// Coarse task phase.
+    pub phase: TaskPhase,
+}
+
+/// An [`EventSink`] that folds the stream into a pollable
+/// [`StatusSnapshot`] — the progress surface frontends poll while a
+/// task runs (current turn, in-flight tools, running attempt, phase).
+///
+/// Clone it and hand one clone to the driving API — directly, or as a
+/// [`FanoutSink`] child via `with(recorder.clone())` — and keep the
+/// other for polling: clones share one snapshot, so the retained handle
+/// observes everything emitted. It is a pure in-memory tally: it cannot
+/// drop events, so it is a transparent inner choice for [`StrictSink`].
+///
+/// One recorder tracks one task's stream. Frontends driving concurrent
+/// tasks give each run its own recorder (its own fan-out branch);
+/// envelopes from interleaved tasks would otherwise overwrite each
+/// other's fields.
+#[derive(Clone, Default)]
+pub struct StatusRecorder {
+    inner: Arc<StatusInner>,
+}
+
+/// Shared mutable fold state; the lock is held only across one `emit`
+/// and never across an await.
+#[derive(Default)]
+struct StatusInner {
+    state: std::sync::Mutex<RecorderState>,
+}
+
+/// What [`StatusRecorder`] actually tracks; projected into
+/// [`StatusSnapshot`] on poll.
+#[derive(Default)]
+struct RecorderState {
+    task_id: Option<TaskId>,
+    session_id: Option<SessionId>,
+    turn: Option<u32>,
+    attempt: Option<u32>,
+    phase: TaskPhase,
+    /// Correlation id + name per started-but-not-completed tool call,
+    /// so concurrent same-name calls stay distinct.
+    in_flight: Vec<(ToolCallId, String)>,
+}
+
+impl StatusRecorder {
+    /// Creates a recorder whose snapshot starts `Idle` with no fields
+    /// set — the state before any event is observed.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The current progress picture (a cheap clone of small state).
+    pub fn snapshot(&self) -> StatusSnapshot {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        StatusSnapshot {
+            task_id: state.task_id,
+            session_id: state.session_id,
+            turn: state.turn,
+            in_flight_tools: state
+                .in_flight
+                .iter()
+                .map(|(_, name)| name.clone())
+                .collect(),
+            attempt: state.attempt,
+            phase: state.phase,
+        }
+    }
+}
+
+impl EventSink for StatusRecorder {
+    fn emit(&self, task_id: TaskId, kind: EventKind) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.task_id = Some(task_id);
+        match kind {
+            EventKind::TaskStarted => state.phase = TaskPhase::Running,
+            EventKind::TurnStarted { turn } => state.turn = Some(turn),
+            EventKind::ModelRequestStarted { attempt } => state.attempt = Some(attempt),
+            EventKind::ModelCompleted { .. } => state.attempt = None,
+            EventKind::ToolStarted { name, call_id } => {
+                state.in_flight.push((call_id, name));
+            }
+            EventKind::ToolCompleted { call_id, .. } => {
+                state.in_flight.retain(|(id, _)| *id != call_id);
+            }
+            EventKind::TaskCompleted => state.phase = TaskPhase::Completed,
+            EventKind::TaskFailed { .. } => state.phase = TaskPhase::Failed,
+            EventKind::TaskCancelled => state.phase = TaskPhase::Cancelled,
+            EventKind::TaskPaused => state.phase = TaskPhase::Paused,
+            EventKind::AwaitingInput { session_id } => {
+                state.session_id = Some(session_id);
+                state.phase = TaskPhase::Idle;
+            }
+            // Deltas and prune reports do not move the coarse picture.
+            _ => {}
+        }
+    }
+}
+
 /// An [`EventSink`] that cancels the task when an event is lost.
 ///
 /// Evaluation runs must fail on event loss rather than silently accepting a
@@ -832,5 +983,184 @@ mod tests {
             1,
             "caller keeps the child alive"
         );
+    }
+
+    #[test]
+    fn status_recorder_tracks_a_task_lifecycle() {
+        let recorder = StatusRecorder::new();
+        let task = TaskId::new();
+        let call = ToolCallId::try_from("call_1".to_owned()).unwrap();
+
+        // Before anything: idle with no fields set.
+        let idle = recorder.snapshot();
+        assert_eq!(idle.phase, TaskPhase::Idle);
+        assert_eq!(idle.task_id, None);
+
+        recorder.emit(task, EventKind::TaskStarted);
+        assert_eq!(recorder.snapshot().phase, TaskPhase::Running);
+
+        recorder.emit(task, EventKind::TurnStarted { turn: 1 });
+        assert_eq!(recorder.snapshot().turn, Some(1));
+
+        recorder.emit(task, EventKind::ModelRequestStarted { attempt: 1 });
+        assert_eq!(recorder.snapshot().attempt, Some(1));
+
+        recorder.emit(task, EventKind::TextDelta { text: "…".into() });
+        assert_eq!(
+            recorder.snapshot().attempt,
+            Some(1),
+            "deltas keep the attempt"
+        );
+
+        let response = ModelResponse {
+            message: AssistantMessage {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                stop_reason: StopReason::EndTurn,
+            },
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cached_input_tokens: None,
+                thinking_tokens: None,
+                cache_creation_input_tokens: None,
+                cost_usd: None,
+            },
+        };
+        recorder.emit(task, EventKind::ModelCompleted { response });
+        assert_eq!(
+            recorder.snapshot().attempt,
+            None,
+            "completed clears the attempt"
+        );
+
+        recorder.emit(
+            task,
+            EventKind::ToolStarted {
+                name: "read_file".into(),
+                call_id: call.clone(),
+            },
+        );
+        assert_eq!(
+            recorder.snapshot().in_flight_tools,
+            vec!["read_file".to_owned()]
+        );
+
+        recorder.emit(
+            task,
+            EventKind::ToolCompleted {
+                name: "read_file".into(),
+                call_id: call,
+            },
+        );
+        assert_eq!(recorder.snapshot().in_flight_tools, Vec::<String>::new());
+
+        recorder.emit(task, EventKind::TaskCompleted);
+        let done = recorder.snapshot();
+        assert_eq!(done.phase, TaskPhase::Completed);
+        assert_eq!(done.task_id, Some(task));
+        assert_eq!(done.turn, Some(1), "fields persist past the terminal event");
+
+        let session = SessionId::new();
+        recorder.emit(
+            task,
+            EventKind::AwaitingInput {
+                session_id: session,
+            },
+        );
+        let idle = recorder.snapshot();
+        assert_eq!(idle.phase, TaskPhase::Idle);
+        assert_eq!(idle.session_id, Some(session));
+    }
+
+    #[test]
+    fn status_recorder_shares_one_snapshot_across_clones() {
+        // The driving pattern: fan a clone out to the task, keep the
+        // original for polling — both must see the same fold state.
+        let recorder = StatusRecorder::new();
+        let (channel, mut receiver) = ChannelEventSink::new();
+        let sink = FanoutSink::new().with(recorder.clone()).with(channel);
+        let task = TaskId::new();
+
+        sink.emit(task, EventKind::TaskStarted);
+        sink.emit(task, EventKind::TurnStarted { turn: 2 });
+
+        assert_eq!(recorder.snapshot().phase, TaskPhase::Running);
+        assert_eq!(recorder.snapshot().turn, Some(2));
+        assert_eq!(sink.dropped(), 0, "the tally cannot drop");
+        assert_eq!(
+            receiver.try_recv().unwrap().kind,
+            EventKind::TaskStarted,
+            "siblings still receive"
+        );
+    }
+
+    #[test]
+    fn status_recorder_keeps_concurrent_tool_calls_distinct() {
+        let recorder = StatusRecorder::new();
+        let task = TaskId::new();
+        let a = ToolCallId::try_from("call_a".to_owned()).unwrap();
+        let b = ToolCallId::try_from("call_b".to_owned()).unwrap();
+
+        recorder.emit(
+            task,
+            EventKind::ToolStarted {
+                name: "shell".into(),
+                call_id: a.clone(),
+            },
+        );
+        recorder.emit(
+            task,
+            EventKind::ToolStarted {
+                name: "shell".into(),
+                call_id: b.clone(),
+            },
+        );
+        assert_eq!(
+            recorder.snapshot().in_flight_tools,
+            vec!["shell".to_owned(), "shell".to_owned()]
+        );
+
+        recorder.emit(
+            task,
+            EventKind::ToolCompleted {
+                name: "shell".into(),
+                call_id: a,
+            },
+        );
+        assert_eq!(
+            recorder.snapshot().in_flight_tools,
+            vec!["shell".to_owned()],
+            "completion correlates by call id, not name"
+        );
+        recorder.emit(
+            task,
+            EventKind::ToolCompleted {
+                name: "shell".into(),
+                call_id: b,
+            },
+        );
+        assert_eq!(recorder.snapshot().in_flight_tools, Vec::<String>::new());
+    }
+
+    #[test]
+    fn status_snapshot_survives_a_json_round_trip() {
+        // IPC-ready: a GUI may shuttle snapshots across a process
+        // boundary; the shape must round-trip like the events it
+        // derives from.
+        let snapshot = StatusSnapshot {
+            task_id: Some(TaskId::new()),
+            session_id: Some(SessionId::new()),
+            turn: Some(3),
+            in_flight_tools: vec!["edit_file".to_owned()],
+            attempt: Some(1),
+            phase: TaskPhase::Running,
+        };
+        let value = serde_json::to_value(&snapshot).expect("serializes");
+        assert_eq!(value["phase"], "running");
+        assert_eq!(value["in_flight_tools"][0], "edit_file");
+        let round: StatusSnapshot = serde_json::from_value(value).expect("round-trips");
+        assert_eq!(round, snapshot);
     }
 }

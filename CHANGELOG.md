@@ -3,6 +3,22 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — StatusRecorder: pollable progress snapshots (B5)
+
+Frontends polling "where is this task right now?" no longer need to
+reimplement event folding. `kernel::event::StatusRecorder` is a sink
+that folds the stream a task already emits into a `StatusSnapshot`:
+current turn, in-flight tools (correlated by call id, so concurrent
+same-name calls stay distinct), the running model-request attempt,
+task phase (idle/running/completed/failed/cancelled/paused), and the
+idle session after `AwaitingInput` — the id a resume loop sends the
+next input to. Clones share one snapshot: fan a clone out next to the
+rendering sink (`FanoutSink::new().with(recorder.clone())`), poll the
+retained handle. Pure in-memory tally — cannot drop, transparent to
+`StrictSink`; one recorder tracks one task. Snapshots serialize, so a
+GUI can shuttle them across a process boundary. No event-schema
+change: the stream already carried everything.
+
 ## 2026-10-09 — TaskControl: two-granularity stopping (cancel vs pause)
 
 `run_task` and `continue_session` now take a `TaskControl` instead of a

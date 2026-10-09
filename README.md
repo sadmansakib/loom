@@ -57,7 +57,7 @@ pruning with turn-age masking and one-line stubs, bootstrap repo facts
 (tree, toolchains, AGENTS.md), sandboxed command execution (Seatbelt on
 macOS, bubblewrap on Linux), `edit_file` batch edits with region echo and
 whitespace-trim repair, a completion gate that refuses premature end turns,
-and `loom stats`. 664 tests.
+and `loom stats`. 669 tests.
 
 ## Development
 

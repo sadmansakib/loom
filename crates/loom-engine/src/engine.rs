@@ -618,6 +618,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recorder_observes_the_engine_lifecycle_through_a_fanout() {
+        // B5's consumer shape: fan a StatusRecorder clone out next to a
+        // rendering channel; polling the retained handle must see the
+        // task run and the engine's idle marker flip it back to Idle.
+        let engine = fake_engine(FakeProvider::scripted(vec![FakeProvider::end_turn_script(
+            "done",
+        )]));
+        let recorder = loom_kernel::event::StatusRecorder::new();
+        let (channel, _receiver) = loom_kernel::event::ChannelEventSink::new();
+        let sink = loom_kernel::event::FanoutSink::new()
+            .with(recorder.clone())
+            .with(channel);
+        let mut session = engine.new_session();
+
+        engine
+            .run_task(&mut session, "anything", &sink, &Default::default())
+            .await
+            .expect("task completes");
+
+        let snapshot = recorder.snapshot();
+        assert_eq!(snapshot.phase, loom_kernel::event::TaskPhase::Idle);
+        assert_eq!(snapshot.session_id, Some(session.id));
+        assert_eq!(
+            snapshot.task_id,
+            session.tasks.last().map(|record| record.id),
+            "the idle marker's envelope names the ended task"
+        );
+        assert_eq!(snapshot.turn, Some(1));
+        assert_eq!(snapshot.attempt, None);
+        assert_eq!(snapshot.in_flight_tools, Vec::<String>::new());
+    }
+
+    #[tokio::test]
     async fn continue_session_reports_unknown_ids() {
         let engine = fake_engine(FakeProvider::scripted(vec![FakeProvider::end_turn_script(
             "unused",
