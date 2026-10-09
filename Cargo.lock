@@ -1469,6 +1469,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tiktoken-rs",
+ "tokio",
  "tokio-util",
  "tracing",
  "uuid",

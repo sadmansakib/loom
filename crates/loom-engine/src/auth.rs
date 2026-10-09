@@ -56,6 +56,41 @@ pub fn provider_env_names(provider: &str) -> &'static [&'static str] {
     }
 }
 
+/// One environment fallback: its name and whether it currently holds a
+/// non-empty value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnvVarState {
+    /// The variable name, as [`provider_env_names`] lists it.
+    pub name: &'static str,
+    /// Whether the variable is set to a non-empty value.
+    pub set: bool,
+}
+
+/// Which of `provider`'s environment fallbacks are currently live.
+///
+/// Resolution consults the environment only after saved accounts (ADR-009),
+/// so a frontend reports this beside its account table (`auth list`).
+/// Computing it here, next to [`provider_env_names`], keeps the
+/// environment knowledge in one place.
+pub fn provider_env_state(provider: &str) -> Vec<EnvVarState> {
+    provider_env_state_with(provider, |name| std::env::var(name).ok())
+}
+
+/// [`provider_env_state`] over an injected environment, for callers and
+/// tests that must not touch the process environment.
+fn provider_env_state_with(
+    provider: &str,
+    get_env: impl Fn(&str) -> Option<String>,
+) -> Vec<EnvVarState> {
+    provider_env_names(provider)
+        .iter()
+        .map(|&name| EnvVarState {
+            name,
+            set: get_env(name).is_some_and(|value| !value.is_empty()),
+        })
+        .collect()
+}
+
 /// Identity of one stored account, used as the keychain user. A UUID v7
 /// string, so ids are time-ordered and collision-free.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1076,7 +1111,44 @@ mod tests {
         assert_eq!(provider_env_names("anthropic"), &["ANTHROPIC_API_KEY"]);
         assert_eq!(provider_env_names("openrouter"), &["OPENROUTER_API_KEY"]);
         assert_eq!(provider_env_names("glm"), &["ZAI_API_KEY", "Z_AI_API_KEY"]);
+        assert_eq!(
+            provider_env_names("nvidia"),
+            &["NVIDIA_API_KEY", "NIM_API_KEY"]
+        );
         assert!(provider_env_names("nope").is_empty());
+    }
+
+    #[test]
+    fn env_state_marks_only_populated_names() {
+        // glm declares two fallbacks in order; only a set, non-empty
+        // variable counts as live.
+        let state = provider_env_state_with("glm", |name| {
+            (name == "ZAI_API_KEY").then(|| "k".to_owned())
+        });
+        assert_eq!(
+            state,
+            vec![
+                EnvVarState {
+                    name: "ZAI_API_KEY",
+                    set: true
+                },
+                EnvVarState {
+                    name: "Z_AI_API_KEY",
+                    set: false
+                },
+            ]
+        );
+        // An empty value is as good as absent.
+        let state = provider_env_state_with("deepseek", |_| Some(String::new()));
+        assert_eq!(
+            state,
+            vec![EnvVarState {
+                name: "DEEPSEEK_API_KEY",
+                set: false
+            }]
+        );
+        // Unknown providers have no fallbacks to report.
+        assert!(provider_env_state_with("nope", |_| None).is_empty());
     }
 
     #[test]

@@ -9,9 +9,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::Context;
-use loom_core::engine::auth::Auth;
 use loom_core::kernel::event::ChannelEventSink;
-use loom_core::providers::{OPENROUTER_PROVIDER_NAME, ProviderCatalog};
 use loom_core::{Engine, EngineConfig};
 use tokio_util::sync::CancellationToken;
 
@@ -25,29 +23,24 @@ use loom_core::engine::trace::{Outcome, TraceMeta, TraceWriter};
 /// (`130` for cancellation, `1` otherwise); only setup failures propagate as
 /// `Err`.
 pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
-    // The runtime exists before the engine opens: fetching the OpenRouter
-    // catalog is asynchronous and must complete before `Engine::open`, which
-    // resolves capabilities from it.
+    // The runtime exists before the engine opens: the provider's requests
+    // (and, for OpenRouter, the catalog fetch inside `open_async`) need a
+    // reactor, and Ctrl-C arrives as a tokio signal.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("building the tokio runtime")?;
 
     let db_path = loom_core::paths::db_path();
-    let catalog = if args.provider == OPENROUTER_PROVIDER_NAME {
-        Some(ProviderCatalog::OpenRouter(load_openrouter_catalog(
-            &runtime, &args, &db_path,
-        )?))
-    } else {
-        None
-    };
 
     // Captured before `EngineConfig` consumes the strings: the trace
     // manifest needs the run configuration after the task ended.
     let trace_provider = args.provider.clone();
     let trace_model = args.model.clone();
 
-    let engine = Engine::open(EngineConfig {
+    // `open_async` owns the catalog sequencing: fetch, cache beside the
+    // database, fall back to a stale cache — identical for every frontend.
+    let engine = runtime.block_on(Engine::open_async(EngineConfig {
         provider: args.provider,
         model: args.model,
         base_url: args.base_url,
@@ -58,8 +51,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         max_turns: args.max_turns,
         db_path,
         persist: !args.no_save,
-        catalog,
-    })?;
+        catalog: None,
+    }))?;
 
     let mut session = engine.new_session();
     let input = args.task.join(" ");
@@ -156,25 +149,4 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             })
         }
     }
-}
-
-/// Obtains the OpenRouter catalog before the engine opens.
-///
-/// The engine resolves capabilities from the catalog, so a missing one is a
-/// setup failure, not a runtime one. Credential resolution goes through the
-/// engine's account store, so `--account`, saved accounts, and the
-/// environment behave exactly as they will for the provider itself.
-fn load_openrouter_catalog(
-    runtime: &tokio::runtime::Runtime,
-    args: &RunArgs,
-    db_path: &std::path::Path,
-) -> anyhow::Result<loom_core::providers::OpenRouterCatalog> {
-    let auth = Auth::open(db_path).context("opening the account store")?;
-    runtime.block_on(crate::catalog::load(
-        &auth,
-        &args.provider,
-        args.account.as_deref(),
-        args.base_url.as_deref(),
-        db_path,
-    ))
 }

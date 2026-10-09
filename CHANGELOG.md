@@ -3,6 +3,23 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — Catalog policy behind the engine; `Engine::open_async`; auth env-state helper
+
+The OpenRouter catalog policy — fetch with the credential the provider
+itself would use, cache beside the state database with a 24-hour TTL,
+fall back to a stale cache when the network is unreachable — moved from
+the CLI into `engine::catalog` (A5). `Engine::open_async` (B2) drives it
+before the synchronous open when a config needs a catalog and does not
+already carry one, so every frontend gets the sequencing identically
+instead of re-implementing it around `Engine::open`; the CLI's `run`
+dropped its runtime-dances and calls `open_async` like anyone else.
+
+`auth::provider_env_state` (B6) computes which environment fallbacks
+are live, next to `provider_env_names` where the names are declared;
+`auth list` renders it instead of scanning the environment itself.
+Tests: 653 (+2 — `open_async` credential ordering, env-state marking);
+the four catalog-policy tests moved crates with the module.
+
 ## 2026-10-09 — Trace format + attribution move behind the engine
 
 The trace export (`events.ndjson` / `manifest.json` / `transcript.json`)

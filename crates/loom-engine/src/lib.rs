@@ -8,6 +8,9 @@
 //!   reasoning effort, turn ceiling, and whether sessions persist.
 //! - **Credential resolution** ([`auth`]) — the SQLite account store, the OS
 //!   keychain backend, and ADR-009 resolution order.
+//! - **The model-catalog policy** ([`catalog`]) — fetch, cache beside the
+//!   database, and fall back to a stale cache, driven by
+//!   [`Engine::open_async`].
 //! - **Composition** ([`Engine::open`]) — one concrete provider, the built-in
 //!   tool registry, and the durable session store, assembled through the
 //!   `loom-kernel` traits.
@@ -32,6 +35,7 @@
 //! credentials (ADR-009) and uses `tracing` for diagnostics.
 
 pub mod auth;
+pub mod catalog;
 pub mod engine;
 mod estimate;
 mod provider;

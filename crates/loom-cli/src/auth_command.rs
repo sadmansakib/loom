@@ -83,12 +83,12 @@ fn list(auth: &Auth, args: ListArgs) -> anyhow::Result<()> {
     providers.sort();
     providers.dedup();
     for provider in providers {
-        for name in auth::provider_env_names(&provider) {
-            let state = match std::env::var(name) {
-                Ok(value) if !value.is_empty() => "set",
-                _ => "unset",
-            };
-            println!("  environment {provider} {name} ({state})");
+        for state in auth::provider_env_state(&provider) {
+            println!(
+                "  environment {provider} {} ({})",
+                state.name,
+                if state.set { "set" } else { "unset" }
+            );
         }
     }
     Ok(())

@@ -27,6 +27,8 @@ tokio-util = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `Engine::open_async` tests (rt + macros for #[tokio::test]).
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]
 workspace = true

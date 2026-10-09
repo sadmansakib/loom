@@ -24,7 +24,7 @@ kernel never links a filesystem store or a CLI, the engine never prints.
 |---|---|---|
 | `loom-core` | Facade re-exporting the public surface for embedders, plus the shared data-dir policy (`paths`) | engine, kernel, providers, store, tools |
 | `loom-kernel` | The agent itself: loop, context compilation, session/transcript model, tool abstraction, tool cache, artifacts, events, budgets | no workspace crates — it defines the side-effect traits (`ModelProvider`, `SessionStore`, `ArtifactStore`, `Tool`, …) itself |
-| `loom-engine` | Composition root: builds a configured `Agent` from paths, auth, a provider factory, tool registry, and stores; repository facts scanner; owns the trace export format (`engine::trace`) and its aggregation (`engine::trace_stats`) | kernel, store, providers, tools |
+| `loom-engine` | Composition root: builds a configured `Agent` from paths, auth, a provider factory, tool registry, and stores; repository facts scanner; owns the OpenRouter catalog policy (`engine::catalog`), the trace export format (`engine::trace`), and its aggregation (`engine::trace_stats`) | kernel, store, providers, tools |
 | `loom-providers` | Model provider adapters (DeepSeek, OpenRouter, GLM, NVIDIA over one shared OpenAI-compatible wire; Anthropic on its own messages-API driver) | kernel model types |
 | `loom-store` | SQLite persistence: sessions, turns, tasks, artifacts, auth accounts | kernel store traits |
 | `loom-tools` | The shipped tool suite (read/search/edit/write/list/run/verify + artifact read) | kernel tool traits |
@@ -459,6 +459,11 @@ wrap the context compiler with the pruning decorator, attach the facts
 source, and open the stores. It returns an `Engine` or a fully
 taxonomized `EngineError` — never a partially wired agent. The engine
 never prints; it reports through typed results and the event stream.
+Its asynchronous counterpart `Engine::open_async` adds exactly one step
+in front — obtaining the OpenRouter model catalog through `engine::
+catalog` (fetch with the provider's own credential, cache beside the
+database, stale-cache fallback) when the config does not already carry
+one — so no frontend re-implements that sequencing.
 
 Provider selection lives in one private engine module
 (`provider.rs`), the only place that names concrete adapters. It matches
@@ -521,10 +526,13 @@ Five adapters ship:
 - **OpenRouter** — capabilities and pricing resolved from the provider's
   model catalog (`GET /models`). Free and paid models travel the same
   path: pricing is data (zero for free, non-zero for paid), never a
-  branch. The catalog is fetched and cached by the *frontend* and handed
-  to the engine as `EngineConfig::catalog`, so the engine
-  stays synchronous and offline-capable. Attribution headers are
-  optional configuration.
+  branch. The catalog policy — fetch with the credential the provider
+  itself would use, cache beside the state database with a 24-hour TTL,
+  fall back to a stale cache when the network is unreachable — is owned
+  by the engine (`engine::catalog`), driven by `Engine::open_async`; a
+  frontend holding a snapshot already can pass it as
+  `EngineConfig::catalog` to the synchronous `Engine::open`.
+  Attribution headers are optional configuration.
 - **GLM** — Z.ai's **metered** API (`api.z.ai/api/paas/v4`), never the
   Coding Plan endpoint. Same OpenAI-compatible wire as DeepSeek with
   GLM's `thinking` parameter: the 5.3 family forces thinking on
@@ -669,7 +677,7 @@ Compare suites by medians over N ≥ 5; the observed noise floor is ±10%.
 - Blocking work on the blocking pool; hashing never under a lock.
 - Facts scanned once per task; capabilities resolved once per task.
 
-**Testing** — the workspace carries 651 tests (13 live-API tests
+**Testing** — the workspace carries 653 tests (13 live-API tests
 ignored by default): unit tests per module,
 protocol and invariant tests against in-memory seams, security regression
 tests for confinement, canary tests for secrets, integration tests that

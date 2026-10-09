@@ -1,17 +1,21 @@
 //! The OpenRouter model-catalog cache.
 //!
-//! Fetching the catalog is a frontend responsibility: the engine receives
-//! the parsed snapshot as data and stays synchronous. This module owns the
-//! CLI's policy for obtaining one — reuse a fresh cache, refresh when it is
-//! stale, and fall back to a stale cache when the network is unreachable, so
-//! a transient outage cannot block a run that already has a usable catalog.
+//! The engine resolves model capabilities from the catalog, so obtaining
+//! one is part of opening an engine, not a frontend chore: [`load`]
+//! reuses a fresh cache, refreshes a stale one through the credential
+//! the provider itself would use, and falls back to a stale cache when
+//! the network is unreachable — a transient outage cannot block a run
+//! that already has a usable catalog. [`Engine::open_async`] drives this
+//! before the synchronous open; a frontend that already holds a snapshot
+//! can pass it in [`EngineConfig::catalog`] and use [`Engine::open`].
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::Context;
-use loom_core::engine::auth::Auth;
-use loom_core::providers::{self, OpenRouterCatalog};
+use loom_providers::{self, OpenRouterCatalog};
+
+use crate::auth::Auth;
+use crate::engine::EngineError;
 
 /// How long a fetched catalog is considered fresh.
 const CATALOG_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -28,7 +32,7 @@ pub fn catalog_path(db_path: &Path) -> PathBuf {
 ///
 /// Order: a fresh cache wins without touching the network; otherwise the
 /// credential is resolved through the engine's account store (the same
-/// implementation the engine uses) and the catalog is fetched. A fetch
+/// implementation the provider uses) and the catalog is fetched. A fetch
 /// failure falls back to a stale cache when one exists.
 pub async fn load(
     auth: &Auth,
@@ -36,25 +40,23 @@ pub async fn load(
     account: Option<&str>,
     base_url: Option<&str>,
     db_path: &Path,
-) -> anyhow::Result<OpenRouterCatalog> {
+) -> Result<OpenRouterCatalog, EngineError> {
     let path = catalog_path(db_path);
     let cached = read_cache(&path);
 
     if let Some(cached) = &cached
-        && is_fresh(cached, providers::now_epoch_secs())
+        && is_fresh(cached, loom_providers::now_epoch_secs())
     {
         return Ok(cached.clone());
     }
 
-    let credential = auth
-        .resolve(provider, account)
-        .context("resolving the OpenRouter credential")?;
-    let base = base_url.unwrap_or(providers::OPENROUTER_DEFAULT_BASE_URL);
+    let credential = auth.resolve(provider, account)?;
+    let base = base_url.unwrap_or(loom_providers::OPENROUTER_DEFAULT_BASE_URL);
 
-    match providers::fetch_catalog(
+    match loom_providers::fetch_catalog(
         base,
         credential.secret.expose(),
-        providers::TimeoutConfig::default(),
+        loom_providers::TimeoutConfig::default(),
     )
     .await
     {
@@ -71,7 +73,7 @@ pub async fn load(
                 tracing::warn!(%error, "using the stale OpenRouter catalog");
                 Ok(cached)
             }
-            None => Err(error).context("fetching the OpenRouter model catalog"),
+            None => Err(EngineError::Provider(Box::new(error))),
         },
     }
 }
@@ -95,13 +97,12 @@ fn read_cache(path: &Path) -> Option<OpenRouterCatalog> {
 }
 
 /// Writes the catalog cache, creating the parent directory as needed.
-fn write_cache(path: &Path, catalog: &OpenRouterCatalog) -> anyhow::Result<()> {
+fn write_cache(path: &Path, catalog: &OpenRouterCatalog) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        std::fs::create_dir_all(parent)?;
     }
-    let body = serde_json::to_vec(catalog).context("serializing the OpenRouter catalog")?;
-    std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))
+    let body = serde_json::to_vec(catalog).map_err(std::io::Error::other)?;
+    std::fs::write(path, body)
 }
 
 #[cfg(test)]
@@ -117,7 +118,7 @@ mod tests {
 
     #[test]
     fn cache_round_trips_through_the_file() {
-        let dir = std::env::temp_dir().join("loom-cli-catalog-test");
+        let dir = std::env::temp_dir().join("loom-engine-catalog-test");
         let path = catalog_path(&dir.join("loom.db"));
         let original = catalog(1_700_000_000);
         write_cache(&path, &original).expect("writes");
@@ -127,11 +128,11 @@ mod tests {
 
     #[test]
     fn missing_or_corrupt_cache_reads_as_absent() {
-        let path = std::env::temp_dir().join("loom-cli-catalog-missing.json");
+        let path = std::env::temp_dir().join("loom-engine-catalog-missing.json");
         let _ = std::fs::remove_file(&path);
         assert_eq!(read_cache(&path), None);
 
-        let corrupt = std::env::temp_dir().join("loom-cli-catalog-corrupt.json");
+        let corrupt = std::env::temp_dir().join("loom-engine-catalog-corrupt.json");
         std::fs::write(&corrupt, b"not json").expect("writes");
         assert_eq!(read_cache(&corrupt), None);
         let _ = std::fs::remove_file(&corrupt);

@@ -18,7 +18,7 @@ use loom_kernel::id::SessionId;
 use loom_kernel::session::Session;
 use loom_kernel::store::StoreError;
 use loom_kernel::tool::ToolRegistry;
-use loom_providers::{ProviderCatalog, ReasoningEffort};
+use loom_providers::{OPENROUTER_PROVIDER_NAME, ProviderCatalog, ReasoningEffort};
 use loom_store::SqliteStore;
 use loom_tools::policy::CommandPolicy;
 use loom_tools::{
@@ -68,12 +68,13 @@ pub struct EngineConfig {
     pub persist: bool,
     /// Model catalog for catalog-driven adapters, handed in as data.
     ///
-    /// The frontend fetches and caches the snapshot (see
-    /// [`loom_providers::fetch_catalog`]) and passes the matching
-    /// [`ProviderCatalog`] variant here, so the engine stays synchronous
-    /// and never performs network discovery of its own. Adapters that
-    /// resolve capabilities from a built-in table ignore it; adapters
-    /// that need one reject the run when it is absent.
+    /// A frontend that already holds a snapshot passes the matching
+    /// [`ProviderCatalog`] variant here and uses [`Engine::open`], which
+    /// stays synchronous and never performs network discovery of its own.
+    /// Otherwise [`Engine::open_async`] fetches and caches one through
+    /// [`crate::catalog`] first. Adapters that resolve capabilities from a
+    /// built-in table ignore it; adapters that need one reject the run
+    /// when it is absent.
     pub catalog: Option<ProviderCatalog>,
 }
 
@@ -190,6 +191,41 @@ impl Engine {
         }
 
         Ok(Self { agent })
+    }
+
+    /// Opens the engine, fetching the OpenRouter catalog first when one is
+    /// needed and not already supplied.
+    ///
+    /// The asynchronous counterpart of [`Engine::open`]: capabilities are
+    /// resolved from the catalog, so `openrouter` runs must obtain one
+    /// before the synchronous open. The sequencing — resolve the
+    /// credential, fetch, cache beside the database, fall back to a stale
+    /// cache — lives here ([`crate::catalog`]) so every frontend gets it
+    /// identically instead of re-implementing it before `open`. A config
+    /// that already carries a catalog, or names a provider that needs
+    /// none, skips the network entirely.
+    ///
+    /// Await this from the frontend's async context; everything after the
+    /// optional fetch is the same blocking work [`Engine::open`] documents.
+    pub async fn open_async(config: EngineConfig) -> Result<Self, EngineError> {
+        let config = if config.catalog.is_none() && config.provider == OPENROUTER_PROVIDER_NAME {
+            let auth = crate::auth::Auth::open(&config.db_path)?;
+            let catalog = crate::catalog::load(
+                &auth,
+                &config.provider,
+                config.account.as_deref(),
+                config.base_url.as_deref(),
+                &config.db_path,
+            )
+            .await?;
+            EngineConfig {
+                catalog: Some(ProviderCatalog::OpenRouter(catalog)),
+                ..config
+            }
+        } else {
+            config
+        };
+        Engine::open(config)
     }
 
     /// Creates a fresh session handle for one run.
@@ -380,4 +416,35 @@ pub enum EngineError {
     /// The session store could not be opened, read, or written.
     #[error("session store: {0}")]
     Session(#[source] StoreError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn open_async_resolves_the_credential_before_fetching() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = base.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let mut config = test_config();
+        config.provider = OPENROUTER_PROVIDER_NAME.to_owned();
+        config.workspace = workspace;
+        config.db_path = base.path().join("loom.db");
+
+        // No cached catalog and no credential: the fetch path must reach
+        // credential resolution (inside `catalog::load`) and report the
+        // missing credential — never a network call in tests.
+        let error = match Engine::open_async(config).await {
+            Ok(_) => panic!("open succeeded without a credential"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                EngineError::Auth(auth::AuthError::NoCredential { .. })
+            ),
+            "unexpected error: {error}"
+        );
+    }
 }
