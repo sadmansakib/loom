@@ -507,6 +507,17 @@ Three adapters ship:
 - **Anthropic** — the messages API, not the OpenAI wire: system as a
   top-level param, `tool_use`/`tool_result` content blocks,
   `thinking_delta` reasoning capture, and Anthropic's error taxonomy.
+  Only *leading* system messages fold into the top-level `system` param;
+  a system message that appears after the conversation has started
+  stays in place as an in-turn `role: "system"` message. That in-turn
+  form is the 5.5-era per-turn steering channel (e.g. an
+  `output_config.effort` note): it applies to the next assistant turn
+  without rewriting the cached prefix, whereas hoisting it into the
+  top-level param would bust every cache breakpoint. Usage accounting
+  carries the two Anthropic-specific fields the wire reports:
+  `cache_creation_input_tokens` (cache writes, billed above base rate)
+  and `thinking_tokens` (`usage.output_tokens_details`, the attribution
+  split of output tokens while thinking is always-on-adaptive on 5.5).
   It deliberately runs its own streaming state machine instead of the
   shared `WireEndpoint` driver: refactoring the OpenAI wire's delicate
   paths without a funded key to re-verify DeepSeek/OpenRouter live was

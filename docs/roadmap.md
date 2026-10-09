@@ -700,7 +700,14 @@ reproduces them.
     per-turn system-message effort form (Fable 5.1+) that applies to the
     next assistant turn without a cache bust — and thinking counts
     toward `max_tokens`, so the output budget needs headroom at high
-    effort.
+    effort. **Transport shipped (wiremock-verified):** the Anthropic
+    adapter keeps post-conversation-start system messages in place as
+    in-turn `role: "system"` turns (leading ones still fold into the
+    top-level `system` param), and `Usage` now carries
+    `thinking_tokens` + `cache_creation_input_tokens` for attribution —
+    what a schedule needs to observe its own cost. The schedule itself
+    (a kernel-side effort policy emitting those in-turn notes) remains
+    open, gated on item 1.
 10. **Pruning, phase 2** (G2).
     - **Turn-age masking**: stub read-only results older than K turns
       even below the window trigger — SWE-agent's last-5-observations

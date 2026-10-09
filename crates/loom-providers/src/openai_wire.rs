@@ -272,11 +272,24 @@ pub(crate) struct WireUsage {
     /// DeepSeek-specific; absent on providers without cache reporting.
     #[serde(default)]
     pub prompt_cache_hit_tokens: Option<u64>,
+    /// `completion_tokens_details` when present; OpenAI-family
+    /// providers report the reasoning share of completion tokens here.
+    #[serde(default)]
+    pub completion_tokens_details: Option<WireCompletionDetails>,
     /// The provider-reported charge for this request in USD (OpenRouter
     /// reports `0.0` for free models and the actual spend for paid ones);
     /// absent on providers that do not report cost.
     #[serde(default)]
     pub cost: Option<f64>,
+}
+
+/// The `completion_tokens_details` sub-object of a `usage` block.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct WireCompletionDetails {
+    /// The reasoning/thinking share of `completion_tokens` (already
+    /// counted there — an attribution split, not an addition).
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
 }
 
 /// One accumulated tool call under construction.
@@ -539,6 +552,10 @@ impl ChunkAccumulator {
             input_tokens: wire.prompt_tokens.unwrap_or(0),
             output_tokens: wire.completion_tokens.unwrap_or(0),
             cached_input_tokens: wire.prompt_cache_hit_tokens,
+            thinking_tokens: wire
+                .completion_tokens_details
+                .and_then(|details| details.reasoning_tokens),
+            cache_creation_input_tokens: None,
             cost_usd: wire.cost,
         }) {
             Some(usage) => usage,
@@ -812,6 +829,7 @@ mod tests {
                 prompt_tokens: Some(10),
                 completion_tokens: Some(5),
                 prompt_cache_hit_tokens: Some(4),
+                completion_tokens_details: None,
                 cost: None,
             }),
             error: None,
@@ -832,6 +850,8 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: Some(4),
+                thinking_tokens: None,
+                cache_creation_input_tokens: None,
                 cost_usd: None,
             }
         );
@@ -1020,6 +1040,7 @@ mod tests {
                 prompt_tokens: Some(100),
                 completion_tokens: Some(20),
                 prompt_cache_hit_tokens: None,
+                completion_tokens_details: None,
                 cost: Some(0.000123),
             }),
             error: None,
@@ -1218,6 +1239,7 @@ mod tests {
                 prompt_tokens: Some(3),
                 completion_tokens: Some(1),
                 prompt_cache_hit_tokens: None,
+                completion_tokens_details: None,
                 cost: None,
             }),
             error: None,
@@ -1225,6 +1247,30 @@ mod tests {
         assert!(deltas.is_empty());
         let response = acc.finalize(true, &policy("test")).unwrap();
         assert_eq!(response.usage.cached_input_tokens, None);
+    }
+
+    #[test]
+    fn reasoning_tokens_map_to_the_thinking_attribution() {
+        // OpenAI-family `completion_tokens_details.reasoning_tokens`
+        // lands in the provider-neutral `thinking_tokens` split.
+        let mut acc = ChunkAccumulator::default();
+        acc.ingest(ChatChunk {
+            choices: vec![],
+            usage: Some(WireUsage {
+                prompt_tokens: Some(50),
+                completion_tokens: Some(20),
+                prompt_cache_hit_tokens: None,
+                completion_tokens_details: Some(WireCompletionDetails {
+                    reasoning_tokens: Some(12),
+                }),
+                cost: None,
+            }),
+            error: None,
+        });
+        let response = acc.finalize(true, &policy("test")).unwrap();
+        assert_eq!(response.usage.thinking_tokens, Some(12));
+        // The split is already inside the output total.
+        assert_eq!(response.usage.output_tokens, 20);
     }
 
     #[test]

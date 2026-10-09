@@ -33,6 +33,21 @@ pub struct Usage {
     pub output_tokens: u64,
     /// Prompt tokens served from a provider-side cache, if reported.
     pub cached_input_tokens: Option<u64>,
+    /// Tokens the model spent on reasoning/thinking, if the provider
+    /// reports them separately (Anthropic
+    /// `usage.output_tokens_details.thinking_tokens`, OpenAI-family
+    /// `completion_tokens_details.reasoning_tokens`).
+    ///
+    /// These are already counted in [`Usage::output_tokens`]; the field
+    /// is an attribution split, not an addition.
+    #[serde(default)]
+    pub thinking_tokens: Option<u64>,
+    /// Prompt tokens written to a provider-side cache on this request,
+    /// if reported (Anthropic `cache_creation_input_tokens`). Providers
+    /// typically bill cache writes above the base input rate, so cost
+    /// realism needs this alongside [`Usage::cached_input_tokens`].
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u64>,
     /// The provider-reported charge for this request in US dollars, if
     /// reported. Absent means "not reported", not "free".
     ///
@@ -56,6 +71,19 @@ impl std::ops::Add for Usage {
             input_tokens: self.input_tokens + rhs.input_tokens,
             output_tokens: self.output_tokens + rhs.output_tokens,
             cached_input_tokens: match (self.cached_input_tokens, rhs.cached_input_tokens) {
+                (Some(a), Some(b)) => Some(a + b),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            },
+            thinking_tokens: match (self.thinking_tokens, rhs.thinking_tokens) {
+                (Some(a), Some(b)) => Some(a + b),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            },
+            cache_creation_input_tokens: match (
+                self.cache_creation_input_tokens,
+                rhs.cache_creation_input_tokens,
+            ) {
                 (Some(a), Some(b)) => Some(a + b),
                 (Some(a), None) | (None, Some(a)) => Some(a),
                 (None, None) => None,
@@ -688,6 +716,8 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: Some(2),
+                thinking_tokens: None,
+                cache_creation_input_tokens: None,
                 cost_usd: None,
             },
         };

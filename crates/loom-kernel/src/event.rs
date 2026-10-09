@@ -499,6 +499,8 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: Some(3),
+                thinking_tokens: None,
+                cache_creation_input_tokens: None,
                 cost_usd: None,
             },
         };

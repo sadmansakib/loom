@@ -188,6 +188,114 @@ async fn a_stable_prefix_places_a_cache_breakpoint() {
 }
 
 #[tokio::test]
+async fn in_turn_system_messages_survive_the_round_trip() {
+    let server = MockServer::start().await;
+    mount_sse(&server, text_response()).await;
+
+    let mut request = plain_request("claude-opus-5-5");
+    request.messages = vec![
+        Message::System {
+            text: "global".into(),
+        },
+        Message::User {
+            text: "task".into(),
+        },
+        // Per-turn steering form (Fable 5.1+): must stay in the
+        // messages array, not fold into the top-level `system`.
+        Message::System {
+            text: "output_config: effort high".into(),
+        },
+    ];
+    request.stable_prefix_messages = Some(2);
+
+    let provider = provider_at(&server.uri());
+    let _ = collect(provider.stream(&request)).await;
+
+    let requests = server.received_requests().await.expect("captured request");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["system"], serde_json::json!("global"));
+    assert_eq!(body["messages"].as_array().map(Vec::len), Some(2));
+    assert_eq!(body["messages"][1]["role"], serde_json::json!("system"));
+    assert_eq!(
+        body["messages"][1]["content"][0]["text"],
+        "output_config: effort high"
+    );
+    // The breakpoint marks the stable user turn, not the steering
+    // message after it.
+    assert_eq!(
+        body["messages"][0]["content"][0]["cache_control"],
+        serde_json::json!({"type": "ephemeral"})
+    );
+    assert!(
+        body["messages"][1]["content"][0]
+            .get("cache_control")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_55_thinking_stream_accounts_thinking_and_cache_writes() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse(&[
+            serde_json::json!({
+                "type": "message_start",
+                "message": {"usage": {
+                    "input_tokens": 100,
+                    "cache_read_input_tokens": 40,
+                    "cache_creation_input_tokens": 10
+                }}
+            }),
+            serde_json::json!({
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""}
+            }),
+            serde_json::json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "pondering"}
+            }),
+            serde_json::json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "signature_delta", "signature": "sig-1"}
+            }),
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+            serde_json::json!({
+                "type": "content_block_start", "index": 1,
+                "content_block": {"type": "text", "text": ""}
+            }),
+            serde_json::json!({
+                "type": "content_block_delta", "index": 1,
+                "delta": {"type": "text_delta", "text": "Done"}
+            }),
+            serde_json::json!({"type": "content_block_stop", "index": 1}),
+            serde_json::json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 50, "output_tokens_details": {"thinking_tokens": 30}}
+            }),
+            serde_json::json!({"type": "message_stop"}),
+        ]),
+    )
+    .await;
+
+    let provider = provider_at(&server.uri());
+    let events = collect(provider.stream(&plain_request("claude-opus-5-5"))).await;
+
+    let response = expect_completed(events);
+    assert_eq!(response.message.content, "Done");
+    assert_eq!(
+        response.message.reasoning.as_ref().map(|r| r.text.as_str()),
+        Some("pondering")
+    );
+    assert_eq!(response.usage.input_tokens, 60);
+    assert_eq!(response.usage.cached_input_tokens, Some(40));
+    assert_eq!(response.usage.cache_creation_input_tokens, Some(10));
+    assert_eq!(response.usage.thinking_tokens, Some(30));
+    assert_eq!(response.usage.output_tokens, 50);
+}
+
+#[tokio::test]
 async fn tool_call_streams_assemble_into_tool_calls() {
     let server = MockServer::start().await;
     mount_sse(

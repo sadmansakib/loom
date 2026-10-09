@@ -3,6 +3,33 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — Anthropic 5.5 wire behaviors: in-turn system messages, thinking/cache-write usage
+
+No funded key, so the 5.5 behaviors are pinned by wiremock tests, not
+live runs. Two changes make the adapter ready for a reasoning-effort
+schedule (roadmap item 9):
+
+* **In-turn system messages** — only leading system messages fold into
+  the top-level `system` param. A system message that appears after the
+  conversation starts stays in place as an in-turn `role: "system"`
+  turn: the 5.5-era per-turn steering channel (an `output_config.effort`
+  note) that applies to the next assistant turn without busting cache
+  breakpoints. Hoisting it into the global param would have rewritten
+  the cached prefix — the old fold-all behavior was a bug for this
+  mechanism. Breakpoint placement still counts in-turn system messages
+  as regular turns.
+* **Usage attribution** — `Usage` gains `thinking_tokens` (the
+  Anthropic `usage.output_tokens_details.thinking_tokens` /
+  OpenAI `completion_tokens_details.reasoning_tokens` split of output
+  tokens) and `cache_creation_input_tokens` (Anthropic cache writes,
+  billed above base rate). The OpenAI-compatible wire maps
+  `completion_tokens_details.reasoning_tokens`; the Anthropic assembler
+  captures both fields from `message_start`/`message_delta`.
+
+New tests: in-turn system round trip and breakpoint interaction,
+5.5-style thinking stream with thinking/cache-write accounting, and the
+OpenAI-wire reasoning-token mapping.
+
 ## 2026-10-09 — Trace export: `loom run --trace DIR` (item 20.1, phase 1)
 
 One directory per task with three files: `events.ndjson` (the numbered

@@ -9,6 +9,11 @@
 //! Wire shape (Messages API, `anthropic-version: 2023-06-01`):
 //!
 //! - the system prompt is a top-level `system` parameter, not a message;
+//!   a `System` message that appears **after** the conversation has
+//!   started is *not* hoisted there — it stays in place as an in-turn
+//!   `system`-role message, the Fable 5.1+ steering form (e.g. a
+//!   per-turn `output_config.effort` note) that applies to the next
+//!   assistant turn without invalidating the cached prefix;
 //! - conversation turns are `user`/`assistant` messages whose `content`
 //!   is an array of typed blocks (`text`, `tool_use`, `tool_result`);
 //! - tool results travel in `user`-role `tool_result` blocks keyed by
@@ -78,23 +83,42 @@ pub(crate) const DEFAULT_MAX_TOKENS: u32 = 8_192;
 pub(crate) fn build_request_body(request: &ModelRequest) -> Value {
     let mut system_parts: Vec<String> = Vec::new();
     let mut turns: Vec<Value> = Vec::new();
-    let system_count = request
-        .messages
-        .iter()
-        .filter(|message| matches!(message, Message::System { .. }))
-        .count();
+    // Only the leading contiguous System messages fold into the
+    // top-level `system` parameter. A System message that appears after
+    // the conversation has started stays in place as an in-turn
+    // system-role message: hoisting it would move its effect from "the
+    // next assistant turn" to "the whole request" and rewrite the
+    // cached prefix — exactly what the per-turn steering form exists
+    // to avoid.
+    let mut still_leading = true;
+    let mut system_count = 0usize;
 
     for message in &request.messages {
         match message {
-            Message::System { text } => system_parts.push(text.clone()),
+            Message::System { text } => {
+                if still_leading {
+                    system_parts.push(text.clone());
+                    system_count += 1;
+                } else {
+                    turns.push(json!({
+                        "role": "system",
+                        "content": [{"type": "text", "text": text}],
+                    }));
+                }
+            }
             Message::User { text } => {
+                still_leading = false;
                 turns.push(json!({
                     "role": "user",
                     "content": [{"type": "text", "text": text}],
                 }));
             }
-            Message::Assistant(inner) => turns.push(assistant_message(inner)),
+            Message::Assistant(inner) => {
+                still_leading = false;
+                turns.push(assistant_message(inner));
+            }
             Message::ToolResult(result) => {
+                still_leading = false;
                 let is_error = !matches!(result.status, ToolStatus::Success);
                 turns.push(json!({
                     "role": "user",
@@ -285,6 +309,12 @@ pub(crate) struct AnthropicAssembler {
     /// Usage from `message_start` (input side).
     input_usage: u64,
     cached_input: Option<u64>,
+    /// Cache-write tokens from `message_start`, if reported (billed
+    /// above the base input rate on Anthropic).
+    cache_creation: Option<u64>,
+    /// Thinking tokens from `message_delta` usage details, if reported
+    /// (already counted in the output total — an attribution split).
+    thinking: Option<u64>,
     /// Usage from `message_delta` (output side, cumulative).
     output_usage: Option<u64>,
 }
@@ -318,6 +348,7 @@ impl AnthropicAssembler {
                 let usage = &event["message"]["usage"];
                 self.input_usage = usage["input_tokens"].as_u64().unwrap_or(0);
                 self.cached_input = usage["cache_read_input_tokens"].as_u64();
+                self.cache_creation = usage["cache_creation_input_tokens"].as_u64();
                 if let Some(cached) = self.cached_input {
                     self.input_usage = self.input_usage.saturating_sub(cached);
                 }
@@ -373,6 +404,11 @@ impl AnthropicAssembler {
                 if let Some(output) = event["usage"]["output_tokens"].as_u64() {
                     self.output_usage = Some(output);
                 }
+                if let Some(thinking) =
+                    event["usage"]["output_tokens_details"]["thinking_tokens"].as_u64()
+                {
+                    self.thinking = Some(thinking);
+                }
                 Ok((Vec::new(), false))
             }
             "message_stop" => Ok((Vec::new(), true)),
@@ -419,6 +455,8 @@ impl AnthropicAssembler {
                     input_tokens: self.input_usage,
                     output_tokens: self.output_usage.unwrap_or(0),
                     cached_input_tokens: self.cached_input,
+                    thinking_tokens: self.thinking,
+                    cache_creation_input_tokens: self.cache_creation,
                     cost_usd: None,
                 },
             });
@@ -489,6 +527,8 @@ impl AnthropicAssembler {
                 input_tokens: self.input_usage,
                 output_tokens: self.output_usage.unwrap_or(0),
                 cached_input_tokens: self.cached_input,
+                thinking_tokens: self.thinking,
+                cache_creation_input_tokens: self.cache_creation,
                 cost_usd: None,
             },
         })
@@ -704,6 +744,96 @@ mod tests {
                 .get("cache_control")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn in_turn_system_messages_stay_in_place() {
+        // The Fable 5.1+ steering form: a System message after the
+        // conversation has started must NOT fold into the top-level
+        // `system` parameter — hoisting it would rewrite the cached
+        // prefix and widen its effect to the whole request.
+        let body = build_request_body(&request(vec![
+            Message::System {
+                text: "global prompt".into(),
+            },
+            Message::User {
+                text: "task".into(),
+            },
+            Message::System {
+                text: "output_config: effort high for this turn".into(),
+            },
+            Message::User { text: "go".into() },
+        ]));
+        // Only the leading system message reaches the top level.
+        assert_eq!(body["system"], json!("global prompt"));
+        // The in-turn system message keeps its position and role.
+        assert_eq!(body["messages"].as_array().map(Vec::len), Some(3));
+        assert_eq!(body["messages"][1]["role"], json!("system"));
+        assert_eq!(
+            body["messages"][1]["content"],
+            json!([{
+                "type": "text",
+                "text": "output_config: effort high for this turn"
+            }])
+        );
+        assert_eq!(body["messages"][2]["role"], json!("user"));
+    }
+
+    #[test]
+    fn a_stable_prefix_marks_turns_before_an_in_turn_system_message() {
+        // Breakpoint indexing counts an in-turn system message like any
+        // other turn: prefix = 2 (leading system + first user) marks
+        // the user turn, never the steering message that follows it.
+        let mut req = request(vec![
+            Message::System { text: "sys".into() },
+            Message::User {
+                text: "task".into(),
+            },
+            Message::System {
+                text: "steer".into(),
+            },
+            Message::User { text: "go".into() },
+        ]);
+        req.stable_prefix_messages = Some(2);
+        let body = build_request_body(&req);
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        for turn in 1..3 {
+            assert!(
+                body["messages"][turn]["content"][0]
+                    .get("cache_control")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_and_cache_creation_usage_are_accounted() {
+        let mut assembler = AnthropicAssembler::default();
+        for data in [
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":40,"cache_creation_input_tokens":10}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"ponder"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-1"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":50,"output_tokens_details":{"thinking_tokens":30}}}"#,
+            r#"{"type":"message_stop"}"#,
+        ] {
+            assembler.ingest(data).unwrap();
+        }
+        let response = assembler.finalize().unwrap();
+        assert_eq!(
+            response.message.reasoning.as_ref().map(|r| r.text.as_str()),
+            Some("ponder")
+        );
+        assert_eq!(response.usage.input_tokens, 60);
+        assert_eq!(response.usage.cached_input_tokens, Some(40));
+        assert_eq!(response.usage.cache_creation_input_tokens, Some(10));
+        // Thinking tokens are an attribution split of the output total.
+        assert_eq!(response.usage.thinking_tokens, Some(30));
+        assert_eq!(response.usage.output_tokens, 50);
     }
 
     #[test]
