@@ -3,6 +3,27 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — GLM adapter on Z.ai's metered API; usage dialects move to their adapters
+
+`--provider glm` targets `api.z.ai/api/paas/v4` (never the Coding Plan
+endpoint). The 5.3 family (glm-5.3, -flash, -flashx) forces thinking
+on — `disabled` fails the request — so a configured effort of "none"
+clamps to `low` instead of disabling; glm-5.2 accepts both. Requests
+carry `clear_thinking: false` (Preserved Thinking): the wire layer
+already replays assistant `reasoning_content` verbatim, which is that
+mode's client obligation. Capability table pins the four 1M-context
+ids; unknown ids fail loud. Engine/auth/estimator wired (ZAI_API_KEY
+or Z_AI_API_KEY); verified by 8 wiremock tests, not live — no funded
+key.
+
+The shared OpenAI wire now carries only OpenAI-standard usage shapes:
+`prompt_tokens_details.cached_tokens` and
+`completion_tokens_details.reasoning_tokens` are generic, while
+DeepSeek's `prompt_cache_hit_tokens` and OpenRouter's `cost` moved to
+`dialect_usage` overrides in their own adapter files, threaded through
+the finalize policy like every other provider opinion. GLM, whose
+usage block sticks to the standard shapes, adds no dialect code.
+
 ## 2026-10-09 — Anthropic 5.5 wire behaviors: in-turn system messages, thinking/cache-write usage
 
 No funded key, so the 5.5 behaviors are pinned by wiremock tests, not

@@ -64,6 +64,19 @@ pub(crate) trait WireEndpoint: Clone + Send + Sync + 'static {
     fn classify_wire_error(status: Option<u16>, message: &str) -> ModelErrorKind {
         crate::openai_wire::classify_wire_error(status, message)
     }
+
+    /// Reads this provider's dialect fields out of a usage block's
+    /// non-standard keys (everything the OpenAI-standard shapes in
+    /// [`WireUsage`](crate::openai_wire::WireUsage) do not claim).
+    ///
+    /// Defaults to none — an adapter whose usage block sticks to the
+    /// standard shapes (GLM) adds no code. DeepSeek overrides for
+    /// `prompt_cache_hit_tokens`, OpenRouter for `cost`.
+    fn dialect_usage(
+        _extra: &serde_json::Map<String, serde_json::Value>,
+    ) -> crate::openai_wire::DialectUsage {
+        crate::openai_wire::DialectUsage::default()
+    }
 }
 
 /// Drives one streamed request to completion for `provider`.
@@ -121,6 +134,7 @@ fn policy<P: WireEndpoint>(provider: &P) -> FinalizePolicy<'_> {
         classify_in_stream: &P::in_stream_failure,
         classify_wire_error: &P::classify_wire_error,
         id_prefix: provider.name(),
+        dialect_usage: &P::dialect_usage,
     }
 }
 

@@ -263,24 +263,41 @@ pub(crate) struct ToolCallFunctionDelta {
 }
 
 /// The `usage` object of a chunk.
+///
+/// Only the OpenAI-standard shapes live here; every key they do not
+/// claim lands in [`WireUsage::extra`], where each adapter reads its
+/// own dialect (see [`WireEndpoint::dialect_usage`](crate::wire_stream::WireEndpoint::dialect_usage)).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct WireUsage {
     #[serde(default)]
     pub prompt_tokens: Option<u64>,
     #[serde(default)]
     pub completion_tokens: Option<u64>,
-    /// DeepSeek-specific; absent on providers without cache reporting.
+    /// OpenAI-standard cache reporting (`prompt_tokens_details.cached_tokens`).
     #[serde(default)]
-    pub prompt_cache_hit_tokens: Option<u64>,
+    pub prompt_tokens_details: Option<WirePromptDetails>,
     /// `completion_tokens_details` when present; OpenAI-family
     /// providers report the reasoning share of completion tokens here.
     #[serde(default)]
     pub completion_tokens_details: Option<WireCompletionDetails>,
+    /// Every key the standard shapes above do not claim. Adapter
+    /// dialects (DeepSeek's `prompt_cache_hit_tokens`, OpenRouter's
+    /// `cost`) are read from here, in their own files.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Provider-dialect additions to a [`WireUsage`], extracted by each
+/// adapter from the keys the standard shapes do not claim.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct DialectUsage {
+    /// The provider's own name for the cache-hit count (DeepSeek's
+    /// `prompt_cache_hit_tokens`). Wins over the generic
+    /// `prompt_tokens_details.cached_tokens` when both appear.
+    pub cached_input_tokens: Option<u64>,
     /// The provider-reported charge for this request in USD (OpenRouter
-    /// reports `0.0` for free models and the actual spend for paid ones);
-    /// absent on providers that do not report cost.
-    #[serde(default)]
-    pub cost: Option<f64>,
+    /// reports `0.0` for free models and the actual spend for paid ones).
+    pub cost_usd: Option<f64>,
 }
 
 /// The `completion_tokens_details` sub-object of a `usage` block.
@@ -290,6 +307,15 @@ pub(crate) struct WireCompletionDetails {
     /// counted there — an attribution split, not an addition).
     #[serde(default)]
     pub reasoning_tokens: Option<u64>,
+}
+
+/// The `prompt_tokens_details` sub-object of a `usage` block.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct WirePromptDetails {
+    /// The cached share of `prompt_tokens` (already counted there —
+    /// an attribution split, not an addition).
+    #[serde(default)]
+    pub cached_tokens: Option<u64>,
 }
 
 /// One accumulated tool call under construction.
@@ -548,15 +574,22 @@ impl ChunkAccumulator {
             tool_calls: calls,
             stop_reason,
         };
-        let usage = match self.usage.map(|wire| Usage {
-            input_tokens: wire.prompt_tokens.unwrap_or(0),
-            output_tokens: wire.completion_tokens.unwrap_or(0),
-            cached_input_tokens: wire.prompt_cache_hit_tokens,
-            thinking_tokens: wire
-                .completion_tokens_details
-                .and_then(|details| details.reasoning_tokens),
-            cache_creation_input_tokens: None,
-            cost_usd: wire.cost,
+        let usage = match self.usage.map(|wire| {
+            let dialect = (policy.dialect_usage)(&wire.extra);
+            Usage {
+                input_tokens: wire.prompt_tokens.unwrap_or(0),
+                output_tokens: wire.completion_tokens.unwrap_or(0),
+                cached_input_tokens: dialect.cached_input_tokens.or_else(|| {
+                    wire.prompt_tokens_details
+                        .as_ref()
+                        .and_then(|d| d.cached_tokens)
+                }),
+                thinking_tokens: wire
+                    .completion_tokens_details
+                    .and_then(|details| details.reasoning_tokens),
+                cache_creation_input_tokens: None,
+                cost_usd: dialect.cost_usd,
+            }
         }) {
             Some(usage) => usage,
             None => {
@@ -598,6 +631,10 @@ pub(crate) struct FinalizePolicy<'a> {
     pub classify_wire_error: &'a dyn Fn(Option<u16>, &str) -> ModelErrorKind,
     /// Prefix for synthesized tool-call ids, normally the provider name.
     pub id_prefix: &'a str,
+    /// Reads the adapter's dialect keys out of a usage block's
+    /// non-standard fields. The wire module itself holds no dialect
+    /// knowledge; each adapter's override owns its provider's names.
+    pub dialect_usage: &'a dyn Fn(&serde_json::Map<String, serde_json::Value>) -> DialectUsage,
 }
 
 /// Classifies a generic mid-stream error object by its HTTP-ish status.
@@ -669,6 +706,19 @@ mod tests {
             classify_in_stream: &no_in_stream,
             classify_wire_error: &classify_wire_error,
             id_prefix: prefix,
+            dialect_usage: &|_| DialectUsage::default(),
+        }
+    }
+
+    /// A policy wired to DeepSeek's real dialect override, so the
+    /// `prompt_cache_hit_tokens` extraction is tested through the same
+    /// path the stream driver uses.
+    fn deepseek_policy(prefix: &str) -> FinalizePolicy<'_> {
+        FinalizePolicy {
+            classify_in_stream: &no_in_stream,
+            classify_wire_error: &classify_wire_error,
+            id_prefix: prefix,
+            dialect_usage: &<crate::deepseek::DeepSeekProvider as crate::wire_stream::WireEndpoint>::dialect_usage,
         }
     }
 
@@ -828,9 +878,11 @@ mod tests {
             usage: Some(WireUsage {
                 prompt_tokens: Some(10),
                 completion_tokens: Some(5),
-                prompt_cache_hit_tokens: Some(4),
+                prompt_tokens_details: Some(WirePromptDetails {
+                    cached_tokens: Some(4),
+                }),
                 completion_tokens_details: None,
-                cost: None,
+                extra: Default::default(),
             }),
             error: None,
         });
@@ -986,6 +1038,7 @@ mod tests {
                     classify_in_stream: &classify,
                     classify_wire_error: &classify_wire_error,
                     id_prefix: "test",
+                    dialect_usage: &|_| DialectUsage::default(),
                 },
             )
             .unwrap_err();
@@ -1039,13 +1092,24 @@ mod tests {
             usage: Some(WireUsage {
                 prompt_tokens: Some(100),
                 completion_tokens: Some(20),
-                prompt_cache_hit_tokens: None,
+                prompt_tokens_details: None,
                 completion_tokens_details: None,
-                cost: Some(0.000123),
+                extra: Default::default(),
             }),
             error: None,
         });
-        let response = acc.finalize(true, &policy("openrouter")).unwrap();
+        // OpenRouter's `cost` key is a dialect field: the policy's
+        // dialect hook supplies it, the generic wire only carries it.
+        let policy = FinalizePolicy {
+            classify_in_stream: &no_in_stream,
+            classify_wire_error: &classify_wire_error,
+            id_prefix: "openrouter",
+            dialect_usage: &|_| DialectUsage {
+                cost_usd: Some(0.000123),
+                ..Default::default()
+            },
+        };
+        let response = acc.finalize(true, &policy).unwrap();
         assert_eq!(response.usage.cost_usd, Some(0.000123));
         assert_eq!(response.usage.input_tokens, 100);
     }
@@ -1238,9 +1302,9 @@ mod tests {
             usage: Some(WireUsage {
                 prompt_tokens: Some(3),
                 completion_tokens: Some(1),
-                prompt_cache_hit_tokens: None,
+                prompt_tokens_details: None,
                 completion_tokens_details: None,
-                cost: None,
+                extra: Default::default(),
             }),
             error: None,
         });
@@ -1259,11 +1323,11 @@ mod tests {
             usage: Some(WireUsage {
                 prompt_tokens: Some(50),
                 completion_tokens: Some(20),
-                prompt_cache_hit_tokens: None,
+                prompt_tokens_details: None,
                 completion_tokens_details: Some(WireCompletionDetails {
                     reasoning_tokens: Some(12),
                 }),
-                cost: None,
+                extra: Default::default(),
             }),
             error: None,
         });
@@ -1271,6 +1335,74 @@ mod tests {
         assert_eq!(response.usage.thinking_tokens, Some(12));
         // The split is already inside the output total.
         assert_eq!(response.usage.output_tokens, 20);
+    }
+
+    #[test]
+    fn openai_dialect_cached_tokens_map_when_the_deepseek_field_is_absent() {
+        // Z.ai/GLM reports cache hits via `prompt_tokens_details
+        // .cached_tokens` instead of DeepSeek's `prompt_cache_hit_tokens`;
+        // the DeepSeek field stays authoritative when both appear.
+        let mut acc = ChunkAccumulator::default();
+        acc.ingest(ChatChunk {
+            choices: vec![],
+            usage: Some(WireUsage {
+                prompt_tokens: Some(100),
+                completion_tokens: Some(10),
+                prompt_tokens_details: Some(WirePromptDetails {
+                    cached_tokens: Some(40),
+                }),
+                completion_tokens_details: None,
+                extra: Default::default(),
+            }),
+            error: None,
+        });
+        let response = acc.finalize(true, &policy("test")).unwrap();
+        assert_eq!(response.usage.cached_input_tokens, Some(40));
+
+        // DeepSeek names the same count `prompt_cache_hit_tokens`; its
+        // dialect override wins when both forms appear in one block.
+        let mut acc = ChunkAccumulator::default();
+        acc.ingest(ChatChunk {
+            choices: vec![],
+            usage: Some(WireUsage {
+                prompt_tokens: Some(100),
+                completion_tokens: Some(10),
+                prompt_tokens_details: Some(WirePromptDetails {
+                    cached_tokens: Some(40),
+                }),
+                completion_tokens_details: None,
+                extra: {
+                    let mut extra = serde_json::Map::new();
+                    extra.insert(
+                        "prompt_cache_hit_tokens".to_string(),
+                        serde_json::Value::from(7u64),
+                    );
+                    extra
+                },
+            }),
+            error: None,
+        });
+        let response = acc.finalize(true, &deepseek_policy("test")).unwrap();
+        assert_eq!(response.usage.cached_input_tokens, Some(7));
+
+        // With only the generic form present, DeepSeek's dialect
+        // falls back to it unchanged.
+        let mut acc = ChunkAccumulator::default();
+        acc.ingest(ChatChunk {
+            choices: vec![],
+            usage: Some(WireUsage {
+                prompt_tokens: Some(100),
+                completion_tokens: Some(10),
+                prompt_tokens_details: Some(WirePromptDetails {
+                    cached_tokens: Some(40),
+                }),
+                completion_tokens_details: None,
+                extra: Default::default(),
+            }),
+            error: None,
+        });
+        let response = acc.finalize(true, &deepseek_policy("test")).unwrap();
+        assert_eq!(response.usage.cached_input_tokens, Some(40));
     }
 
     #[test]

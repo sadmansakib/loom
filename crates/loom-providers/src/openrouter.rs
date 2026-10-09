@@ -493,6 +493,27 @@ impl WireEndpoint for OpenRouterProvider {
         }
     }
 
+    /// OpenRouter's usage block carries a `cost` key with the actual
+    /// USD charge for the request (`0.0` for free models). Read it
+    /// here, in the OpenRouter file, and let the generic wire stay
+    /// dialect-free.
+    fn dialect_usage(
+        extra: &serde_json::Map<String, serde_json::Value>,
+    ) -> crate::openai_wire::DialectUsage {
+        #[derive(serde::Deserialize)]
+        struct OpenRouterUsage {
+            #[serde(default)]
+            cost: Option<f64>,
+        }
+        let parsed =
+            serde_json::from_value::<OpenRouterUsage>(serde_json::Value::Object(extra.clone()))
+                .ok();
+        crate::openai_wire::DialectUsage {
+            cached_input_tokens: None,
+            cost_usd: parsed.and_then(|u| u.cost),
+        }
+    }
+
     /// Classifies an HTTP status per the OpenRouter error model.
     ///
     /// 402 signals exhausted credits and blocks even free models (a
@@ -693,6 +714,24 @@ mod tests {
         assert_eq!(
             <OpenRouterProvider as WireEndpoint>::in_stream_failure("stop"),
             None
+        );
+    }
+
+    #[test]
+    fn dialect_reads_reported_cost() {
+        use crate::openai_wire::DialectUsage;
+        let mut extra = serde_json::Map::new();
+        extra.insert("cost".to_string(), serde_json::Value::from(0.000123));
+        assert_eq!(
+            <OpenRouterProvider as WireEndpoint>::dialect_usage(&extra),
+            DialectUsage {
+                cached_input_tokens: None,
+                cost_usd: Some(0.000123),
+            }
+        );
+        assert_eq!(
+            <OpenRouterProvider as WireEndpoint>::dialect_usage(&Default::default()),
+            DialectUsage::default()
         );
     }
 

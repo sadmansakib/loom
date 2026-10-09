@@ -25,7 +25,7 @@ kernel never links a filesystem store or a CLI, the engine never prints.
 | `loom-core` | Facade re-exporting the public surface for embedders | engine, kernel, providers, tools |
 | `loom-kernel` | The agent itself: loop, context compilation, session/transcript model, tool abstraction, tool cache, artifacts, events, budgets | no workspace crates — it defines the side-effect traits (`ModelProvider`, `SessionStore`, `ArtifactStore`, `Tool`, …) itself |
 | `loom-engine` | Composition root: builds a configured `Agent` from paths, auth, a provider factory, tool registry, and stores; repository facts scanner | kernel, store, providers, tools |
-| `loom-providers` | Model provider adapters (DeepSeek, OpenRouter over one shared OpenAI-compatible wire; Anthropic on its own messages-API driver) | kernel model types |
+| `loom-providers` | Model provider adapters (DeepSeek, OpenRouter, GLM over one shared OpenAI-compatible wire; Anthropic on its own messages-API driver) | kernel model types |
 | `loom-store` | SQLite persistence: sessions, turns, tasks, artifacts, auth accounts | kernel store traits |
 | `loom-tools` | The shipped tool suite (read/search/edit/write/list/run/verify + artifact read) | kernel tool traits |
 | `loom-cli` | Binary: argument parsing, output rendering, run/eval/auth commands | engine |
@@ -492,11 +492,14 @@ still needs prune-event variants in `EventKind`, a schema v3 bump.
 
 ## 10. Providers
 
-Three adapters ship:
+Four adapters ship:
 
 - **DeepSeek** — a built-in capability table, because its API serves no
   capability metadata; reasoning effort and a thinking on/off switch are
-  sent explicitly on every request.
+  sent explicitly on every request. Its usage block names the cache-hit
+  count `prompt_cache_hit_tokens` instead of the OpenAI-standard
+  `prompt_tokens_details.cached_tokens`; that dialect is read by a
+  `dialect_usage` override in this file, not by the shared wire.
 - **OpenRouter** — capabilities and pricing resolved from the provider's
   model catalog (`GET /models`). Free and paid models travel the same
   path: pricing is data (zero for free, non-zero for paid), never a
@@ -504,6 +507,16 @@ Three adapters ship:
   to the engine as `EngineConfig::catalog`, so the engine
   stays synchronous and offline-capable. Attribution headers are
   optional configuration.
+- **GLM** — Z.ai's **metered** API (`api.z.ai/api/paas/v4`), never the
+  Coding Plan endpoint. Same OpenAI-compatible wire as DeepSeek with
+  GLM's `thinking` parameter: the 5.3 family forces thinking on
+  (`disabled` fails the request), so a configured effort of "none" is
+  clamped to `low` rather than disabling; glm-5.2 accepts both.
+  `clear_thinking: false` requests Preserved Thinking — the wire layer
+  already replays assistant `reasoning_content` verbatim, which is the
+  client-side obligation that mode carries. Its usage block sticks to
+  the OpenAI-standard shapes, so this adapter adds no usage-dialect
+  code at all. Verified by wiremock, not live: no funded key.
 - **Anthropic** — the messages API, not the OpenAI wire: system as a
   top-level param, `tool_use`/`tool_result` content blocks,
   `thinking_delta` reasoning capture, and Anthropic's error taxonomy.
@@ -549,6 +562,11 @@ and stop-signal normalization. An adapter supplies only configuration and
 error classification through a `WireEndpoint` trait, so the delicate
 streaming behaviour cannot drift between providers. The finalize policy
 also classifies mid-stream error objects, which OpenRouter can emit.
+Usage dialects follow the same rule: the shared wire structs carry only
+OpenAI-standard shapes, everything else lands in a flatten-caught map,
+and each adapter's `dialect_usage` hook reads its own keys (DeepSeek's
+`prompt_cache_hit_tokens`, OpenRouter's `cost`) — a provider that sticks
+to the standard shapes, like GLM, writes no dialect code.
 
 `ModelCapabilities` are explicit per model (window, output cap, tool
 support) and resolved at setup, so an unknown model fails before the

@@ -300,6 +300,26 @@ impl WireEndpoint for DeepSeekProvider {
         }
     }
 
+    /// DeepSeek's usage block names the cache-hit count
+    /// `prompt_cache_hit_tokens` instead of the OpenAI-standard
+    /// `prompt_tokens_details.cached_tokens`. Read it here, in the
+    /// DeepSeek file, and let the generic wire stay dialect-free.
+    fn dialect_usage(
+        extra: &serde_json::Map<String, serde_json::Value>,
+    ) -> crate::openai_wire::DialectUsage {
+        #[derive(serde::Deserialize)]
+        struct DeepSeekUsage {
+            #[serde(default)]
+            prompt_cache_hit_tokens: Option<u64>,
+        }
+        let parsed =
+            serde_json::from_value::<DeepSeekUsage>(serde_json::Value::Object(extra.clone())).ok();
+        crate::openai_wire::DialectUsage {
+            cached_input_tokens: parsed.and_then(|u| u.prompt_cache_hit_tokens),
+            cost_usd: None,
+        }
+    }
+
     /// Classifies an HTTP status per the DeepSeek error model
     /// (HTTP-status only; no business codes).
     fn classify_status(status: reqwest::StatusCode, body: &str) -> ModelError {
@@ -389,6 +409,27 @@ mod tests {
             Some(ModelErrorKind::Transport)
         );
         assert_eq!(DeepSeekProvider::in_stream_failure("stop"), None);
+    }
+
+    #[test]
+    fn dialect_reads_prompt_cache_hit_tokens() {
+        use crate::openai_wire::DialectUsage;
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "prompt_cache_hit_tokens".to_string(),
+            serde_json::Value::from(4u64),
+        );
+        assert_eq!(
+            <DeepSeekProvider as WireEndpoint>::dialect_usage(&extra),
+            DialectUsage {
+                cached_input_tokens: Some(4),
+                cost_usd: None,
+            }
+        );
+        assert_eq!(
+            <DeepSeekProvider as WireEndpoint>::dialect_usage(&Default::default()),
+            DialectUsage::default()
+        );
     }
 
     #[test]

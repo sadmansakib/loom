@@ -158,11 +158,12 @@ Shipped semantics that later iterations must preserve:
 - **Capabilities are per model** (`provider + model → ModelCapabilities`),
   and the model is fixed for the life of a task.
 
-Planned GLM support differs from the original plan: Loom will target the
+Planned GLM support differs from the original plan: Loom targets the
 **metered Z.ai API**, never the GLM Coding Plan subscription endpoint
 (a non-API product; custom-harness use risks an account ban — see the
 warnings in `crates/loom-cli/tests/eval.rs`). Shipped adapters are
-DeepSeek, OpenRouter, and Anthropic.
+DeepSeek, OpenRouter, Anthropic, and GLM (wiremock-verified against the
+Z.ai spec; no funded key yet for live runs).
 
 ### Iteration 2 — Core efficiency & repository intelligence (current)
 
@@ -252,7 +253,7 @@ architecture is research input, not a dependency.
 Smallest sufficient reasoning for each task class (trivial → large,
 research), treated as an optimization problem; verification uses no model
 when deterministic checks pass. Prerequisites shipped: per-model
-capabilities and pricing as data, three providers. Model profiles
+capabilities and pricing as data, four providers. Model profiles
 (item 9) come first; routing changes the per-task model-fixed invariant
 and needs an ADR.
 
@@ -282,8 +283,8 @@ orchestration — downstream of a strong core.
 ```text
 Current iteration:     2 (core efficiency), with iteration 4 tools shipped early
 Language:              Rust (stable), 7 crates, unsafe forbidden
-Shipped providers:     DeepSeek, OpenRouter (free + paid), Anthropic
-Planned provider:      GLM via the metered Z.ai API (never the Coding Plan)
+Shipped providers:     DeepSeek, OpenRouter (free + paid), Anthropic, GLM
+GLM status:            metered Z.ai API, wiremock-verified (no funded key)
 Eval models in use:    OpenRouter free tier (high variance); DeepSeek key drained
 Primary target:        successful work per model invocation
 Biggest open risk:     N=1 measurements below the noise floor (see item 1)
@@ -444,10 +445,12 @@ also summarized here so this section is the single source of truth.
   call quality, edit acceptance, repeats, repairs, spill savings — from
   transcripts), exit-code discipline (130 on cancel).
   Engine is frontend-neutral: no printing outside the CLI renderer.
-- **Providers.** Three adapters. Two share one OpenAI-compatible wire
+- **Providers.** Four adapters. Three share one OpenAI-compatible wire
   and SSE streaming driver: DeepSeek (built-in capability table,
-  reasoning effort and thinking controls) and OpenRouter (capabilities
-  and pricing resolved from the provider's model catalog). Free and
+  reasoning effort and thinking controls), OpenRouter (capabilities
+  and pricing resolved from the provider's model catalog), and GLM
+  (Z.ai metered API; 5.3-family forced thinking with effort clamping,
+  Preserved Thinking). Free and
   paid models travel the same path — pricing is data, never a branch —
   and the catalog is fetched and cached by the frontend, so the engine
   stays synchronous. Unknown models, missing catalogs, and windows
