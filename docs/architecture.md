@@ -42,9 +42,11 @@ property.
 
 ## 2. Runtime model
 
-- **Tokio, multi-threaded runtime**, owned by the CLI. The CLI's consumer
-  thread owns stdout/stderr and receives rendered events via a channel, so
-  engine code never touches the terminal. Shutdown uses
+- **Tokio, multi-threaded runtime**, owned by the CLI. The CLI's
+  consumers — the stdout/stderr renderer, plus the NDJSON trace writer
+  when `--trace` is on — receive events from a kernel `FanoutSink`, one
+  channel each, so engine code never touches the terminal and a stalled
+  disk cannot stall rendering. Shutdown uses
   `shutdown_timeout(5s)`; Ctrl-C cancels the task's cancellation token and
   the process exits 130 after the turn in flight is committed.
 - **Cancellation** flows through `CancellationToken`s, one per task. Every
@@ -106,13 +108,17 @@ Invariants the session layer enforces (and tests):
    type; a second finish attempt cannot overwrite the recorded end reason.
 
 **Events** (`event.rs`) are the observation stream: `EventEnvelope`
-(`schema_version: 2`, per-sink monotonically increasing `sequence`,
+(`schema_version: 3`, per-sink monotonically increasing `sequence`,
 snake_case `type` tag). Version 2 adds `Usage.cost_usd`, the
-provider-reported charge; it is `serde(default)`, so version-1 payloads
-still deserialize. A lock spans numbering and send, so arrival order
+provider-reported charge; version 3 adds `ContextPruned` (prune
+attribution). Both new fields are additive, so older payloads still
+deserialize. A lock spans numbering and send, so arrival order
 equals sequence order even with concurrent emitters. The channel sink is
 unbounded — a slow consumer queues rather than back-pressures the agent;
-only a closed receiver drops (counted, warned once). `StrictSink` wraps a
+only a closed receiver drops (counted, warned once). `FanoutSink`
+composes several sinks into one so multi-consumer frontends (the CLI's
+renderer + trace writer, future GUI/TUI) each get their own numbered
+stream; its drop count sums the children. `StrictSink` wraps a
 sink and cancels the task on first drop; the eval harness requires zero
  dropped events.
 
@@ -677,7 +683,7 @@ Compare suites by medians over N ≥ 5; the observed noise floor is ±10%.
 - Blocking work on the blocking pool; hashing never under a lock.
 - Facts scanned once per task; capabilities resolved once per task.
 
-**Testing** — the workspace carries 653 tests (13 live-API tests
+**Testing** — the workspace carries 657 tests (13 live-API tests
 ignored by default): unit tests per module,
 protocol and invariant tests against in-memory seams, security regression
 tests for confinement, canary tests for secrets, integration tests that

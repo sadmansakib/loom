@@ -3,13 +3,13 @@
 //! This is the CLI adapter, not the composition root: the engine (ADR-021)
 //! owns credentials, the provider, the tools, and session durability; this
 //! module builds the process around it — tokio runtime, Ctrl-C cancellation,
-//! the stdout/stderr consumer thread, and the exit code.
+//! the stdout/stderr and trace consumers, and the exit code.
 
 use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::Context;
-use loom_core::kernel::event::ChannelEventSink;
+use loom_core::kernel::event::{ChannelEventSink, FanoutSink};
 use loom_core::{Engine, EngineConfig};
 use tokio_util::sync::CancellationToken;
 
@@ -57,25 +57,40 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let mut session = engine.new_session();
     let input = args.task.join(" ");
 
-    // The consumer owns stdout/stderr; the sink only numbers and sends (§11).
-    // With `--trace` it also appends every envelope to the task's
-    // `events.ndjson` and hands the writer back so the main thread can
-    // finish the export once the outcome is known.
-    let (sink, mut receiver) = ChannelEventSink::new();
+    // Two independent consumers fan out from one sink (§11): the
+    // renderer always owns stdout; with `--trace` a second consumer
+    // appends every envelope to the task's `events.ndjson` and hands
+    // the writer back so the main thread can finish the export once
+    // the outcome is known. A stalled disk can delay the trace without
+    // ever delaying the terminal, and vice versa.
+    let (render_sink, mut render_receiver) = ChannelEventSink::new();
     let json = args.json;
-    let tracer = args.trace.clone().map(TraceWriter::new);
-    let consumer = std::thread::spawn(move || {
+    let renderer_thread = std::thread::spawn(move || {
         let mut renderer = Renderer::new(json);
-        let mut tracer = tracer;
-        while let Some(envelope) = receiver.blocking_recv() {
-            if let Some(writer) = tracer.as_mut() {
-                writer.record(&envelope);
-            }
+        while let Some(envelope) = render_receiver.blocking_recv() {
             renderer.render(&envelope);
         }
         renderer.finish();
-        tracer
     });
+
+    let (trace_sink, tracer_thread) = match args.trace.clone() {
+        Some(dir) => {
+            let (trace_sink, mut trace_receiver) = ChannelEventSink::new();
+            let mut writer = TraceWriter::new(dir);
+            let thread = std::thread::spawn(move || {
+                while let Some(envelope) = trace_receiver.blocking_recv() {
+                    writer.record(&envelope);
+                }
+                writer
+            });
+            (Some(trace_sink), Some(thread))
+        }
+        None => (None, None),
+    };
+    let sink = match trace_sink {
+        Some(trace_sink) => FanoutSink::new().with(render_sink).with(trace_sink),
+        None => FanoutSink::new().with(render_sink),
+    };
 
     // Ctrl-C cancels the task token; the provider's timeouts need the time
     // driver the runtime already enables.
@@ -88,11 +103,19 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     });
 
     let outcome = runtime.block_on(engine.run_task(&mut session, input, &sink, &cancellation));
+    // Dropping the fan-out (and with it both channel senders) closes
+    // the consumers' `blocking_recv` loops.
     drop(sink);
     signal.abort();
-    let tracer = consumer.join().unwrap_or_else(|_| {
-        eprintln!("warning: event consumer thread panicked; trace not written");
-        None
+    if renderer_thread.join().is_err() {
+        eprintln!("warning: event renderer thread panicked");
+    }
+    let tracer = tracer_thread.and_then(|thread| match thread.join() {
+        Ok(writer) => Some(writer),
+        Err(_) => {
+            eprintln!("warning: trace consumer thread panicked; trace not written");
+            None
+        }
     });
 
     // The trace export is best-effort: a failure to write files must not

@@ -202,7 +202,9 @@ pub enum EventKind {
 /// increasing) and must never block or fail the task on delivery
 /// problems. The canonical iteration-1 implementation is
 /// [`ChannelEventSink`]; the CLI's NDJSON writer lives on the consumer
-/// side of the channel.
+/// side of the channel. Several sinks compose into one with
+/// [`FanoutSink`] — the shape multi-consumer frontends (GUI, TUI) fan
+/// out on.
 ///
 /// Loss visibility is part of the contract: [`dropped`](EventSink::dropped)
 /// feeds the task-end `events_dropped` report (§11). The count must be
@@ -312,6 +314,62 @@ impl EventSink for ChannelEventSink {
 
     fn dropped(&self) -> u64 {
         self.inner.dropped.load(Ordering::Relaxed)
+    }
+}
+
+/// An [`EventSink`] that fans every event out to several child sinks.
+///
+/// Multi-consumer frontends — a GUI streaming deltas while a tracer
+/// writes NDJSON, say — wrap their sinks in one `FanoutSink` and hand
+/// that single sink to the driving API. Each child numbers its own
+/// stream ([`EventEnvelope::sequence`] is per sink), so every consumer
+/// sees a contiguous 0-based view; no ordering holds *across*
+/// consumers. Delivery stays best-effort: a child that drops (a closed
+/// channel) costs its event and nothing else — siblings still receive,
+/// and the task keeps running.
+///
+/// [`dropped`](EventSink::dropped) sums across children, so the
+/// task-end `events_dropped` report counts a loss on any consumer. An
+/// empty fan-out is a valid no-op sink.
+#[derive(Clone, Default)]
+pub struct FanoutSink {
+    sinks: Vec<Arc<dyn EventSink>>,
+}
+
+impl FanoutSink {
+    /// Creates an empty fan-out, which observes nothing.
+    pub fn new() -> Self {
+        Self { sinks: Vec::new() }
+    }
+
+    /// Adds an owned child sink, chainable:
+    /// `FanoutSink::new().with(renderer_sink).with(trace_sink)`.
+    pub fn with(mut self, sink: impl EventSink + 'static) -> Self {
+        self.sinks.push(Arc::new(sink));
+        self
+    }
+
+    /// Adds a shared child sink, for callers that keep their own
+    /// handle (e.g. to poll one consumer's drop count while the task
+    /// runs).
+    pub fn with_shared(mut self, sink: Arc<dyn EventSink>) -> Self {
+        self.sinks.push(sink);
+        self
+    }
+}
+
+impl EventSink for FanoutSink {
+    fn emit(&self, task_id: TaskId, kind: EventKind) {
+        for sink in &self.sinks {
+            // One clone per child keeps every consumer's stream
+            // independent; the payload copy is cheap next to
+            // token-rate serialization.
+            sink.emit(task_id, kind.clone());
+        }
+    }
+
+    fn dropped(&self) -> u64 {
+        self.sinks.iter().map(|sink| sink.dropped()).sum()
     }
 }
 
@@ -637,5 +695,76 @@ mod tests {
         }
         assert!(!token.is_cancelled());
         assert_eq!(sink.dropped(), 0);
+    }
+
+    #[test]
+    fn fanout_delivers_every_event_to_every_consumer() {
+        let (a, mut rx_a) = ChannelEventSink::new();
+        let (b, mut rx_b) = ChannelEventSink::new();
+        let sink = FanoutSink::new().with(a).with(b);
+        let task = TaskId::new();
+
+        sink.emit(task, EventKind::TaskStarted);
+        sink.emit(task, EventKind::TextDelta { text: "x".into() });
+        sink.emit(task, EventKind::TaskCompleted);
+
+        // Each consumer numbers its own stream from zero.
+        for rx in [&mut rx_a, &mut rx_b] {
+            let mut expected = 0u64;
+            while let Ok(event) = rx.try_recv() {
+                assert_eq!(event.sequence, expected);
+                assert_eq!(event.task_id, task);
+                expected += 1;
+            }
+            assert_eq!(expected, 3);
+        }
+        assert_eq!(sink.dropped(), 0);
+    }
+
+    #[test]
+    fn fanout_counts_drops_but_keeps_healthy_consumers_fed() {
+        let (dead, receiver) = ChannelEventSink::new();
+        drop(receiver); // this consumer is gone: its events must drop
+        let (live, mut rx_live) = ChannelEventSink::new();
+        let sink = FanoutSink::new().with(dead).with(live);
+        let task = TaskId::new();
+
+        sink.emit(task, EventKind::TaskStarted);
+        sink.emit(task, EventKind::TaskCompleted);
+
+        assert_eq!(sink.dropped(), 2, "one drop per event on the closed child");
+        assert_eq!(
+            rx_live.try_recv().unwrap().kind,
+            EventKind::TaskStarted,
+            "a dead sibling must not starve healthy consumers"
+        );
+        assert_eq!(rx_live.try_recv().unwrap().kind, EventKind::TaskCompleted);
+    }
+
+    #[test]
+    fn empty_fanout_observes_nothing() {
+        let sink = FanoutSink::new();
+        sink.emit(TaskId::new(), EventKind::TaskStarted);
+        assert_eq!(sink.dropped(), 0);
+    }
+
+    #[test]
+    fn fanout_shares_children_through_arc_handles() {
+        // `with_shared` is for callers that keep a handle to one child
+        // (status polls); the child must stay shared, not owned.
+        let (child, mut rx) = ChannelEventSink::new();
+        let shared: Arc<dyn EventSink> = Arc::new(child);
+        let sink = FanoutSink::new().with_shared(shared.clone());
+
+        sink.emit(TaskId::new(), EventKind::TaskStarted);
+        assert!(rx.try_recv().is_ok(), "shared child receives");
+        assert_eq!(shared.dropped(), 0, "handle observes the child state");
+
+        drop(sink);
+        assert_eq!(
+            Arc::strong_count(&shared),
+            1,
+            "caller keeps the child alive"
+        );
     }
 }

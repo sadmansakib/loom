@@ -3,6 +3,23 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — FanoutSink: multi-consumer event fan-out
+
+`loom_core::kernel::event::FanoutSink` composes several event sinks into
+one: every event fans out to each child, each consumer numbers its own
+stream from zero, and a dropping child (closed channel) costs nothing but
+its own events — siblings keep receiving and the task keeps running. The
+fan-out's drop count sums the children, so the task-end `events_dropped`
+report still catches a loss on any consumer. Chainable:
+`FanoutSink::new().with(renderer).with(tracer)`; `with_shared` takes an
+`Arc<dyn EventSink>` for callers that keep a handle to one child.
+
+The CLI now uses it: `loom run` splits its single consumer thread into
+two — the stdout renderer always, the NDJSON trace writer when
+`--trace` is on — so a stalled disk can delay the trace without ever
+delaying the terminal, and vice versa. This is the kernel-side shape
+GUI/TUI frontends fan out on (punch-list item B1).
+
 ## 2026-10-09 — Catalog policy behind the engine; `Engine::open_async`; auth env-state helper
 
 The OpenRouter catalog policy — fetch with the credential the provider
