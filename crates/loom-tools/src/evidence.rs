@@ -540,14 +540,10 @@ pub fn go_failures(output: &str) -> Vec<TestFailure> {
             continue;
         }
         let trimmed = line.trim();
-        let is_status = trimmed == "FAIL"
-            || trimmed == "PASS"
-            || trimmed.starts_with("ok ")
-            || trimmed.starts_with("FAIL");
         let Some(failure) = current.as_mut() else {
             continue;
         };
-        if is_status {
+        if go_is_status(trimmed) {
             if let Some(failure) = current.take() {
                 failures.push(failure);
             }
@@ -568,6 +564,15 @@ pub fn go_failures(output: &str) -> Vec<TestFailure> {
         failures.push(failure);
     }
     failures
+}
+
+/// Whether `trimmed` is a bare `go test` package status line — the
+/// section-independent trailers that end any open failure section.
+fn go_is_status(trimmed: &str) -> bool {
+    trimmed == "FAIL"
+        || trimmed == "PASS"
+        || trimmed.starts_with("ok ")
+        || trimmed.starts_with("FAIL")
 }
 
 /// Parses pytest human output into failing tests.
@@ -615,7 +620,7 @@ pub fn pytest_failures(output: &str) -> Vec<TestFailure> {
         // in real output, so it must not end the section either. Only
         // rule bars (`====`, `----`) end a section.
         let trimmed = line.trim();
-        if line.starts_with([' ', '\t']) || trimmed.is_empty() || line.starts_with('>') {
+        if pytest_is_body(line, trimmed) {
             continue;
         }
         if let Some(location) = python_anchor(line) {
@@ -635,22 +640,38 @@ pub fn pytest_failures(output: &str) -> Vec<TestFailure> {
         failures.push(failure);
     }
     if failures.is_empty() {
-        for line in output.lines() {
-            let trimmed = line.trim();
-            let Some(rest) = trimmed.strip_prefix("FAILED ") else {
-                continue;
-            };
-            let Some((nodeid, message)) = rest.split_once(" - ") else {
-                continue;
-            };
-            failures.push(TestFailure {
-                name: nodeid.trim().to_owned(),
-                message: message.trim().to_owned(),
-                location: None,
-            });
-        }
+        return pytest_summary_failures(output);
     }
     failures
+}
+
+/// The `FAILED <nodeid> - <message>` short-summary fallback: when no
+/// `FAILURES` section parsed (terse output, `-q`, plugins), pytest still
+/// prints one summary line per failure at the end.
+fn pytest_summary_failures(output: &str) -> Vec<TestFailure> {
+    let mut failures = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("FAILED ") else {
+            continue;
+        };
+        let Some((nodeid, message)) = rest.split_once(" - ") else {
+            continue;
+        };
+        failures.push(TestFailure {
+            name: nodeid.trim().to_owned(),
+            message: message.trim().to_owned(),
+            location: None,
+        });
+    }
+    failures
+}
+
+/// Whether a line inside a `FAILURES` section is body (indented source,
+/// blank, or the `>` failing-line marker) rather than a column-0
+/// structural line.
+fn pytest_is_body(line: &str, trimmed: &str) -> bool {
+    line.starts_with([' ', '\t']) || trimmed.is_empty() || line.starts_with('>')
 }
 
 /// The test name in a pytest `____ <name> ____` section header.

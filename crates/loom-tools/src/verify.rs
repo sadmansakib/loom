@@ -228,33 +228,7 @@ pub(crate) fn render(
 ) -> ToolOutput {
     let raw = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // Parsers are per ecosystem, each with stdout-then-stderr fallback so
-    // the two streams never duplicate one failure.
-    let mut evidence = Evidence {
-        changed_paths: recent_changes.to_vec(),
-        ..Evidence::default()
-    };
-    match ecosystem {
-        Ecosystem::Cargo => {
-            evidence.diagnostics =
-                non_empty(cargo_diagnostics(&raw), || cargo_diagnostics(&stderr));
-            evidence.failures = non_empty(libtest_failures(&raw), || nextest_junit(&raw));
-        }
-        Ecosystem::Go => {
-            evidence.diagnostics = non_empty(go_diagnostics(&raw), || go_diagnostics(&stderr));
-            evidence.failures = go_failures(&raw);
-        }
-        Ecosystem::Python => {
-            // compileall reports on stderr; pytest prints on stdout.
-            evidence.diagnostics =
-                non_empty(python_diagnostics(&stderr), || python_diagnostics(&raw));
-            evidence.failures = non_empty(pytest_failures(&raw), || pytest_failures(&stderr));
-        }
-        // No stable human format for these runners: the bounded raw
-        // fallback below is the honest representation.
-        Ecosystem::Npm | Ecosystem::Make => {}
-    }
+    let evidence = parse_evidence(ecosystem, &raw, &stderr, recent_changes);
 
     let mut text = format!("$ {program} {}", args.join(" "));
     text.push('\n');
@@ -273,14 +247,7 @@ pub(crate) fn render(
         } else {
             // Nothing parseable but the command failed: fall back to the
             // bounded raw output so the failure is never hidden, just capped.
-            if !raw.trim().is_empty() {
-                text.push_str("--- output ---\n");
-                text.push_str(&raw);
-            }
-            if !stderr.trim().is_empty() {
-                text.push_str("--- stderr ---\n");
-                text.push_str(&stderr);
-            }
+            push_raw_fallback(&mut text, &raw, &stderr);
         }
     } else {
         text.push_str(&evidence.render());
@@ -298,6 +265,55 @@ pub(crate) fn render(
 /// The first list if non-empty, otherwise the fallback's.
 fn non_empty<T>(first: Vec<T>, fallback: impl FnOnce() -> Vec<T>) -> Vec<T> {
     if first.is_empty() { fallback() } else { first }
+}
+
+/// Parses one run's output streams into structured [`Evidence`].
+///
+/// Parsers are per ecosystem, each with a stdout-then-stderr fallback so
+/// the two streams never duplicate one failure (Python inverts the
+/// diagnostic order: compileall reports on stderr, pytest on stdout).
+fn parse_evidence(
+    ecosystem: Ecosystem,
+    raw: &str,
+    stderr: &str,
+    recent_changes: &[String],
+) -> Evidence {
+    let mut evidence = Evidence {
+        changed_paths: recent_changes.to_vec(),
+        ..Evidence::default()
+    };
+    match ecosystem {
+        Ecosystem::Cargo => {
+            evidence.diagnostics = non_empty(cargo_diagnostics(raw), || cargo_diagnostics(stderr));
+            evidence.failures = non_empty(libtest_failures(raw), || nextest_junit(raw));
+        }
+        Ecosystem::Go => {
+            evidence.diagnostics = non_empty(go_diagnostics(raw), || go_diagnostics(stderr));
+            evidence.failures = go_failures(raw);
+        }
+        Ecosystem::Python => {
+            // compileall reports on stderr; pytest prints on stdout.
+            evidence.diagnostics =
+                non_empty(python_diagnostics(stderr), || python_diagnostics(raw));
+            evidence.failures = non_empty(pytest_failures(raw), || pytest_failures(stderr));
+        }
+        // No stable human format for these runners: the bounded raw
+        // fallback in `render` is the honest representation.
+        Ecosystem::Npm | Ecosystem::Make => {}
+    }
+    evidence
+}
+
+/// Appends the capped raw streams, labeled, for output nothing parsed.
+fn push_raw_fallback(text: &mut String, raw: &str, stderr: &str) {
+    if !raw.trim().is_empty() {
+        text.push_str("--- output ---\n");
+        text.push_str(raw);
+    }
+    if !stderr.trim().is_empty() {
+        text.push_str("--- stderr ---\n");
+        text.push_str(stderr);
+    }
 }
 
 /// The harness's own one-line summary of a passing run, if present, so a

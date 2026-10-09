@@ -3,6 +3,22 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — Complexity pass, tools batch: edit, confinement, and evidence hotspots decompose
+
+Tier-1 (CCN ≥ 15) reductions across loom-tools, same treatment as the
+kernel and providers batches: `edit_file::apply_edits` 26→13 and
+`edit_file::call` 17→12 (load/resolve/replace-span/repair-probe/assemble
+helpers — the fused edit+verify flow keeps its shape);
+`policy::validate` 17→13 (`bare_name` predicate); `confinement::walk`
+17→10 (`step_normal` carries the symlink machinery — lstat, existing
+target canonicalisation, dangling-target recursion with the
+`SYMLINK_LIMIT` bound; all 19 confinement security tests green);
+`evidence::go_failures` 16→13 (`go_is_status`),
+`evidence::pytest_failures` 17→14 (`pytest_summary_failures` fallback +
+`pytest_is_body` predicate); `verify::render` 15→5 (`parse_evidence`
+per-ecosystem dispatch + `push_raw_fallback`). Every extraction is
+behavior-preserving; 672 tests unchanged.
+
 ## 2026-10-09 — Complexity pass, providers batch: the wire hotspots decompose
 
 Tier 1 of the complexity audit (lizard CCN ≥ 15), provider batch. The

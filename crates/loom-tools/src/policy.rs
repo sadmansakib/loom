@@ -277,12 +277,7 @@ impl CommandPolicy {
 /// path-qualified or empty program names, out-of-range caps, or scrub
 /// names that are not environment variable names.
 fn validate(rule: &CommandRule, path: &str) -> Result<(), PolicyError> {
-    if rule.program.is_empty()
-        || rule.program.contains('/')
-        || rule.program.contains('\\')
-        || rule.program == "."
-        || rule.program == ".."
-    {
+    if !bare_name(&rule.program) {
         return Err(PolicyError::Invalid {
             path: path.to_owned(),
             message: format!(
@@ -331,6 +326,18 @@ fn validate(rule: &CommandRule, path: &str) -> Result<(), PolicyError> {
         }
     }
     Ok(())
+}
+
+/// Whether `program` names an executable the way a careful operator
+/// would: non-empty, no path separators, and not a directory reference.
+/// Path-qualified names would make the allowlist depend on where the
+/// binary lives, so they are refused at parse time.
+fn bare_name(program: &str) -> bool {
+    !(program.is_empty()
+        || program.contains('/')
+        || program.contains('\\')
+        || program == "."
+        || program == "..")
 }
 
 #[cfg(test)]

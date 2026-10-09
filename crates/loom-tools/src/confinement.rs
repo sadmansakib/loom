@@ -125,51 +125,7 @@ fn walk(
                 }
             }
             Component::Normal(name) => {
-                if missing {
-                    current.push(name);
-                    continue;
-                }
-                let next = current.join(name);
-                match std::fs::symlink_metadata(&next) {
-                    Ok(meta) if meta.file_type().is_symlink() => match next.canonicalize() {
-                        Ok(resolved) => current = resolved,
-                        Err(_) => {
-                            // Dangling link: the lstat succeeded but
-                            // the target is gone. Resolve the target
-                            // with the same component-wise walk, so
-                            // `..` and nested links inside the target
-                            // obey real resolution rules.
-                            if depth >= SYMLINK_LIMIT {
-                                return Err(ToolError::InvalidInput(format!(
-                                    "path \"{}\" exceeds {SYMLINK_LIMIT} levels of \
-                                     symbolic links",
-                                    user.display()
-                                )));
-                            }
-                            let target = std::fs::read_link(&next).map_err(|err| {
-                                ToolError::InvalidInput(format!(
-                                    "cannot resolve symlink in path \"{}\": {err}",
-                                    user.display()
-                                ))
-                            })?;
-                            current = walk(&current, canonical_root, &target, depth + 1)?;
-                            // The target may resolve back to an
-                            // existing directory (e.g. `x/..` lands
-                            // on the root). Only stay lexical when
-                            // the resolved path is really missing —
-                            // hardcoding `true` let a later symlink
-                            // skip its lstat check entirely.
-                            missing = !current.try_exists().unwrap_or(false);
-                        }
-                    },
-                    // A real (non-symlink) existing component: still
-                    // canonical, since `current` was.
-                    Ok(_) => current = next,
-                    Err(_) => {
-                        current = next;
-                        missing = true;
-                    }
-                }
+                missing = step_normal(&mut current, missing, name, canonical_root, user, depth)?;
             }
         }
     }
@@ -178,6 +134,73 @@ fn walk(
         Ok(current)
     } else {
         Err(escape())
+    }
+}
+
+/// Advances the walk by one normal component, lstat-checking it:
+/// symlinks are followed (existing targets become the new `current`;
+/// dangling targets are resolved with the same component-wise walk,
+/// bounded by [`SYMLINK_LIMIT`]), real components are appended as-is,
+/// and a missing component flips the walk into its lexical regime.
+///
+/// Returns the component's `missing` verdict; `current` is updated in
+/// place.
+fn step_normal(
+    current: &mut PathBuf,
+    missing: bool,
+    name: &std::ffi::OsStr,
+    canonical_root: &Path,
+    user: &Path,
+    depth: usize,
+) -> Result<bool, ToolError> {
+    if missing {
+        current.push(name);
+        return Ok(true);
+    }
+    let next = current.join(name);
+    match std::fs::symlink_metadata(&next) {
+        Ok(meta) if meta.file_type().is_symlink() => match next.canonicalize() {
+            Ok(resolved) => {
+                *current = resolved;
+                Ok(false)
+            }
+            Err(_) => {
+                // Dangling link: the lstat succeeded but the target
+                // is gone. Resolve the target with the same
+                // component-wise walk, so `..` and nested links
+                // inside the target obey real resolution rules.
+                if depth >= SYMLINK_LIMIT {
+                    return Err(ToolError::InvalidInput(format!(
+                        "path \"{}\" exceeds {SYMLINK_LIMIT} levels of \
+                         symbolic links",
+                        user.display()
+                    )));
+                }
+                let target = std::fs::read_link(&next).map_err(|err| {
+                    ToolError::InvalidInput(format!(
+                        "cannot resolve symlink in path \"{}\": {err}",
+                        user.display()
+                    ))
+                })?;
+                *current = walk(current, canonical_root, &target, depth + 1)?;
+                // The target may resolve back to an existing
+                // directory (e.g. `x/..` lands on the root). Only
+                // stay lexical when the resolved path is really
+                // missing — hardcoding `true` let a later symlink
+                // skip its lstat check entirely.
+                Ok(!current.try_exists().unwrap_or(false))
+            }
+        },
+        // A real (non-symlink) existing component: still canonical,
+        // since `current` was.
+        Ok(_) => {
+            *current = next;
+            Ok(false)
+        }
+        Err(_) => {
+            *current = next;
+            Ok(true)
+        }
     }
 }
 

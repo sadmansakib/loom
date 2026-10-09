@@ -108,6 +108,44 @@ impl EditInput {
     }
 }
 
+/// Resolves every edit's display path against the workspace root.
+/// Confinement is checked per edit before anything runs: a batch that
+/// would escape the workspace fails as a whole, before any file is read.
+fn resolve_edits(
+    root: &Path,
+    batch: Vec<(String, String, String)>,
+) -> Result<Vec<(PathBuf, String, String)>, ToolError> {
+    batch
+        .into_iter()
+        .map(|(display, old, new)| Ok((resolve_within(root, &display)?, old, new)))
+        .collect()
+}
+
+/// Turns an applied batch into its effects and the pre-verify output
+/// body: the success line, the repair note when Loom salvaged calls,
+/// and the echoed regions.
+fn assemble_body(outcome: &EditOutcome) -> (ToolEffects, String, bool) {
+    let mut effects = ToolEffects::none();
+    for (relative, _) in &outcome.files {
+        effects = effects.with_file_written(relative.clone());
+    }
+    for note in &outcome.repairs {
+        effects = effects.with_repair(note.clone());
+    }
+    let repair_note = if outcome.repairs.is_empty() {
+        String::new()
+    } else {
+        format!("\n(repaired: {})", outcome.repairs.join("; "))
+    };
+    let (echo, truncated_echo) = render_echo(outcome);
+    let mut content = format!("edited {}{}", outcome.detail, repair_note);
+    if !echo.is_empty() {
+        content.push_str("\n\n");
+        content.push_str(&echo);
+    }
+    (effects, content, truncated_echo)
+}
+
 impl Tool for EditFileTool {
     fn spec(&self) -> &ToolSpec {
         static SPEC: OnceLock<ToolSpec> = OnceLock::new();
@@ -154,38 +192,13 @@ impl Tool for EditFileTool {
             let input: EditInput = serde_json::from_value(input)
                 .map_err(|err| ToolError::InvalidInput(format!("invalid arguments: {err}")))?;
             let batch = input.batch()?;
-            // Confinement is checked per edit before anything runs: a
-            // batch that would escape the workspace fails as a whole,
-            // before any file is read.
             let scope = input.verify;
-            let edits: Vec<(PathBuf, String, String)> = batch
-                .into_iter()
-                .map(|(display, old, new)| {
-                    Ok((resolve_within(&ctx.workspace_root, &display)?, old, new))
-                })
-                .collect::<Result<Vec<_>, ToolError>>()?;
+            let edits = resolve_edits(&ctx.workspace_root, batch)?;
             let root = ctx.workspace_root.clone();
             let outcome = tokio::task::spawn_blocking(move || apply_edits(&root, &edits))
                 .await
                 .map_err(|err| ToolError::Execution(format!("edit task failed: {err}")))??;
-            let mut effects = ToolEffects::none();
-            for (relative, _) in &outcome.files {
-                effects = effects.with_file_written(relative.clone());
-            }
-            for note in &outcome.repairs {
-                effects = effects.with_repair(note.clone());
-            }
-            let repair_note = if outcome.repairs.is_empty() {
-                String::new()
-            } else {
-                format!("\n(repaired: {})", outcome.repairs.join("; "))
-            };
-            let (echo, truncated_echo) = render_echo(&outcome);
-            let mut content = format!("edited {}{}", outcome.detail, repair_note);
-            if !echo.is_empty() {
-                content.push_str("\n\n");
-                content.push_str(&echo);
-            }
+            let (mut effects, mut content, truncated_echo) = assemble_body(&outcome);
             let mut truncated = false;
             if let Some(scope) = scope {
                 let verify_target = outcome
@@ -225,23 +238,16 @@ struct EditOutcome {
     repairs: Vec<String>,
 }
 
-/// Reads every target file once, applies the edits in order against the
-/// evolving texts, and writes all files back only when every edit
-/// matched exactly once. `root` is the workspace root, for relative
-/// paths in the effects.
-fn apply_edits(root: &Path, edits: &[(PathBuf, String, String)]) -> Result<EditOutcome, ToolError> {
-    let batch_len = edits.len();
-    let prefix = |index: usize| -> String {
-        if batch_len > 1 {
-            format!("edit {} of {batch_len}: ", index + 1)
-        } else {
-            String::new()
-        }
-    };
-    // Unlike the read tools, a missing file here is an execution error, not an
-    // informational "does not exist": a write path that targets nothing is a
-    // model mistake (read first, or use write_file), and the loop's failure
-    // ledger should refuse a blind repeat (ADR-020).
+/// Loads every distinct target file once, enforcing the size cap and the
+/// UTF-8 requirement up front.
+///
+/// Unlike the read tools, a missing file here is an execution error, not an
+/// informational "does not exist": a write path that targets nothing is a
+/// model mistake (read first, or use write_file), and the loop's failure
+/// ledger should refuse a blind repeat (ADR-020).
+fn load_edit_files(
+    edits: &[(PathBuf, String, String)],
+) -> Result<Vec<(PathBuf, String)>, ToolError> {
     let mut files: Vec<(PathBuf, String)> = Vec::new();
     for (path, _, _) in edits {
         if files.iter().any(|(p, _)| p == path) {
@@ -264,17 +270,92 @@ fn apply_edits(root: &Path, edits: &[(PathBuf, String, String)]) -> Result<EditO
             .map_err(|_| ToolError::Execution(String::from("file is not valid UTF-8")))?;
         files.push((path.clone(), text));
     }
-    // Apply in order, tracking each replacement's byte span so later
-    // edits on the same file shift earlier spans instead of orphaning
-    // them. A replaced range can never overlap a recorded span: each
-    // consumed a distinct unique match.
+    Ok(files)
+}
+
+/// Replaces `old_len` bytes at `start` with `new` in `text`, shifting the
+/// file's already-recorded spans that sit after the replacement so later
+/// edits on the same file move earlier spans instead of orphaning them,
+/// and records the replacement's own span.
+///
+/// A replaced range can never overlap a recorded span: each consumed a
+/// distinct unique match.
+fn replace_span(
+    text: &mut String,
+    file_spans: &mut Vec<(usize, usize)>,
+    start: usize,
+    old_len: usize,
+    new: &str,
+) {
+    text.replace_range(start..start + old_len, new);
+    let delta = new.len() as isize - old_len as isize;
+    for (recorded_start, _) in file_spans.iter_mut() {
+        if start < *recorded_start {
+            *recorded_start = (*recorded_start as isize + delta) as usize;
+        }
+    }
+    file_spans.push((start, new.len()));
+}
+
+/// The repair probe (roadmap item 6): models pad `old_string` with
+/// incidental whitespace far more often than they genuinely misremember
+/// the text. Returns the byte offset when exactly one trimmed copy
+/// matches (and the trim removed something); anything else stays `None`
+/// so the caller keeps the original error.
+fn trimmed_match(text: &str, old: &str) -> Option<usize> {
+    let trimmed = old.trim();
+    if trimmed.is_empty() || text.matches(trimmed).count() != 1 {
+        return None;
+    }
+    text.find(trimmed)
+}
+
+/// The `edited …` success line: one file gets the occurrence count,
+/// several get the per-file rollup.
+fn edit_detail(resolved: &[(String, String)], per_file_counts: &[usize]) -> String {
+    if resolved.len() == 1 {
+        let (relative, _) = &resolved[0];
+        format!(
+            "{relative}: replaced {} occurrence{}",
+            per_file_counts[0],
+            if per_file_counts[0] == 1 { "" } else { "s" }
+        )
+    } else {
+        let summary = resolved
+            .iter()
+            .zip(per_file_counts)
+            .map(|((relative, _), count)| format!("{relative} ×{count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{} edits across {} files ({summary})",
+            per_file_counts.iter().sum::<usize>(),
+            resolved.len()
+        )
+    }
+}
+
+/// Reads every target file once, applies the edits in order against the
+/// evolving texts, and writes all files back only when every edit
+/// matched exactly once. `root` is the workspace root, for relative
+/// paths in the effects.
+fn apply_edits(root: &Path, edits: &[(PathBuf, String, String)]) -> Result<EditOutcome, ToolError> {
+    let batch_len = edits.len();
+    let prefix = |index: usize| -> String {
+        if batch_len > 1 {
+            format!("edit {} of {batch_len}: ", index + 1)
+        } else {
+            String::new()
+        }
+    };
+    let mut files = load_edit_files(edits)?;
     let mut spans: Vec<Vec<(usize, usize)>> = vec![Vec::new(); files.len()];
     let mut repairs: Vec<String> = Vec::new();
     for (index, (path, old, new)) in edits.iter().enumerate() {
         let file_idx = match files.iter().position(|(p, _)| p == path) {
             Some(idx) => idx,
             None => {
-                // Unreachable: the load loop above inserted every edit's
+                // Unreachable: `load_edit_files` inserted every edit's
                 // path. Stated as an error rather than a panic so the
                 // invariant is checkable, not assumed.
                 return Err(ToolError::Execution(String::from(
@@ -291,26 +372,8 @@ fn apply_edits(root: &Path, edits: &[(PathBuf, String, String)]) -> Result<EditO
         }
         match (text.matches(old).count(), text.find(old)) {
             (0, _) => {
-                // Repair pass (roadmap item 6): models pad `old_string`
-                // with incidental whitespace far more often than they
-                // genuinely misremember the text. When exactly one trimmed
-                // copy of the old string matches, apply the edit and note
-                // the repair; anything else keeps the original error.
-                let trimmed = old.trim();
-                let repaired = match text.matches(trimmed).count() {
-                    1 if !trimmed.is_empty() => text.find(trimmed),
-                    _ => None,
-                };
-                if let Some(start) = repaired {
-                    let end = start + trimmed.len();
-                    text.replace_range(start..end, new);
-                    let delta = new.len() as isize - trimmed.len() as isize;
-                    for (recorded_start, _) in &mut spans[file_idx] {
-                        if start < *recorded_start {
-                            *recorded_start = (*recorded_start as isize + delta) as usize;
-                        }
-                    }
-                    spans[file_idx].push((start, new.len()));
+                if let Some(start) = trimmed_match(text, old) {
+                    replace_span(text, &mut spans[file_idx], start, old.trim().len(), new);
                     repairs.push(format!(
                         "{}old_string matched after trimming whitespace",
                         prefix(index)
@@ -323,15 +386,7 @@ fn apply_edits(root: &Path, edits: &[(PathBuf, String, String)]) -> Result<EditO
                 }
             }
             (1, Some(start)) => {
-                let end = start + old.len();
-                text.replace_range(start..end, new);
-                let delta = new.len() as isize - old.len() as isize;
-                for (recorded_start, _) in &mut spans[file_idx] {
-                    if start < *recorded_start {
-                        *recorded_start = (*recorded_start as isize + delta) as usize;
-                    }
-                }
-                spans[file_idx].push((start, new.len()));
+                replace_span(text, &mut spans[file_idx], start, old.len(), new);
             }
             (n, _) => {
                 return Err(ToolError::InvalidInput(format!(
@@ -351,26 +406,6 @@ fn apply_edits(root: &Path, edits: &[(PathBuf, String, String)]) -> Result<EditO
         .map(|(path, text)| (workspace_relative(root, path), text.clone()))
         .collect();
     let per_file_counts: Vec<usize> = spans.iter().map(Vec::len).collect();
-    let detail = if resolved.len() == 1 {
-        let (relative, _) = &resolved[0];
-        format!(
-            "{relative}: replaced {} occurrence{}",
-            per_file_counts[0],
-            if per_file_counts[0] == 1 { "" } else { "s" }
-        )
-    } else {
-        let summary = resolved
-            .iter()
-            .zip(&per_file_counts)
-            .map(|((relative, _), count)| format!("{relative} ×{count}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "{} edits across {} files ({summary})",
-            per_file_counts.iter().sum::<usize>(),
-            resolved.len()
-        )
-    };
     let mut echoes = Vec::new();
     for (file_idx, file_spans) in spans.iter().enumerate() {
         for (start, len) in file_spans {
@@ -378,7 +413,7 @@ fn apply_edits(root: &Path, edits: &[(PathBuf, String, String)]) -> Result<EditO
         }
     }
     Ok(EditOutcome {
-        detail,
+        detail: edit_detail(&resolved, &per_file_counts),
         files: resolved,
         spans: echoes,
         repairs,
