@@ -3,6 +3,18 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — Complexity pass, eval batch: grade_gate's arms split
+
+Tier-1 close-out (lizard CCN ≥ 15): `eval::grade_gate` 17 → 6. The
+fixture-test run moved to `gate_tests` (with the spawn_blocking join
+and its two error reports); the two gate kinds each got their grader —
+`grade_bugfix` (fail_to_pass / pass_to_pass / protected-file ledger)
+and `grade_outcome` (exact-files / contains / tests-green checks).
+`grade_gate` itself is now the dispatch: which gate, whether tests are
+needed, which grader. 672 tests unchanged. With this, every function
+in the Tier-1 audit is under the threshold — 19 functions across five
+commits, behavior-preserving throughout.
+
 ## 2026-10-09 — Complexity pass, cli batch: run's consumer wiring decomposes
 
 The CLI adapter's `run` (lizard CCN 22 → 7) is now the process skeleton

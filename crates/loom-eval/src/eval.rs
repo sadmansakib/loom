@@ -814,95 +814,121 @@ async fn grade_gate(
         TaskGate::Bugfix(_) => true,
         TaskGate::Outcome(spec) => spec.tests_green.is_some(),
     };
-    let (code, output) = if needs_tests {
-        let root = root.to_path_buf();
-        match tokio::task::spawn_blocking(move || run_fixture_tests(&root)).await {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(error)) => {
-                return Some(serde_json::json!({
-                    "bug_fixed": false,
-                    "error": format!("cargo test failed to run: {error}"),
-                }));
-            }
-            Err(join) => {
-                return Some(serde_json::json!({
-                    "bug_fixed": false,
-                    "error": format!("gate task join error: {join}"),
-                }));
-            }
-        }
-    } else {
-        (None, String::new())
+    let (code, output) = match gate_tests(root, needs_tests).await {
+        Ok(pair) => pair,
+        Err(error) => return Some(error),
     };
     match gate {
-        TaskGate::Bugfix(spec) => {
-            let outcomes = test_outcomes(&output);
-            let passed = |name: &str| outcomes.iter().any(|(n, ok)| n == name && *ok);
-            let fail_to_pass: Vec<_> = spec
-                .fail_to_pass
-                .iter()
-                .map(|name| serde_json::json!({"name": name, "passed": passed(name)}))
-                .collect();
-            let pass_to_pass: Vec<_> = spec
-                .pass_to_pass
-                .iter()
-                .map(|name| serde_json::json!({"name": name, "passed": passed(name)}))
-                .collect();
-            let protected_unmodified = protected_before.is_some_and(|snapshot| {
-                snapshot
-                    .iter()
-                    .all(|(path, before)| std::fs::read(path).is_ok_and(|now| now == *before))
-            });
-            let bug_fixed = code == Some(0)
-                && fail_to_pass
-                    .iter()
-                    .all(|r| r["passed"].as_bool().unwrap_or(false))
-                && pass_to_pass
-                    .iter()
-                    .all(|r| r["passed"].as_bool().unwrap_or(false))
-                && protected_unmodified;
-            Some(serde_json::json!({
-                "bug_fixed": bug_fixed,
-                "cargo_exit": code,
-                "fail_to_pass": fail_to_pass,
-                "pass_to_pass": pass_to_pass,
-                "tests_passed": outcomes.iter().filter(|(_, ok)| *ok).count(),
-                "protected_unmodified": protected_unmodified,
-            }))
-        }
-        TaskGate::Outcome(spec) => {
-            let mut checks = Vec::new();
-            for (rel, expected) in &spec.exact_files {
-                // One optional trailing newline is tolerated (see OutcomeSpec).
-                let ok = std::fs::read(root.join(rel)).is_ok_and(|body| {
-                    body.strip_suffix(b"\n").unwrap_or(&body) == expected.as_bytes()
-                });
-                checks.push(serde_json::json!({"exact": rel, "ok": ok}));
-            }
-            for (rel, needle) in &spec.contains {
-                let ok = std::fs::read_to_string(root.join(rel)).is_ok_and(|body| {
-                    body.to_ascii_lowercase()
-                        .contains(&needle.to_ascii_lowercase())
-                });
-                checks.push(serde_json::json!({"contains": rel, "needle": needle, "ok": ok}));
-            }
-            if let Some(expected) = spec.tests_green {
-                let passed = count_tests_passed(&output);
-                checks.push(serde_json::json!({
-                    "tests_green": true,
-                    "ok": code == Some(0) && passed >= expected,
-                }));
-            }
-            let bug_fixed = checks
-                .iter()
-                .all(|check| check["ok"].as_bool().unwrap_or(false));
-            Some(serde_json::json!({
-                "bug_fixed": bug_fixed,
-                "checks": checks,
-                "cargo_exit": code,
-            }))
-        }
+        TaskGate::Bugfix(spec) => Some(grade_bugfix(spec, code, &output, protected_before)),
+        TaskGate::Outcome(spec) => Some(grade_outcome(spec, root, code, &output)),
     }
+}
+
+/// Runs the fixture tests a gate needs, returning `(exit code, combined
+/// output)` — or the ready-to-emit failure JSON when `cargo test` could
+/// not run at all. Tasks that need no tests get the empty pair.
+async fn gate_tests(
+    root: &Path,
+    needs_tests: bool,
+) -> Result<(Option<i32>, String), serde_json::Value> {
+    if !needs_tests {
+        return Ok((None, String::new()));
+    }
+    let root = root.to_path_buf();
+    match tokio::task::spawn_blocking(move || run_fixture_tests(&root)).await {
+        Ok(Ok(pair)) => Ok(pair),
+        Ok(Err(error)) => Err(serde_json::json!({
+            "bug_fixed": false,
+            "error": format!("cargo test failed to run: {error}"),
+        })),
+        Err(join) => Err(serde_json::json!({
+            "bug_fixed": false,
+            "error": format!("gate task join error: {join}"),
+        })),
+    }
+}
+
+/// The SWE-bench-shaped verdict: exit 0, every FAIL_TO_PASS flipped to
+/// passing, every PASS_TO_PASS still passing, and the protected files
+/// byte-identical to their pre-run snapshot.
+fn grade_bugfix(
+    spec: &BugfixSpec,
+    code: Option<i32>,
+    output: &str,
+    protected_before: Option<&[(PathBuf, Vec<u8>)]>,
+) -> serde_json::Value {
+    let outcomes = test_outcomes(output);
+    let passed = |name: &str| outcomes.iter().any(|(n, ok)| n == name && *ok);
+    let fail_to_pass: Vec<_> = spec
+        .fail_to_pass
+        .iter()
+        .map(|name| serde_json::json!({"name": name, "passed": passed(name)}))
+        .collect();
+    let pass_to_pass: Vec<_> = spec
+        .pass_to_pass
+        .iter()
+        .map(|name| serde_json::json!({"name": name, "passed": passed(name)}))
+        .collect();
+    let protected_unmodified = protected_before.is_some_and(|snapshot| {
+        snapshot
+            .iter()
+            .all(|(path, before)| std::fs::read(path).is_ok_and(|now| now == *before))
+    });
+    let bug_fixed = code == Some(0)
+        && fail_to_pass
+            .iter()
+            .all(|r| r["passed"].as_bool().unwrap_or(false))
+        && pass_to_pass
+            .iter()
+            .all(|r| r["passed"].as_bool().unwrap_or(false))
+        && protected_unmodified;
+    serde_json::json!({
+        "bug_fixed": bug_fixed,
+        "cargo_exit": code,
+        "fail_to_pass": fail_to_pass,
+        "pass_to_pass": pass_to_pass,
+        "tests_passed": outcomes.iter().filter(|(_, ok)| *ok).count(),
+        "protected_unmodified": protected_unmodified,
+    })
+}
+
+/// The outcome-task verdict: every exact-file, contains, and (when
+/// requested) tests-green check satisfied by the workspace state.
+fn grade_outcome(
+    spec: &OutcomeSpec,
+    root: &Path,
+    code: Option<i32>,
+    output: &str,
+) -> serde_json::Value {
+    let mut checks = Vec::new();
+    for (rel, expected) in &spec.exact_files {
+        // One optional trailing newline is tolerated (see OutcomeSpec).
+        let ok = std::fs::read(root.join(rel))
+            .is_ok_and(|body| body.strip_suffix(b"\n").unwrap_or(&body) == expected.as_bytes());
+        checks.push(serde_json::json!({"exact": rel, "ok": ok}));
+    }
+    for (rel, needle) in &spec.contains {
+        let ok = std::fs::read_to_string(root.join(rel)).is_ok_and(|body| {
+            body.to_ascii_lowercase()
+                .contains(&needle.to_ascii_lowercase())
+        });
+        checks.push(serde_json::json!({"contains": rel, "needle": needle, "ok": ok}));
+    }
+    if let Some(expected) = spec.tests_green {
+        let passed = count_tests_passed(output);
+        checks.push(serde_json::json!({
+            "tests_green": true,
+            "ok": code == Some(0) && passed >= expected,
+        }));
+    }
+    let bug_fixed = checks
+        .iter()
+        .all(|check| check["ok"].as_bool().unwrap_or(false));
+    serde_json::json!({
+        "bug_fixed": bug_fixed,
+        "checks": checks,
+        "cargo_exit": code,
+    })
 }
 
 /// Per-test outcomes from libtest output: `(name, passed)` for every
