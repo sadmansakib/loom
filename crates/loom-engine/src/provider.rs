@@ -11,7 +11,8 @@ use loom_kernel::model::{ModelCapabilities, ModelProvider};
 use loom_providers::{
     ANTHROPIC_PROVIDER_NAME, AnthropicConfig, AnthropicProvider, DEEPSEEK_PROVIDER_NAME,
     DeepSeekConfig, DeepSeekProvider, GLM_PROVIDER_NAME, GlmConfig, GlmProvider,
-    OPENROUTER_PROVIDER_NAME, OpenRouterConfig, OpenRouterProvider, ProviderCatalog,
+    NVIDIA_PROVIDER_NAME, NvidiaConfig, NvidiaProvider, OPENROUTER_PROVIDER_NAME, OpenRouterConfig,
+    OpenRouterProvider, ProviderCatalog,
 };
 
 use crate::engine::{EngineConfig, EngineError};
@@ -53,6 +54,7 @@ pub(crate) fn build(config: &EngineConfig, api_key: &str) -> Result<ProviderHand
         ANTHROPIC_PROVIDER_NAME => build_anthropic(config, api_key),
         OPENROUTER_PROVIDER_NAME => build_openrouter(config, api_key),
         GLM_PROVIDER_NAME => build_glm(config, api_key),
+        NVIDIA_PROVIDER_NAME => build_nvidia(config, api_key),
         other => Err(EngineError::UnknownProvider(other.to_owned())),
     }
 }
@@ -122,6 +124,34 @@ fn build_glm(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, Eng
         provider_config = provider_config.with_base_url(base_url.clone());
     }
     let provider = GlmProvider::new(provider_config)
+        .map_err(|error| EngineError::Provider(Box::new(error)))?;
+    let capabilities = provider
+        .capabilities(&config.model)
+        .ok_or_else(|| unknown_model(config))?;
+    if !capabilities.reasoning {
+        return Err(EngineError::ModelWithoutReasoning {
+            model: config.model.clone(),
+        });
+    }
+    check_window(config, &capabilities)?;
+    Ok(ProviderHandle {
+        provider: Box::new(provider),
+        capabilities,
+    })
+}
+
+/// Builds the NVIDIA adapter for NIM hosted inference.
+///
+/// Sends a top-level `reasoning_effort` on every request, so
+/// reasoning-capable models are required (every row in its table is
+/// reasoning-capable anyway).
+fn build_nvidia(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, EngineError> {
+    let mut provider_config =
+        NvidiaConfig::new(api_key).with_reasoning_effort(config.reasoning_effort);
+    if let Some(base_url) = &config.base_url {
+        provider_config = provider_config.with_base_url(base_url.clone());
+    }
+    let provider = NvidiaProvider::new(provider_config)
         .map_err(|error| EngineError::Provider(Box::new(error)))?;
     let capabilities = provider
         .capabilities(&config.model)

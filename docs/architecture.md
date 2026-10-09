@@ -25,7 +25,7 @@ kernel never links a filesystem store or a CLI, the engine never prints.
 | `loom-core` | Facade re-exporting the public surface for embedders | engine, kernel, providers, tools |
 | `loom-kernel` | The agent itself: loop, context compilation, session/transcript model, tool abstraction, tool cache, artifacts, events, budgets | no workspace crates — it defines the side-effect traits (`ModelProvider`, `SessionStore`, `ArtifactStore`, `Tool`, …) itself |
 | `loom-engine` | Composition root: builds a configured `Agent` from paths, auth, a provider factory, tool registry, and stores; repository facts scanner | kernel, store, providers, tools |
-| `loom-providers` | Model provider adapters (DeepSeek, OpenRouter, GLM over one shared OpenAI-compatible wire; Anthropic on its own messages-API driver) | kernel model types |
+| `loom-providers` | Model provider adapters (DeepSeek, OpenRouter, GLM, NVIDIA over one shared OpenAI-compatible wire; Anthropic on its own messages-API driver) | kernel model types |
 | `loom-store` | SQLite persistence: sessions, turns, tasks, artifacts, auth accounts | kernel store traits |
 | `loom-tools` | The shipped tool suite (read/search/edit/write/list/run/verify + artifact read) | kernel tool traits |
 | `loom-cli` | Binary: argument parsing, output rendering, run/eval/auth commands | engine |
@@ -497,7 +497,7 @@ checkpoint emit nothing).
 
 ## 10. Providers
 
-Four adapters ship:
+Five adapters ship:
 
 - **DeepSeek** — a built-in capability table, because its API serves no
   capability metadata; reasoning effort and a thinking on/off switch are
@@ -522,6 +522,19 @@ Four adapters ship:
   client-side obligation that mode carries. Its usage block sticks to
   the OpenAI-standard shapes, so this adapter adds no usage-dialect
   code at all. Verified by wiremock, not live: no funded key.
+- **NVIDIA** — NIM hosted inference (`integrate.api.nvidia.com/v1`),
+  OpenAI-compatible. Model ids are `publisher/model` (`z-ai/glm-5.3`,
+  `deepseek-ai/deepseek-v4-pro`, …); a built-in capability table covers
+  the five verified deployments. Reasoning depth rides the top-level
+  `reasoning_effort` field: GLM-5.3 deployments clamp an effort of
+  "none" to `low` (thinking is always on there too), while DeepSeek V4
+  deployments pass `none` through as real non-think mode. No `thinking`
+  object — that is Z.ai first-party dialect. NIM's chat template
+  defaults `clear_thinking` to false (preserved thinking), which the
+  wire layer already satisfies by replaying `reasoning_content`
+  verbatim. Like GLM, no usage-dialect code. Verified by wiremock, not
+  live; the free trial tier requires no credit card and is the
+  standing zero-cost candidate for the eval backlog (roadmap item 1).
 - **Anthropic** — the messages API, not the OpenAI wire: system as a
   top-level param, `tool_use`/`tool_result` content blocks,
   `thinking_delta` reasoning capture, and Anthropic's error taxonomy.
@@ -639,7 +652,7 @@ Compare suites by medians over N ≥ 5; the observed noise floor is ±10%.
 - Blocking work on the blocking pool; hashing never under a lock.
 - Facts scanned once per task; capabilities resolved once per task.
 
-**Testing** — the workspace carries 629 tests (13 live-API tests
+**Testing** — the workspace carries 643 tests (13 live-API tests
 ignored by default): unit tests per module,
 protocol and invariant tests against in-memory seams, security regression
 tests for confinement, canary tests for secrets, integration tests that

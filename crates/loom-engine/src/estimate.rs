@@ -78,9 +78,9 @@ impl TokenEstimator for AnthropicEstimator {
 ///
 /// Anthropic models count text differently from everything else Loom
 /// speaks, so they get [`AnthropicEstimator`]; every other provider
-/// (DeepSeek, OpenRouter's OpenAI-family backends, GLM on Z.ai's
-/// OpenAI-compatible wire) uses [`O200kEstimator`]. Called once per
-/// engine open, before the compilers are built.
+/// (DeepSeek, OpenRouter's OpenAI-family backends, GLM on Z.ai's and
+/// NVIDIA's NIM OpenAI-compatible wires) uses [`O200kEstimator`].
+/// Called once per engine open, before the compilers are built.
 #[must_use]
 pub fn estimator_for(provider: &str) -> Arc<dyn TokenEstimator> {
     if provider == loom_providers::ANTHROPIC_PROVIDER_NAME {

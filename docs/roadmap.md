@@ -162,7 +162,7 @@ Planned GLM support differs from the original plan: Loom targets the
 **metered Z.ai API**, never the GLM Coding Plan subscription endpoint
 (a non-API product; custom-harness use risks an account ban — see the
 warnings in `crates/loom-cli/tests/eval.rs`). Shipped adapters are
-DeepSeek, OpenRouter, Anthropic, and GLM (wiremock-verified against the
+DeepSeek, OpenRouter, Anthropic, GLM, and NVIDIA (wiremock-verified against the
 Z.ai spec; no funded key yet for live runs).
 
 ### Iteration 2 — Core efficiency & repository intelligence (current)
@@ -253,7 +253,7 @@ architecture is research input, not a dependency.
 Smallest sufficient reasoning for each task class (trivial → large,
 research), treated as an optimization problem; verification uses no model
 when deterministic checks pass. Prerequisites shipped: per-model
-capabilities and pricing as data, four providers. Model profiles
+capabilities and pricing as data, five providers. Model profiles
 (item 9) come first; routing changes the per-task model-fixed invariant
 and needs an ADR.
 
@@ -283,9 +283,12 @@ orchestration — downstream of a strong core.
 ```text
 Current iteration:     2 (core efficiency), with iteration 4 tools shipped early
 Language:              Rust (stable), 7 crates, unsafe forbidden
-Shipped providers:     DeepSeek, OpenRouter (free + paid), Anthropic, GLM
+Shipped providers:     DeepSeek, OpenRouter (free + paid), Anthropic, GLM,
+                      NVIDIA (NIM hosted inference)
 GLM status:            metered Z.ai API, wiremock-verified (no funded key)
-Eval models in use:    OpenRouter free tier (high variance); DeepSeek key drained
+NVIDIA status:         NIM free-trial tier (no credit card), wiremock-verified
+Eval models in use:    OpenRouter free tier (high variance); DeepSeek key drained;
+                      NVIDIA NIM free tier (wired, wiremock-verified, not yet live-run)
 Primary target:        successful work per model invocation
 Biggest open risk:     N=1 measurements below the noise floor (see item 1)
 ```
@@ -445,12 +448,13 @@ also summarized here so this section is the single source of truth.
   call quality, edit acceptance, repeats, repairs, spill savings — from
   transcripts), exit-code discipline (130 on cancel).
   Engine is frontend-neutral: no printing outside the CLI renderer.
-- **Providers.** Four adapters. Three share one OpenAI-compatible wire
+- **Providers.** Five adapters. Four share one OpenAI-compatible wire
   and SSE streaming driver: DeepSeek (built-in capability table,
   reasoning effort and thinking controls), OpenRouter (capabilities
   and pricing resolved from the provider's model catalog), and GLM
   (Z.ai metered API; 5.3-family forced thinking with effort clamping,
-  Preserved Thinking). Free and
+  Preserved Thinking), and NVIDIA (NIM hosted
+  inference; publisher/model ids; free-trial tier). Free and
   paid models travel the same path — pricing is data, never a branch —
   and the catalog is fetched and cached by the frontend, so the engine
   stays synchronous. Unknown models, missing catalogs, and windows
@@ -470,7 +474,7 @@ also summarized here so this section is the single source of truth.
   and cached tokens / cost / wall time / tool-cache hits, per-task
   aggregates and a gated-pass-rate suite headline; strict and tolerant
   modes.
-- **Verification bar.** 629 tests passing (13 live-API tests ignored by
+- **Verification bar.** 643 tests passing (13 live-API tests ignored by
   default), clippy clean, fmt clean.
 
 ---
@@ -543,6 +547,12 @@ reproduces them.
       runs; at a cache-heavy 0.3-1M input tokens per run plus output, a
       full sweep lands in the tens of dollars — the blocker was never
       the price, it is having a metered key wired into the eval at all.
+      A third candidate costs nothing at all: NVIDIA's NIM free-trial
+      tier (no credit card) hosts both z-ai/glm-5.3 and
+      deepseek-ai/deepseek-v4-pro at 1M context, so a free
+      `NVIDIA_API_KEY` may satisfy this prerequisite within its
+      per-model rate limits — the N≥5 sweep then paces itself instead
+      of paying.
    - **Basic-harness baseline and model tiers** (G4, G5, G9). Add a
      "bare loop" configuration (read/edit/shell only; no facts, pruning,
      evidence shaping, completion gate) and run the same suite on at

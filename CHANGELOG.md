@@ -3,6 +3,29 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — NVIDIA adapter: NIM hosted inference, free-tier eval path
+
+`--provider nvidia` runs the five verified NIM deployments —
+`z-ai/glm-5.3`, `z-ai/glm-5.3-flash`, `deepseek-ai/deepseek-v4-pro`,
+`deepseek-ai/deepseek-v4-pro-0813`, `deepseek-ai/deepseek-v4-flash` —
+over the shared OpenAI-compatible wire at `integrate.api.nvidia.com/v1`
+(Bearer `NVIDIA_API_KEY` or `NIM_API_KEY`). Model ids keep their
+`publisher/model` form. Reasoning depth is the top-level
+`reasoning_effort` field: GLM-5.3 deployments force thinking on and
+clamp an effort of "none" to `low`; DeepSeek V4 deployments pass `none`
+through as real non-think mode. No `thinking` object is sent (that is
+Z.ai first-party dialect) and no usage-dialect code is needed (NIM
+uses the OpenAI-standard details shapes). NIM's chat template defaults
+`clear_thinking` to false — preserved thinking — which the wire layer
+already satisfies by replaying `reasoning_content` verbatim.
+
+The free-trial tier needs no credit card, so this adapter is also the
+standing zero-cost candidate for the funded-eval-model prerequisite
+(roadmap item 1): GLM-5.3 and DeepSeek V4 Pro at 1M context, within
+per-model rate limits. Verified by wiremock (8 integration tests +
+6 unit tests; workspace now 643 passing, 13 live-API ignored), not
+yet by a live run.
+
 ## 2026-10-09 — Prune attribution on the event stream (item 20.1, phase 2)
 
 Event schema v3 adds `ContextPruned`: when a pruning pass freezes a new

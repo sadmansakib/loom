@@ -29,8 +29,8 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use loom_providers::{
-    ANTHROPIC_PROVIDER_NAME, DEEPSEEK_PROVIDER_NAME, GLM_PROVIDER_NAME, OPENROUTER_PROVIDER_NAME,
-    SecretString,
+    ANTHROPIC_PROVIDER_NAME, DEEPSEEK_PROVIDER_NAME, GLM_PROVIDER_NAME, NVIDIA_PROVIDER_NAME,
+    OPENROUTER_PROVIDER_NAME, SecretString,
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -51,6 +51,7 @@ pub fn provider_env_names(provider: &str) -> &'static [&'static str] {
         ANTHROPIC_PROVIDER_NAME => &["ANTHROPIC_API_KEY"],
         OPENROUTER_PROVIDER_NAME => &["OPENROUTER_API_KEY"],
         GLM_PROVIDER_NAME => &["ZAI_API_KEY", "Z_AI_API_KEY"],
+        NVIDIA_PROVIDER_NAME => &["NVIDIA_API_KEY", "NIM_API_KEY"],
         _ => &[],
     }
 }

@@ -12,15 +12,18 @@
 //! serves none), OpenRouter (capabilities and pricing resolved from
 //! the provider's model catalog, which the frontend fetches and caches),
 //! Anthropic (its own Messages API driver — see [`anthropic`] for
-//! why it does not share the OpenAI wire machine), and GLM (Z.ai's
+//! why it does not share the OpenAI wire machine), GLM (Z.ai's
 //! metered API on the OpenAI-compatible wire — see [`glm`] for why the
-//! Coding Plan endpoint is off-limits).
+//! Coding Plan endpoint is off-limits), and NVIDIA (NIM hosted
+//! inference — see [`nvidia`] for why the free tier matters to the
+//! eval backlog).
 
 mod anthropic;
 mod anthropic_wire;
 mod deepseek;
 mod glm;
 mod http;
+mod nvidia;
 mod openai_wire;
 mod openrouter;
 mod secret;
@@ -40,6 +43,8 @@ pub use deepseek::{
 pub use glm::PROVIDER_NAME as GLM_PROVIDER_NAME;
 pub use glm::{GlmConfig, GlmProvider, model_capabilities as glm_model_capabilities};
 pub use http::TimeoutConfig;
+pub use nvidia::PROVIDER_NAME as NVIDIA_PROVIDER_NAME;
+pub use nvidia::{NvidiaConfig, NvidiaProvider, model_capabilities as nvidia_model_capabilities};
 pub use openrouter::PROVIDER_NAME as OPENROUTER_PROVIDER_NAME;
 pub use openrouter::{
     CatalogError, DEFAULT_BASE_URL as OPENROUTER_DEFAULT_BASE_URL, OpenRouterCatalog,

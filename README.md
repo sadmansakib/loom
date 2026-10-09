@@ -28,7 +28,7 @@ Capabilities move from model to software over time, never the reverse.
 | Crate | Purpose |
 |---|---|
 | `loom-kernel` | Domain model and traits (session, turns, tools, providers). No workspace dependencies. |
-| `loom-providers` | Provider adapters: DeepSeek, OpenRouter, GLM (OpenAI-compatible wire format) and Anthropic (messages API). |
+| `loom-providers` | Provider adapters: DeepSeek, OpenRouter, GLM, NVIDIA (OpenAI-compatible wire format) and Anthropic (messages API). |
 | `loom-store` | SQLite persistence for sessions and events. |
 | `loom-tools` | Built-in deterministic tools: file read/write/edit, search, listing, sandboxed command execution. |
 | `loom-engine` | The deterministic turn loop: context compilation, token estimation, pruning, repo intelligence, completion gate. |
@@ -45,19 +45,19 @@ and `loom-cli` sit on top.
 Iteration 2 — the loop runs end to end with real providers:
 
 ```
-Task → Session → engine turn loop → provider (DeepSeek / OpenRouter / Anthropic / GLM)
+Task → Session → engine turn loop → provider (DeepSeek / OpenRouter / Anthropic / GLM / NVIDIA)
      → tool calls → deterministic execution (incl. sandboxed shell)
      → tool results → pruning/estimation → completion gate → done
 ```
 
 Shipped so far: time-ordered session/task IDs, transcript types, session
-aggregate with atomic turn commits, streaming adapters for four providers,
+aggregate with atomic turn commits, streaming adapters for five providers,
 per-provider token estimators (o200k-based; Anthropic-scaled), context
 pruning with turn-age masking and one-line stubs, bootstrap repo facts
 (tree, toolchains, AGENTS.md), sandboxed command execution (Seatbelt on
 macOS, bubblewrap on Linux), `edit_file` batch edits with region echo and
 whitespace-trim repair, a completion gate that refuses premature end turns,
-and `loom stats`. 629 tests.
+and `loom stats`. 643 tests.
 
 ## Development
 
