@@ -5,20 +5,20 @@
 
 use std::process::Command;
 
-use loom_kernel::artifact::ArtifactRef;
-use loom_kernel::id::{ArtifactId, SessionId};
-use loom_kernel::model::StopReason;
-use loom_kernel::session::Session;
-use loom_kernel::store::SessionStore;
-use loom_kernel::transcript::{
+use loom_core::kernel::artifact::ArtifactRef;
+use loom_core::kernel::id::{ArtifactId, SessionId};
+use loom_core::kernel::model::StopReason;
+use loom_core::kernel::session::Session;
+use loom_core::kernel::store::SessionStore;
+use loom_core::kernel::transcript::{
     AssistantMessage, Item, ToolArguments, ToolCall, ToolFailure, ToolResult, ToolStatus,
 };
-use loom_store::SqliteStore;
+use loom_core::store::SqliteStore;
 use serde_json::json;
 
 fn call(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
     ToolCall {
-        id: loom_kernel::transcript::ToolCallId::try_from(id.to_owned()).unwrap(),
+        id: loom_core::kernel::transcript::ToolCallId::try_from(id.to_owned()).unwrap(),
         name: name.to_owned(),
         arguments: ToolArguments::try_from(args).unwrap(),
     }
@@ -26,7 +26,7 @@ fn call(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
 
 fn result(id: &str, status: ToolStatus, content: &str) -> ToolResult {
     ToolResult::new(
-        loom_kernel::transcript::ToolCallId::try_from(id.to_owned()).unwrap(),
+        loom_core::kernel::transcript::ToolCallId::try_from(id.to_owned()).unwrap(),
         status,
         content,
         false,

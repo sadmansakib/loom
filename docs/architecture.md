@@ -22,13 +22,13 @@ kernel never links a filesystem store or a CLI, the engine never prints.
 
 | Crate | Role | Depends on |
 |---|---|---|
-| `loom-core` | Facade re-exporting the public surface for embedders | engine, kernel, providers, tools |
+| `loom-core` | Facade re-exporting the public surface for embedders, plus the shared data-dir policy (`paths`) | engine, kernel, providers, store, tools |
 | `loom-kernel` | The agent itself: loop, context compilation, session/transcript model, tool abstraction, tool cache, artifacts, events, budgets | no workspace crates — it defines the side-effect traits (`ModelProvider`, `SessionStore`, `ArtifactStore`, `Tool`, …) itself |
 | `loom-engine` | Composition root: builds a configured `Agent` from paths, auth, a provider factory, tool registry, and stores; repository facts scanner | kernel, store, providers, tools |
 | `loom-providers` | Model provider adapters (DeepSeek, OpenRouter, GLM, NVIDIA over one shared OpenAI-compatible wire; Anthropic on its own messages-API driver) | kernel model types |
 | `loom-store` | SQLite persistence: sessions, turns, tasks, artifacts, auth accounts | kernel store traits |
 | `loom-tools` | The shipped tool suite (read/search/edit/write/list/run/verify + artifact read) | kernel tool traits |
-| `loom-cli` | Binary: argument parsing, output rendering, run/eval/auth commands | engine |
+| `loom-cli` | Binary: argument parsing, output rendering, run/eval/auth commands | `loom-core` only (ADR-021) |
 
 The kernel defines traits for everything with side effects
 (`SessionStore`, `ArtifactStore`, `ModelProvider`, `FactsSource`,
@@ -475,11 +475,16 @@ reasoning to a dim stderr, NDJSON mode for machines; `--trace DIR`
 exports the task's evidence — see below), `loom auth`
 (login/list/set-active/remove), `loom stats` (per-session analytics from
 stored transcripts: turns, per-tool call quality, edit acceptance,
-repeats, repairs, spill savings; `--trace DIR` switches the source to
+repeats, repairs, spill savings; the listing/filter/fold data step is
+`kernel::analytics::sessions_overview`, so every frontend computes
+identical numbers; `--trace DIR` switches the source to
 exported traces, where the manifests carry the provider's own billed
 counts and the event streams carry `context_pruned` reports — per-task
 and per-trigger prune attribution without server-side persistence), and
-the eval entry points. Exit codes: 0 success, non-zero failure, 130
+the eval entry points. The data-dir resolution the frontends share
+(`LOOM_DATA_DIR` → XDG → `~/.local/share`) is `loom_core::paths`, a
+suggested default the engine itself never consults (ADR-008). Exit
+codes: 0 success, non-zero failure, 130
 cancelled.
 
 `loom run --trace DIR` writes one directory per task (roadmap item
@@ -660,7 +665,7 @@ Compare suites by medians over N ≥ 5; the observed noise floor is ±10%.
 - Blocking work on the blocking pool; hashing never under a lock.
 - Facts scanned once per task; capabilities resolved once per task.
 
-**Testing** — the workspace carries 648 tests (13 live-API tests
+**Testing** — the workspace carries 651 tests (13 live-API tests
 ignored by default): unit tests per module,
 protocol and invariant tests against in-memory seams, security regression
 tests for confinement, canary tests for secrets, integration tests that

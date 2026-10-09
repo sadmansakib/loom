@@ -3,6 +3,27 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — Facade completion: stats + data-dir policy behind loom-core
+
+ADR-021 says a frontend depends on `loom-core` and nothing else; the CLI
+still held two direct dependencies and two pieces of domain policy:
+
+- `loom stats` opened the SQLite store and walked it itself. The data
+  step — listing, id-substring filtering, and folding every session's
+  transcript analytics into totals — is now
+  `kernel::analytics::sessions_overview(store, filter)`, returning a
+  typed `SessionsOverview`; the CLI renders it. The fold now carries
+  `repairs` too (the CLI's old fold silently dropped them, so store-wide
+  totals always reported zero).
+- `loom-core` re-exports `loom-store`, so the CLI (and any future
+  frontend) opens the durable store through the facade.
+- The `LOOM_DATA_DIR` → `$XDG_DATA_HOME` → `~/.local/share/loom`
+  resolution moved from the CLI to `loom_core::paths` as the suggested
+  default every frontend may adopt — the engine still never reads the
+  environment for the database location (ADR-008).
+
+`loom-cli` now depends on `loom-core` alone.
+
 ## 2026-10-09 — NVIDIA live verification; DeepSeek V4 NIM rows end-of-life
 
 First live run against NIM with a real free-tier key: a two-turn

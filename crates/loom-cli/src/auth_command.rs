@@ -11,11 +11,10 @@ use anyhow::Context;
 use loom_core::engine::auth::{self, Auth, DEFAULT_PROVIDER, LoginSpec, Method};
 
 use crate::args::{AuthCommand, ListArgs, LoginArgs, RemoveArgs, UseArgs};
-use crate::paths;
 
 /// Runs one `loom auth` subcommand.
 pub fn run(command: AuthCommand) -> anyhow::Result<()> {
-    let auth = Auth::open(&paths::db_path()).context("opening the account store")?;
+    let auth = Auth::open(&loom_core::paths::db_path()).context("opening the account store")?;
     match command {
         AuthCommand::Login(args) => login(&auth, args),
         AuthCommand::List(args) => list(&auth, args),

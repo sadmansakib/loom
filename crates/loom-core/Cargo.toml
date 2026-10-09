@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 loom-kernel = { workspace = true }
+loom-store = { workspace = true }
 loom-engine = { workspace = true }
 loom-providers = { workspace = true }
 loom-tools = { workspace = true }

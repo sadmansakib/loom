@@ -1432,8 +1432,6 @@ dependencies = [
  "clap",
  "futures",
  "loom-core",
- "loom-kernel",
- "loom-store",
  "rpassword",
  "serde",
  "serde_json",
@@ -1451,6 +1449,7 @@ dependencies = [
  "loom-engine",
  "loom-kernel",
  "loom-providers",
+ "loom-store",
  "loom-tools",
 ]
 

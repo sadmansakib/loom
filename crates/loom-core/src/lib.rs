@@ -11,15 +11,28 @@
 //!   HTTP, keychain, and SQLite dependencies (ADR-001).
 //! - [`providers`] — concrete model providers.
 //! - [`tools`] — the built-in tool implementations.
+//! - [`store`] — the durable-state implementation (SQLite) behind the
+//!   kernel's [`kernel::store`] seams, for frontends that read state the
+//!   engine does not surface (e.g. a transcript-analytics listing).
+//!
+//! The facade also owns [`paths`] — the *suggested* per-user data locations
+//! (`LOOM_DATA_DIR` → XDG → `~/.local/share`). Resolving them is a frontend
+//! concern, not engine policy (ADR-008: the engine never reads the
+//! environment), but every frontend must resolve them identically or each
+//! finds a different `loom.db`; frontends adopt the helper instead of
+//! copy-pasting the ordering.
 //!
 //! Bindings are in-process: a frontend links this crate and calls the engine
 //! directly, receiving events through [`kernel::event::EventSink`] with no IPC
 //! and no serialization on the hot path. The serializable event protocol is
 //! retained only as the optional out-of-process seam for a future server.
 
+pub mod paths;
+
 pub use loom_engine as engine;
 pub use loom_kernel as kernel;
 pub use loom_providers as providers;
+pub use loom_store as store;
 pub use loom_tools as tools;
 
 // The driving API, surfaced at the facade root so the common path is

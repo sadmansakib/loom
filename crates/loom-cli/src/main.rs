@@ -13,7 +13,6 @@ mod args;
 mod auth_command;
 mod catalog;
 mod output;
-mod paths;
 mod run;
 mod stats_command;
 mod trace;

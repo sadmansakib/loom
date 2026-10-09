@@ -17,7 +17,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::args::RunArgs;
 use crate::output::{self, Renderer};
-use crate::paths;
 use crate::trace::{Outcome, TraceMeta, TraceWriter};
 
 /// Runs one task end to end and returns the process exit code.
@@ -34,7 +33,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         .build()
         .context("building the tokio runtime")?;
 
-    let db_path = paths::db_path();
+    let db_path = loom_core::paths::db_path();
     let catalog = if args.provider == OPENROUTER_PROVIDER_NAME {
         Some(ProviderCatalog::OpenRouter(load_openrouter_catalog(
             &runtime, &args, &db_path,

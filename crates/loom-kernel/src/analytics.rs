@@ -31,7 +31,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::id::SessionId;
 use crate::session::Session;
+use crate::store::{SessionStore, StoreError};
 use crate::transcript::{Item, ToolFailure, ToolStatus};
 
 /// Per-tool counters derived from one transcript.
@@ -89,6 +91,20 @@ impl ToolCounts {
     #[must_use]
     pub fn malformed(&self) -> u64 {
         self.unknown_tool + self.not_exposed + self.invalid_input
+    }
+
+    /// Adds `other` into `self`, counter by counter (store-wide totals).
+    pub fn add(&mut self, other: &ToolCounts) {
+        self.calls += other.calls;
+        self.success += other.success;
+        self.invalid_input += other.invalid_input;
+        self.execution += other.execution;
+        self.timeout += other.timeout;
+        self.repeated += other.repeated;
+        self.unknown_tool += other.unknown_tool;
+        self.not_exposed += other.not_exposed;
+        self.cancelled += other.cancelled;
+        self.failed += other.failed;
     }
 }
 
@@ -151,6 +167,25 @@ pub struct SessionStats {
     pub spills: Vec<Spill>,
 }
 
+impl SessionStats {
+    /// Adds `other` into `self`: counts sum, per-tool maps merge, spills
+    /// concatenate in order. The store-wide totals of a
+    /// [`sessions_overview`] are folded with this.
+    pub fn add(&mut self, other: &SessionStats) {
+        self.turns += other.turns;
+        self.identical_repeats += other.identical_repeats;
+        self.repairs += other.repairs;
+        self.edit_apply.attempts += other.edit_apply.attempts;
+        self.edit_apply.applied += other.edit_apply.applied;
+        self.malformed_calls += other.malformed_calls;
+        for (name, counts) in &other.tools {
+            self.tools.entry(name.clone()).or_default().add(counts);
+        }
+        self.totals.add(&other.totals);
+        self.spills.extend(other.spills.iter().cloned());
+    }
+}
+
 /// Computes [`SessionStats`] from a persisted session.
 ///
 /// Pure: one pass over the transcript, no I/O, no clocks. Assistant
@@ -211,6 +246,63 @@ pub fn session_stats(session: &Session) -> SessionStats {
 
     stats.malformed_calls = stats.totals.malformed();
     stats
+}
+
+/// One analyzed session from a [`sessions_overview`] pass.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionOverview {
+    /// The session's id (v7, creation-ordered; also the label a
+    /// frontend filters on).
+    pub id: SessionId,
+    /// Transcript-derived statistics for the session.
+    pub stats: SessionStats,
+}
+
+/// Store-wide transcript analytics: every analyzed session plus the
+/// totals folded across them.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionsOverview {
+    /// One row per analyzed session, oldest creation order.
+    pub rows: Vec<SessionOverview>,
+    /// Every row folded into one value ([`SessionStats::add`]).
+    pub totals: SessionStats,
+}
+
+/// Analyzes every session in `store`, optionally keeping only the ones
+/// whose id contains `filter`.
+///
+/// This is the whole of `loom stats`' data step — the iteration,
+/// filtering, and folding are policy, not presentation, so every
+/// frontend lists sessions identically. Derives each row with
+/// [`session_stats`]; an unreadable session fails the pass (the store
+/// is the source of truth, and silently skipping a row would
+/// undercount).
+pub fn sessions_overview(
+    store: &dyn SessionStore,
+    filter: Option<&str>,
+) -> Result<SessionsOverview, StoreError> {
+    // v7 ids order by creation time; sort regardless so the listing is
+    // deterministic whatever the store's iteration order.
+    let mut ids = store.session_ids()?;
+    ids.sort();
+
+    let mut overview = SessionsOverview::default();
+    for id in ids {
+        let Some(session) = store.load(&id)? else {
+            continue;
+        };
+        if let Some(filter) = filter
+            && !id.to_string().contains(filter)
+        {
+            continue;
+        }
+        let stats = session_stats(&session);
+        overview.totals.add(&stats);
+        overview.rows.push(SessionOverview { id, stats });
+    }
+    Ok(overview)
 }
 
 #[cfg(test)]
@@ -398,5 +490,90 @@ mod tests {
         assert_eq!(stats.totals.calls, 0);
         assert!(stats.tools.is_empty());
         assert!(stats.spills.is_empty());
+    }
+
+    #[test]
+    fn sessions_overview_folds_totals_across_the_store() {
+        use crate::store::MemorySessionStore;
+
+        // Seeds one session through the store's own seams: plan the turn
+        // against a local mirror, persist, then apply — the same dance
+        // the loop performs per committed turn.
+        fn seed(
+            store: &MemorySessionStore,
+            calls: Vec<ToolCall>,
+            results: Vec<ToolResult>,
+        ) -> SessionId {
+            let mut session = Session::new(SessionId::new());
+            store.ensure_session(&session.id).unwrap();
+            let user = Item::User {
+                text: "task".into(),
+            };
+            let index = session.push_item(user.clone()).unwrap();
+            store.append_item(&session.id, index, &user).unwrap();
+
+            let planned = session.plan_turn(assistant("go", calls), results).unwrap();
+            store.append_turn(&session.id, &planned).unwrap();
+            session.apply_planned_turn(planned);
+            session.id
+        }
+
+        let store = MemorySessionStore::new();
+        let first = seed(
+            &store,
+            vec![call("a", "read_file", json!({"path": "x"}))],
+            vec![ok_result("a", "contents")],
+        );
+        let second = seed(
+            &store,
+            vec![call("b", "run_command", json!({"program": "cargo"}))],
+            vec![failed_result("b", ToolFailure::Execution)],
+        );
+
+        let overview = sessions_overview(&store, None).unwrap();
+        assert_eq!(overview.rows.len(), 2);
+        assert_eq!(overview.totals.turns, 2);
+        assert_eq!(overview.totals.totals.calls, 2);
+        assert_eq!(overview.totals.totals.failed, 1);
+        let listed: HashSet<SessionId> = overview.rows.iter().map(|row| row.id).collect();
+        assert_eq!(listed, HashSet::from([first, second]));
+    }
+
+    #[test]
+    fn sessions_overview_filters_by_id_substring() {
+        use crate::store::MemorySessionStore;
+
+        let only = session(vec![Item::Assistant(assistant("go", Vec::new()))]);
+        let store = MemorySessionStore::with_session(only.clone());
+
+        let overview = sessions_overview(&store, Some(&only.id.to_string())).unwrap();
+        assert_eq!(overview.rows.len(), 1);
+        assert_eq!(overview.rows[0].id, only.id);
+
+        let none = sessions_overview(&store, Some("no-such-id")).unwrap();
+        assert!(none.rows.is_empty());
+        assert_eq!(none.totals.turns, 0);
+    }
+
+    #[test]
+    fn sessions_overview_folds_repairs_into_totals() {
+        use crate::store::MemorySessionStore;
+
+        let mut repaired = ok_result("a", "edited f.rs");
+        repaired.effects = ToolEffects::none().with_repair("old_string matched after trimming");
+        let repaired_session = session(vec![
+            Item::Assistant(assistant(
+                "go",
+                vec![call("a", "edit_file", json!({"path": "f.rs"}))],
+            )),
+            Item::ToolResult(repaired),
+        ]);
+        let store = MemorySessionStore::with_session(repaired_session);
+
+        let overview = sessions_overview(&store, None).unwrap();
+        assert_eq!(overview.rows[0].stats.repairs, 1);
+        // The fold must carry repairs too, or store-wide totals would
+        // silently report zero.
+        assert_eq!(overview.totals.repairs, 1);
     }
 }
