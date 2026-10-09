@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use futures::stream;
-use loom_kernel::agent::{Agent, RetryPolicy, TaskBudget, TaskError};
+use loom_kernel::agent::{Agent, RetryPolicy, TaskBudget, TaskControl, TaskError};
 use loom_kernel::context::{
     AgentConfig, DefaultContextCompiler, GitState, KnownFacts, StaticFacts,
 };
@@ -154,6 +154,33 @@ impl Tool for FakeTool {
         input: Value,
         _ctx: &'a ToolContext,
     ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
+        Box::pin(async move { Ok(ToolOutput::new(format!("echo: {input}"))) })
+    }
+}
+
+/// A tool that requests a graceful pause as it runs and then completes
+/// normally — makes the pause-vs-turn-boundary outcome deterministic
+/// without racing a spawned sleeper against a microsecond-scale turn.
+struct PausingTool {
+    spec: ToolSpec,
+    control: TaskControl,
+}
+
+impl Tool for PausingTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
+    fn call<'a>(
+        &'a self,
+        input: Value,
+        _ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
+        self.control.pause();
         Box::pin(async move { Ok(ToolOutput::new(format!("echo: {input}"))) })
     }
 }
@@ -395,7 +422,7 @@ async fn repository_facts_are_projected_as_a_stable_system_block() {
     let requests = provider.requests_handle();
     let mut session = Session::new(SessionId::new());
     let (sink, _receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let facts = KnownFacts::new(
         PathBuf::from("/ws"),
         vec!["Rust".to_owned()],
@@ -419,7 +446,7 @@ async fn repository_facts_are_projected_as_a_stable_system_block() {
     .with_facts_source(Box::new(StaticFacts::new(facts)));
 
     let summary = agent
-        .run_task(&mut session, "what changed?", &sink, &token)
+        .run_task(&mut session, "what changed?", &sink, &control)
         .await
         .unwrap();
 
@@ -452,11 +479,11 @@ async fn end_turn_completes_the_task_and_commits_the_assistant() {
     );
     let mut session = Session::new(SessionId::new());
     let (sink, mut receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent(provider, ToolRegistry::new(), 10);
 
     let summary = agent
-        .run_task(&mut session, "hello", &sink, &token)
+        .run_task(&mut session, "hello", &sink, &control)
         .await
         .unwrap();
 
@@ -528,11 +555,11 @@ async fn an_unverified_finish_is_refused_once_then_accepted() {
     let requests = provider.requests_handle();
     let mut session = Session::new(SessionId::new());
     let (sink, _receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent(provider, registry, 10);
 
     let summary = agent
-        .run_task(&mut session, "fix the bug", &sink, &token)
+        .run_task(&mut session, "fix the bug", &sink, &control)
         .await
         .unwrap();
 
@@ -587,11 +614,11 @@ async fn a_fused_green_check_finishes_without_refusal() {
     let requests = provider.requests_handle();
     let mut session = Session::new(SessionId::new());
     let (sink, _receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent(provider, registry, 10);
 
     let summary = agent
-        .run_task(&mut session, "fix the bug", &sink, &token)
+        .run_task(&mut session, "fix the bug", &sink, &control)
         .await
         .unwrap();
 
@@ -630,11 +657,11 @@ async fn tool_round_trip_executes_and_commits_one_turn_per_model_response() {
     let requests = provider.requests_handle();
     let mut session = Session::new(SessionId::new());
     let (sink, mut receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent(provider, registry_with("echo"), 10);
 
     let summary = agent
-        .run_task(&mut session, "run the tool", &sink, &token)
+        .run_task(&mut session, "run the tool", &sink, &control)
         .await
         .unwrap();
 
@@ -706,11 +733,11 @@ async fn max_tokens_commits_the_assistant_then_fails() {
     );
     let mut session = Session::new(SessionId::new());
     let (sink, _receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent(provider, ToolRegistry::new(), 10);
 
     let error = agent
-        .run_task(&mut session, "go", &sink, &token)
+        .run_task(&mut session, "go", &sink, &control)
         .await
         .unwrap_err();
 
@@ -745,11 +772,11 @@ async fn persistent_tool_calls_hit_the_turn_limit() {
     .repeat_last();
     let mut session = Session::new(SessionId::new());
     let (sink, mut receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent(provider, registry_with("echo"), 3);
 
     let error = agent
-        .run_task(&mut session, "loop", &sink, &token)
+        .run_task(&mut session, "loop", &sink, &control)
         .await
         .unwrap_err();
 
@@ -787,11 +814,11 @@ async fn retryable_failure_is_retried_and_partial_output_discarded() {
     let requests = provider.requests_handle();
     let mut session = Session::new(SessionId::new());
     let (sink, mut receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent(provider, ToolRegistry::new(), 10);
 
     let summary = agent
-        .run_task(&mut session, "go", &sink, &token)
+        .run_task(&mut session, "go", &sink, &control)
         .await
         .unwrap();
 
@@ -832,12 +859,12 @@ async fn a_pre_cancelled_task_commits_nothing() {
     );
     let mut session = Session::new(SessionId::new());
     let (sink, mut receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
-    token.cancel();
+    let control = TaskControl::new();
+    control.cancel();
     let agent = agent(provider, ToolRegistry::new(), 10);
 
     let error = agent
-        .run_task(&mut session, "go", &sink, &token)
+        .run_task(&mut session, "go", &sink, &control)
         .await
         .unwrap_err();
 
@@ -886,11 +913,11 @@ async fn retry_before_output_started_reports_no_response() {
     );
     let mut session = Session::new(SessionId::new());
     let (sink, mut receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent(provider, ToolRegistry::new(), 10);
 
     let summary = agent
-        .run_task(&mut session, "go", &sink, &token)
+        .run_task(&mut session, "go", &sink, &control)
         .await
         .unwrap();
 
@@ -924,7 +951,7 @@ async fn exhausted_attempts_fail_without_committing() {
     );
     let mut session = Session::new(SessionId::new());
     let (sink, mut receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent_with_retry(
         provider,
         ToolRegistry::new(),
@@ -936,7 +963,7 @@ async fn exhausted_attempts_fail_without_committing() {
     );
 
     let error = agent
-        .run_task(&mut session, "go", &sink, &token)
+        .run_task(&mut session, "go", &sink, &control)
         .await
         .unwrap_err();
 
@@ -974,11 +1001,11 @@ async fn non_retryable_kind_fails_immediately() {
     );
     let mut session = Session::new(SessionId::new());
     let (sink, mut receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent(provider, ToolRegistry::new(), 10);
 
     let error = agent
-        .run_task(&mut session, "go", &sink, &token)
+        .run_task(&mut session, "go", &sink, &control)
         .await
         .unwrap_err();
 
@@ -1009,13 +1036,14 @@ async fn non_retryable_kind_fails_immediately() {
 #[tokio::test]
 async fn cancellation_during_stream_commits_nothing() {
     let token = CancellationToken::new();
+    let control = TaskControl::from(token.clone());
     let provider = FakeProvider::new(capabilities(), Vec::new()).cancel_on_stream(token.clone());
     let mut session = Session::new(SessionId::new());
     let (sink, mut receiver) = ChannelEventSink::new();
     let agent = agent(provider, ToolRegistry::new(), 10);
 
     let error = agent
-        .run_task(&mut session, "go", &sink, &token)
+        .run_task(&mut session, "go", &sink, &control)
         .await
         .unwrap_err();
 
@@ -1035,6 +1063,98 @@ async fn cancellation_during_stream_commits_nothing() {
             .any(|kind| matches!(kind, EventKind::ModelRequestStarted { .. }))
     );
     assert!(matches!(kinds.last().unwrap(), EventKind::TaskCancelled));
+}
+
+/// A pause requested before the task starts nothing: no model request,
+/// no turn, and the record ends `paused` — not `cancelled`, not
+/// `failed`.
+#[tokio::test]
+async fn pause_before_the_first_turn_starts_nothing() {
+    let provider = FakeProvider::new(capabilities(), Vec::new());
+    let requests = provider.requests_handle();
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let control = TaskControl::new();
+    let agent = agent(provider, ToolRegistry::new(), 10);
+
+    control.pause();
+    let error = agent
+        .run_task(&mut session, "go", &sink, &control)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(&error, TaskError::Paused));
+    assert!(!error.is_cancelled());
+    assert_eq!(error.end_reason(), "paused");
+    assert!(requests.lock().unwrap().is_empty(), "no model request");
+    // Only the user item; no turn ever ran.
+    assert_eq!(session.transcript.len(), 1);
+    assert_eq!(session.tasks[0].status, TaskStatus::Paused);
+    assert_eq!(session.tasks[0].end_reason.as_deref(), Some("paused"));
+
+    let kinds = drain(&mut receiver);
+    assert!(matches!(kinds.last().unwrap(), EventKind::TaskPaused));
+}
+
+/// A pause that fires mid-batch still finishes the turn: the tool's
+/// result commits, the reply stays in the transcript, and the loop
+/// stops before spending the next request. The scripted second turn
+/// is never consumed.
+#[tokio::test]
+async fn pause_during_a_batch_finishes_the_in_flight_turn() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            completed(
+                assistant(
+                    "",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_1", "echo", json!({ "q": "hi" }))],
+                ),
+                usage(20, 5, None),
+            ),
+            completed(
+                assistant("all done", StopReason::EndTurn, Vec::new()),
+                usage(30, 7, None),
+            ),
+        ],
+    );
+    let requests = provider.requests_handle();
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let control = TaskControl::new();
+    // The tool pauses the task as it runs; the batch still completes and
+    // commits before the loop stops.
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(PausingTool {
+            spec: spec("echo"),
+            control: control.clone(),
+        }))
+        .unwrap();
+    let agent = agent(provider, registry, 10);
+
+    let error = agent
+        .run_task(&mut session, "run the tool", &sink, &control)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(&error, TaskError::Paused));
+    assert_eq!(session.tasks[0].status, TaskStatus::Paused);
+    assert_eq!(session.tasks[0].turns, 1);
+    // Only the first scripted turn was spent.
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    // user, assistant(call), tool result — the turn committed in full.
+    assert_eq!(session.transcript.len(), 3);
+
+    let kinds = drain(&mut receiver);
+    assert!(matches!(kinds.last().unwrap(), EventKind::TaskPaused));
+    assert!(
+        !kinds
+            .iter()
+            .any(|kind| matches!(kind, EventKind::TaskCancelled)),
+        "a pause is not a cancellation"
+    );
 }
 
 /// Cancellation during a tool batch: the turn is still committed, with the
@@ -1057,11 +1177,11 @@ async fn cancellation_during_batch_commits_turn_with_fillers() {
     );
     let mut session = Session::new(SessionId::new());
     let (sink, mut receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent(provider, registry_for_cancel_batch(), 10);
 
     let error = agent
-        .run_task(&mut session, "run both", &sink, &token)
+        .run_task(&mut session, "run both", &sink, &control)
         .await
         .unwrap_err();
 
@@ -1110,11 +1230,11 @@ async fn retried_deltas_are_never_committed() {
     );
     let mut session = Session::new(SessionId::new());
     let (sink, mut receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent(provider, ToolRegistry::new(), 10);
 
     agent
-        .run_task(&mut session, "go", &sink, &token)
+        .run_task(&mut session, "go", &sink, &control)
         .await
         .unwrap();
 
@@ -1147,11 +1267,11 @@ async fn a_broken_event_consumer_does_not_change_the_outcome() {
     let (sink, receiver) = ChannelEventSink::new();
     // Drop the consumer before the task runs: every emit is now a drop.
     drop(receiver);
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent(provider, ToolRegistry::new(), 10);
 
     let summary = agent
-        .run_task(&mut session, "go", &sink, &token)
+        .run_task(&mut session, "go", &sink, &control)
         .await
         .unwrap();
 
@@ -1183,11 +1303,11 @@ async fn event_sequence_is_monotonic() {
     );
     let mut session = Session::new(SessionId::new());
     let (sink, mut receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent(provider, registry_with("echo"), 10);
 
     agent
-        .run_task(&mut session, "go", &sink, &token)
+        .run_task(&mut session, "go", &sink, &control)
         .await
         .unwrap();
 
@@ -1264,11 +1384,11 @@ async fn repeated_failed_call_is_refused_and_not_rereun() {
     let (registry, invocations) = registry_for_repeat();
     let mut session = Session::new(SessionId::new());
     let (sink, _receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent(provider, registry, 10);
 
     let summary = agent
-        .run_task(&mut session, "run it twice", &sink, &token)
+        .run_task(&mut session, "run it twice", &sink, &control)
         .await
         .unwrap();
 
@@ -1351,11 +1471,11 @@ async fn a_successful_call_clears_the_failure_ledger() {
     let (registry, invocations) = registry_for_repeat();
     let mut session = Session::new(SessionId::new());
     let (sink, _receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent(provider, registry, 10);
 
     let summary = agent
-        .run_task(&mut session, "fail, succeed, fail again", &sink, &token)
+        .run_task(&mut session, "fail, succeed, fail again", &sink, &control)
         .await
         .unwrap();
 
@@ -1396,12 +1516,12 @@ async fn total_token_budget_stops_the_task_before_the_next_request() {
     .repeat_last();
     let mut session = Session::new(SessionId::new());
     let (sink, _receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent(provider, registry_with("echo"), 10)
         .with_budget(TaskBudget::new().with_max_total_tokens(1_000));
 
     let error = agent
-        .run_task(&mut session, "loop", &sink, &token)
+        .run_task(&mut session, "loop", &sink, &control)
         .await
         .unwrap_err();
 
@@ -1443,12 +1563,12 @@ async fn tool_call_budget_stops_after_the_batch_that_crossed_it() {
     .repeat_last();
     let mut session = Session::new(SessionId::new());
     let (sink, _receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent(provider, registry_with("echo"), 10)
         .with_budget(TaskBudget::new().with_max_tool_calls(1));
 
     let error = agent
-        .run_task(&mut session, "loop", &sink, &token)
+        .run_task(&mut session, "loop", &sink, &control)
         .await
         .unwrap_err();
 
@@ -1477,12 +1597,12 @@ async fn wall_time_budget_can_stop_before_the_first_request() {
     );
     let mut session = Session::new(SessionId::new());
     let (sink, _receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent(provider, ToolRegistry::new(), 10)
         .with_budget(TaskBudget::new().with_max_wall_time(Duration::ZERO));
 
     let error = agent
-        .run_task(&mut session, "go", &sink, &token)
+        .run_task(&mut session, "go", &sink, &control)
         .await
         .unwrap_err();
 
@@ -1506,7 +1626,7 @@ async fn remaining_budget_is_surfaced_on_success() {
     );
     let mut session = Session::new(SessionId::new());
     let (sink, _receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent(provider, ToolRegistry::new(), 10).with_budget(
         TaskBudget::new()
             .with_max_total_tokens(100)
@@ -1515,7 +1635,7 @@ async fn remaining_budget_is_surfaced_on_success() {
     );
 
     let summary = agent
-        .run_task(&mut session, "go", &sink, &token)
+        .run_task(&mut session, "go", &sink, &control)
         .await
         .unwrap();
 
@@ -1540,11 +1660,11 @@ async fn summary_carries_the_final_turn_context_census() {
     );
     let mut session = Session::new(SessionId::new());
     let (sink, _receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent(provider, ToolRegistry::new(), 10);
 
     let summary = agent
-        .run_task(&mut session, "inspect the repo", &sink, &token)
+        .run_task(&mut session, "inspect the repo", &sink, &control)
         .await
         .unwrap();
 
@@ -1566,11 +1686,11 @@ async fn default_budget_is_unbounded_and_reports_no_ceilings() {
     );
     let mut session = Session::new(SessionId::new());
     let (sink, _receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent(provider, ToolRegistry::new(), 10);
 
     let summary = agent
-        .run_task(&mut session, "go", &sink, &token)
+        .run_task(&mut session, "go", &sink, &control)
         .await
         .unwrap();
 
@@ -1592,7 +1712,7 @@ async fn cancellation_during_retry_backoff_stops_the_task() {
     );
     let mut session = Session::new(SessionId::new());
     let (sink, mut receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent = agent_with_retry(
         provider,
         ToolRegistry::new(),
@@ -1602,13 +1722,13 @@ async fn cancellation_during_retry_backoff_stops_the_task() {
             .with_jitter_fraction(0.0),
     );
 
-    let canceller = token.clone();
+    let canceller = control.clone();
     let handle = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(20)).await;
         canceller.cancel();
     });
     let error = agent
-        .run_task(&mut session, "hello", &sink, &token)
+        .run_task(&mut session, "hello", &sink, &control)
         .await
         .expect_err("cancelled while backing off");
     handle.await.ok();
@@ -1763,12 +1883,12 @@ async fn a_store_failure_fails_the_task_without_committing_memory() {
     );
     let mut session = Session::new(SessionId::new());
     let (sink, mut receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent =
         agent(provider, registry_with("echo"), 10).with_store(Box::new(StoreHandle::new(&store)));
 
     let error = agent
-        .run_task(&mut session, "run the tool", &sink, &token)
+        .run_task(&mut session, "run the tool", &sink, &control)
         .await
         .expect_err("the store rejected the turn");
 
@@ -1815,12 +1935,12 @@ async fn a_committed_task_is_mirrored_in_the_store() {
     );
     let mut session = Session::new(SessionId::new());
     let (sink, _receiver) = ChannelEventSink::new();
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
     let agent =
         agent(provider, registry_with("echo"), 10).with_store(Box::new(StoreHandle::new(&store)));
 
     agent
-        .run_task(&mut session, "run the tool", &sink, &token)
+        .run_task(&mut session, "run the tool", &sink, &control)
         .await
         .unwrap();
 
@@ -1844,7 +1964,7 @@ async fn a_persisted_session_resumes_from_the_store() {
     });
     let id = SessionId::new();
     let mut session = Session::new(id);
-    let token = CancellationToken::new();
+    let control = TaskControl::new();
 
     let first = agent(
         FakeProvider::new(
@@ -1860,7 +1980,7 @@ async fn a_persisted_session_resumes_from_the_store() {
     .with_store(Box::new(StoreHandle::new(&store)));
     let (sink, _receiver) = ChannelEventSink::new();
     first
-        .run_task(&mut session, "first task", &sink, &token)
+        .run_task(&mut session, "first task", &sink, &control)
         .await
         .unwrap();
 
@@ -1882,7 +2002,7 @@ async fn a_persisted_session_resumes_from_the_store() {
     .with_store(Box::new(StoreHandle::new(&store)));
     let (sink, _receiver) = ChannelEventSink::new();
     second
-        .run_task(&mut resumed, "second task", &sink, &token)
+        .run_task(&mut resumed, "second task", &sink, &control)
         .await
         .unwrap();
 

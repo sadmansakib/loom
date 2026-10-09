@@ -3,6 +3,23 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — TaskControl: two-granularity stopping (cancel vs pause)
+
+`run_task` and `continue_session` now take a `TaskControl` instead of a
+bare cancellation token. `cancel` keeps the old semantics — abort
+mid-flight, drop the stream, fill unstarted tool calls — and the
+session survives it: every committed item was persisted, so aborting a
+call never loses the session. `pause` is the new graceful stop:
+observed only at turn boundaries, it lets the in-flight turn (model
+reply and tool batch) commit in full, then ends the task as
+`TaskStatus::Paused` with `end_reason: "paused"` and a `TaskPaused`
+event (event schema v5) — a pause is not a cancellation, and both the
+status and the event stream say so. The CLI maps one Ctrl-C to pause
+("stopping after the current turn") and a second to abort; either
+exits 130 with the session resumable. `TaskControl::from(token)`
+wraps an existing hard-stop token, which is how the eval harness's
+strict sink keeps tripping the task on event loss.
+
 ## 2026-10-09 — Session continuation + the AwaitingInput event (B3)
 
 First-class resume for the driving API: `Engine::continue_session(id,

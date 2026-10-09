@@ -29,7 +29,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use loom_core::engine::repo::FsFactsSource;
-use loom_core::kernel::agent::Agent;
+use loom_core::kernel::agent::{Agent, TaskControl};
 use loom_core::kernel::context::{AgentConfig, DefaultContextCompiler};
 use loom_core::kernel::event::{EventKind, EventSink};
 use loom_core::kernel::id::{SessionId, TaskId};
@@ -39,7 +39,6 @@ use loom_core::kernel::tool::ToolRegistry;
 use loom_core::kernel::transcript::{Item, ToolFailure, ToolStatus};
 use loom_core::providers::{DeepSeekConfig, DeepSeekProvider, ReasoningEffort};
 use loom_core::tools::{ListDirTool, ReadFileTool, SearchTool};
-use tokio_util::sync::CancellationToken;
 
 /// A provider tally built from the event stream: retries and the
 /// `response_started` split that measures the cost of retrying after output.
@@ -153,12 +152,10 @@ async fn b1_read_only_repository_inspection() {
 
     let mut session = Session::new(SessionId::new());
     let sink = CountingSink(Mutex::new(Tally::default()));
-    let cancellation = CancellationToken::new();
+    let control = TaskControl::new();
 
     let started = Instant::now();
-    let outcome = agent
-        .run_task(&mut session, prompt, &sink, &cancellation)
-        .await;
+    let outcome = agent.run_task(&mut session, prompt, &sink, &control).await;
     let wall_time = started.elapsed();
 
     let tally = sink.0.into_inner().unwrap();

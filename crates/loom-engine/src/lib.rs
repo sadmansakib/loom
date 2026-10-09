@@ -47,6 +47,7 @@ pub use engine::{Continuation, Engine, EngineConfig, EngineError, default_system
 pub use estimate::{
     ANTHROPIC_TOKEN_SCALE_PER_MILLE, AnthropicEstimator, O200kEstimator, estimator_for,
 };
+pub use loom_kernel::agent::TaskControl;
 // The provider/effort types a frontend must name to build an `EngineConfig`;
 // re-exported so a frontend never depends on the provider crate directly.
 pub use loom_providers::{ProviderCatalog, ReasoningEffort};

@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use loom_kernel::agent::{Agent, TaskError, TaskSummary};
+use loom_kernel::agent::{Agent, TaskControl, TaskError, TaskSummary};
 use loom_kernel::context::{
     AgentConfig, DefaultContextCompiler, PruneConfig, PruningContextCompiler,
 };
@@ -25,10 +25,8 @@ use loom_tools::{
     ArtifactReadTool, EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool,
     VerifyTool, WriteFileTool,
 };
-use tokio_util::sync::CancellationToken;
 
 use crate::auth::{self, KeychainBackend, SqliteAuthStore};
-
 /// Everything a frontend must decide before [`Engine::open`].
 ///
 /// `workspace` is canonicalized by the engine; the rest maps one-to-one to the
@@ -252,17 +250,19 @@ impl Engine {
     /// accepts more input, whether through another `run_task` call or
     /// [`Engine::continue_session`]. Stream-only frontends key their resume
     /// loop on it.
+    ///
+    /// `control` carries the operator's two stop granularities:
+    /// [`TaskControl::cancel`] aborts mid-flight (the session survives —
+    /// every committed item was persisted), [`TaskControl::pause`] stops at
+    /// the next turn boundary with the in-flight turn fully committed.
     pub async fn run_task(
         &self,
         session: &mut Session,
         input: impl Into<String>,
         sink: &dyn EventSink,
-        cancellation: &CancellationToken,
+        control: &TaskControl,
     ) -> Result<TaskSummary, TaskError> {
-        let outcome = self
-            .agent
-            .run_task(session, input, sink, cancellation)
-            .await;
+        let outcome = self.agent.run_task(session, input, sink, control).await;
         // The engine is idle again once the task's terminal event has been
         // emitted. The marker carries the ended task's id (envelope shape)
         // and the session (payload); a session whose very first user item
@@ -283,10 +283,10 @@ impl Engine {
     ///
     /// The first-class resume flow (the core seam of roadmap item 15): the
     /// advanced [`Session`] and the task's outcome travel back together in a
-    /// [`Continuation`]. A failed or cancelled task is **not** an `Err` here
-    /// — the session has still advanced (input committed, partial turns
-    /// persisted) and the caller can continue again — only loading problems
-    /// are errors: an unknown id (or no persistence) is
+    /// [`Continuation`]. A failed, cancelled, or paused task is **not** an
+    /// `Err` here — the session has still advanced (input committed, partial
+    /// turns persisted) and the caller can continue again — only loading
+    /// problems are errors: an unknown id (or no persistence) is
     /// [`EngineError::SessionNotFound`], a store failure
     /// [`EngineError::Session`].
     ///
@@ -297,12 +297,12 @@ impl Engine {
         id: &SessionId,
         input: impl Into<String>,
         sink: &dyn EventSink,
-        cancellation: &CancellationToken,
+        control: &TaskControl,
     ) -> Result<Continuation, EngineError> {
         let mut session = self
             .load_session(id)?
             .ok_or(EngineError::SessionNotFound { id: *id })?;
-        let outcome = self.run_task(&mut session, input, sink, cancellation).await;
+        let outcome = self.run_task(&mut session, input, sink, control).await;
         Ok(Continuation { session, outcome })
     }
 

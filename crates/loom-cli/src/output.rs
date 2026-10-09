@@ -103,6 +103,7 @@ impl Renderer {
             | EventKind::TaskCompleted
             | EventKind::TaskFailed { .. }
             | EventKind::TaskCancelled
+            | EventKind::TaskPaused
             // The engine is idle again; a one-shot run just exits, so the
             // marker needs no output.
             | EventKind::AwaitingInput { .. } => {}

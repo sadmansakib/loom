@@ -47,8 +47,9 @@ property.
   when `--trace` is on — receive events from a kernel `FanoutSink`, one
   channel each, so engine code never touches the terminal and a stalled
   disk cannot stall rendering. Shutdown uses
-  `shutdown_timeout(5s)`; Ctrl-C cancels the task's cancellation token and
-  the process exits 130 after the turn in flight is committed.
+  `shutdown_timeout(5s)`; Ctrl-C steers a `TaskControl` — one press
+  pauses (the in-flight turn commits, then the loop stops), a second
+  aborts mid-flight — and the process exits 130 either way.
 - **Cancellation** flows through `CancellationToken`s, one per task. Every
   long-running await — model requests, tool calls, subprocess pipes, facts
   scan — is selected against the token. In-flight work is never torn down
@@ -108,11 +109,13 @@ Invariants the session layer enforces (and tests):
    type; a second finish attempt cannot overwrite the recorded end reason.
 
 **Events** (`event.rs`) are the observation stream: `EventEnvelope`
-(`schema_version: 4`, per-sink monotonically increasing `sequence`,
+(`schema_version: 5`, per-sink monotonically increasing `sequence`,
 snake_case `type` tag). Version 2 adds `Usage.cost_usd`, the
 provider-reported charge; version 3 adds `ContextPruned` (prune
 attribution); version 4 adds `AwaitingInput` (engine idle marker after a
-task ends, naming the session — the signal a resume loop keys on). All
+task ends, naming the session — the signal a resume loop keys on);
+version 5 adds `TaskPaused` (graceful between-turns stop, distinct from
+`TaskCancelled`'s mid-flight abort). All
 new fields are additive, so older payloads still
 deserialize. A lock spans numbering and send, so arrival order
 equals sequence order even with concurrent emitters. The channel sink is
@@ -167,7 +170,9 @@ instruction instead of accepting the end turn.
 `UnrecoverableStop`
 (max_tokens / context_limit / content_filter) commits the truncated or
 filtered reply first, so it stays inspectable; `MaxTurns` at the ceiling
-with tool calls pending; budget exhaustion; cancellation.
+with tool calls pending; budget exhaustion; cancellation; and a graceful
+pause (§9) — a between-turns stop whose in-flight turn committed in
+full.
 
 ---
 
@@ -476,14 +481,24 @@ one — so no frontend re-implements that sequencing.
 The driving API is resume-first: besides `run_task` on a live session
 handle, `Engine::continue_session(id, input, …)` loads a persisted
 session and runs the next task on it, returning the advanced `Session`
-and the task outcome together in a `Continuation` — a failed or
-cancelled task still advances the session, so only load errors are
+and the task outcome together in a `Continuation` — a failed, cancelled,
+or paused task still advances the session, so only load errors are
 `Err` (`SessionNotFound` when the id does not resolve). After every
 task's terminal event the engine emits `AwaitingInput` naming the idle
 session: a stream-only frontend keys its resume loop on that marker
 without polling. Kernel-level drivers emit no such marker — it is an
 engine concept, so hand-rolled loops (the eval harness) see no new
 events.
+
+Stopping is two-granularity: `TaskControl` (the `run_task`/
+`continue_session` parameter) offers `cancel` — the hard stop that
+aborts mid-flight, drops the stream, and fills unstarted tool calls
+while keeping every already-committed item — and `pause`, a graceful
+stop observed only at turn boundaries: the in-flight turn (model reply
+and tool batch) commits in full, then the loop ends with
+`TaskStatus::Paused`/`end_reason: "paused"` and a `TaskPaused` event.
+The session survives either stop; the CLI maps one Ctrl-C to pause and
+a second to cancel.
 
 Provider selection lives in one private engine module
 (`provider.rs`), the only place that names concrete adapters. It matches
@@ -697,7 +712,7 @@ Compare suites by medians over N ≥ 5; the observed noise floor is ±10%.
 - Blocking work on the blocking pool; hashing never under a lock.
 - Facts scanned once per task; capabilities resolved once per task.
 
-**Testing** — the workspace carries 661 tests (13 live-API tests
+**Testing** — the workspace carries 664 tests (13 live-API tests
 ignored by default): unit tests per module,
 protocol and invariant tests against in-memory seams, security regression
 tests for confinement, canary tests for secrets, integration tests that

@@ -152,6 +152,12 @@ pub enum TaskError {
     /// The task's cancellation token fired.
     #[error("task was cancelled")]
     Cancelled,
+    /// The operator paused the loop between turns: the in-flight turn
+    /// (model reply and tool results) fully committed before the stop,
+    /// and the session is resumable. Distinct from
+    /// [`TaskError::Cancelled`], which aborts mid-flight.
+    #[error("task was paused between turns")]
+    Paused,
     /// The model stopped for a reason Iteration 1 does not recover from
     /// (`max_tokens`, `context_limit`, `content_filter`). The assistant item
     /// is still committed so the truncated or filtered reply stays
@@ -184,6 +190,13 @@ impl TaskError {
         matches!(self, TaskError::Cancelled)
     }
 
+    /// Whether this error is a graceful between-turns pause: not a
+    /// failure, and unlike cancellation nothing in flight was aborted.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        matches!(self, TaskError::Paused)
+    }
+
     /// Stable snake_case token recorded as the task's `end_reason`.
     #[must_use]
     pub fn end_reason(&self) -> &str {
@@ -195,9 +208,86 @@ impl TaskError {
             TaskError::MaxTurns { .. } => "max_turns",
             TaskError::BudgetExhausted { .. } => "budget_exhausted",
             TaskError::Cancelled => "user_cancelled",
+            TaskError::Paused => "paused",
             TaskError::UnrecoverableStop { stop_reason } => stop_reason,
             TaskError::Persistence(_) => "persistence",
             TaskError::UnknownModel { .. } => "unknown_model",
+        }
+    }
+}
+
+/// Cooperative stop control for one task run: the operator's two
+/// granularities (§6).
+///
+/// [`cancel`](TaskControl::cancel) is the hard stop that already existed:
+/// the in-flight model stream is dropped, tool calls receive cancelled
+/// fillers, and the task ends as
+/// [`Cancelled`](TaskError::Cancelled). The session survives — every
+/// committed item was persisted before the abort — so "abort the call"
+/// never means "lose the session".
+///
+/// [`pause`](TaskControl::pause) is the graceful stop: the in-flight
+/// turn (model reply and tool batch) runs to completion and commits,
+/// and the loop stops at the next turn boundary with
+/// [`Paused`](TaskError::Paused). A second pause adds nothing; a later
+/// [`cancel`](TaskControl::cancel) still wins mid-turn.
+///
+/// Clones share state, so a UI thread can hold one copy while the
+/// driving task consumes another.
+#[derive(Clone, Default, Debug)]
+pub struct TaskControl {
+    /// The hard stop honored by the stream and tool paths (§6.5–§6.6).
+    hard: CancellationToken,
+    /// The graceful stop, observed only at turn boundaries.
+    soft: CancellationToken,
+}
+
+impl TaskControl {
+    /// A fresh control with neither stop fired.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Abort now: mid-stream, mid-tool, wherever the task is.
+    pub fn cancel(&self) {
+        self.hard.cancel();
+    }
+
+    /// Stop after the current turn completes. Checked at turn
+    /// boundaries only — the in-flight turn always finishes.
+    pub fn pause(&self) {
+        self.soft.cancel();
+    }
+
+    /// Whether the hard stop has fired.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.hard.is_cancelled()
+    }
+
+    /// Whether a graceful pause has been requested.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.soft.is_cancelled()
+    }
+
+    /// The hard-stop token, for callers that wire a cancellation into
+    /// existing `CancellationToken` consumers (tool contexts, stream
+    /// selects). The pause has no token form on purpose: it is a
+    /// turn-boundary decision, not something to race against I/O.
+    #[must_use]
+    pub fn hard_token(&self) -> CancellationToken {
+        self.hard.clone()
+    }
+}
+
+impl From<CancellationToken> for TaskControl {
+    /// Wraps a bare hard-stop token; the result can never pause.
+    fn from(hard: CancellationToken) -> Self {
+        Self {
+            hard,
+            soft: CancellationToken::new(),
         }
     }
 }
@@ -564,8 +654,9 @@ impl Agent {
     /// each turn as it completes.
     ///
     /// Returns a [`TaskSummary`] on terminal success (`EndTurn`). Every other
-    /// terminal state — including cancellation — returns a [`TaskError`];
-    /// the [`TaskRecord`] in `session` carries the same outcome.
+    /// terminal state — including cancellation and a graceful pause —
+    /// returns a [`TaskError`]; the [`TaskRecord`] in `session` carries the
+    /// same outcome.
     ///
     /// The loop never blocks on the event sink and never treats delivery
     /// failure as a task failure (§11): events are best-effort, the
@@ -575,7 +666,7 @@ impl Agent {
         session: &mut Session,
         input: impl Into<String>,
         sink: &dyn EventSink,
-        cancellation: &CancellationToken,
+        control: &TaskControl,
     ) -> Result<TaskSummary, TaskError> {
         let started = Instant::now();
 
@@ -606,14 +697,7 @@ impl Agent {
         // 3. The turn loop; the epilogue below always finalizes the record.
         let mut accounting = Accounting::default();
         let outcome = self
-            .run_turns(
-                session,
-                task_id,
-                sink,
-                cancellation,
-                &mut accounting,
-                started,
-            )
+            .run_turns(session, task_id, sink, control, &mut accounting, started)
             .await;
 
         // 4. Finalize: record the outcome, emit the terminal event, and
@@ -623,6 +707,7 @@ impl Agent {
         let status = match &outcome {
             Ok(_) => TerminalTaskStatus::Completed,
             Err(error) if error.is_cancelled() => TerminalTaskStatus::Cancelled,
+            Err(error) if error.is_paused() => TerminalTaskStatus::Paused,
             Err(_) => TerminalTaskStatus::Failed,
         };
         let end_reason = match &outcome {
@@ -648,6 +733,7 @@ impl Agent {
         match &outcome {
             Ok(_) => sink.emit(task_id, EventKind::TaskCompleted),
             Err(error) if error.is_cancelled() => sink.emit(task_id, EventKind::TaskCancelled),
+            Err(error) if error.is_paused() => sink.emit(task_id, EventKind::TaskPaused),
             Err(error) => sink.emit(
                 task_id,
                 EventKind::TaskFailed {
@@ -685,7 +771,7 @@ impl Agent {
         session: &mut Session,
         task_id: TaskId,
         sink: &dyn EventSink,
-        cancellation: &CancellationToken,
+        control: &TaskControl,
         accounting: &mut Accounting,
         started: Instant,
     ) -> Result<ContextCensus, TaskError> {
@@ -733,7 +819,20 @@ impl Agent {
         // refers to a state some green check actually covered.
         let mut completion = CompletionGate::default();
 
+        // The hard-stop token the stream and tool paths select on
+        // (§6.5–§6.6); the pause is a turn-boundary decision and never
+        // races against I/O.
+        let hard = control.hard_token();
+
         for turn in 1..=self.max_turns {
+            // A pause requested before the task or during the previous
+            // turn's tool batch stops here: the in-flight turn has fully
+            // committed, nothing is dropped, and the session is
+            // resumable. The user's signal wins over further spending.
+            if control.is_paused() {
+                return Err(TaskError::Paused);
+            }
+
             // Enforce the task's resource envelope before spending anything
             // further (§14). Checked once per turn, so the unit in flight when
             // a ceiling was crossed still completed and stays committed.
@@ -783,7 +882,7 @@ impl Agent {
             // b. Stream with bounded retry (§6.3). Only a `Completed` event
             //    produces a response; failed attempts leave no trace.
             let response = self
-                .stream_with_retry(&request, task_id, sink, cancellation, accounting)
+                .stream_with_retry(&request, task_id, sink, &hard, accounting)
                 .await?;
             accounting.usage = accounting.usage + response.usage;
             let assistant = response.message;
@@ -839,7 +938,7 @@ impl Agent {
                             &stubbed_calls,
                             task_id,
                             sink,
-                            cancellation,
+                            &hard,
                             accounting,
                             &mut failures,
                             &recent_changes(session),
@@ -857,8 +956,14 @@ impl Agent {
                     self.commit(session, assistant, results)?;
                     accounting.turns = turn;
                     accounting.sync(session, task_id);
-                    if cancellation.is_cancelled() {
+                    if control.is_cancelled() {
                         return Err(TaskError::Cancelled);
+                    }
+                    // A pause that fired during the batch stops here too:
+                    // the batch committed, and the user's signal wins
+                    // over the max-turns bookkeeping below.
+                    if control.is_paused() {
+                        return Err(TaskError::Paused);
                     }
                     if turn == self.max_turns {
                         return Err(TaskError::MaxTurns {

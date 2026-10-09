@@ -58,8 +58,9 @@ use tokio_util::sync::CancellationToken;
 /// so v1 payloads still deserialize).
 /// v3 adds `ContextPruned` (prune attribution: trigger arm plus
 /// per-call mechanism and estimated reclaim).
-/// v4 adds `AwaitingInput` (engine idle marker after a task ends).
-pub const EVENT_SCHEMA_VERSION: u16 = 4;
+/// v4 adds `AwaitingInput` (engine idle marker after a task ends);
+/// v5 adds `TaskPaused` (graceful between-turns stop).
+pub const EVENT_SCHEMA_VERSION: u16 = 5;
 
 /// One observed occurrence during a task, wrapped for the wire.
 ///
@@ -195,13 +196,17 @@ pub enum EventKind {
     },
     /// The task was cancelled (cooperative cancellation won).
     TaskCancelled,
+    /// The task was paused between turns: the in-flight turn committed
+    /// fully and the session is resumable. Distinct from
+    /// [`EventKind::TaskCancelled`], which aborted mid-flight.
+    TaskPaused,
     /// The driving engine is idle: the task ended, and its session now
     /// awaits the next user input.
     ///
     /// Emitted by the engine's driving layer right after the terminal
     /// task event ([`EventKind::TaskCompleted`],
-    /// [`EventKind::TaskFailed`], or [`EventKind::TaskCancelled`]), so
-    /// consumers that render only the event stream learn when more
+    /// [`EventKind::TaskFailed`], [`EventKind::TaskCancelled`], or
+    /// [`EventKind::TaskPaused`]), so consumers that render only the event stream learn when more
     /// input can be sent — the signal a GUI or TUI resume loop keys on.
     /// The envelope's `task_id` is the task that just ended; the payload
     /// names the idle session. Being engine-level (not task loop)
@@ -538,6 +543,23 @@ mod tests {
             value["kind"]["session_id"],
             serde_json::to_value(session_id).expect("id serializes")
         );
+        let round: EventEnvelope = serde_json::from_value(value).expect("round-trips");
+        assert_eq!(round, envelope);
+    }
+
+    /// Schema v5: `TaskPaused` serializes under the snake_case tag so a
+    /// paused (resumable) ending is distinguishable from a mid-flight
+    /// cancellation on the event stream alone.
+    #[test]
+    fn task_paused_serializes_with_its_tag() {
+        let envelope = EventEnvelope {
+            schema_version: EVENT_SCHEMA_VERSION,
+            sequence: 7,
+            task_id: TaskId::new(),
+            kind: EventKind::TaskPaused,
+        };
+        let value = serde_json::to_value(&envelope).expect("serializes");
+        assert_eq!(value["kind"]["type"], "task_paused");
         let round: EventEnvelope = serde_json::from_value(value).expect("round-trips");
         assert_eq!(round, envelope);
     }

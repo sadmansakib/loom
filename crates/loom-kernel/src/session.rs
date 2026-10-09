@@ -274,6 +274,9 @@ pub enum TaskStatus {
     Failed,
     /// Terminal: the user (or a shutdown) cancelled the run.
     Cancelled,
+    /// Terminal: the operator paused between turns. The in-flight turn
+    /// committed fully; the session resumes from here.
+    Paused,
 }
 
 /// Metadata for one task run inside a session.
@@ -317,6 +320,9 @@ pub enum TerminalTaskStatus {
     Failed,
     /// Terminal: the user (or a shutdown) cancelled the run.
     Cancelled,
+    /// Terminal: the operator paused between turns; the in-flight turn
+    /// committed fully and the session is resumable.
+    Paused,
 }
 
 impl From<TerminalTaskStatus> for TaskStatus {
@@ -325,6 +331,7 @@ impl From<TerminalTaskStatus> for TaskStatus {
             TerminalTaskStatus::Completed => TaskStatus::Completed,
             TerminalTaskStatus::Failed => TaskStatus::Failed,
             TerminalTaskStatus::Cancelled => TaskStatus::Cancelled,
+            TerminalTaskStatus::Paused => TaskStatus::Paused,
         }
     }
 }

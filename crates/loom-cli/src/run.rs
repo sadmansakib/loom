@@ -2,16 +2,17 @@
 //!
 //! This is the CLI adapter, not the composition root: the engine (ADR-021)
 //! owns credentials, the provider, the tools, and session durability; this
-//! module builds the process around it — tokio runtime, Ctrl-C cancellation,
-//! the stdout/stderr and trace consumers, and the exit code.
+//! module builds the process around it — tokio runtime, the two-stage
+//! Ctrl-C stop (pause between turns, then abort), the stdout/stderr and
+//! trace consumers, and the exit code.
 
 use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::Context;
+use loom_core::engine::TaskControl;
 use loom_core::kernel::event::{ChannelEventSink, FanoutSink};
 use loom_core::{Engine, EngineConfig};
-use tokio_util::sync::CancellationToken;
 
 use crate::args::RunArgs;
 use crate::output::{self, Renderer};
@@ -20,8 +21,8 @@ use loom_core::engine::trace::{Outcome, TraceMeta, TraceWriter};
 /// Runs one task end to end and returns the process exit code.
 ///
 /// Terminal `TaskError`s are reported here and mapped to a non-zero code
-/// (`130` for cancellation, `1` otherwise); only setup failures propagate as
-/// `Err`.
+/// (`130` for a user stop — cancellation or pause — `1` otherwise); only
+/// setup failures propagate as `Err`.
 pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     // The runtime exists before the engine opens: the provider's requests
     // (and, for OpenRouter, the catalog fetch inside `open_async`) need a
@@ -92,17 +93,25 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         None => FanoutSink::new().with(render_sink),
     };
 
-    // Ctrl-C cancels the task token; the provider's timeouts need the time
+    // Ctrl-C steers the task's stop control: the first press pauses —
+    // the in-flight turn finishes and commits, then the loop stops —
+    // and a second press aborts mid-flight. Either way the session
+    // survives to be resumed. The provider's timeouts need the time
     // driver the runtime already enables.
-    let cancellation = CancellationToken::new();
-    let signal_token = cancellation.clone();
+    let control = TaskControl::new();
+    let signal_control = control.clone();
     let signal = runtime.spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            signal_token.cancel();
+            eprintln!("stopping after the current turn (Ctrl-C again to abort)…");
+            signal_control.pause();
+            if tokio::signal::ctrl_c().await.is_ok() {
+                eprintln!("aborting…");
+                signal_control.cancel();
+            }
         }
     });
 
-    let outcome = runtime.block_on(engine.run_task(&mut session, input, &sink, &cancellation));
+    let outcome = runtime.block_on(engine.run_task(&mut session, input, &sink, &control));
     // Dropping the fan-out (and with it both channel senders) closes
     // the consumers' `blocking_recv` loops.
     drop(sink);
@@ -129,6 +138,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                     Outcome::Ended {
                         status: if error.is_cancelled() {
                             "cancelled"
+                        } else if error.is_paused() {
+                            "paused"
                         } else {
                             "failed"
                         },
@@ -165,7 +176,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         Err(error) => {
             output::print_failure(&error, args.json);
             runtime.shutdown_timeout(Duration::from_secs(5));
-            Ok(if error.is_cancelled() {
+            Ok(if error.is_cancelled() || error.is_paused() {
                 ExitCode::from(130)
             } else {
                 ExitCode::FAILURE

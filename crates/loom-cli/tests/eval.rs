@@ -80,7 +80,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use loom_core::engine::repo::FsFactsSource;
-use loom_core::kernel::agent::Agent;
+use loom_core::kernel::agent::{Agent, TaskControl};
 use loom_core::kernel::context::{
     AgentConfig, ContextCompiler, DefaultContextCompiler, PruneConfig, PruningContextCompiler,
     TokenEstimator,
@@ -102,7 +102,6 @@ use loom_core::tools::{
     EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool, VerifyTool, WriteFileTool,
 };
 use serde::{Deserialize, Serialize};
-use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------- tasks ---
 
@@ -973,16 +972,16 @@ async fn run_once(
     )
     .with_facts_source(Box::new(FsFactsSource::new(root.clone())));
     let mut session = Session::new(SessionId::new());
-    let cancellation = CancellationToken::new();
+    let control = TaskControl::new();
     // V21: strict evaluation sink — a run that loses events fails rather than
     // silently producing a truncated trace. The tally sink cannot drop, so
     // this only bites if the harness ever swaps in a lossy sink.
     let tally_state = Arc::new(Mutex::new(Tally::default()));
-    let sink = StrictSink::new(CountingSink(Arc::clone(&tally_state)), cancellation.clone());
+    let sink = StrictSink::new(CountingSink(Arc::clone(&tally_state)), control.hard_token());
 
     let started = Instant::now();
     let outcome = agent
-        .run_task(&mut session, task.prompt.clone(), &sink, &cancellation)
+        .run_task(&mut session, task.prompt.clone(), &sink, &control)
         .await;
     let observed_ms = started.elapsed().as_millis() as u64;
     let tally = *tally_state.lock().unwrap();

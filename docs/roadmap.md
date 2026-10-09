@@ -475,7 +475,7 @@ also summarized here so this section is the single source of truth.
   and cached tokens / cost / wall time / tool-cache hits, per-task
   aggregates and a gated-pass-rate suite headline; strict and tolerant
   modes.
-- **Verification bar.** 661 tests passing (13 live-API tests ignored by
+- **Verification bar.** 664 tests passing (13 live-API tests ignored by
   default), clippy clean, fmt clean.
 
 ---
@@ -851,7 +851,11 @@ reproduces them.
 15. **CLI session resume.** Listing, selection, continuation, and
     transcript export (also the input for item 19). The core seam
     shipped 2026-10-09: `Engine::continue_session` plus the
-    `AwaitingInput` event — remaining work is the CLI command surface.
+    `AwaitingInput` event, and stopping is two-granularity through
+    `TaskControl` (`cancel` aborts mid-flight, `pause` stops at the
+    next turn boundary with the in-flight turn committed — one Ctrl-C
+    pauses, a second cancels) — remaining work is the CLI command
+    surface.
 16. **Search parity.** Adopt the `ignore` crate's matcher for chained
     gitignore files or pin the documented negation-precedence
     divergence with real-repository fixtures.
