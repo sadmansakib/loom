@@ -577,6 +577,22 @@ savings per mechanism by summing `reclaimed_tokens` across those events
 (deduplicating by `call_id` — turns that merely re-apply a frozen
 checkpoint emit nothing).
 
+The boundary itself is guarded, not just described: `loom-cli` reaches
+workspace code through `loom-core` alone (ADR-021), and
+`crates/loom-cli/tests/facade.rs` fails the suite the moment the binary
+gains a direct dependency on any other workspace crate — the rule runs
+with `cargo test --workspace` in CI, not on review vigilance. What
+stays in the CLI is presentation only: argument parsing (`args.rs`),
+the terminal renderer (`output.rs`), tracing setup and exit codes
+(`main.rs`), the auth prompts (`auth_command.rs`), and the Ctrl-C
+signal mapping — domain logic lives behind the facade where every
+frontend shares it. Cross-process frontends are deliberately not part
+of today's design: everything runs in-process, and the seam a future
+server process would cut along already exists in draft form — the
+serde-envelope event stream is versioned (`EVENT_SCHEMA_VERSION`) and
+self-describing, `StatusSnapshot` is serializable, and the trace
+formats are byte-stable data contracts.
+
 ## 10. Providers
 
 Five adapters ship:
@@ -741,7 +757,7 @@ Compare suites by medians over N ≥ 5; the observed noise floor is ±10%.
 - Blocking work on the blocking pool; hashing never under a lock.
 - Facts scanned once per task; capabilities resolved once per task.
 
-**Testing** — the workspace carries 671 tests (13 live-API tests
+**Testing** — the workspace carries 672 tests (13 live-API tests
 ignored by default): unit tests per module,
 protocol and invariant tests against in-memory seams, security regression
 tests for confinement, canary tests for secrets, integration tests that

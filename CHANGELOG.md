@@ -3,6 +3,21 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-09 — Facade boundary guarded: loom-cli depends on loom-core alone
+
+The ADR-021 rule is now enforced by the suite, not by review vigilance:
+`crates/loom-cli/tests/facade.rs` fails `cargo test --workspace` the
+moment `loom-cli` declares a direct dependency on any workspace crate
+other than `loom-core` (dependencies, dev-dependencies, and
+target-specific sections all covered), and also asserts the facade
+dependency is present so the guard cannot pass vacuously. The
+architecture doc's §9 closes with the boundary's inventory: the CLI
+keeps presentation only (args, renderer, tracing/exit codes, auth
+prompts, Ctrl-C mapping), and the cross-process story stays in-process
+by design — with the versioned event stream, serializable
+`StatusSnapshot`, and byte-stable trace formats documented as the seam
+a future server would cut along.
+
 ## 2026-10-09 — loom-eval: the eval harness becomes a crate, driven by the engine (C1)
 
 The eval harness moved out of `loom-cli`'s test directory into an eighth
