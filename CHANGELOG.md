@@ -3,6 +3,33 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-10 — Surfaced decisions: harness black boxes become events
+
+Three under-the-hood decisions the harness made silently are now events
+on the trace stream (event schema v8):
+
+- `FastPathDeclined` — a fast-path attempt that fell through says why,
+  coarsely: `no-intent-match` (no grammar matched) versus
+  `intent-{kind}-unsolved` (matched, but a guard or the offline verifier
+  said no). Emitted after the task's terminal events; the workspace was
+  untouched either way.
+- `CapabilitiesResolved` — once per engine, which authority fixed the
+  configured model's capabilities: a catalog row, a provider table, or
+  (under replay) the recording itself. A silent table fallback after a
+  failed catalog fetch is exactly the kind of quiet substitution this
+  exists to expose.
+- `HarnessNotice` — per-command deviations reported out of the tools
+  layer, deduped per batch: a command that ran unconfined
+  (`sandbox.passthrough` — policy opt-out or a platform without a
+  wrapper) and a stream abandoned to an escaped pipe-holder
+  (`stream.truncated`).
+
+All three ride the existing serde envelope (snake_case tags, additive
+fields), the CLI prints them as a `decisions:` line in `loom stats`,
+and `trace_stats` aggregates them per task and per report. Consumers
+must tolerate unknown notice categories — categories are stable
+strings, not a closed enum.
+
 ## 2026-10-10 — Leaked-descendant pipe hold no longer hangs collection
 
 A command that leaks a background process (a test suite spawning `sleep`,

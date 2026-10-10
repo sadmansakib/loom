@@ -98,7 +98,9 @@ use loom_core::kernel::model::{
 };
 use loom_core::kernel::session::Session;
 use loom_core::kernel::tool::ToolRegistry;
-use loom_core::kernel::transcript::{AssistantMessage, Item, ToolArguments, ToolCall, ToolCallId};
+use loom_core::kernel::transcript::{
+    AssistantMessage, Item, ReasoningTrace, ToolArguments, ToolCall, ToolCallId,
+};
 use loom_core::providers::ReasoningEffort;
 use loom_core::tools::{
     EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool, VerifyTool, WriteFileTool,
@@ -598,6 +600,10 @@ impl ModelProvider for ReplayProvider {
         // the live run served, so no provider's static table can veto a
         // model replay actually used.
         (model == self.model).then_some(self.capabilities)
+    }
+
+    fn capability_source(&self) -> &'static str {
+        "recording"
     }
 
     fn stream<'a>(&'a self, request: &'a ModelRequest) -> ModelStream<'a> {
@@ -2574,4 +2580,86 @@ async fn eval_replay_synthetic() {
     // The scripted tool call must have executed against the real workspace.
     // (assert_replay_equivalence already proved turn equality; this checks
     // the tool result landed next to it.)
+}
+
+/// Replay's capabilities are derived from the recording itself, and the
+/// provider says so: `capability_source() == "recording"` is what the
+/// engine's `CapabilitiesResolved` event surfaces, keeping the trace
+/// honest about which authority fixed the window (v8).
+#[test]
+fn replay_capabilities_derive_from_the_recording() {
+    let model = "deepseek-flash";
+    let request = ModelRequest {
+        model: model.to_owned(),
+        messages: Vec::new(),
+        tools: Vec::new(),
+        max_tokens: None,
+        temperature: None,
+        stable_prefix_messages: None,
+    };
+    let exchange = |message: AssistantMessage| Exchange {
+        request: request.clone(),
+        response: ModelResponse {
+            message,
+            usage: Usage::default(),
+        },
+    };
+    let exchanges = vec![
+        // One turn proving tools, parallel calls, and reasoning.
+        exchange(AssistantMessage {
+            content: String::new(),
+            reasoning: Some(ReasoningTrace {
+                text: String::from("thinking"),
+                provider_data: None,
+            }),
+            tool_calls: vec![
+                ToolCall {
+                    id: ToolCallId::try_from(String::from("synthetic-1")).unwrap(),
+                    name: String::from("read_file"),
+                    arguments: ToolArguments::try_from(serde_json::json!({
+                        "path": "README.md"
+                    }))
+                    .unwrap(),
+                },
+                ToolCall {
+                    id: ToolCallId::try_from(String::from("synthetic-2")).unwrap(),
+                    name: String::from("list_dir"),
+                    arguments: ToolArguments::try_from(serde_json::json!({
+                        "path": "src"
+                    }))
+                    .unwrap(),
+                },
+            ],
+            stop_reason: StopReason::ToolCalls,
+        }),
+        // One plain turn: capabilities are the union of the recording.
+        exchange(AssistantMessage {
+            content: String::from("done"),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            stop_reason: StopReason::EndTurn,
+        }),
+    ];
+
+    let provider = ReplayProvider::new(model, &exchanges);
+    assert_eq!(provider.capability_source(), "recording");
+    let capabilities = provider.capabilities(model).expect("model matches");
+    assert!(
+        capabilities.tool_calls,
+        "a recorded tool call proves support"
+    );
+    assert!(
+        capabilities.parallel_tool_calls,
+        "a recorded multi-call turn proves parallel support"
+    );
+    assert!(
+        capabilities.reasoning,
+        "a recorded reasoning trace proves support"
+    );
+    // Tiny requests: the 256K floor, not the request-derived bound, wins.
+    assert_eq!(capabilities.max_context_tokens, 262_144);
+    assert!(
+        provider.capabilities("some-other-model").is_none(),
+        "capabilities are per-model"
+    );
 }

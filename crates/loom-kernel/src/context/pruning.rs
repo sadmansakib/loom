@@ -1702,6 +1702,7 @@ fn stub_tokens(
         truncated: false,
         effects: crate::tool::ToolEffects::none(),
         artifact: None,
+        notices: Vec::new(),
     });
     estimate_serialized(estimator, &probe)
 }

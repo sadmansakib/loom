@@ -113,6 +113,12 @@ pub struct Engine {
     /// bare-loop arm — the A/B baseline must spend its turns like a
     /// basic harness would.
     fast_paths: bool,
+    /// The capability-resolution facts (source, model) to surface once
+    /// per engine instance as a `CapabilitiesResolved` event (v8).
+    /// `None` only for hand-built test engines.
+    resolution: Option<(&'static str, String)>,
+    /// Guards the one-shot emission of the resolution events.
+    notices_flushed: std::sync::OnceLock<()>,
 }
 
 /// A function that wraps the provider an open produced — built from
@@ -272,6 +278,10 @@ impl Engine {
             Some(hook) => hook(provider),
             None => provider,
         };
+        // The resolution facts the trace surfaces once per engine (v8):
+        // which authority — catalog row, provider table, or recording —
+        // fixed this model's capabilities.
+        let resolution = crate::provider::resolution_source(&config, provider.as_ref());
 
         // One policy drives both the tool registry and the fast paths'
         // verification runs, so a manifest rule changes them together.
@@ -389,6 +399,8 @@ impl Engine {
             // harness does not short-circuit mechanical tasks — the
             // fast path is a Loom lever, so it flips with the others.
             fast_paths: overrides.fast_paths.unwrap_or(true) && !overrides.bare_loop,
+            resolution: Some(resolution),
+            notices_flushed: std::sync::OnceLock::new(),
         })
     }
 
@@ -497,36 +509,73 @@ impl Engine {
         // declined guard, or reverted failure falls through to the
         // agent loop over an untouched workspace, so the loop is never
         // worse off for trying.
-        if self.fast_paths
-            && let Some(solve) =
-                loom_tools::fastpath::try_fast_path(&self.workspace, &input, &self.policy).await
-        {
-            let summary = self
-                .agent
-                .record_fast_path(
-                    session,
-                    input,
-                    loom_kernel::agent::FastPathSolve {
-                        kind: solve.kind.to_owned(),
-                        files_changed: solve.files_changed,
-                        note: solve.note,
-                    },
-                    sink,
-                )
-                .await?;
-            // Same idle marker the loop-driven path emits: the
-            // session accepts follow-up input either way.
-            if let Some(record) = session.tasks.last() {
+        let mut fast_path_decline: Option<&'static str> = None;
+        if self.fast_paths {
+            let attempt =
+                loom_tools::fastpath::try_fast_path(&self.workspace, &input, &self.policy).await;
+            match attempt.outcome {
+                Some(solve) => {
+                    let summary = self
+                        .agent
+                        .record_fast_path(
+                            session,
+                            input,
+                            loom_kernel::agent::FastPathSolve {
+                                kind: solve.kind.to_owned(),
+                                files_changed: solve.files_changed,
+                                note: solve.note,
+                            },
+                            sink,
+                        )
+                        .await?;
+                    // Same idle marker the loop-driven path emits: the
+                    // session accepts follow-up input either way.
+                    if let Some(record) = session.tasks.last() {
+                        sink.emit(
+                            record.id,
+                            EventKind::AwaitingInput {
+                                session_id: session.id,
+                            },
+                        );
+                    }
+                    return Ok(summary);
+                }
+                None => fast_path_decline = attempt.decline,
+            }
+        }
+        let outcome = self.agent.run_task(session, input, sink, control).await;
+        // v8 surfaced decisions, attributed to the task that just ran:
+        // the fast-path attempt that fell through (post-hoc — the
+        // attempt happens before a task record exists), then the
+        // engine's one-shot resolution facts.
+        if let Some(record) = session.tasks.last() {
+            if let Some(reason) = fast_path_decline {
                 sink.emit(
                     record.id,
-                    EventKind::AwaitingInput {
-                        session_id: session.id,
+                    EventKind::FastPathDeclined {
+                        reason: reason.to_owned(),
                     },
                 );
             }
-            return Ok(summary);
+            if self.notices_flushed.set(()).is_ok()
+                && let Some((source, model)) = &self.resolution
+            {
+                sink.emit(
+                    record.id,
+                    EventKind::CapabilitiesResolved {
+                        model: model.clone(),
+                        source: (*source).to_owned(),
+                    },
+                );
+                sink.emit(
+                    record.id,
+                    EventKind::HarnessNotice {
+                        category: String::from("sandbox"),
+                        detail: loom_tools::sandbox::baseline().to_owned(),
+                    },
+                );
+            }
         }
-        let outcome = self.agent.run_task(session, input, sink, control).await;
         // The engine is idle again once the task's terminal event has been
         // emitted. The marker carries the ended task's id (envelope shape)
         // and the session (payload); a session whose very first user item
@@ -832,7 +881,11 @@ mod tests {
         }
 
         fn capabilities(&self, _model: &str) -> Option<ModelCapabilities> {
-            Some(ModelCapabilities::new(8192))
+            // Tool-calling on: scripts emit tool calls, and the default
+            // compiler exposes tools only to a model that can call them
+            // (§8.2) — with this off, every scripted call would bounce
+            // back `NotExposed` instead of running.
+            Some(ModelCapabilities::new(8192).with_tool_calls(true))
         }
 
         fn stream<'a>(&'a self, _request: &'a ModelRequest) -> ModelStream<'a> {
@@ -857,6 +910,8 @@ mod tests {
             workspace: PathBuf::from("."),
             policy: CommandPolicy::default(),
             fast_paths: false,
+            resolution: None,
+            notices_flushed: std::sync::OnceLock::new(),
         }
     }
 
@@ -1030,6 +1085,192 @@ mod tests {
                 .any(|kind| matches!(kind, EventKind::FastPathHit { .. }))
         );
         assert!(kinds.contains(&EventKind::TaskCompleted));
+        // The attempted-and-declined side of the fast path is surfaced,
+        // not swallowed (v8): no intent matched, the loop took over.
+        assert!(kinds.contains(&EventKind::FastPathDeclined {
+            reason: "no-intent-match".to_owned()
+        }));
+        // So is the authority that fixed the fake provider's
+        // capabilities: its own table.
+        assert!(kinds.contains(&EventKind::CapabilitiesResolved {
+            model: "deepseek-flash".to_owned(),
+            source: "provider-table".to_owned()
+        }));
+    }
+
+    #[tokio::test]
+    async fn capability_resolution_surfaces_once_per_engine() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = rename_fixture(base.path());
+        let mut config = test_config();
+        config.workspace = workspace.clone();
+        config.db_path = base.path().join("loom.db");
+        let engine = Engine::open_with(
+            config,
+            EngineOverrides {
+                provider: Some(Box::new(FakeProvider::scripted(vec![
+                    FakeProvider::end_turn_script("done"),
+                    FakeProvider::end_turn_script("done again"),
+                ]))),
+                ..EngineOverrides::default()
+            },
+        )
+        .expect("engine");
+
+        let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
+        let mut session = engine.new_session();
+        engine
+            .run_task(&mut session, "Say hello.", &sink, &Default::default())
+            .await
+            .expect("first task");
+        engine
+            .run_task(&mut session, "Say it again.", &sink, &Default::default())
+            .await
+            .expect("second task");
+
+        let kinds = drain(&mut receiver);
+        let resolutions = kinds
+            .iter()
+            .filter(|kind| matches!(kind, EventKind::CapabilitiesResolved { .. }))
+            .count();
+        assert_eq!(
+            resolutions, 1,
+            "one engine, one capability resolution — not one per task"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_solver_decline_names_the_intent() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = rename_fixture(base.path());
+        let mut config = test_config();
+        config.workspace = workspace.clone();
+        config.db_path = base.path().join("loom.db");
+        // The analyzer matches a rename intent, but the target symbol
+        // does not exist: the solver declines, and the decline carries
+        // the intent kind rather than a bare no-match.
+        let engine = Engine::open_with(
+            config,
+            EngineOverrides {
+                provider: Some(Box::new(FakeProvider::scripted(vec![
+                    FakeProvider::end_turn_script("done"),
+                ]))),
+                ..EngineOverrides::default()
+            },
+        )
+        .expect("engine");
+
+        let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
+        let mut session = engine.new_session();
+        let summary = engine
+            .run_task(
+                &mut session,
+                "Rename missing_symbol to renamed_symbol",
+                &sink,
+                &Default::default(),
+            )
+            .await
+            .expect("agent task");
+
+        assert_eq!(summary.model_requests, 1, "the loop took over");
+        let kinds = drain(&mut receiver);
+        assert!(kinds.contains(&EventKind::FastPathDeclined {
+            reason: "intent-rename-unsolved".to_owned()
+        }));
+        // The fixture is untouched — a declined fast path never edits.
+        let lib = std::fs::read_to_string(workspace.join("src/lib.rs")).expect("lib");
+        assert!(lib.contains("pub fn parse_opts() -> u32"));
+    }
+
+    /// One script: an assistant turn that asks for two identical
+    /// `run_command` calls (same program, same arguments).
+    fn two_identical_commands_script() -> Vec<Result<ModelEvent, ModelError>> {
+        use loom_kernel::transcript::{ToolArguments, ToolCall, ToolCallId};
+        let call = || ToolCall {
+            id: ToolCallId::try_from(format!("call-{}", std::process::id())).unwrap(),
+            name: "run_command".to_owned(),
+            arguments: ToolArguments::try_from(serde_json::json!({
+                "program": "echo",
+                "args": ["hi"],
+            }))
+            .expect("arguments"),
+        };
+        vec![Ok(ModelEvent::Completed(ModelResponse {
+            message: AssistantMessage {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![call(), call()],
+                stop_reason: StopReason::ToolCalls,
+            },
+            usage: Usage::default(),
+        }))]
+    }
+
+    #[tokio::test]
+    async fn harness_notices_dedupe_within_a_batch() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = rename_fixture(base.path());
+        // The manifest opts `echo` out of the OS sandbox: the loudest
+        // escalation a rule can grant, and exactly the under-the-hood
+        // deviation the v8 notices exist to surface.
+        std::fs::create_dir_all(workspace.join(".loom")).expect("loom dir");
+        std::fs::write(
+            workspace.join(".loom/commands.toml"),
+            "[[command]]\nprogram = \"echo\"\nsandbox = false\n",
+        )
+        .expect("manifest");
+        let mut config = test_config();
+        config.workspace = workspace.clone();
+        config.db_path = base.path().join("loom.db");
+        // A tool turn plus the closing turn.
+        config.max_turns = 2;
+        // Two identical unconfined commands in one turn: the
+        // sandbox-passthrough observation is a property of the batch,
+        // not of each call — one event, not two.
+        let engine = Engine::open_with(
+            config,
+            EngineOverrides {
+                provider: Some(Box::new(FakeProvider::scripted(vec![
+                    two_identical_commands_script(),
+                    FakeProvider::end_turn_script("done"),
+                ]))),
+                ..EngineOverrides::default()
+            },
+        )
+        .expect("engine");
+
+        let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
+        let mut session = engine.new_session();
+        let summary = engine
+            .run_task(
+                &mut session,
+                "Check the toolchain twice.",
+                &sink,
+                &Default::default(),
+            )
+            .await
+            .expect("agent task");
+
+        assert_eq!(summary.model_requests, 2, "tool turn plus final turn");
+        let kinds = drain(&mut receiver);
+        let completed = kinds
+            .iter()
+            .filter(|kind| matches!(kind, EventKind::ToolCompleted { .. }))
+            .count();
+        assert_eq!(completed, 2, "both calls ran");
+        let notices = kinds
+            .iter()
+            .filter(|kind| {
+                matches!(
+                    kind,
+                    EventKind::HarnessNotice { category, .. } if category == "sandbox.passthrough"
+                )
+            })
+            .count();
+        assert_eq!(
+            notices, 1,
+            "identical notices collapse to one event per batch"
+        );
     }
 
     #[tokio::test]

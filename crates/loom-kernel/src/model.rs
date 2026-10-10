@@ -478,6 +478,14 @@ pub trait ModelProvider: Send + Sync {
     /// configured fallback or fails before the first request (§6.4).
     fn capabilities(&self, model: &str) -> Option<ModelCapabilities>;
 
+    /// The authority `capabilities` answers from, for the trace's
+    /// `CapabilitiesResolved` event (v8): the static provider table by
+    /// default; an adapter whose rows come from elsewhere (replay
+    /// derives them from the recording) says so here.
+    fn capability_source(&self) -> &'static str {
+        "provider-table"
+    }
+
     /// Starts a request and returns its event stream.
     ///
     /// Lazy: nothing is sent until first poll. Dropping the stream cancels

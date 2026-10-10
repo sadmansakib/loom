@@ -159,6 +159,29 @@ fn trace_report(base: &std::path::Path, json: bool) -> anyhow::Result<ExitCode> 
             "attribution: {}  (estimator-side estimates)",
             attribution_line(&totals)
         );
+        if !totals.decisions.fast_path_declined.is_empty()
+            || !totals.decisions.harness_notices.is_empty()
+        {
+            let mut parts: Vec<String> = Vec::new();
+            if totals.decisions.capabilities_resolved > 0 {
+                parts.push(format!(
+                    "{} capability resolution{}",
+                    totals.decisions.capabilities_resolved,
+                    if totals.decisions.capabilities_resolved == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ));
+            }
+            for (reason, count) in &totals.decisions.fast_path_declined {
+                parts.push(format!("fast path declined ({reason})×{count}"));
+            }
+            for (category, count) in &totals.decisions.harness_notices {
+                parts.push(format!("{category}×{count}"));
+            }
+            println!("decisions: {}", parts.join(", "));
+        }
         if totals.corrupt > 0 {
             println!("skipped {} unreadable task directories", totals.corrupt);
         }

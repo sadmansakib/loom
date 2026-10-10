@@ -25,6 +25,21 @@
 
 use std::path::{Path, PathBuf};
 
+/// The OS-sandbox baseline a rule-less command runs under, for the
+/// trace's one-shot `sandbox` notice (v8): which wrapper confines
+/// commands on this platform, or that none exists. Per-command
+/// deviations (a policy opt-out, a platform without a wrapper) surface
+/// separately as `sandbox.passthrough` notices.
+pub fn baseline() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "commands run OS-confined (macOS Seatbelt profile: workspace + temp + cargo home writable, network off)"
+    } else if cfg!(target_os = "linux") {
+        "commands run OS-confined (bubblewrap: workspace + temp + cargo home writable, network off)"
+    } else {
+        "no OS sandbox wrapper on this platform: commands run unconfined"
+    }
+}
+
 /// Escalation grants from the command policy, beyond the sandbox
 /// default. `None` rule (previously: rejected program) means the pure
 /// default: sandboxed, no network, no extra writable paths.
@@ -107,6 +122,24 @@ impl Sandbox {
         }
         dirs.extend(self.grants.extra_writable.iter().cloned());
         dirs
+    }
+
+    /// Whether commands under this sandbox are OS-confined. `false`
+    /// means every wrap passes through: the policy opted out, or the
+    /// platform has no wrapper at all — a fact the trace surfaces as a
+    /// `sandbox.passthrough` notice rather than a silent difference.
+    pub(crate) fn confined(&self) -> bool {
+        if !self.grants.enabled {
+            return false;
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            true
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            false
+        }
     }
 
     /// Wraps `program args...` into the sandbox wrapper's argv, or

@@ -51,6 +51,30 @@ pub struct FastPathOutcome {
     pub note: String,
 }
 
+/// One fast-path attempt: the solve when every guard held, else the
+/// coarse reason it fell through to the agent loop. `decline` is
+/// `None` exactly when `outcome` is `Some` — the reason distinguishes
+/// "no intent matched" from "matched, but a guard or the offline
+/// verifier said no" without leaking solver internals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FastPathAttempt {
+    /// The verified solve, when the fast path succeeded.
+    pub outcome: Option<FastPathOutcome>,
+    /// Coarse decline reason (`"no-intent-match"` or
+    /// `"intent-{kind}-unsolved"`).
+    pub decline: Option<&'static str>,
+}
+
+impl FastPathAttempt {
+    /// A failed attempt with its reason.
+    pub fn declined(reason: &'static str) -> Self {
+        Self {
+            outcome: None,
+            decline: Some(reason),
+        }
+    }
+}
+
 /// A literal value as it can appear in a task instruction and in a
 /// `const` declaration. Rendering is round-trip-exact: the token the
 /// analyzer parsed from the instruction must equal the token in the
@@ -96,6 +120,19 @@ enum Intent {
         crate_name: String,
         to_version: String,
     },
+}
+
+impl Intent {
+    /// The decline reason when the intent matched but its solver's
+    /// guards (or the offline verifier) said no.
+    fn decline_reason(&self) -> &'static str {
+        match self {
+            Self::Rename { .. } => "intent-rename-unsolved",
+            Self::Constant { .. } => "intent-constant-unsolved",
+            Self::FormatRust | Self::FormatGo | Self::Format => "intent-format-unsolved",
+            Self::DependencyUpdate { .. } => "intent-dependency-unsolved",
+        }
+    }
 }
 
 /// Identifiers the fast path refuses to touch: Rust keywords would
@@ -518,7 +555,7 @@ async fn program_ok(
         Duration::from_secs(300),
     );
     match run_bounded(program, &owned, &ctx, &limits, &sandbox).await {
-        Ok(output) => output.status.success(),
+        Ok(outcome) => outcome.output.status.success(),
         Err(error) => {
             tracing::debug!(error = %error, "fast path verification could not run");
             false
@@ -551,10 +588,10 @@ async fn program_output(
         CancellationToken::new(),
         Duration::from_secs(300),
     );
-    let output = run_bounded(program, &owned, &ctx, &limits, &sandbox)
+    let outcome = run_bounded(program, &owned, &ctx, &limits, &sandbox)
         .await
         .ok()?;
-    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    Some(String::from_utf8_lossy(&outcome.output.stdout).into_owned())
 }
 
 /// Applies the rename intent: collision-checked, whole-word, verified.
@@ -1051,23 +1088,39 @@ fn rewrite_dep_line(line: &str, crate_name: &str, to_version: &str) -> Option<(S
 ///
 /// Never-worse contract: on every `None` path the workspace is
 /// byte-identical to what it was on entry.
+/// Attempts a deterministic solve of `task` in `workspace`.
+///
+/// Returns the solve when every guard holds, or the coarse reason the
+/// attempt fell through — never-worse outranks coverage, and the agent
+/// loop takes over an untouched workspace either way.
 pub async fn try_fast_path(
     workspace: &Path,
     task: &str,
     policy: &CommandPolicy,
-) -> Option<FastPathOutcome> {
-    match analyze(task)? {
+) -> FastPathAttempt {
+    let Some(intent) = analyze(task) else {
+        return FastPathAttempt::declined("no-intent-match");
+    };
+    let outcome = match &intent {
         Intent::FormatRust => apply_format(workspace, policy, FormatClass::Rust).await,
         Intent::FormatGo => apply_format(workspace, policy, FormatClass::Go).await,
         Intent::Format => apply_format(workspace, policy, FormatClass::Auto).await,
-        Intent::Rename { from, to } => apply_rename(workspace, policy, &from, &to).await,
+        Intent::Rename { from, to } => apply_rename(workspace, policy, from, to).await,
         Intent::Constant { name, from, to } => {
-            apply_constant(workspace, policy, &name, &from, &to).await
+            apply_constant(workspace, policy, name, from, to).await
         }
         Intent::DependencyUpdate {
             crate_name,
             to_version,
-        } => apply_dependency_update(workspace, policy, &crate_name, &to_version).await,
+        } => apply_dependency_update(workspace, policy, crate_name, to_version).await,
+    };
+    if outcome.is_some() {
+        FastPathAttempt {
+            outcome,
+            decline: None,
+        }
+    } else {
+        FastPathAttempt::declined(intent.decline_reason())
     }
 }
 
@@ -1107,6 +1160,48 @@ mod tests {
         assert_eq!(analyze("rename fn to match"), None);
         assert_eq!(analyze("rename parse_opts to parse_opts"), None);
         assert_eq!(analyze("renamed parse_opts to parse_options"), None);
+    }
+
+    #[tokio::test]
+    async fn decline_reasons_distinguish_no_match_from_unsolved() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = base.path().join("ws");
+        std::fs::create_dir_all(workspace.join("src")).expect("dirs");
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"fp_decline\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn parse_opts() -> u32 {\n    7\n}\n",
+        )
+        .expect("lib");
+        let policy = CommandPolicy::cargo_only();
+
+        // No grammar match: the decline names the absence of an intent.
+        let attempt = try_fast_path(&workspace, "Refactor the parser for clarity.", &policy).await;
+        assert_eq!(attempt.decline, Some("no-intent-match"));
+        assert!(attempt.outcome.is_none());
+
+        // A rename of a symbol the file does not carry: the intent
+        // matched, the solver's guards said no — a different reason.
+        let attempt = try_fast_path(
+            &workspace,
+            "Rename missing_symbol to renamed_symbol",
+            &policy,
+        )
+        .await;
+        assert_eq!(attempt.decline, Some("intent-rename-unsolved"));
+
+        // A dependency bump for a crate the manifest does not carry.
+        let attempt = try_fast_path(
+            &workspace,
+            "Update the dependency tiny-dep to 2.0.0",
+            &policy,
+        )
+        .await;
+        assert_eq!(attempt.decline, Some("intent-dependency-unsolved"));
     }
 
     #[test]

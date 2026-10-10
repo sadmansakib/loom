@@ -343,6 +343,12 @@ pub struct ToolResult {
     /// and it defaults to `None` for results persisted before step 2D.
     #[serde(default)]
     pub artifact: Option<ArtifactRef>,
+    /// Harness observations carried out of the tools layer (v8):
+    /// sandbox passthrough, truncated streams. Persisted for tracing,
+    /// never projected into the model's view; defaults to empty for
+    /// results persisted before the field existed.
+    #[serde(default)]
+    pub notices: Vec<crate::tool::ToolNotice>,
 }
 
 impl ToolResult {
@@ -364,6 +370,7 @@ impl ToolResult {
             truncated,
             effects: ToolEffects::none(),
             artifact: None,
+            notices: Vec::new(),
         }
     }
 

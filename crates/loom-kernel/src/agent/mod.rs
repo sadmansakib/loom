@@ -1502,6 +1502,9 @@ impl Agent {
         let batch = ToolBatch::new(&self.registry, &exposure)
             .with_max_concurrency(self.max_tool_concurrency);
         let ran = batch.execute(&runnable, &context).await;
+        // Dedupe key for harness notices within this batch: one event per
+        // distinct (category, detail), not one per parallel call.
+        let mut emitted_notices: HashSet<(String, String)> = HashSet::new();
 
         // Refused calls were never handed to the engine; reconstruct every
         // result in call order from the executed set plus refusal fillers.
@@ -1544,6 +1547,21 @@ impl Agent {
                         call_id: call.id.clone(),
                     },
                 );
+                // Harness observations ride the result into the trace:
+                // one event per distinct notice in this batch (a healthy
+                // default run attaches none).
+                for notice in &result.notices {
+                    let key = (notice.category.clone(), notice.detail.clone());
+                    if emitted_notices.insert(key) {
+                        sink.emit(
+                            task_id,
+                            EventKind::HarnessNotice {
+                                category: notice.category.clone(),
+                                detail: notice.detail.clone(),
+                            },
+                        );
+                    }
+                }
             }
         }
         results

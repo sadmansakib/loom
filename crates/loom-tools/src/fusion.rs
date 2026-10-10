@@ -41,7 +41,7 @@ pub(crate) async fn run_fused(
         &ctx.workspace_root,
         crate::sandbox::SandboxGrants::from_rule(None),
     );
-    let output = crate::exec::run_bounded(
+    let outcome = crate::exec::run_bounded(
         program,
         &args,
         ctx,
@@ -49,6 +49,7 @@ pub(crate) async fn run_fused(
         &sandbox,
     )
     .await?;
+    let output = outcome.output;
     let effect = CommandEffect::new(program, args.clone(), output.status.code());
     let mut recent = ctx.recent_changes();
     recent.push(changed.to_owned());

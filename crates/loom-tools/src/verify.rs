@@ -206,14 +206,31 @@ impl Tool for VerifyTool {
             };
             let grants = crate::sandbox::SandboxGrants::from_rule(rule);
             let sandbox = crate::sandbox::Sandbox::resolve(&ctx.workspace_root, grants);
-            let output = crate::exec::run_bounded(program, &args, ctx, &limits, &sandbox).await?;
+            let outcome = crate::exec::run_bounded(program, &args, ctx, &limits, &sandbox).await?;
+            let output = outcome.output;
             let effects = ToolEffects::none().with_command(CommandEffect::new(
                 program,
                 args.clone(),
                 output.status.code(),
             ));
             let recent_changes = ctx.recent_changes();
-            Ok(render(ecosystem, program, &args, &output, &recent_changes).with_effects(effects))
+            let mut rendered =
+                render(ecosystem, program, &args, &output, &recent_changes).with_effects(effects);
+            // Same trace-side facts `run_command` surfaces: an unconfined
+            // verification run, a stream an escaped holder truncated.
+            if !sandbox.confined() {
+                rendered = rendered.with_notice(loom_kernel::tool::ToolNotice::new(
+                    "sandbox.passthrough",
+                    format!("\"{program}\" (verify) ran unconfined"),
+                ));
+            }
+            if outcome.pipe_hold_truncated {
+                rendered = rendered.with_notice(loom_kernel::tool::ToolNotice::new(
+                    "stream.truncated",
+                    format!("\"{program}\" (verify) output truncated: a descendant held the pipes after exit"),
+                ));
+            }
+            Ok(rendered)
         })
     }
 }

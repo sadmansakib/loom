@@ -457,9 +457,37 @@ pub struct ToolOutput {
     pub effects: ToolEffects,
     /// Set when the full output was stored out of band (ADR-012 decision 3,
     /// ADR-014): the transcript then carries this compact handle and
-    /// `content` says how to refetch the body with `artifact_read`. `None`
+    /// `content` says how to refetch it with `artifact_read`. `None`
     /// for an ordinary inline result.
     pub artifact: Option<ArtifactRef>,
+    /// Harness-level observations for the trace, not the model: a
+    /// sandbox that passed a command through, a stream a leaked
+    /// descendant truncated. The context compiler never projects these
+    /// into the model's view — they ride the result into
+    /// `events.ndjson` as [`crate::event::EventKind::HarnessNotice`]s.
+    pub notices: Vec<ToolNotice>,
+}
+
+/// One surfaced harness observation attached to a tool output.
+///
+/// Categories are stable dotted strings (`"sandbox.passthrough"`,
+/// `"stream.truncated"`); consumers must tolerate unknown categories.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolNotice {
+    /// Dotted category for filtering and attribution (stable string).
+    pub category: String,
+    /// One-line human-readable detail.
+    pub detail: String,
+}
+
+impl ToolNotice {
+    /// Builds a notice from category and detail.
+    pub fn new(category: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            category: category.to_owned(),
+            detail: detail.into(),
+        }
+    }
 }
 
 impl ToolOutput {
@@ -470,6 +498,7 @@ impl ToolOutput {
             truncated: false,
             effects: ToolEffects::none(),
             artifact: None,
+            notices: Vec::new(),
         }
     }
 
@@ -477,6 +506,13 @@ impl ToolOutput {
     #[must_use]
     pub fn with_truncated(mut self) -> Self {
         self.truncated = true;
+        self
+    }
+
+    /// Attaches a harness observation for the trace (builder style).
+    #[must_use]
+    pub fn with_notice(mut self, notice: ToolNotice) -> Self {
+        self.notices.push(notice);
         self
     }
 

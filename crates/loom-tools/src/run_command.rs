@@ -174,7 +174,7 @@ impl Tool for RunCommandTool {
             let sandbox = crate::sandbox::Sandbox::resolve(&ctx.workspace_root, grants);
             let bounded =
                 crate::exec::run_bounded(&input.program, &input.args, ctx, &limits, &sandbox);
-            let output = match rule.and_then(|rule| rule.timeout_secs) {
+            let outcome = match rule.and_then(|rule| rule.timeout_secs) {
                 None => bounded.await?,
                 Some(secs) => {
                     match tokio::time::timeout(Duration::from_secs(secs), bounded).await {
@@ -192,13 +192,35 @@ impl Tool for RunCommandTool {
                 }
             };
             let recent_changes = ctx.recent_changes();
-            Ok(render(
+            // Same trace-side facts the text cannot carry: an
+            // unconfined run (policy opt-out or platform without a
+            // wrapper) and a stream abandoned to an escaped holder.
+            let mut rendered = render(
                 &input.program,
                 &input.args,
-                &output,
+                &outcome.output,
                 &recent_changes,
                 ctx,
-            ))
+            );
+            if !sandbox.confined() {
+                rendered = rendered.with_notice(loom_kernel::tool::ToolNotice::new(
+                    "sandbox.passthrough",
+                    format!(
+                        "\"{}\" ran unconfined (sandbox disabled by policy or platform)",
+                        input.program
+                    ),
+                ));
+            }
+            if outcome.pipe_hold_truncated {
+                rendered = rendered.with_notice(loom_kernel::tool::ToolNotice::new(
+                    "stream.truncated",
+                    format!(
+                        "\"{}\" output truncated: a descendant held the pipes after exit",
+                        input.program
+                    ),
+                ));
+            }
+            Ok(rendered)
         })
     }
 }
@@ -870,6 +892,56 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured
         assert!(
             started.elapsed().as_secs() < 10,
             "must not wait for the child"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsandboxed_rule_surfaces_a_passthrough_notice() {
+        let (_guard, root) = temp_root();
+        // The loudest escalation a manifest can grant: run outside the
+        // OS sandbox entirely. The deviation rides the output as a
+        // `sandbox.passthrough` notice — a fact for the trace, never
+        // text the model reads.
+        let policy = CommandPolicy::parse("[[command]]\nprogram = \"echo\"\nsandbox = false\n")
+            .expect("policy");
+        let tool = RunCommandTool::with_policy(policy);
+        let output = run(&tool, &root, json!({"program": "echo", "args": ["hi"]}))
+            .await
+            .expect("echo ran");
+        assert!(
+            output
+                .notices
+                .iter()
+                .any(|notice| notice.category == "sandbox.passthrough"
+                    && notice.detail.contains("\"echo\"")),
+            "expected a passthrough notice, got {:?}",
+            output.notices
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sandboxed_command_attaches_no_notices() {
+        let (_guard, root) = temp_root();
+        // No rule: the boxed default. On macOS/Linux the command runs
+        // OS-confined and the output carries no notices — silence is
+        // the signal that the defaults held.
+        let tool = RunCommandTool::with_allowed(["echo"]);
+        let output = run(&tool, &root, json!({"program": "echo", "args": ["hi"]}))
+            .await
+            .expect("echo ran");
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        assert!(
+            output.notices.is_empty(),
+            "confined run must stay silent: {:?}",
+            output.notices
+        );
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        assert!(
+            output
+                .notices
+                .iter()
+                .any(|n| n.category == "sandbox.passthrough"),
+            "no wrapper on this platform: passthrough must be surfaced"
         );
     }
 

@@ -164,15 +164,17 @@ pub async fn execute_call(
             if let Some(reads) = &cacheable {
                 cache_result(reads, call, &output, ctx).await;
             }
-            let (content, truncated, effects, artifact) = bound(output, ctx);
-            finish(
+            let (content, truncated, effects, artifact, notices) = bound(output, ctx);
+            let mut result = finish(
                 call,
                 ToolStatus::Success,
                 content,
                 truncated,
                 effects,
                 artifact,
-            )
+            );
+            result.notices = notices;
+            result
         }
         Either::Right((Ok(Err(ToolError::InvalidInput(msg))), _)) => finish(
             call,
@@ -262,15 +264,17 @@ async fn cached_result(reads: &[String], call: &ToolCall, ctx: &ToolContext) -> 
             None,
         )
     } else {
-        let (content, truncated, effects, artifact) = bound(output, ctx);
-        finish(
+        let (content, truncated, effects, artifact, notices) = bound(output, ctx);
+        let mut result = finish(
             call,
             ToolStatus::Success,
             content,
             truncated,
             effects,
             artifact,
-        )
+        );
+        result.notices = notices;
+        result
     })
 }
 
@@ -305,8 +309,9 @@ async fn cache_result(reads: &[String], call: &ToolCall, output: &ToolOutput, ct
 const ARTIFACT_KIND: &str = "tool_output";
 
 /// Applies [`MAX_TOOL_OUTPUT_BYTES`] on a char boundary; a tool-set
-/// `truncated` flag is never cleared. Effects pass through untouched —
-/// truncating text never changes what the call did.
+/// `truncated` flag is never cleared. Effects and notices pass through
+/// untouched — truncating text never changes what the call did, and the
+/// harness observations a tool attached are trace-side, not content.
 ///
 /// Output over the bound prefers spilling the whole body into the
 /// artifact store over silently cutting it (ADR-014): the model gets a
@@ -317,15 +322,22 @@ const ARTIFACT_KIND: &str = "tool_output";
 fn bound(
     output: ToolOutput,
     ctx: &ToolContext,
-) -> (String, bool, ToolEffects, Option<ArtifactRef>) {
+) -> (
+    String,
+    bool,
+    ToolEffects,
+    Option<ArtifactRef>,
+    Vec<crate::tool::ToolNotice>,
+) {
     let ToolOutput {
         content,
         truncated,
         effects,
         artifact,
+        notices,
     } = output;
     if content.len() <= MAX_TOOL_OUTPUT_BYTES {
-        return (content, truncated, effects, artifact);
+        return (content, truncated, effects, artifact, notices);
     }
     if artifact.is_none()
         && let Some(store) = &ctx.artifacts
@@ -344,7 +356,7 @@ fn bound(
         }
         head.truncate(cut);
         head.push_str(&note);
-        return (head, true, effects, Some(reference));
+        return (head, true, effects, Some(reference), notices);
     }
     let mut content = content;
     let mut cut = MAX_TOOL_OUTPUT_BYTES;
@@ -352,7 +364,7 @@ fn bound(
         cut -= 1;
     }
     content.truncate(cut);
-    (content, true, effects, artifact)
+    (content, true, effects, artifact, notices)
 }
 
 /// A cancelled call's result; `started` decides which honest message
@@ -396,6 +408,7 @@ fn finish(
         truncated,
         effects,
         artifact,
+        notices: Vec::new(),
     }
 }
 

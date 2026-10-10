@@ -63,7 +63,13 @@ use tokio_util::sync::CancellationToken;
 /// v6 adds `ContextHandoff` (LLM handoff compaction marker: turn and
 /// summary length).
 /// v7 adds `FastPathHit` (deterministic solve with zero model calls).
-pub const EVENT_SCHEMA_VERSION: u16 = 7;
+/// v8 adds the surfaced-decision events: `FastPathDeclined` (the
+/// attempted fall-through side of `FastPathHit`),
+/// `CapabilitiesResolved` (which authority — catalog, provider table,
+/// or recording — fixed the model's capabilities), and
+/// `HarnessNotice` (per-command deviations such as an unconfined
+/// sandbox or a truncated stream, carried out of the tools layer).
+pub const EVENT_SCHEMA_VERSION: u16 = 8;
 
 /// One observed occurrence during a task, wrapped for the wire.
 ///
@@ -137,6 +143,43 @@ pub enum EventKind {
         kind: String,
         /// Files the fast path rewrote before verification.
         files_changed: u32,
+    },
+    /// The engine attempted a fast path and fell through to the agent
+    /// loop: the analyzer matched no intent, or the solver declined
+    /// its guards (never-worse outranks coverage). Emitted after the
+    /// task's terminal events — the attempt happens before a task
+    /// record exists, so this reads as a post-hoc annotation on the
+    /// model-driven task that resulted. The workspace was untouched.
+    FastPathDeclined {
+        /// Coarse decline reason: `"no-intent-match"` or
+        /// `"intent-{kind}-unsolved"` (matched, but a guard or the
+        /// offline verifier said no).
+        reason: String,
+    },
+    /// The authority that fixed the configured model's capabilities,
+    /// emitted once per engine instance on its first task: catalog row,
+    /// provider table, or — under replay — the recording itself.
+    /// Surfaced because a silent table fallback after a failed catalog
+    /// fetch is exactly the kind of under-the-hood box this event
+    /// exists to unbox.
+    CapabilitiesResolved {
+        /// The model id the resolution fixed.
+        model: String,
+        /// `"catalog"`, `"provider-table"`, or `"recording"`.
+        source: String,
+    },
+    /// A harness-level observation that never had a first-class event:
+    /// per-command deviations reported out of the tools layer (sandbox
+    /// passthrough, a stream truncated by a pipe-holding descendant)
+    /// plus one-shot baselines (the sandbox mode the policy resolved
+    /// to). Categories are stable strings; unknown categories must be
+    /// tolerated by consumers.
+    HarnessNotice {
+        /// Dotted category, e.g. `"sandbox.passthrough"`,
+        /// `"stream.truncated"`.
+        category: String,
+        /// One-line human-readable detail.
+        detail: String,
     },
     /// The loop spent one model call on an LLM handoff (roadmap item
     /// 12's last resort): the projection from here on is brief +
@@ -740,6 +783,59 @@ mod tests {
         assert_eq!(value["kind"]["type"], "task_paused");
         let round: EventEnvelope = serde_json::from_value(value).expect("round-trips");
         assert_eq!(round, envelope);
+    }
+
+    /// Schema v8: the surfaced-decision kinds serialize under their
+    /// snake_case tags and round-trip, so NDJSON consumers can read
+    /// harness decisions straight off the event stream.
+    #[test]
+    fn surfaced_decisions_serialize_and_round_trip() {
+        let cases = vec![
+            (
+                EventKind::FastPathDeclined {
+                    reason: "intent-rename-unsolved".to_owned(),
+                },
+                "fast_path_declined",
+                serde_json::json!({ "reason": "intent-rename-unsolved" }),
+            ),
+            (
+                EventKind::CapabilitiesResolved {
+                    model: "z-ai/glm-5.3-flash".to_owned(),
+                    source: "catalog".to_owned(),
+                },
+                "capabilities_resolved",
+                serde_json::json!({
+                    "model": "z-ai/glm-5.3-flash",
+                    "source": "catalog"
+                }),
+            ),
+            (
+                EventKind::HarnessNotice {
+                    category: "sandbox.passthrough".to_owned(),
+                    detail: "\"echo\" ran unconfined".to_owned(),
+                },
+                "harness_notice",
+                serde_json::json!({
+                    "category": "sandbox.passthrough",
+                    "detail": "\"echo\" ran unconfined"
+                }),
+            ),
+        ];
+        for (kind, tag, fields) in cases {
+            let envelope = EventEnvelope {
+                schema_version: EVENT_SCHEMA_VERSION,
+                sequence: 7,
+                task_id: TaskId::new(),
+                kind: kind.clone(),
+            };
+            let value = serde_json::to_value(&envelope).expect("serializes");
+            assert_eq!(value["kind"]["type"], tag);
+            for (field, expected) in fields.as_object().expect("object") {
+                assert_eq!(&value["kind"][field], expected, "{tag}.{field}");
+            }
+            let round: EventEnvelope = serde_json::from_value(value).expect("round-trips");
+            assert_eq!(round, envelope);
+        }
     }
 
     #[test]

@@ -19,6 +19,58 @@ use loom_core::{Engine, EngineConfig};
 use crate::args::RunArgs;
 use crate::output::{self, Renderer};
 use loom_core::engine::trace::{Outcome, TraceMeta, TraceWriter};
+use loom_core::kernel::event::{EventKind, EventSink};
+use loom_core::kernel::id::TaskId;
+
+/// Collects the surfaced-decision events (v8) so `loom run` can end
+/// with a short "decisions" footer: which authority fixed the
+/// capabilities, whether a fast path was tried and declined, and any
+/// harness notice (sandbox passthrough, truncated streams). The
+/// renderer keeps stdout; this footer prints to stderr after the task.
+#[derive(Clone, Default)]
+struct DecisionLog {
+    lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl EventSink for DecisionLog {
+    fn emit(&self, _task_id: TaskId, kind: EventKind) {
+        let line = match kind {
+            EventKind::CapabilitiesResolved { model, source } => {
+                format!("model {model}: capabilities resolved from {source}")
+            }
+            EventKind::FastPathDeclined { reason } => {
+                format!("fast path attempted and declined ({reason}); the agent loop took over")
+            }
+            EventKind::HarnessNotice { category, detail } => format!("[{category}] {detail}"),
+            _ => return,
+        };
+        if let Ok(mut lines) = self.lines.lock() {
+            lines.push(line);
+        }
+    }
+}
+
+/// Prints the footer: first occurrence of each decision line, in
+/// emission order. Silence (no footer) is itself the signal — the
+/// defaults held.
+fn print_decisions(log: &DecisionLog) {
+    let lines = match log.lines.lock() {
+        Ok(lines) => lines.clone(),
+        Err(_) => return,
+    };
+    let mut seen = std::collections::HashSet::new();
+    let unique: Vec<&String> = lines
+        .iter()
+        .filter(|line| seen.insert((*line).clone()))
+        .collect();
+    if unique.is_empty() {
+        return;
+    }
+    eprintln!("decisions:");
+    for line in unique {
+        eprintln!("  - {line}");
+    }
+}
 
 /// Runs one task end to end and returns the process exit code.
 ///
@@ -95,7 +147,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let mut session = engine.new_session();
     let input = args.task.join(" ");
 
-    let (sink, renderer_thread, tracer_thread) = spawn_consumers(args.json, args.trace.clone());
+    let decision_log = DecisionLog::default();
+    let (sink, renderer_thread, tracer_thread) =
+        spawn_consumers(args.json, args.trace.clone(), decision_log.clone());
 
     // The provider's timeouts need the time driver the runtime enables.
     let control = TaskControl::new();
@@ -103,6 +157,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
 
     let outcome = runtime.block_on(engine.run_task(&mut session, input, &sink, &control));
     let tracer = join_consumers(sink, signal, renderer_thread, tracer_thread);
+    print_decisions(&decision_log);
 
     // The trace export is best-effort: a failure to write files must not
     // change the run's exit code, only warn.
@@ -148,6 +203,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
 fn spawn_consumers(
     json: bool,
     trace: Option<std::path::PathBuf>,
+    decision_log: DecisionLog,
 ) -> (
     FanoutSink,
     std::thread::JoinHandle<()>,
@@ -177,8 +233,11 @@ fn spawn_consumers(
         None => (None, None),
     };
     let sink = match trace_sink {
-        Some(trace_sink) => FanoutSink::new().with(render_sink).with(trace_sink),
-        None => FanoutSink::new().with(render_sink),
+        Some(trace_sink) => FanoutSink::new()
+            .with(render_sink)
+            .with(trace_sink)
+            .with(decision_log),
+        None => FanoutSink::new().with(render_sink).with(decision_log),
     };
     (sink, renderer_thread, tracer_thread)
 }

@@ -48,6 +48,27 @@ fn resolve_capabilities(
     }
 }
 
+/// The authority that fixed the configured model's capabilities, and
+/// the model it fixed them for — one fact, surfaced once per engine as
+/// a `CapabilitiesResolved` event (v8). Mirrors [`resolve_capabilities`]:
+/// a catalog row wins, otherwise the provider's own table (under
+/// replay, the recording).
+pub(crate) fn resolution_source(
+    config: &EngineConfig,
+    provider: &dyn ModelProvider,
+) -> (&'static str, String) {
+    let catalog_hit = matches!(
+        config.catalog.as_ref(),
+        Some(ProviderCatalog::OpenRouter(catalog)) if catalog.capabilities(&config.model).is_some()
+    );
+    let source = if catalog_hit {
+        "catalog"
+    } else {
+        provider.capability_source()
+    };
+    (source, config.model.clone())
+}
+
 /// A constructed provider plus the capabilities resolved for the
 /// configured model.
 pub(crate) struct ProviderHandle {

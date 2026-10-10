@@ -43,6 +43,21 @@ pub struct PruneStats {
     pub malformed_lines: u64,
 }
 
+/// Surfaced-decision events (schema v8) for one task: which authority
+/// fixed the capabilities, fast paths tried and declined, and
+/// harness-level notices. The silent fallbacks this module counts are
+/// exactly the under-the-hood boxes the v8 events exist to unbox.
+#[derive(Debug, Default)]
+pub struct DecisionStats {
+    /// `capabilities_resolved` events (0 or 1 per task in practice —
+    /// once per engine).
+    pub capabilities_resolved: u64,
+    /// `fast_path_declined` events keyed by decline reason.
+    pub fast_path_declined: BTreeMap<String, u64>,
+    /// `harness_notice` events keyed by category.
+    pub harness_notices: BTreeMap<String, u64>,
+}
+
 /// One task directory: manifest distilled plus its prune stats.
 #[derive(Debug)]
 pub struct TaskRow {
@@ -68,6 +83,8 @@ pub struct TaskRow {
     pub events_write_failures: u64,
     /// Prune attribution from the event stream.
     pub prunes: PruneStats,
+    /// Surfaced-decision events from the event stream (v8).
+    pub decisions: DecisionStats,
 }
 
 impl TaskRow {
@@ -85,6 +102,7 @@ impl TaskRow {
             events_written: 0,
             events_write_failures: 0,
             prunes: PruneStats::default(),
+            decisions: DecisionStats::default(),
         }
     }
 }
@@ -126,6 +144,8 @@ pub struct Totals {
     pub by_trigger: BTreeMap<String, PruneAgg>,
     /// Prune attribution keyed by per-call reason.
     pub by_reason: BTreeMap<String, PruneAgg>,
+    /// Surfaced-decision events across all tasks (v8).
+    pub decisions: DecisionStats,
 }
 
 /// Reads every task directory under `base`.
@@ -163,6 +183,7 @@ pub fn collect(base: &Path) -> io::Result<Vec<TaskRow>> {
             }
         };
         let prunes = prune_stats(&path);
+        let decisions = decision_stats(&path);
         rows.push(TaskRow {
             dir_name: entry.file_name().to_string_lossy().into_owned(),
             corrupt: false,
@@ -177,6 +198,7 @@ pub fn collect(base: &Path) -> io::Result<Vec<TaskRow>> {
             events_written: manifest["events_written"].as_u64().unwrap_or(0),
             events_write_failures: manifest["events_write_failures"].as_u64().unwrap_or(0),
             prunes,
+            decisions,
         });
     }
     rows.sort_by(|a, b| a.dir_name.cmp(&b.dir_name));
@@ -220,6 +242,34 @@ fn prune_stats(task_dir: &Path) -> PruneStats {
     stats
 }
 
+/// Extracts surfaced-decision events (v8) from one task's
+/// `events.ndjson`. Malformed lines are the prune stats' concern; this
+/// pass skips them.
+fn decision_stats(task_dir: &Path) -> DecisionStats {
+    let mut stats = DecisionStats::default();
+    let Ok(text) = std::fs::read_to_string(task_dir.join(EVENTS_FILE_NAME)) else {
+        return stats;
+    };
+    for line in text.lines() {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match event["type"].as_str() {
+            Some("capabilities_resolved") => stats.capabilities_resolved += 1,
+            Some("fast_path_declined") => {
+                let reason = event["reason"].as_str().unwrap_or("unknown").to_owned();
+                *stats.fast_path_declined.entry(reason).or_default() += 1;
+            }
+            Some("harness_notice") => {
+                let category = event["category"].as_str().unwrap_or("unknown").to_owned();
+                *stats.harness_notices.entry(category).or_default() += 1;
+            }
+            _ => {}
+        }
+    }
+    stats
+}
+
 /// Sums every row into one [`Totals`] value.
 pub fn fold_totals(rows: &[TaskRow]) -> Totals {
     let mut totals = Totals::default();
@@ -248,6 +298,15 @@ pub fn fold_totals(rows: &[TaskRow]) -> Totals {
         totals.malformed_event_lines += row.prunes.malformed_lines;
         merge_aggmaps(&mut totals.by_trigger, &row.prunes.by_trigger);
         merge_aggmaps(&mut totals.by_reason, &row.prunes.by_reason);
+        totals.decisions.capabilities_resolved += row.decisions.capabilities_resolved;
+        merge_countmaps(
+            &mut totals.decisions.fast_path_declined,
+            &row.decisions.fast_path_declined,
+        );
+        merge_countmaps(
+            &mut totals.decisions.harness_notices,
+            &row.decisions.harness_notices,
+        );
     }
     totals
 }
@@ -265,6 +324,13 @@ fn merge_aggmaps(into: &mut BTreeMap<String, PruneAgg>, from: &BTreeMap<String, 
         slot.events += agg.events;
         slot.calls += agg.calls;
         slot.reclaimed_tokens += agg.reclaimed_tokens;
+    }
+}
+
+/// Adds `from`'s plain counts into `into`.
+fn merge_countmaps(into: &mut BTreeMap<String, u64>, from: &BTreeMap<String, u64>) {
+    for (key, count) in from {
+        *into.entry(key.clone()).or_default() += count;
     }
 }
 
@@ -290,6 +356,16 @@ pub fn task_json(row: &TaskRow) -> Value {
                 .collect::<serde_json::Map<String, Value>>(),
             "malformed_lines": row.prunes.malformed_lines,
         },
+        "decisions": decisions_json(&row.decisions),
+    })
+}
+
+/// The JSON block for one task's surfaced-decision events.
+fn decisions_json(decisions: &DecisionStats) -> Value {
+    serde_json::json!({
+        "capabilities_resolved": decisions.capabilities_resolved,
+        "fast_path_declined": decisions.fast_path_declined,
+        "harness_notices": decisions.harness_notices,
     })
 }
 
@@ -326,6 +402,7 @@ pub fn totals_json(totals: &Totals) -> Value {
         "prunes_by_reason": totals.by_reason.iter()
             .map(|(k, v)| (k.clone(), agg_json(v)))
             .collect::<serde_json::Map<String, Value>>(),
+        "decisions": decisions_json(&totals.decisions),
     })
 }
 
@@ -494,10 +571,20 @@ mod tests {
         "not json at all\n",
         r#"{"schema_version":3,"sequence":2,"task_id":"task-a","type":"text_delta","text":"hi"}"#,
         "\n",
+        r#"{"schema_version":8,"sequence":3,"task_id":"task-a","type":"capabilities_resolved","model":"deepseek-v4-pro","source":"catalog"}"#,
+        "\n",
+        r#"{"schema_version":8,"sequence":4,"task_id":"task-a","type":"fast_path_declined","reason":"no-intent-match"}"#,
+        "\n",
+        r#"{"schema_version":8,"sequence":5,"task_id":"task-a","type":"harness_notice","category":"sandbox.passthrough","detail":"\"cargo\" ran unconfined"}"#,
+        "\n",
+        r#"{"schema_version":8,"sequence":6,"task_id":"task-a","type":"harness_notice","category":"stream.truncated","detail":"descendant held the pipe"}"#,
+        "\n",
     );
 
     const TASK_B_EVENTS: &str = concat!(
         r#"{"schema_version":3,"sequence":0,"task_id":"task-b","type":"context_pruned","report":{"trigger":"window","calls":[{"call_id":"c1","reason":"SizeLimit","reclaimed_tokens":300}],"reclaimed_tokens":300}}"#,
+        "\n",
+        r#"{"schema_version":8,"sequence":1,"task_id":"task-b","type":"fast_path_declined","reason":"no-intent-match"}"#,
         "\n",
     );
 
@@ -562,6 +649,21 @@ mod tests {
             200
         );
 
+        // Surfaced decisions (v8): one capability resolution, declines
+        // summed across tasks, notices keyed by category.
+        assert_eq!(totals.decisions.capabilities_resolved, 1);
+        assert_eq!(totals.decisions.fast_path_declined["no-intent-match"], 2);
+        assert_eq!(totals.decisions.harness_notices["sandbox.passthrough"], 1);
+        assert_eq!(totals.decisions.harness_notices["stream.truncated"], 1);
+        assert_eq!(
+            report["decisions"]["fast_path_declined"]["no-intent-match"],
+            2
+        );
+        assert_eq!(
+            report["decisions"]["harness_notices"]["sandbox.passthrough"],
+            1
+        );
+
         let task_a = rows
             .iter()
             .find(|row| row.dir_name == "task-a")
@@ -571,6 +673,8 @@ mod tests {
         assert_eq!(body["corrupt"], false);
         assert_eq!(body["prunes"]["by_trigger"]["age_mask"]["events"], 1);
         assert_eq!(body["prunes"]["malformed_lines"], 1);
+        assert_eq!(body["decisions"]["capabilities_resolved"], 1);
+        assert_eq!(body["decisions"]["harness_notices"]["stream.truncated"], 1);
 
         let _ = fs::remove_dir_all(&base);
     }

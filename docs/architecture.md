@@ -110,13 +110,22 @@ Invariants the session layer enforces (and tests):
    type; a second finish attempt cannot overwrite the recorded end reason.
 
 **Events** (`event.rs`) are the observation stream: `EventEnvelope`
-(`schema_version: 5`, per-sink monotonically increasing `sequence`,
+(`schema_version: 8`, per-sink monotonically increasing `sequence`,
 snake_case `type` tag). Version 2 adds `Usage.cost_usd`, the
 provider-reported charge; version 3 adds `ContextPruned` (prune
 attribution); version 4 adds `AwaitingInput` (engine idle marker after a
 task ends, naming the session — the signal a resume loop keys on);
 version 5 adds `TaskPaused` (graceful between-turns stop, distinct from
-`TaskCancelled`'s mid-flight abort). All
+`TaskCancelled`'s mid-flight abort); version 6 adds `ContextHandoff`
+(one-shot LLM handoff compaction); version 7 adds `FastPathHit` (a
+zero-request solve booked as a transcript-shaped turn); version 8 adds
+the surfaced-decision kinds — `FastPathDeclined` (the coarse reason a
+fast path fell through: no intent matched, or the solver's guards said
+no), `CapabilitiesResolved` (which authority — catalog row, provider
+table, or replay recording — fixed the model's capabilities, emitted
+once per engine), and `HarnessNotice` (per-command deviations the tools
+layer reports: sandbox passthrough, a stream truncated by a
+pipe-holding descendant; one event per distinct notice per batch). All
 new fields are additive, so older payloads still
 deserialize. A lock spans numbering and send, so arrival order
 equals sequence order even with concurrent emitters. The channel sink is
@@ -331,7 +340,12 @@ never assistant content or reasoning.
   (`Agent::record_fast_path`: user item, `FastPathHit` — event schema
   v7 — assistant item with the note, `TaskCompleted` with all-zero
   counters), so transcripts and summaries stay honest about the model
-  never being called. `EngineOverrides::fast_paths` (default on) gates
+  never being called. A miss surfaces too: the attempt returns a coarse
+  decline reason (`FastPathAttempt`), and the engine emits
+  `FastPathDeclined` (schema v8) after the task's terminal events —
+  `no-intent-match` versus `intent-{kind}-unsolved` — so the trace
+  shows the harness tried and stepped aside, not that the decision
+  never happened. `EngineOverrides::fast_paths` (default on) gates
   the seam; the bare arm turns it off with loop shaping.
 - **Fast-path seam, second slice.** The same seam now also parses
   dependency-update intents (`update/bump <crate> to <version>`) and
