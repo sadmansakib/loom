@@ -14,11 +14,15 @@
 //!    captured before the first write, and any failure (I/O, parse,
 //!    verification) restores them byte-exact before falling through to
 //!    the agent loop, which starts from the untouched workspace.
-//! 3. Verification is the workspace's own compiler: `cargo check`
-//!    (and `cargo fmt --check` for the format path) must exit green
-//!    before the solve is claimed. v1 is Cargo-only — the pattern
-//!    classes are Rust-typed, and other ecosystems grow their own
-//!    verifiers when their patterns arrive.
+//! 3. Verification is the workspace's own toolchain under the same
+//!    policy and sandbox as `run_command`: `cargo check` for code
+//!    edits, `cargo fmt --check` for the Cargo format path, `gofmt -l`
+//!    plus `go build ./...` for Go modules, and
+//!    `cargo metadata --no-deps --offline` for dependency updates (the
+//!    manifest-class edit: parse-validity is what a no-network sandbox
+//!    can prove; lock regeneration and builds stay with the loop).
+//!    Ecosystems without a deterministic workspace-local formatter
+//!    (npm, Python, Make) decline rather than guess.
 //!
 //! The engine calls [`try_fast_path`] before spawning the agent turn
 //! loop; `None` (no match, declined, or failed-and-reverted) means the
@@ -80,7 +84,18 @@ enum Intent {
         from: Option<Literal>,
         to: Literal,
     },
+    /// A rust/rustfmt-specific formatting instruction — never routed to
+    /// another ecosystem's formatter.
+    FormatRust,
+    /// A gofmt-specific formatting instruction.
+    FormatGo,
+    /// An ecosystem-neutral phrase ("format the codebase"); the
+    /// workspace's manifest picks the formatter.
     Format,
+    DependencyUpdate {
+        crate_name: String,
+        to_version: String,
+    },
 }
 
 /// Identifiers the fast path refuses to touch: Rust keywords would
@@ -101,14 +116,28 @@ const FORMAT_PHRASES: &[&str] = &[
     "run cargo fmt",
     "apply cargo fmt",
     "cargo rustfmt",
-    "format the code",
-    "format the codebase",
-    "format the crate",
     "format the rust code",
-    "format the project",
     "run rustfmt on the codebase",
     "apply rustfmt to the codebase",
     "rustfmt the codebase",
+];
+
+/// Ecosystem-neutral formatting phrases: the manifest decides which
+/// formatter runs.
+const GENERIC_FORMAT_PHRASES: &[&str] = &[
+    "format the code",
+    "format the codebase",
+    "format the crate",
+    "format the project",
+];
+
+/// gofmt-specific phrases.
+const GO_FORMAT_PHRASES: &[&str] = &[
+    "run gofmt",
+    "apply gofmt",
+    "gofmt the codebase",
+    "gofmt the code",
+    "format the go code",
 ];
 
 /// Parses an identifier: `[A-Za-z_][A-Za-z0-9_]*`, returning it with the
@@ -161,9 +190,9 @@ fn parse_literal(text: &str) -> Option<(Literal, &str)> {
         if let Some(rest) = trimmed.strip_prefix(word)
             && (rest.is_empty()
                 || rest.starts_with(|byte: char| !byte.is_ascii_alphanumeric() && byte != '_'))
-            {
-                return Some((Literal::Bool(word == "true"), rest));
-            }
+        {
+            return Some((Literal::Bool(word == "true"), rest));
+        }
     }
     None
 }
@@ -205,6 +234,38 @@ fn strip_noun(text: &str) -> &str {
 /// given the remaining text, drops a leading and trailing '`' pair.
 fn strip_ticks(text: &str) -> &str {
     text.trim_matches('`')
+}
+
+/// Parses a crate name token: `[A-Za-z0-9_-]+` (Cargo dependency keys,
+/// hyphens included), returning it with the unconsumed rest.
+fn parse_crate_name(text: &str) -> Option<(&str, &str)> {
+    let bytes = text.as_bytes();
+    let end = bytes
+        .iter()
+        .position(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'-'))
+        .unwrap_or(bytes.len());
+    if end == 0 {
+        return None;
+    }
+    Some((&text[..end], &text[end..]))
+}
+
+/// Parses a version-requirement token: a leading digit then
+/// `[0-9A-Za-z.+-]`, at most 64 bytes. Wildcards (`*`), carets, and
+/// `latest` fail the leading-digit check and are declined.
+fn parse_version(text: &str) -> Option<(&str, &str)> {
+    let bytes = text.as_bytes();
+    if !bytes.first().is_some_and(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let end = bytes
+        .iter()
+        .position(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-')))
+        .unwrap_or(bytes.len());
+    if end > 64 {
+        return None;
+    }
+    Some((&text[..end], &text[end..]))
 }
 
 /// Recognizes the strict fast-path grammars over the whole task text.
@@ -296,7 +357,45 @@ fn analyze(task: &str) -> Option<Intent> {
         });
     }
 
+    // update|bump [the][dependency|crate] `NAME` to `VERSION`
+    for verb in ["update", "bump"] {
+        let prefix = format!("{verb} ");
+        if text.len() >= prefix.len() && text[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+            let rest = strip_keyword(&text[prefix.len()..], "the ");
+            let rest = strip_keyword(rest, "dependency ");
+            let rest = strip_keyword(rest, "crate ");
+            let rest = strip_ticks(rest.trim_start());
+            let (crate_name, rest) = parse_crate_name(rest)?;
+            let rest = strip_ticks(rest).trim_start();
+            let lowered = rest.to_ascii_lowercase();
+            if !lowered.starts_with("to ") {
+                return None;
+            }
+            let after = strip_ticks(rest[3..].trim_start());
+            let (version, rest) = parse_version(after)?;
+            if !rest.trim().is_empty() {
+                return None;
+            }
+            return Some(Intent::DependencyUpdate {
+                crate_name: crate_name.to_owned(),
+                to_version: version.to_owned(),
+            });
+        }
+    }
+
     if FORMAT_PHRASES
+        .iter()
+        .any(|phrase| text.eq_ignore_ascii_case(phrase))
+    {
+        return Some(Intent::FormatRust);
+    }
+    if GO_FORMAT_PHRASES
+        .iter()
+        .any(|phrase| text.eq_ignore_ascii_case(phrase))
+    {
+        return Some(Intent::FormatGo);
+    }
+    if GENERIC_FORMAT_PHRASES
         .iter()
         .any(|phrase| text.eq_ignore_ascii_case(phrase))
     {
@@ -397,11 +496,16 @@ fn count_word(text: &str, needle: &str) -> usize {
     count
 }
 
-/// Runs `cargo <args…>` under the same policy, sandbox, and bounds the
-/// `run_command` tool uses; green exit means verified.
-async fn cargo_ok(workspace: &Path, policy: &CommandPolicy, args: &[&str]) -> bool {
+/// Runs `<program> <args…>` under the policy, sandbox, and bounds the
+/// `run_command` tool uses for that program; green exit means verified.
+async fn program_ok(
+    workspace: &Path,
+    policy: &CommandPolicy,
+    program: &str,
+    args: &[&str],
+) -> bool {
     let owned: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
-    let rule = policy.rule("cargo");
+    let rule = policy.rule(program);
     let limits = ExecLimits {
         stream_window: rule.and_then(|rule| rule.max_output_bytes),
         scrub: rule.map(|rule| rule.env_scrub.clone()).unwrap_or_default(),
@@ -413,13 +517,44 @@ async fn cargo_ok(workspace: &Path, policy: &CommandPolicy, args: &[&str]) -> bo
         CancellationToken::new(),
         Duration::from_secs(300),
     );
-    match run_bounded("cargo", &owned, &ctx, &limits, &sandbox).await {
+    match run_bounded(program, &owned, &ctx, &limits, &sandbox).await {
         Ok(output) => output.status.success(),
         Err(error) => {
             tracing::debug!(error = %error, "fast path verification could not run");
             false
         }
     }
+}
+
+/// `cargo` specialization of [`program_ok`].
+async fn cargo_ok(workspace: &Path, policy: &CommandPolicy, args: &[&str]) -> bool {
+    program_ok(workspace, policy, "cargo", args).await
+}
+
+/// Runs `<program> <args…>` capturing stdout, when the run exits at all.
+async fn program_output(
+    workspace: &Path,
+    policy: &CommandPolicy,
+    program: &str,
+    args: &[&str],
+) -> Option<String> {
+    let owned: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    let rule = policy.rule(program);
+    let limits = ExecLimits {
+        stream_window: rule.and_then(|rule| rule.max_output_bytes),
+        scrub: rule.map(|rule| rule.env_scrub.clone()).unwrap_or_default(),
+    };
+    let grants = SandboxGrants::from_rule(rule);
+    let sandbox = Sandbox::resolve(workspace, grants);
+    let ctx = ToolContext::new(
+        workspace.to_path_buf(),
+        CancellationToken::new(),
+        Duration::from_secs(300),
+    );
+    let output = run_bounded(program, &owned, &ctx, &limits, &sandbox)
+        .await
+        .ok()?;
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Applies the rename intent: collision-checked, whole-word, verified.
@@ -535,11 +670,12 @@ async fn apply_constant(
     }
     let (path, text, literal_start, literal_end, current) = sites.pop()?;
     if let Some(expected) = from
-        && expected.render() != current.render() {
-            // The instruction's "from" value disagrees with the source:
-            // stale instruction or moved code — decline.
-            return None;
-        }
+        && expected.render() != current.render()
+    {
+        // The instruction's "from" value disagrees with the source:
+        // stale instruction or moved code — decline.
+        return None;
+    }
     let snapshot = Snapshot {
         path: path.clone(),
         bytes: std::fs::read(&path).ok()?,
@@ -603,15 +739,47 @@ fn const_on_line(line: &str, name: &str) -> Option<(usize, usize, Literal)> {
     None
 }
 
-/// Applies the format intent: `cargo fmt`, then format-idempotence and
-/// compile verification.
-async fn apply_format(workspace: &Path, policy: &CommandPolicy) -> Option<FastPathOutcome> {
-    if crate::verify::detect_ecosystem(workspace) != Some(crate::verify::Ecosystem::Cargo) {
-        return None;
+/// Routes a formatting intent to the workspace's formatter. The
+/// phrase-class intents stay strict: `FormatRust` only ever runs
+/// `cargo fmt`, `FormatGo` only `gofmt`, and the neutral phrase picks
+/// whatever the manifest says. Ecosystems without a deterministic,
+/// workspace-local formatter (npm, Python, Make) decline.
+async fn apply_format(
+    workspace: &Path,
+    policy: &CommandPolicy,
+    class: FormatClass,
+) -> Option<FastPathOutcome> {
+    let ecosystem = crate::verify::detect_ecosystem(workspace);
+    match class {
+        FormatClass::Rust if ecosystem == Some(crate::verify::Ecosystem::Cargo) => {
+            apply_format_cargo(workspace, policy).await
+        }
+        FormatClass::Go if ecosystem == Some(crate::verify::Ecosystem::Go) => {
+            apply_format_go(workspace, policy).await
+        }
+        FormatClass::Auto => match ecosystem {
+            Some(crate::verify::Ecosystem::Cargo) => apply_format_cargo(workspace, policy).await,
+            Some(crate::verify::Ecosystem::Go) => apply_format_go(workspace, policy).await,
+            _ => None,
+        },
+        _ => None,
     }
+}
+
+/// Which formatter a phrase class demands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormatClass {
+    Rust,
+    Go,
+    Auto,
+}
+
+/// Applies the format intent to a Cargo workspace: `cargo fmt`, then
+/// format-idempotence and compile verification.
+async fn apply_format_cargo(workspace: &Path, policy: &CommandPolicy) -> Option<FastPathOutcome> {
     // Pre-check names the files fmt would touch, so the snapshot is
     // exactly the revert set.
-    let check = cargo_output(workspace, policy, &["fmt", "--check"]).await?;
+    let check = program_output(workspace, policy, "cargo", &["fmt", "--check"]).await?;
     let unformatted = check
         .lines()
         .filter(|line| line.starts_with("Diff in "))
@@ -654,25 +822,227 @@ async fn apply_format(workspace: &Path, policy: &CommandPolicy) -> Option<FastPa
     })
 }
 
-/// Runs `cargo <args…>` capturing stdout, when the run exits at all.
-async fn cargo_output(workspace: &Path, policy: &CommandPolicy, args: &[&str]) -> Option<String> {
-    let owned: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
-    let rule = policy.rule("cargo");
-    let limits = ExecLimits {
-        stream_window: rule.and_then(|rule| rule.max_output_bytes),
-        scrub: rule.map(|rule| rule.env_scrub.clone()).unwrap_or_default(),
-    };
-    let grants = SandboxGrants::from_rule(rule);
-    let sandbox = Sandbox::resolve(workspace, grants);
-    let ctx = ToolContext::new(
-        workspace.to_path_buf(),
-        CancellationToken::new(),
-        Duration::from_secs(300),
-    );
-    let output = run_bounded("cargo", &owned, &ctx, &limits, &sandbox)
+/// Applies the format intent to a Go module: `gofmt -l .` names the
+/// unformatted files (the revert set), `gofmt -w` rewrites them, and
+/// idempotence plus `go build ./...` verify green. A module whose
+/// dependencies need downloading fails `go build` under the sandbox's
+/// network-off default and the whole path declines — never worse.
+async fn apply_format_go(workspace: &Path, policy: &CommandPolicy) -> Option<FastPathOutcome> {
+    let listed = program_output(workspace, policy, "gofmt", &["-l", "."]).await?;
+    let files: Vec<PathBuf> = listed
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty() && !line.starts_with('/') && !line.contains(".."))
+        .map(|relative| workspace.join(relative))
+        .collect();
+    if files.is_empty() {
+        return Some(FastPathOutcome {
+            kind: "format",
+            files_changed: 0,
+            note: "Fast path (format): the module is already \
+                   gofmt-clean; nothing to change. Verified with \
+                   `gofmt -l .`."
+                .to_owned(),
+        });
+    }
+    if files.len() > 500 {
+        return None;
+    }
+    let snapshots: Vec<Snapshot> = files
+        .iter()
+        .filter_map(|path| {
+            std::fs::read(path).ok().map(|bytes| Snapshot {
+                path: path.clone(),
+                bytes,
+            })
+        })
+        .collect();
+    let owned: Vec<String> = files
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    let mut write_args: Vec<&str> = vec!["-w"];
+    write_args.extend(owned.iter().map(|path| path.as_str()));
+    if !program_ok(workspace, policy, "gofmt", &write_args).await {
+        restore(&snapshots);
+        return None;
+    }
+    let still_listed = program_output(workspace, policy, "gofmt", &["-l", "."])
         .await
-        .ok()?;
-    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+        .is_some_and(|out| out.lines().any(|line| !line.trim().is_empty()));
+    let green = !still_listed && program_ok(workspace, policy, "go", &["build", "./..."]).await;
+    if !green {
+        restore(&snapshots);
+        return None;
+    }
+    Some(FastPathOutcome {
+        kind: "format",
+        files_changed: files.len() as u32,
+        note: format!(
+            "Fast path (format): `gofmt` applied to {} file(s); verified \
+             with `gofmt -l .` and `go build ./...`.",
+            files.len()
+        ),
+    })
+}
+
+/// Applies the dependency-update intent to the workspace root
+/// `Cargo.toml`: plain `name = "old"` entries in the three dependency
+/// tables are rewritten, the manifest is re-parsed with
+/// `cargo metadata --no-deps --offline`, and any failure reverts.
+/// Complex entries (inline tables, `.workspace` inheritance, dotted
+/// keys) are left untouched; a crate with no plain entry declines.
+async fn apply_dependency_update(
+    workspace: &Path,
+    policy: &CommandPolicy,
+    crate_name: &str,
+    to_version: &str,
+) -> Option<FastPathOutcome> {
+    if crate::verify::detect_ecosystem(workspace) != Some(crate::verify::Ecosystem::Cargo) {
+        return None;
+    }
+    let manifest_path = workspace.join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest_path).ok()?;
+    // CRLF manifests are declined: line rebuilding assumes '\n' endings.
+    if text.contains("\r\n") {
+        return None;
+    }
+    let (rewritten, changes) = edit_manifest(&text, crate_name, to_version)?;
+    if changes.len() > 64 {
+        return None;
+    }
+    // Zero plain entries: the crate is absent from the dependency tables
+    // or only present in complex shapes — either way, decline.
+    if changes.is_empty() {
+        return None;
+    }
+    // Every plain site already carries the target: a clean no-op solve,
+    // verified by the manifest's current parse (the unchanged file).
+    if changes.iter().all(|(old, new)| old == new) {
+        return Some(FastPathOutcome {
+            kind: "dependency",
+            files_changed: 0,
+            note: format!(
+                "Fast path (dependency): `{crate_name}` is already at \
+                 {to_version} in Cargo.toml; nothing to change."
+            ),
+        });
+    }
+    let snapshot = Snapshot {
+        path: manifest_path.clone(),
+        bytes: std::fs::read(&manifest_path).ok()?,
+    };
+    if std::fs::write(&manifest_path, &rewritten).is_err() {
+        restore(std::slice::from_ref(&snapshot));
+        return None;
+    }
+    if !cargo_ok(
+        workspace,
+        policy,
+        &[
+            "metadata",
+            "--no-deps",
+            "--offline",
+            "--format-version",
+            "1",
+        ],
+    )
+    .await
+    {
+        restore(std::slice::from_ref(&snapshot));
+        return None;
+    }
+    let old = changes
+        .iter()
+        .map(|(old, _)| old.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(FastPathOutcome {
+        kind: "dependency",
+        files_changed: 1,
+        note: format!(
+            "Fast path (dependency): `{crate_name}` {old} → {to_version} in \
+             Cargo.toml ({} site(s)); verified with `cargo metadata \
+             --no-deps --offline`.",
+            changes.len()
+        ),
+    })
+}
+
+/// Rewrites plain `name = "version"` entries for `crate_name` inside
+/// `[dependencies]`, `[dev-dependencies]`, and `[build-dependencies]`
+/// tables, returning the new text and the per-site `(old, new)` pairs.
+/// Pure: snapshot/verify live in the caller. Target tables only —
+/// `[package]`, `[features]`, `target.'…'.dependencies` and the rest are
+/// passed through untouched, so an edit can never reach a non-dependency
+/// key.
+fn edit_manifest(
+    text: &str,
+    crate_name: &str,
+    to_version: &str,
+) -> Option<(String, Vec<(String, String)>)> {
+    let mut out = String::with_capacity(text.len());
+    let mut changes = Vec::new();
+    let mut in_dep_table = false;
+    for line in text.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let trimmed = body.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            let table = &trimmed[1..trimmed.len() - 1];
+            in_dep_table = matches!(
+                table,
+                "dependencies" | "dev-dependencies" | "build-dependencies"
+            );
+            out.push_str(line);
+            continue;
+        }
+        if in_dep_table
+            && let Some((old, rewritten)) = rewrite_dep_line(trimmed, crate_name, to_version)
+        {
+            let indent_len = body.len() - body.trim_start().len();
+            let indent = &body[..indent_len];
+            out.push_str(indent);
+            out.push_str(&rewritten);
+            if line.ends_with('\n') {
+                out.push('\n');
+            }
+            changes.push((old, to_version.to_owned()));
+            continue;
+        }
+        out.push_str(line);
+    }
+    Some((out, changes))
+}
+
+/// Rewrites one dependency line when it is exactly `name = "version"`
+/// (after trimming): returns the old version and the rewritten line.
+/// Inline tables, dotted keys, and non-plain shapes return `None`.
+fn rewrite_dep_line(line: &str, crate_name: &str, to_version: &str) -> Option<(String, String)> {
+    let (ident, rest) = parse_crate_name(line.trim_start())?;
+    if ident != crate_name {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('=')?;
+    let value = rest.trim();
+    let inner = value.strip_prefix('"')?.strip_suffix('"')?;
+    if inner.is_empty() || inner.len() > 64 {
+        return None;
+    }
+    if !inner
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    if !inner
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-'))
+    {
+        return None;
+    }
+    Some((inner.to_owned(), format!("{crate_name} = \"{to_version}\"")))
 }
 
 /// Analyzes the task and, on a strict match, applies and verifies the
@@ -687,11 +1057,17 @@ pub async fn try_fast_path(
     policy: &CommandPolicy,
 ) -> Option<FastPathOutcome> {
     match analyze(task)? {
-        Intent::Format => apply_format(workspace, policy).await,
+        Intent::FormatRust => apply_format(workspace, policy, FormatClass::Rust).await,
+        Intent::FormatGo => apply_format(workspace, policy, FormatClass::Go).await,
+        Intent::Format => apply_format(workspace, policy, FormatClass::Auto).await,
         Intent::Rename { from, to } => apply_rename(workspace, policy, &from, &to).await,
         Intent::Constant { name, from, to } => {
             apply_constant(workspace, policy, &name, &from, &to).await
         }
+        Intent::DependencyUpdate {
+            crate_name,
+            to_version,
+        } => apply_dependency_update(workspace, policy, &crate_name, &to_version).await,
     }
 }
 
@@ -781,10 +1157,134 @@ mod tests {
 
     #[test]
     fn analyze_format_grammar() {
-        assert_eq!(analyze("run rustfmt"), Some(Intent::Format));
-        assert_eq!(analyze("cargo fmt"), Some(Intent::Format));
+        assert_eq!(analyze("run rustfmt"), Some(Intent::FormatRust));
+        assert_eq!(analyze("cargo fmt"), Some(Intent::FormatRust));
         assert_eq!(analyze("Please format the codebase."), Some(Intent::Format));
+        assert_eq!(analyze("run gofmt"), Some(Intent::FormatGo));
+        assert_eq!(analyze("format the go code"), Some(Intent::FormatGo));
         assert_eq!(analyze("format the disk"), None);
+    }
+
+    fn dependency(name: &str, version: &str) -> Option<Intent> {
+        Some(Intent::DependencyUpdate {
+            crate_name: name.to_owned(),
+            to_version: version.to_owned(),
+        })
+    }
+
+    #[test]
+    fn analyze_dependency_grammar() {
+        assert_eq!(
+            analyze("update serde to 1.0.300"),
+            dependency("serde", "1.0.300")
+        );
+        assert_eq!(
+            analyze("please update the dependency serde to 1.0.300."),
+            dependency("serde", "1.0.300")
+        );
+        assert_eq!(
+            analyze("Update crate tiny-dep to 2.0.0"),
+            dependency("tiny-dep", "2.0.0")
+        );
+        assert_eq!(analyze("bump serde to 1"), dependency("serde", "1"));
+        assert_eq!(
+            analyze("bump the dependency serde to 1.0.0-beta.1"),
+            dependency("serde", "1.0.0-beta.1")
+        );
+    }
+
+    #[test]
+    fn analyze_dependency_rejects_noise() {
+        assert_eq!(analyze("update serde"), None);
+        assert_eq!(analyze("update serde to latest"), None);
+        assert_eq!(analyze("update serde to *"), None);
+        assert_eq!(
+            analyze("update serde to 1.0.300 and regenerate the lock"),
+            None
+        );
+        assert_eq!(analyze("bump the major version"), None);
+        assert_eq!(analyze("updated serde to 1.0.300"), None);
+        // "everything" parses as a crate token (shape-valid); with no
+        // such dependency the apply layer declines. Grammar tests assert
+        // shape, apply tests assert the decline.
+        assert_eq!(
+            analyze("update everything to 2"),
+            dependency("everything", "2")
+        );
+    }
+
+    #[test]
+    fn edit_manifest_rewrites_only_dependency_tables() {
+        let manifest = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n\
+            [dependencies]\nserde = \"1.0.100\"\ntiny-dep = \"1\"\n\n\
+            [dev-dependencies]\nserde = \"1.0.100\"\n\n\
+            [build-dependencies]\nserde = \"1.0.100\"\n\n\
+            [features]\nserde = [\"full\"]\n";
+        let (out, changes) = edit_manifest(manifest, "serde", "1.0.300").unwrap();
+        assert_eq!(changes.len(), 3);
+        assert!(
+            changes
+                .iter()
+                .all(|(old, new)| old == "1.0.100" && new == "1.0.300")
+        );
+        assert_eq!(out.matches("serde = \"1.0.300\"").count(), 3);
+        assert_eq!(out.matches("serde = \"1.0.100\"").count(), 0);
+        // Non-dependency keys survive untouched.
+        assert!(out.contains("version = \"0.1.0\""));
+        assert!(out.contains("serde = [\"full\"]"));
+        assert!(out.contains("tiny-dep = \"1\""));
+    }
+
+    #[test]
+    fn edit_manifest_leaves_complex_entries_and_reports_no_changes() {
+        let manifest = "[dependencies]\nserde = { version = \"1.0.100\", features = [\"derive\"] }\n\
+            other.workspace = true\nother.default-features = false\n";
+        let (out, changes) = edit_manifest(manifest, "serde", "1.0.300").unwrap();
+        assert!(changes.is_empty());
+        assert_eq!(out, manifest);
+
+        let (out, changes) = edit_manifest(manifest, "other", "2").unwrap();
+        assert!(changes.is_empty());
+        assert_eq!(out, manifest);
+
+        // A plain entry elsewhere under the same name does not leak in.
+        let (out, changes) = edit_manifest(manifest, "version", "9").unwrap();
+        assert!(changes.is_empty());
+        assert_eq!(out, manifest);
+    }
+
+    #[test]
+    fn edit_manifest_preserves_indent_and_final_newline() {
+        let manifest = "[dependencies]\n    serde = \"1.0.100\"\n";
+        let (out, changes) = edit_manifest(manifest, "serde", "2").unwrap();
+        assert_eq!(changes, vec![("1.0.100".to_owned(), "2".to_owned())]);
+        assert_eq!(out, "[dependencies]\n    serde = \"2\"\n");
+
+        let manifest = "[dependencies]\nserde = \"1.0.100\"";
+        let (out, _) = edit_manifest(manifest, "serde", "2").unwrap();
+        assert_eq!(out, "[dependencies]\nserde = \"2\"");
+    }
+
+    #[test]
+    fn rewrite_dep_line_is_strict_about_shapes() {
+        assert_eq!(
+            rewrite_dep_line("serde = \"1.0.100\"", "serde", "2"),
+            Some(("1.0.100".to_owned(), "serde = \"2\"".to_owned()))
+        );
+        // Prefix-similar crate names are whole tokens, not substrings.
+        assert_eq!(rewrite_dep_line("serde_extra = \"1\"", "serde", "2"), None);
+        assert_eq!(rewrite_dep_line("serde2 = \"1\"", "serde", "2"), None);
+        // Non-plain values decline.
+        assert_eq!(
+            rewrite_dep_line("serde = { version = \"1\" }", "serde", "2"),
+            None
+        );
+        assert_eq!(
+            rewrite_dep_line("serde = { path = \"..\" }", "serde", "2"),
+            None
+        );
+        assert_eq!(rewrite_dep_line("serde = \"*\"", "serde", "2"), None);
+        assert_eq!(rewrite_dep_line("serde = \"latest\"", "serde", "2"), None);
     }
 
     #[test]

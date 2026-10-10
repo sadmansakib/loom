@@ -1,0 +1,9 @@
+[workspace]
+
+[package]
+name = "fp_deps_fixture"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tiny-dep = "1.0.0"

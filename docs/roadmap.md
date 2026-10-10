@@ -174,7 +174,10 @@ subsystems:
   historical selection, reasoning-inclusion policy, better estimation,
   cache-friendly construction, references to archived artifacts.
   *Shipped:* pruning v1 + turn-age masking, frozen checkpoints, artifact
-  refs, o200k estimation. *Open:* items 10 (rest), 12.
+  refs, o200k estimation, assistant-text elision + LLM handoff (item 12).
+  *Open:* the deferred tail of item 10 (cold-cache pruning, reasoning
+  clearing, usage-calibrated estimates — parked with evidence until a
+  funded model or cache-gap workload reopens it).
 - **Repository intelligence** — answer "which parts of this repository
   matter for this task?" *Shipped:* facts scan + bootstrap facts (item 4).
   *Open:* a persistent symbol/import/reference index is **not** yet
@@ -198,7 +201,16 @@ subsystems:
   never worse than its absence. The engine books a solve as a zero-
   request turn (`FastPathHit`, event schema v7), and the eval suite
   grew the FPATH slice (tier s: constant, rename, format) to keep the
-  lever measured. *Open:* dependency updates and non-Cargo ecosystems.
+  lever measured. *Shipped (2026-10-10, second slice):* dependency
+  updates (Cargo manifest class: `update/bump <crate> to <version>`,
+  strict table-scoped rewrite of simple `name = "x.y.z"` entries,
+  verified offline with `cargo metadata --no-deps --offline`) and
+  ecosystem routing for format (`gofmt -l` + `go build` verify on Go
+  manifests; the format grammar now says which toolchain it means).
+  npm/Python/Make formats decline — no deterministic offline
+  formatter/verifier for the edit class — and non-Cargo dependency
+  bumps decline the same way. *Open:* non-Cargo dependency updates,
+  pending offline-verifiable semantics per ecosystem.
 - **Measurement** — turns, context tokens per turn, tokens per solved
   task, exploratory calls, verification-triggered retries vs the
   Iteration 1 baseline. *Shipped* in the eval suite; N ≥ 5 comparisons

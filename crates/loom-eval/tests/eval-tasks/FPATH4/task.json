@@ -1,0 +1,18 @@
+{
+  "id": "FPATH4",
+  "prompt": "Update the dependency tiny-dep to 2.0.0.",
+  "tools": "coding",
+  "heavy": false,
+  "tier": "s",
+  "workspace": "copy",
+  "gate": {
+    "kind": "outcome",
+    "contains": [
+      [
+        "Cargo.toml",
+        "tiny-dep = \"2.0.0\""
+      ]
+    ],
+    "tests_green": 1
+  }
+}

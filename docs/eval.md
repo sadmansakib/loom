@@ -79,6 +79,11 @@ close those gaps:
   which is the measurable point — the grammars are general, not
   task-shaped, so solving them via the analyzer or the full loop are
   both honest outcomes.
+- **FPATH4** (tier s) — dependency update: bump an unused
+  `tiny-dep = "1.0.0"` to `2.0.0` in `Cargo.toml`, verified offline by
+  `cargo metadata --no-deps --offline`. Gated like its siblings: the
+  `contains` check pins the bumped manifest line and `tests_green`
+  rebuilds, so a manifest that parses-and-builds is part of passing.
 
 ## Gates (SWE-bench shape)
 
