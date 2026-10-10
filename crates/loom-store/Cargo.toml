@@ -3,6 +3,7 @@ name = "loom-store"
 description = "Durable state substrate: the SQLite implementations of the kernel's session and artifact stores."
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 
 [dependencies]

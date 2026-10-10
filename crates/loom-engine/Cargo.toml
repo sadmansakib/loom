@@ -3,6 +3,7 @@ name = "loom-engine"
 description = "Loom composition root and control plane: configuration, credential resolution, provider/tool composition, session lifecycle, and the driving API frontends share."
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 
 [dependencies]

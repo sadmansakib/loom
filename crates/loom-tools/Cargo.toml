@@ -3,6 +3,7 @@ name = "loom-tools"
 description = "Built-in deterministic tools for Loom: read_file, list_dir, search, write_file, edit_file, run_command."
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 
 [dependencies]

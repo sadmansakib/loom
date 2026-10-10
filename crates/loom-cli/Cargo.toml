@@ -3,6 +3,7 @@ name = "loom-cli"
 description = "`loom` binary: argument parsing, tracing, signal handling, output, and exit codes."
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 
 [[bin]]

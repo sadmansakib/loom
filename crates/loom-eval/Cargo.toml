@@ -3,6 +3,7 @@ name = "loom-eval"
 description = "Loom eval harness: task fixtures, record/replay providers, gates, and suite reports, driven through the Engine"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
@@ -11,6 +12,11 @@ futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
+tokio-util = { workspace = true }
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "multiswe-import"
+path = "src/bin/multiswe_import.rs"

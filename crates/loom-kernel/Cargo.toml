@@ -3,6 +3,7 @@ name = "loom-kernel"
 description = "Loom domain model and orchestration: sessions, transcript, model/tool abstractions, context compiler, agent loop."
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 
 [dependencies]

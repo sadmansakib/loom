@@ -80,4 +80,4 @@ backlog).
 
 ## License
 
-TBD — this project has not chosen a license yet.
+[MIT](LICENSE) — © 2026 Sadman Sakib.

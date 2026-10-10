@@ -14,6 +14,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 # Raised from 1.85 for `keyring` 4.x (1.88), the CLI's OS-keychain backend
 # (ADR-009). Raised again from 1.88 because `uuid` 1.27 (v7 ids) declares
 # rust-version 1.89, so the floor was unsatisfiable: a 1.88 toolchain failed
