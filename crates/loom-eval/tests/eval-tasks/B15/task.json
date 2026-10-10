@@ -3,10 +3,13 @@
   "prompt": "The test suite of this crate fails. Find the fault in the implementation, fix it, and make `cargo test` pass. The tests under tests/ are the complete and only specification of correct behavior: do not modify anything under tests/, and expect no hidden tests beyond them.",
   "tools": "coding",
   "heavy": false,
+  "tier": "s",
   "workspace": "copy",
   "gate": {
     "kind": "bugfix",
-    "protected": ["tests/regression.rs"],
+    "protected": [
+      "tests/regression.rs"
+    ],
     "fail_to_pass": [
       "a_failed_libtest_run_is_shaped_into_evidence",
       "multiple_failures_keep_document_order",
@@ -18,5 +21,5 @@
       "empty_streams_are_omitted"
     ]
   },
-  "notes": "Reproduces 9a50d23: a failed run_command fell back to bounded raw output even when libtest's human output parsed into structured evidence — failing test, assertion, location, and the recent change that links to it."
+  "notes": "Reproduces 9a50d23: a failed run_command fell back to bounded raw output even when libtest's human output parsed into structured evidence \u2014 failing test, assertion, location, and the recent change that links to it."
 }

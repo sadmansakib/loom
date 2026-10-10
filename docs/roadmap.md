@@ -189,9 +189,16 @@ subsystems:
   model. *Shipped:* multi-ecosystem `verify`, evidence shaping, fused
   verify, completion gate.
 - **Fast paths** — rename, simple compiler fix, constant change, format,
-  dependency update solved with **no** model invocation. *Not started*
-  and not yet a backlog item; needs a task analyzer and an eval slice of
-  fast-path-shaped tasks before it can be ranked.
+  dependency update solved with **no** model invocation. *Shipped
+  (2026-10-10):* the analyzer covers rename / constant change / format
+  with anchored grammars (never a fuzzy guess), whole-workspace guard
+  checks, snapshot-and-revert on any failure, and verification through
+  the same policy-gated sandbox as `run` — a miss leaves the workspace
+  byte-identical and falls through to the agent loop, so the path is
+  never worse than its absence. The engine books a solve as a zero-
+  request turn (`FastPathHit`, event schema v7), and the eval suite
+  grew the FPATH slice (tier s: constant, rename, format) to keep the
+  lever measured. *Open:* dependency updates and non-Cargo ecosystems.
 - **Measurement** — turns, context tokens per turn, tokens per solved
   task, exploratory calls, verification-triggered retries vs the
   Iteration 1 baseline. *Shipped* in the eval suite; N ≥ 5 comparisons
@@ -514,12 +521,42 @@ reproduces them.
    and cost; extend it so it can *rank harness changes*:
    - a 30-task hard subset as the iteration gate (the Meta-Harness
      protocol), then external slices (SWE-bench Verified,
-     Terminal-Bench) for comparability;
+     Terminal-Bench) for comparability — half shipped 2026-10-10: the
+     corpus gained the **scale tier** (NAV1 many-reads, BIG1
+     large-file, MULTI1 cross-file, LONG1 heavy long-horizon — the only
+     in-house task that crosses the pruning floor) and every field task
+     now carries an s/m/l/xl difficulty tier with a per-tier pass rate
+     in the suite headline; `multiswe-import` (loom-eval bin) bridges
+     Multi-SWE-bench JSONL into `EXT-*` tasks (clone at base commit,
+     apply the test patch, gate on the instance's own F2P/P2P), so an
+     imported Lite-80-style slice is a command away. Shipped
+     2026-10-10, the second half: the **external slice is imported and
+     validated** — 5 instances across 4 real repos (tokio-rs/bytes ×2,
+     rayon-rs/rayon, clap-rs/clap at 803 P2P, tokio-rs/tracing),
+     shallow-fetched at the exact base commit (one commit, zero refs —
+     no post-fix history to mine), issue title+body as the prompt, gold
+     patch outside the workspace, seeds proven by the offline
+     `bugfix_seeds_fail_their_gates` like any in-house task; two
+     candidate repos (ripgrep, fd) dropped with machine-checkable
+     reasons — upstream cfg-gates their own P2P tests off macOS, so
+     they are ungradeable on darwin without editing benchmark files,
+     which the no-benchmaxxing rule forbids. And the **formal hard
+     gate shipped**: `LOOM_EVAL_TASKS=hard-gate` — a derived preset
+     (every gated task, heavies included, lab benches never; grows
+     only by addition, so a new task cannot be silently left out) —
+     24 tasks today: B-corpus + scale tier + B7/LONG1 + 5 EXT;
    - ~~headline **$ and turns per solved task**, cache-read ratio, and
      tool-failure rate alongside pass rate~~ — shipped: the suite
      headline now carries an `economics` block (total and per-solved
      cost, turns per solved mean/median, token-weighted cache-read
      ratio over successful runs, micro-eval tool-failure rate);
+     extended 2026-10-10 with the SWE-Effi / Scaffold-Effect metrics —
+     tokens per solved amortized over all billed runs, the
+     expensive-failure ratio (share of spend on unresolved gated runs;
+     field data says failures burn multiples of successes), the
+     failure-category vector (`end_reason` counts plus `gate_failed`),
+     and idle turns / idle-turn rate (the no-tool-call assistant turn
+     tax);
    - ~~per-tool, per-model **failure-mode micro-evals** (edit-apply
      success, malformed-call rate, repeated-call rate) as release
      gates~~ — shipped offline half: every run report (success or
@@ -527,7 +564,8 @@ reproduces them.
      acceptance, identical repeats, spills), recomputable from the
      session snapshots `eval_live` persists under
      `records/sessions/` and cross-checked by an offline test; the
-     per-model comparison dimension and the 30-task gate remain;
+     30-task gate shipped 2026-10-10 (`LOOM_EVAL_TASKS=hard-gate`,
+     derived — see item 1); the per-model comparison dimension remains;
    - `loom stats`: what each mechanism saved — pruning, tool-cache hits,
      evidence shaping, output filters — from the events already
      recorded (RTK's `gain`). Shipped transcript half (`loom stats`
@@ -555,13 +593,24 @@ reproduces them.
       per-model rate limits, and the N≥5 sweep then paces itself
       instead of paying. (The NIM catalog's DeepSeek V4 deployments
       hit end-of-life 2026-08/2026-09 and are no longer candidates.)
-   - **Basic-harness baseline and model tiers** (G4, G5, G9). Add a
-     "bare loop" configuration (read/edit/shell only; no facts, pruning,
-     evidence shaping, completion gate) and run the same suite on at
-     least two model tiers with the model held constant per comparison.
-     This is the only way to test the G4 claim that Loom raises a weaker
-     model's success rate, and the input that model profiles (item 9)
-     need.
+   - ~~**Basic-harness baseline and model tiers**~~ (G4, G5, G9) —
+     shipped 2026-10-10, the A/B half: `LOOM_EVAL_BARE=1` runs the
+     same suite on the bare loop (read/list/write/edit/shell only; no
+     facts, pruning, evidence shaping, or completion gate; plain
+     append-only compiler), artifacts suffixed `-bare` so both arms
+     coexist. Engine seam: `EngineOverrides::bare_loop()` +
+     `Agent::with_loop_shaping(false)`. The funded A/B runs moved
+     2026-10-10 to NVIDIA NIM (z-ai/glm-5.3, free tier, keychain
+     credential) after the DeepSeek key drained mid-run (HTTP 402);
+     both arms (full + bare) on the
+     hard gate at N=5 — numbers in CHANGELOG and
+     `docs/benchmarks/`. That is the test of the G4
+     claim that Loom raises a weaker model's success rate, and the
+     input model profiles (item 9) need. Also shipped alongside: the
+     deterministic **editor bench** (`editbench`, token-free, PR-Edit
+     style) pinning `edit_file` competence across file sizes,
+     ambiguity refusal, batch atomicity, and the oversize cap on every
+     commit.
    - **Persist events** alongside transcripts (also item 20.1), so
      `loom stats` can attribute savings per mechanism.
    Seam: the live eval reports and the event stream.
@@ -807,6 +856,47 @@ reproduces them.
      2.0 unpacking — exactly the buckets Loom's stubs already clear);
      AutoCompact shows model-invoked compaction at phase transitions
      wins even when a 256K window never fills.
+     **Deterministic half shipped (2026-10-10).** The pruning decorator
+     now elides CliffCompaction-style without any LLM calls: aged
+     tool-call arguments collapse to signatures (long strings become
+     `[pruned N chars]`, identifying short fields survive), and user
+     items superseded by a later user item stub out — with the session
+     brief (ordinal 0) and the *last* user item (the live task's
+     instructions under follow-up tasks) exempt by construction.
+     Decisions freeze into the existing `PruneCheckpoint` behind the
+     same 20K-reclaim gate and re-apply verbatim (byte-stable, one cache
+     miss per freeze). What remains for handoff: assistant text and
+     reasoning — still never reduced, so the last-resort handoff stays
+     for sessions whose non-prunable tail alone outgrows the window.
+     **Reasoning half shipped (2026-10-10, provider-gated).** Aged
+     assistant reasoning traces now drop from the projection too
+     (`reasoning = None`, same 8-turn window and freeze) — but only
+     where omitting replayed reasoning is provably safe: GLM (loses
+     only the Preserved-Thinking cache benefit) and Anthropic (never
+     forwards reasoning on replay) get it via the engine's provider
+     gate; DeepSeek stays off because a tool-bearing request whose
+     prior turns lack `reasoning_content` fails with HTTP 400
+     (live-verified). Assistant text was then the last unpruned bucket.
+     **Assistant-text elision + LLM handoff shipped (2026-10-10) — item 12
+     complete.** Aged assistant *text* now collapses deterministically
+     (CliffCompaction-style, ahead of any LLM): outside the protected
+     tail, text older than 8 turns exceeding 400 chars keeps its first
+     200 chars plus a ` [pruned N chars]` marker — idempotent, frozen
+     into the same checkpoint, re-applied verbatim (byte-stable). When
+     the pruned view *still* overruns the budget, the loop performs the
+     last-resort handoff: it builds a goal-directed digest (task, brief,
+     recent assistant messages, recent failed tool results, touched
+     files) and makes exactly one provider call — no tools, 1024-token
+     cap, plain-text end-turn responses only — for a handoff summary;
+     the frozen checkpoint projects a view transcript (brief + handoff
+     as a fresh user item + tail), skipping ordinal-keyed elisions in
+     the view since call-id elisions are position-independent. One
+     handoff per task; a second overrun fails closed. Emits
+     `ContextHandoff` (event schema v6); gated by
+     `AgentConfig::handoff_compaction` and disabled in the engine's
+     bare arm. Remaining nicety, not scope: provider-native compaction
+     (Anthropic `compact_20260112`) when an adapter gains it — the
+     in-house path above is the default everywhere today.
 13. **Background commands** (G1, G2). Long builds and tests run
     detached; the runtime injects a completion notice at the next turn
     boundary instead of blocking a turn on them (Sema Code, Crush). Seam:

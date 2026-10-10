@@ -3,10 +3,13 @@
   "prompt": "The test suite of this crate fails. Find the fault in the implementation, fix it, and make `cargo test` pass. The tests under tests/ are the complete and only specification of correct behavior: do not modify anything under tests/, and expect no hidden tests beyond them.",
   "tools": "coding",
   "heavy": false,
+  "tier": "s",
   "workspace": "copy",
   "gate": {
     "kind": "bugfix",
-    "protected": ["tests/regression.rs"],
+    "protected": [
+      "tests/regression.rs"
+    ],
     "fail_to_pass": [
       "trigger_scales_with_a_large_window",
       "an_extreme_window_saturates_instead_of_overflowing",

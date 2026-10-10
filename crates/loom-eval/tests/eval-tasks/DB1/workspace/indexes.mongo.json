@@ -1,0 +1,8 @@
+{
+  "users": [
+    {
+      "key": { "email": 1 },
+      "name": "uniq_email"
+    }
+  ]
+}

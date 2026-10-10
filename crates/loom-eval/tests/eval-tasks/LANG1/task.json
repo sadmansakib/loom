@@ -1,0 +1,24 @@
+{
+  "id": "LANG1",
+  "prompt": "Nine source files, nine languages, one idiomatic defect each. Fix them all (file edits only — no toolchains to run):\n\n1. src/go/main.go — load() discards the error from os.ReadFile with `_`. Capture it in `err`, and on failure return the empty string from an `if err != nil` block (keep the function signature).\n2. src/java/Main.java — `a == b` compares references, not string content. Use `a != null && a.equals(b)`.\n3. src/c/buffer.c — sprintf can overflow buf[16]. Use snprintf with the buffer size: `snprintf(buf, sizeof buf, \"hello %s\", name)`.\n4. src/csharp/Profile.cs — Label() can return null. Return `Display ?? string.Empty` instead.\n5. src/ruby/greet.rb — '#{name}' inside single quotes does not interpolate. Switch to a double-quoted string so the greeting interpolates.\n6. src/php/hello.php — 'Hello $name!' inside single quotes does not interpolate. Switch to double quotes.\n7. src/ts/format.ts — the parameter is implicitly any. Annotate it: `name: string`.\n8. src/kotlin/User.kt — `user!!.city` throws on null. Use the elvis operator: return `user?.city ?: \"unknown\"`.\n9. src/swift/fetch.swift — the force unwrap crashes on bad input. Replace it with `guard let url = URL(string: raw) else { return nil }`.",
+  "tools": "coding",
+  "heavy": false,
+  "tier": "l",
+  "workspace": "copy",
+  "gate": {
+    "kind": "outcome",
+    "exact_files": [],
+    "contains": [
+      ["src/go/main.go", "if err != nil"],
+      ["src/java/Main.java", ".equals("],
+      ["src/c/buffer.c", "snprintf"],
+      ["src/csharp/Profile.cs", "?? string.Empty"],
+      ["src/ruby/greet.rb", "puts \"Hello"],
+      ["src/php/hello.php", "echo \"Hello"],
+      ["src/ts/format.ts", "name: string"],
+      ["src/kotlin/User.kt", "?: \"unknown\""],
+      ["src/swift/fetch.swift", "guard let"]
+    ],
+    "tests_green": null
+  }
+}

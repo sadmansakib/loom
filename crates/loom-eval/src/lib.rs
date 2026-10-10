@@ -32,4 +32,6 @@
 #[cfg(test)]
 mod benchmark;
 #[cfg(test)]
+mod editbench;
+#[cfg(test)]
 mod eval;

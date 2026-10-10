@@ -1,0 +1,38 @@
+{
+  "id": "LONG1",
+  "prompt": "This crate is an interpreter built to a written specification: docs/spec-01-overview.md through docs/spec-10-non-goals.md. Read every chapter before editing. The tokenizer, parser, and tape are complete; src/eval.rs is a stub whose contract the chapters define. Implement the evaluator so `cargo test` passes. The tests under tests/ are the complete and only specification of correct behavior: do not modify anything under tests/ or docs/, and expect no hidden tests beyond them.",
+  "tools": "coding",
+  "heavy": true,
+  "tier": "l",
+  "workspace": "copy",
+  "gate": {
+    "kind": "bugfix",
+    "protected": [
+      "tests/acceptance.rs",
+      "docs/spec-01-overview.md",
+      "docs/spec-02-alphabet.md",
+      "docs/spec-03-tokens.md",
+      "docs/spec-04-ast.md",
+      "docs/spec-05-tape.md",
+      "docs/spec-06-execution.md",
+      "docs/spec-07-io.md",
+      "docs/spec-08-errors.md",
+      "docs/spec-09-acceptance.md",
+      "docs/spec-10-non-goals.md"
+    ],
+    "fail_to_pass": [
+      "hello_world_program_prints_the_greeting",
+      "digit_adder_sums_two_digits",
+      "comment_lines_are_ignored",
+      "eof_input_leaves_the_cell_unchanged",
+      "cell_values_wrap_modulo_256",
+      "non_ascii_bytes_emit_the_lossy_replacement"
+    ],
+    "pass_to_pass": [
+      "tokenizer_ignores_unknown_characters",
+      "parser_nests_loops_and_rejects_unbalanced_brackets",
+      "tape_moves_and_wraps_values"
+    ]
+  },
+  "notes": "Long-horizon axis: ~50 KB of spec chapters must be read before the (small) implementation lands; the accumulated request crosses the 64K pruning floor mid-task, so the pruning arm finally exercises checkpoints in eval. Runs only when named in LOOM_EVAL_TASKS (heavy)."
+}

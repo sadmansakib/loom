@@ -62,7 +62,9 @@
 //! `vendor/model:free` are accepted — files are named with a slug),
 //! `LOOM_EVAL_RUNS`
 //! (default 5), `LOOM_EVAL_DIR` (default `<workspace>/target/eval`),
-//! `LOOM_EVAL_TASKS` (comma-separated task ids; default all).
+//! `LOOM_EVAL_TASKS` (comma-separated task ids; default all non-heavy;
+//! the literal `hard-gate` expands to every gated task, heavies
+//! included).
 //! Live output lands in `LOOM_EVAL_DIR`: `records/<task>-<model>-<run>.jsonl`
 //! and `report-<task>-<model>.json`. When recording a baseline, copy the
 //! report into `docs/benchmarks/`.
@@ -187,8 +189,14 @@ struct EvalTask {
     workspace: TaskWorkspace,
     tools: ToolSet,
     /// Long-context or otherwise costly: skipped unless explicitly named
-    /// in `LOOM_EVAL_TASKS` (B5, B7).
+    /// in `LOOM_EVAL_TASKS` (B5, B7, LONG1).
     heavy: bool,
+    /// Human-time difficulty tier (`s` ≤15 min, `m` 15–60 min,
+    /// `l` 1–4 h, `xl` ≥4 h) — the stratification Multi-SWE-bench
+    /// validated; the suite headline reports the pass rate per tier,
+    /// because a blended rate hides the tier cliff (84.7 % → 33.1 %
+    /// from easy to hard in field data).
+    tier: Option<String>,
     /// System prompt: `None` runs with the engine default — coding tasks
     /// must measure the prompt users actually get, so parity cannot
     /// drift. Lab tasks (B1/B5) pin theirs in a file deliberately.
@@ -206,6 +214,8 @@ struct TaskDef {
     tools: String,
     #[serde(default)]
     heavy: bool,
+    #[serde(default)]
+    tier: Option<String>,
     #[serde(default)]
     system_prompt_file: Option<String>,
     workspace: String,
@@ -246,6 +256,14 @@ fn eval_tasks_dir() -> PathBuf {
 /// Loads every task directory, sorted by path for deterministic order.
 /// Malformed tasks panic: this is a test harness, and a half-loaded
 /// corpus would silently shrink the suite.
+/// The hard-gate preset keeps exactly the tasks that carry a gate —
+/// lab benches (no gate) never run in it, gated heavies always do.
+/// Derived, not listed: the gate grows only by addition, so a new
+/// gated task cannot be silently left out (anti-benchmaxxing rule).
+fn hard_gate_keeps(task: &EvalTask) -> bool {
+    task.gate.is_some()
+}
+
 fn tasks() -> Vec<EvalTask> {
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(eval_tasks_dir())
         .expect("eval-tasks directory")
@@ -296,12 +314,20 @@ fn tasks() -> Vec<EvalTask> {
             // The file ends with one newline; the prompt itself does not.
             text.strip_suffix('\n').map(str::to_owned).unwrap_or(text)
         });
+        if let Some(tier) = &def.tier {
+            assert!(
+                matches!(tier.as_str(), "s" | "m" | "l" | "xl"),
+                "{}: unknown tier `{tier}` (s | m | l | xl)",
+                def.id
+            );
+        }
         loaded.push(EvalTask {
             id: def.id,
             prompt: def.prompt,
             workspace,
             tools,
             heavy: def.heavy,
+            tier: def.tier,
             system_prompt,
             gate,
             notes: def.notes,
@@ -374,7 +400,14 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let target = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            // Preserve symlinks as links: imported repos carry git
+            // mode-120000 entries that may point at directories (e.g.
+            // ripgrep's HomebrewFormula), which `fs::copy` rejects.
+            let link = std::fs::read_link(entry.path())?;
+            std::os::unix::fs::symlink(&link, &target)?;
+        } else if file_type.is_dir() {
             copy_tree(&entry.path(), &target)?;
         } else {
             std::fs::copy(entry.path(), target)?;
@@ -750,6 +783,70 @@ fn prune_enabled() -> bool {
     })
 }
 
+/// Roadmap item 1's bare-loop arm: `LOOM_EVAL_BARE=1` runs the same
+/// tasks on the basic-harness baseline — no repository facts, no
+/// pruning, no completion gate or failure-ledger feedback, and the
+/// primitive tool set only — so every full-arm number has a delta to be
+/// judged against. Artifacts are suffixed `-bare` so the two arms never
+/// overwrite each other's recordings or reports.
+fn bare_loop() -> bool {
+    std::env::var("LOOM_EVAL_BARE").is_ok_and(|value| {
+        let value = value.to_ascii_lowercase();
+        value != "0" && value != "off" && value != "false"
+    })
+}
+
+/// The bare-loop registry: the primitive tools a basic harness offers
+/// (read/list/write/edit/shell), intersected with the task's set — a
+/// ReadEdit task keeps its read/edit shape, a Coding task loses
+/// `search`, `verify`, and the artifact refetch.
+fn bare_registry(tools: ToolSet) -> ToolRegistry {
+    const PRIMITIVES: [&str; 5] = [
+        "read_file",
+        "list_dir",
+        "write_file",
+        "edit_file",
+        "run_command",
+    ];
+    ToolRegistry::from_tools(
+        registry_for(tools)
+            .into_tools()
+            .filter(|tool| PRIMITIVES.contains(&tool.spec().name.as_str())),
+    )
+}
+
+/// The engine overrides for one eval arm. The full arm keeps the
+/// production wiring (facts, loop shaping) plus the eval's compiler
+/// choice; the bare arm additionally strips facts and loop shaping in
+/// the engine and forces the plain append-only compiler — pruning is
+/// the full harness's lever, not the baseline's.
+fn eval_overrides(
+    provider: &str,
+    tools: ToolSet,
+    hook: ProviderHook,
+    bare: bool,
+) -> EngineOverrides {
+    let mut overrides = EngineOverrides::default()
+        .with_provider_hook(hook)
+        .with_registry(if bare {
+            bare_registry(tools)
+        } else {
+            registry_for(tools)
+        });
+    if bare {
+        // The plain compiler, estimator-matched like the production
+        // chain, but with no pruning wrapper regardless of
+        // LOOM_EVAL_PRUNE: the bare arm never gets the lever.
+        let estimator = estimator_for(provider);
+        overrides = overrides
+            .bare_loop()
+            .with_compiler(Box::new(DefaultContextCompiler::with_estimator(estimator)));
+    } else {
+        overrides = overrides.with_compiler(eval_compiler(provider));
+    }
+    overrides
+}
+
 /// The eval's engine configuration for one run root. Everything the
 /// harness pins explicitly (model, workspace, no persistence, no
 /// per-account targeting); credentials resolve exactly like the CLI
@@ -1115,6 +1212,14 @@ where
     // both arms — a failed run still shows what the model did wrong.
     let micro = serde_json::to_value(loom_core::kernel::analytics::session_stats(&session))
         .unwrap_or(serde_json::json!(null));
+    // Idle-turn tax (Scaffold-Effect metric): assistant turns that made
+    // no tool call — narration without work. Transcript-derived, so it
+    // is exact rather than inferred from call counts.
+    let no_tool_turns = session
+        .transcript
+        .iter()
+        .filter(|item| matches!(item, Item::Assistant(message) if message.tool_calls.is_empty()))
+        .count() as u64;
 
     // Provider-reported charges win when present (OpenRouter bills the
     // account and reports the exact figure); the DeepSeek table remains
@@ -1150,6 +1255,8 @@ where
                 "provider": provider_label,
                 "success": true,
                 "turns": summary.turns,
+                "no_tool_turns": no_tool_turns,
+                "tier": task.tier,
                 "model_requests": summary.model_requests,
                 "input_tokens": summary.input_tokens,
                 "cache_hit_tokens": hit,
@@ -1194,6 +1301,8 @@ where
             "model": model,
             "provider": provider_label,
             "success": false,
+            "no_tool_turns": no_tool_turns,
+            "tier": task.tier,
             "end_reason": error.end_reason(),
             "error": error.to_string(),
             "retries": tally.retries,
@@ -1264,9 +1373,27 @@ async fn eval_live() {
     let sessions_dir = records_dir.join("sessions");
     std::fs::create_dir_all(&sessions_dir).unwrap();
 
-    let only: Option<Vec<String>> = std::env::var("LOOM_EVAL_TASKS")
-        .ok()
-        .map(|raw| raw.split(',').map(|id| id.trim().to_owned()).collect());
+    // `LOOM_EVAL_TASKS=hard-gate` names the release gate: every task
+    // that carries a gate (the lab tasks B1/B5 are excluded), heavy
+    // tasks included. The preset is derived from the corpus, not
+    // listed, so it grows only by addition — a new gated task cannot
+    // be silently left out of the gate.
+    let raw_tasks = std::env::var("LOOM_EVAL_TASKS").ok();
+    let hard_gate = raw_tasks
+        .as_deref()
+        .is_some_and(|raw| raw.trim() == "hard-gate");
+    let only: Option<Vec<String>> = if hard_gate {
+        None
+    } else {
+        raw_tasks.map(|raw| raw.split(',').map(|id| id.trim().to_owned()).collect())
+    };
+
+    // The arm this invocation runs (roadmap item 1): `full` is the
+    // production wiring, `bare` the basic-harness baseline. Artifacts
+    // carry the arm suffix so both arms coexist under one eval dir.
+    let bare = bare_loop();
+    let arm = if bare { "bare" } else { "full" };
+    let file_arm = if bare { "-bare" } else { "" };
 
     let all_tasks = tasks();
     // OpenRouter model ids carry `/` and `:` — every artifact filename
@@ -1279,9 +1406,13 @@ async fn eval_live() {
         {
             continue;
         }
-        // Heavy (long-context) tasks run only when explicitly named: the
-        // default suite stays at B1–B4 to bound time and cost.
-        if task.heavy && only.is_none() {
+        // Hard gate: everything that carries a gate, lab benches never.
+        if hard_gate && !hard_gate_keeps(task) {
+            continue;
+        }
+        // Heavy (long-context) tasks run only when explicitly named or
+        // under the hard gate: the default suite bounds time and cost.
+        if task.heavy && only.is_none() && !hard_gate {
             continue;
         }
         let mut reports = Vec::new();
@@ -1291,15 +1422,13 @@ async fn eval_live() {
             // observes production wiring instead of reproducing it.
             let exchanges = Arc::new(Mutex::new(Vec::new()));
             let hook_exchanges = Arc::clone(&exchanges);
-            let overrides = EngineOverrides::default()
-                .with_provider_hook(Arc::new(move |built| {
-                    Box::new(RecordingProvider {
-                        inner: built,
-                        exchanges: Arc::clone(&hook_exchanges),
-                    }) as Box<dyn ModelProvider>
-                }) as ProviderHook)
-                .with_registry(registry_for(task.tools))
-                .with_compiler(eval_compiler(&provider_name));
+            let hook = Arc::new(move |built: Box<dyn ModelProvider>| {
+                Box::new(RecordingProvider {
+                    inner: built,
+                    exchanges: Arc::clone(&hook_exchanges),
+                }) as Box<dyn ModelProvider>
+            }) as ProviderHook;
+            let overrides = eval_overrides(&provider_name, task.tools, hook, bare);
             let provider_label = provider_name.clone();
             let open_provider = provider_name.clone();
             let open_model = model.clone();
@@ -1313,11 +1442,11 @@ async fn eval_live() {
             let (report, recorded, session) =
                 run_once(task, &model, &provider_label, Some(exchanges), open).await;
             eprintln!(
-                "{} run {}/{}: success={} bug_fixed={}",
+                "{} [{arm}] run {}/{}: success={} bug_fixed={}",
                 task.id, run, runs, report["success"], report["gate"]["bug_fixed"]
             );
             std::fs::write(
-                records_dir.join(format!("{}-{file_model}-{run}.jsonl", task.id)),
+                records_dir.join(format!("{}-{file_model}{file_arm}-{run}.jsonl", task.id)),
                 recorded
                     .iter()
                     .map(|e| serde_json::to_string(e).unwrap())
@@ -1327,7 +1456,10 @@ async fn eval_live() {
             )
             .unwrap();
             std::fs::write(
-                sessions_dir.join(format!("{}-{file_model}-{run}.session.json", task.id)),
+                sessions_dir.join(format!(
+                    "{}-{file_model}{file_arm}-{run}.session.json",
+                    task.id
+                )),
                 serde_json::to_string(&session).unwrap(),
             )
             .unwrap();
@@ -1336,6 +1468,7 @@ async fn eval_live() {
 
         let report = serde_json::json!({
             "harness": "eval 2A",
+            "arm": arm,
             "task": task.id,
             "model": model,
             "provider": provider_name,
@@ -1348,7 +1481,7 @@ async fn eval_live() {
             "aggregates": aggregates_from(&reports),
             "notes": task.notes,
         });
-        let path = dir.join(format!("report-{}-{file_model}.json", task.id));
+        let path = dir.join(format!("report-{}-{file_model}{file_arm}.json", task.id));
         std::fs::write(&path, serde_json::to_string_pretty(&report).unwrap()).unwrap();
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
         eprintln!("wrote {}", path.display());
@@ -1383,9 +1516,10 @@ async fn eval_live() {
         } else {
             "strict"
         },
+        arm,
         &suite,
     );
-    let headline_path = dir.join(format!("report-suite-{file_model}.json"));
+    let headline_path = dir.join(format!("report-suite-{file_model}{file_arm}.json"));
     std::fs::write(
         &headline_path,
         serde_json::to_string_pretty(&headline).unwrap(),
@@ -1400,6 +1534,80 @@ async fn eval_live() {
     );
 }
 
+/// Rebuilds the suite headline from per-task report files already on
+/// disk — the merge path for a split live campaign. A live invocation
+/// overwrites `report-suite-<model><arm>.json` with only the tasks it
+/// ran; when breadth tasks land mid-campaign, the second invocation's
+/// headline would clobber the first. The faithful union loads every
+/// per-task report (each embeds its full `runs` array) and reuses
+/// [`suite_headline`] verbatim, so no economics math is reimplemented.
+/// Default scope: the hard gate, and every file must exist — a missing
+/// report is a release-gate violation, not something to skip silently.
+/// `LOOM_EVAL_TASKS=<ids>` narrows the union to exactly those tasks.
+#[tokio::test]
+#[ignore = "merge: rebuilds a suite headline from per-task reports on disk (no spend)"]
+async fn eval_suite_union() {
+    let model = std::env::var("LOOM_EVAL_MODEL").unwrap_or_else(|_| String::from("deepseek-flash"));
+    let bare = bare_loop();
+    let arm = if bare { "bare" } else { "full" };
+    let file_arm = if bare { "-bare" } else { "" };
+    let file_model = slug(&model);
+    let raw_tasks = std::env::var("LOOM_EVAL_TASKS").ok();
+    let hard_gate = raw_tasks
+        .as_deref()
+        .is_some_and(|raw| raw.trim() == "hard-gate");
+    let only: Option<Vec<String>> = if hard_gate || raw_tasks.is_none() {
+        None
+    } else {
+        raw_tasks.map(|raw| raw.split(',').map(|id| id.trim().to_owned()).collect())
+    };
+    let dir = eval_dir();
+    let mut suite: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
+    for task in tasks() {
+        if let Some(only) = &only
+            && !only.iter().any(|id| id.as_str() == task.id)
+        {
+            continue;
+        }
+        if only.is_none() && !hard_gate_keeps(&task) {
+            continue;
+        }
+        let path = dir.join(format!("report-{}-{file_model}{file_arm}.json", task.id));
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("missing per-task report {}", path.display()));
+        let report: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("unreadable report {}: {e}", path.display()));
+        let runs = report["runs"]
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| panic!("report {} carries no runs array", path.display()));
+        suite.push((task.id.clone(), runs));
+    }
+    assert!(
+        !suite.is_empty(),
+        "no per-task reports for {file_model}{file_arm} under {}",
+        dir.display()
+    );
+    let mode = if std::env::var("LOOM_EVAL_TOLERATE_FAILURES")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        "tolerant"
+    } else {
+        "strict"
+    };
+    let headline = suite_headline(&model, mode, arm, &suite);
+    let path = dir.join(format!("report-suite-{file_model}{file_arm}-union.json"));
+    std::fs::write(&path, serde_json::to_string_pretty(&headline).unwrap()).unwrap();
+    println!(
+        "union of {} tasks, {}/{} gated runs — wrote {}",
+        suite.len(),
+        headline["gated_solved"],
+        headline["gated_runs"],
+        path.display()
+    );
+}
+
 /// Builds the suite headline from per-task run reports — pure, so a unit
 /// test can pin the economics math without a live run.
 ///
@@ -1409,9 +1617,20 @@ async fn eval_live() {
 /// tool-failure rate. Failed runs carry no cost/turn numbers (the
 /// provider may never have completed a request), so every economics
 /// field states its population in the note.
+///
+/// Efficiency extensions (the SWE-Effi / Scaffold-Effect conventions):
+/// `tokens_per_solved` amortizes every billed token — failures bill too
+/// — over solved gated runs; `expensive_failure_ratio` is the share of
+/// spend that unresolved gated runs consumed (field data: failures burn
+/// multiples of successes); `failure_categories` counts how runs died
+/// (`end_reason` for transcript failures, `gate_failed` for runs that
+/// finished but did not fix); `idle_turns` sums the no-tool-call
+/// assistant turns; `by_tier` stratifies the pass rate by the task's
+/// human-time tier, because a blended rate hides the tier cliff.
 fn suite_headline(
     model: &str,
     mode: &str,
+    arm: &str,
     suite: &[(String, Vec<serde_json::Value>)],
 ) -> serde_json::Value {
     let mut per_task = serde_json::Map::new();
@@ -1419,10 +1638,28 @@ fn suite_headline(
     let mut gated_solved = 0usize;
     let mut solved_turns: Vec<u64> = Vec::new();
     let mut total_cost = 0.0;
+    let mut failed_cost = 0.0;
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
     let mut hit_tokens = 0u64;
     let mut miss_tokens = 0u64;
     let mut failed_calls = 0u64;
     let mut total_calls = 0u64;
+    let mut idle_turns = 0u64;
+    let mut all_turns = 0u64;
+    let mut categories: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut tiers: std::collections::BTreeMap<String, (u64, u64)> =
+        std::collections::BTreeMap::new();
+    let mut category = |run: &serde_json::Value| {
+        if !run["success"].as_bool().unwrap_or(false) {
+            let reason = run["end_reason"].as_str().unwrap_or("unknown").to_owned();
+            *categories.entry(reason).or_default() += 1;
+        } else if run.get("gate").is_some_and(|g| !g.is_null())
+            && !run["gate"]["bug_fixed"].as_bool().unwrap_or(false)
+        {
+            *categories.entry(String::from("gate_failed")).or_default() += 1;
+        }
+    };
     for (id, reports) in suite {
         let gated: Vec<&serde_json::Value> = reports
             .iter()
@@ -1443,6 +1680,15 @@ fn suite_headline(
                     .filter(|r| r["gate"]["bug_fixed"].as_bool().unwrap_or(false))
                     .filter_map(|r| r["turns"].as_u64()),
             );
+            // Tier rollup: every gated run enters its task's tier bucket.
+            if let Some(tier) = reports
+                .iter()
+                .find_map(|r| r["tier"].as_str().map(str::to_owned))
+            {
+                let bucket = tiers.entry(tier).or_default();
+                bucket.0 += gated.len() as u64;
+                bucket.1 += solved as u64;
+            }
             serde_json::json!({
                 "kind": "field",
                 "runs": gated.len(),
@@ -1452,11 +1698,22 @@ fn suite_headline(
         };
         per_task.insert(id.clone(), entry);
         for run in reports {
-            total_cost += run["cost_usd"].as_f64().unwrap_or(0.0);
+            let cost = run["cost_usd"].as_f64().unwrap_or(0.0);
+            total_cost += cost;
+            let run_gated_unsolved = run.get("gate").is_some_and(|g| !g.is_null())
+                && !run["gate"]["bug_fixed"].as_bool().unwrap_or(false);
+            if run_gated_unsolved || !run["success"].as_bool().unwrap_or(false) {
+                failed_cost += cost;
+            }
+            category(run);
             if run["success"].as_bool().unwrap_or(false) {
                 hit_tokens += run["cache_hit_tokens"].as_u64().unwrap_or(0);
                 miss_tokens += run["cache_miss_tokens"].as_u64().unwrap_or(0);
+                input_tokens += run["input_tokens"].as_u64().unwrap_or(0);
+                output_tokens += run["output_tokens"].as_u64().unwrap_or(0);
             }
+            idle_turns += run["no_tool_turns"].as_u64().unwrap_or(0);
+            all_turns += run["turns"].as_u64().unwrap_or(0);
             failed_calls += run["micro"]["totals"]["failed"].as_u64().unwrap_or(0);
             total_calls += run["micro"]["totals"]["calls"].as_u64().unwrap_or(0);
         }
@@ -1476,9 +1733,11 @@ fn suite_headline(
             (xs[n / 2 - 1] as f64 + xs[n / 2] as f64) / 2.0
         })
     };
+    let round4 = |v: f64| (v * 1e4).round() / 1e4;
     serde_json::json!({
         "model": model,
         "mode": mode,
+        "arm": arm,
         "tasks": per_task,
         "gated_runs": gated_runs,
         "gated_solved": gated_solved,
@@ -1487,25 +1746,39 @@ fn suite_headline(
         } else {
             serde_json::json!(gated_solved as f64 / gated_runs as f64)
         },
+        "by_tier": tiers.iter().map(|(tier, (runs, solved))| {
+            serde_json::json!({"tier": tier, "runs": runs, "solved": solved, "rate": *solved as f64 / *runs as f64})
+        }).collect::<Vec<_>>(),
+        "failure_categories": categories,
         "economics": {
             "total_cost_usd": (total_cost * 1e4).round() / 1e4,
             "usd_per_solved": if gated_solved == 0 { serde_json::json!(null) } else {
-                serde_json::json!((total_cost / gated_solved as f64 * 1e4).round() / 1e4)
+                serde_json::json!(round4(total_cost / gated_solved as f64))
+            },
+            "tokens_per_solved": if gated_solved == 0 { serde_json::json!(null) } else {
+                serde_json::json!((input_tokens + output_tokens) / gated_solved as u64)
+            },
+            "expensive_failure_ratio": if total_cost == 0.0 { serde_json::json!(null) } else {
+                serde_json::json!(round4(failed_cost / total_cost))
             },
             "turns_per_solved_mean": mean_turns(&solved_turns),
             "turns_per_solved_median": median_turns(&mut solved_turns),
-            "note": "cost over all runs (failures bill too); turns over gated solved runs",
+            "idle_turns": idle_turns,
+            "idle_turn_rate": if all_turns == 0 { serde_json::json!(null) } else {
+                serde_json::json!(round4(idle_turns as f64 / all_turns as f64))
+            },
+            "note": "cost over all runs (failures bill too); turns over gated solved runs; tokens = billed input+output over successful runs, amortized per solved",
             "cache_read_ratio": if hit_tokens + miss_tokens == 0 {
                 serde_json::json!(null)
             } else {
-                serde_json::json!((hit_tokens as f64 / (hit_tokens + miss_tokens) as f64 * 1e4).round() / 1e4)
+                serde_json::json!(round4(hit_tokens as f64 / (hit_tokens + miss_tokens) as f64))
             },
             "cache_note": "token-weighted over successful runs only",
             "tool_failure_rate": {
                 "failed": failed_calls,
                 "total": total_calls,
                 "rate": if total_calls == 0 { serde_json::json!(null) } else {
-                    serde_json::json!((failed_calls as f64 / total_calls as f64 * 1e4).round() / 1e4)
+                    serde_json::json!(round4(failed_calls as f64 / total_calls as f64))
                 },
                 "note": "micro-eval totals over all runs incl. failures",
             },
@@ -1515,60 +1788,153 @@ fn suite_headline(
 
 #[test]
 fn suite_headline_computes_pass_rate_and_economics() {
-    let run =
-        |solved: bool, cost: f64, turns: u64, hit: u64, miss: u64, failed: u64, calls: u64| {
-            serde_json::json!({
-                "success": solved,
-                "turns": turns,
-                "cost_usd": cost,
-                "cache_hit_tokens": hit,
-                "cache_miss_tokens": miss,
-                "gate": {"bug_fixed": solved},
-                "micro": {"totals": {"failed": failed, "calls": calls}},
-            })
-        };
+    let run = |solved: bool,
+               cost: f64,
+               turns: u64,
+               hit: u64,
+               miss: u64,
+               failed: u64,
+               calls: u64,
+               tier: Option<&str>| {
+        serde_json::json!({
+            // A gate failure is transcript-successful: the run
+            // completed, billed, and still did not fix.
+            "success": true,
+            "turns": turns,
+            "no_tool_turns": turns / 4,
+            "tier": tier,
+            "input_tokens": hit + miss,
+            "output_tokens": 50,
+            "cost_usd": cost,
+            "cache_hit_tokens": hit,
+            "cache_miss_tokens": miss,
+            "gate": {"bug_fixed": solved},
+            "micro": {"totals": {"failed": failed, "calls": calls}},
+        })
+    };
     let suite = vec![
         (
             "B2".to_owned(),
             vec![
-                run(true, 0.01, 10, 900, 100, 1, 10),
-                run(true, 0.02, 14, 800, 200, 3, 10),
+                run(true, 0.01, 10, 900, 100, 1, 10, Some("s")),
+                run(true, 0.02, 14, 800, 200, 3, 10, Some("s")),
             ],
         ),
-        ("B3".to_owned(), vec![run(false, 0.03, 20, 0, 500, 5, 10)]),
+        (
+            "B3".to_owned(),
+            vec![run(false, 0.03, 20, 0, 500, 5, 10, Some("m"))],
+        ),
         // Lab: no gate, no economics — contributes nothing but presence.
         (
             "B1".to_owned(),
             vec![serde_json::json!({"success": true, "turns": 3})],
         ),
     ];
-    let headline = suite_headline("m", "strict", &suite);
+    let headline = suite_headline("m", "strict", "full", &suite);
 
     assert_eq!(headline["gated_runs"], serde_json::json!(3));
     assert_eq!(headline["gated_solved"], serde_json::json!(2));
     assert_eq!(headline["pass_rate"], serde_json::json!(2.0 / 3.0));
+    assert_eq!(headline["arm"], serde_json::json!("full"));
     assert_eq!(headline["tasks"]["B1"]["kind"], serde_json::json!("lab"));
+
+    // Tier rollup (BTreeMap order, m < s): m = 0/1, s = 2/2 — the
+    // blended 2/3 hides that split.
+    let m = &headline["by_tier"][0];
+    assert_eq!(m["tier"], serde_json::json!("m"));
+    assert_eq!(m["rate"], serde_json::json!(0.0));
+    let s = &headline["by_tier"][1];
+    assert_eq!(s["tier"], serde_json::json!("s"));
+    assert_eq!(s["rate"], serde_json::json!(1.0));
+
+    // The one gate failure is transcript-successful, so its billed
+    // tokens count toward every population it belongs to.
+    assert_eq!(
+        headline["failure_categories"],
+        serde_json::json!({"gate_failed": 1})
+    );
 
     let econ = &headline["economics"];
     assert_eq!(econ["total_cost_usd"], serde_json::json!(0.06));
     assert_eq!(econ["usd_per_solved"], serde_json::json!(0.03));
+    // tokens_per_solved: every successful run's billed input
+    // (1000+1000+500) + output (3×50) over 2 solved = 1325.
+    assert_eq!(econ["tokens_per_solved"], serde_json::json!(1325));
+    // The failed run's $0.03 is 50 % of total spend — the expensive
+    // failure share.
+    assert_eq!(econ["expensive_failure_ratio"], serde_json::json!(0.5));
     assert_eq!(econ["turns_per_solved_mean"], serde_json::json!(12.0));
     assert_eq!(econ["turns_per_solved_median"], serde_json::json!(12.0));
-    // Token-weighted over successful runs: (900+800) / (900+800+100+200).
-    assert_eq!(econ["cache_read_ratio"], serde_json::json!(0.85));
+    // Idle-turn tax: 2+3+5 = 10 no-tool turns over 47 total turns
+    // (the lab run's 3 count — real turns, real spend).
+    assert_eq!(econ["idle_turns"], serde_json::json!(10));
+    assert_eq!(econ["idle_turn_rate"], serde_json::json!(0.2128));
+    // Token-weighted over successful runs: (900+800) / (1000+1000+500).
+    assert_eq!(econ["cache_read_ratio"], serde_json::json!(0.68));
     assert_eq!(
         econ["tool_failure_rate"],
         serde_json::json!({"failed": 9, "total": 30, "rate": 0.3, "note": "micro-eval totals over all runs incl. failures"})
     );
 }
 
+/// A dummy task for preset tests: only `id`/`heavy`/`gate` matter to
+/// selection logic.
+fn dummy_task(id: &str, heavy: bool, gate: bool) -> EvalTask {
+    EvalTask {
+        id: id.to_owned(),
+        prompt: String::new(),
+        workspace: TaskWorkspace::Repo,
+        tools: ToolSet::Coding,
+        heavy,
+        tier: None,
+        system_prompt: None,
+        gate: if gate {
+            Some(TaskGate::Outcome(OutcomeSpec {
+                exact_files: vec![],
+                contains: vec![],
+                tests_green: None,
+            }))
+        } else {
+            None
+        },
+        notes: None,
+    }
+}
+
+#[test]
+fn hard_gate_preset_keeps_every_gated_task_and_no_lab() {
+    // The preset is the whole point of the release gate: gated heavies
+    // run, lab benches never, and nothing gated can be left out.
+    let corpus = [
+        dummy_task("B1", false, false),  // read-only lab bench
+        dummy_task("B2", false, true),   // plain gated task
+        dummy_task("B5", true, false),   // heavy lab bench
+        dummy_task("LONG1", true, true), // heavy gated task
+        dummy_task("EXT-x", true, true), // imported external task
+    ];
+    let kept: Vec<&str> = corpus
+        .iter()
+        .filter(|t| hard_gate_keeps(t))
+        .map(|t| t.id.as_str())
+        .collect();
+    assert_eq!(kept, vec!["B2", "LONG1", "EXT-x"]);
+}
+
 #[test]
 fn suite_headline_handles_an_empty_or_all_lab_suite() {
-    let headline = suite_headline("m", "tolerant", &[]);
+    let headline = suite_headline("m", "tolerant", "full", &[]);
     assert_eq!(headline["gated_runs"], serde_json::json!(0));
     assert_eq!(headline["pass_rate"], serde_json::json!(null));
     assert_eq!(
         headline["economics"]["usd_per_solved"],
+        serde_json::json!(null)
+    );
+    assert_eq!(
+        headline["economics"]["tokens_per_solved"],
+        serde_json::json!(null)
+    );
+    assert_eq!(
+        headline["economics"]["expensive_failure_ratio"],
         serde_json::json!(null)
     );
     assert_eq!(
@@ -1583,7 +1949,8 @@ fn suite_headline_handles_an_empty_or_all_lab_suite() {
         "B1".to_owned(),
         vec![serde_json::json!({"success": true, "turns": 3, "cost_usd": 0.01})],
     )];
-    let headline = suite_headline("m", "strict", &lab_only);
+    let headline = suite_headline("m", "strict", "bare", &lab_only);
+    assert_eq!(headline["arm"], serde_json::json!("bare"));
     assert_eq!(headline["tasks"]["B1"]["kind"], serde_json::json!("lab"));
     assert_eq!(
         headline["economics"]["total_cost_usd"],

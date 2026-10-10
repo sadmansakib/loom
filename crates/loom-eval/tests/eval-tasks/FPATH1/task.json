@@ -1,0 +1,18 @@
+{
+  "id": "FPATH1",
+  "prompt": "Change MAX_RETRIES from 3 to 5.",
+  "tools": "coding",
+  "heavy": false,
+  "tier": "s",
+  "workspace": "copy",
+  "gate": {
+    "kind": "outcome",
+    "contains": [
+      [
+        "src/lib.rs",
+        "MAX_RETRIES: u32 = 5"
+      ]
+    ],
+    "tests_green": 1
+  }
+}

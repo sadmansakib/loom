@@ -1,0 +1,18 @@
+{
+  "id": "FPATH2",
+  "prompt": "Rename the function parse_opts to parse_options.",
+  "tools": "coding",
+  "heavy": false,
+  "tier": "s",
+  "workspace": "copy",
+  "gate": {
+    "kind": "outcome",
+    "contains": [
+      [
+        "src/lib.rs",
+        "parse_options"
+      ]
+    ],
+    "tests_green": 1
+  }
+}

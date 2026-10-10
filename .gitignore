@@ -2,6 +2,10 @@
 /target
 .loom/
 
+# Eval fixture workspaces: build output is regenerable (cargo test on
+# first use fetches deps); only sources are versioned.
+crates/loom-eval/tests/eval-tasks/*/workspace/target/
+
 # OS noise
 .DS_Store
 

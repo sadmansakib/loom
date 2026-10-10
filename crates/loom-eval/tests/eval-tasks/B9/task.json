@@ -3,15 +3,20 @@
   "prompt": "The test suite of this crate fails. Find the fault in the implementation, fix it, and make `cargo test` pass. The tests are the specification: do not modify anything under tests/.",
   "tools": "coding",
   "heavy": false,
+  "tier": "s",
   "workspace": "copy",
   "notes": "Reproduces 6a3a3b1: the stream cap kept only the head, so compiler errors and panics beyond the first window were lost.",
   "gate": {
     "kind": "bugfix",
-    "protected": ["tests/regression.rs"],
+    "protected": [
+      "tests/regression.rs"
+    ],
     "fail_to_pass": [
       "oversized_stream_keeps_head_tail_and_marker",
       "the_tail_line_of_a_long_listing_survives"
     ],
-    "pass_to_pass": ["small_stream_passes_through_whole"]
+    "pass_to_pass": [
+      "small_stream_passes_through_whole"
+    ]
   }
 }
