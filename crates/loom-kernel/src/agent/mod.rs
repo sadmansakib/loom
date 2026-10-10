@@ -330,6 +330,24 @@ pub struct TaskSummary {
     pub last_context_census: ContextCensus,
 }
 
+/// What the engine's fast path proved, handed to
+/// [`Agent::record_fast_path`].
+///
+/// Built by the engine after a deterministic solve applied and verified
+/// green; the note becomes the task's single assistant item, so the
+/// claim and its evidence survive into continuation sessions.
+#[derive(Debug, Clone)]
+pub struct FastPathSolve {
+    /// The analyzer's classification (`"rename"`, `"constant"`,
+    /// `"format"`), used for event attribution.
+    pub kind: String,
+    /// Files the fast path rewrote before verification.
+    pub files_changed: u32,
+    /// Human-readable proof recorded as the assistant item: what the
+    /// pattern matched, what changed, and what verified it green.
+    pub note: String,
+}
+
 /// A task's resource envelope (§14).
 ///
 /// Every ceiling is optional: `None` means the resource is unbounded, which
@@ -506,6 +524,12 @@ pub struct Agent {
     artifacts: Option<Arc<dyn ArtifactStore>>,
     facts: Arc<dyn FactsSource>,
     cache: Arc<Mutex<ToolCache>>,
+    /// Whether the loop's evidence-shaped feedback is active (roadmap
+    /// item 1's bare-loop arm turns it off): the completion-gate
+    /// refusal, the failure-ledger repeat refusal, and the
+    /// recent-changes evidence handed to tools. `false` reduces the
+    /// loop to stream → execute → commit with no loop-owned reactions.
+    loop_shaping: bool,
 }
 
 impl Agent {
@@ -536,6 +560,7 @@ impl Agent {
             artifacts: None,
             facts: Arc::new(NoFacts),
             cache: Arc::new(Mutex::new(ToolCache::new())),
+            loop_shaping: true,
         }
     }
 
@@ -624,6 +649,17 @@ impl Agent {
         self
     }
 
+    /// Disables the loop's evidence-shaped feedback (the bare-loop arm,
+    /// roadmap item 1): the completion gate stops refusing EndTurns with
+    /// unverified mutations, the failure ledger stops refusing identical
+    /// repeats of failed calls, and tools stop receiving the
+    /// recent-changes list. The default (`true`) is the production loop.
+    #[must_use]
+    pub fn with_loop_shaping(mut self, loop_shaping: bool) -> Self {
+        self.loop_shaping = loop_shaping;
+        self
+    }
+
     /// The model identifier this agent targets.
     #[must_use]
     pub fn model(&self) -> &str {
@@ -702,6 +738,111 @@ impl Agent {
 
         // 4. Finalize and summarize.
         self.finalize_task(session, task_id, &accounting, outcome, started, sink)
+    }
+
+    /// Records a deterministic solve that used zero model calls (roadmap
+    /// item 3's fast paths).
+    ///
+    /// The engine analyzed the instruction, applied mechanical edits,
+    /// and verified them green before any provider traffic existed; this
+    /// method gives that solve the same transcript and bookkeeping
+    /// discipline as a model-driven one — persist-then-commit items, a
+    /// task record finished with `end_reason = "fast_path"`, the
+    /// [`EventKind::FastPathHit`] marker, and a [`TaskSummary`] whose
+    /// zeroed accounting is the proof of the zero-invocation claim. The
+    /// solve's note becomes the task's single assistant item, so
+    /// continuation sessions see what changed and why.
+    pub async fn record_fast_path(
+        &self,
+        session: &mut Session,
+        input: impl Into<String>,
+        solve: FastPathSolve,
+        sink: &dyn EventSink,
+    ) -> Result<TaskSummary, TaskError> {
+        let started = Instant::now();
+
+        // 1. The input becomes the transcript's next user item,
+        //    persist-then-commit, exactly as `run_task` does.
+        let user = Item::User { text: input.into() };
+        if let Some(store) = &self.store {
+            store.ensure_session(&session.id).map_err(persistence)?;
+            store
+                .append_item(&session.id, session.next_index(), &user)
+                .map_err(persistence)?;
+        }
+        session
+            .push_item(user)
+            .map_err(|error| TaskError::Internal(error.to_string()))?;
+
+        // 2. The task record and its start events; the marker names the
+        //    deterministic classification for attribution.
+        let task_id = TaskId::new();
+        let record = TaskRecord::new(task_id, now_millis());
+        self.persist_task(session, &record)?;
+        session.push_task(record);
+        sink.emit(task_id, EventKind::TaskStarted);
+        sink.emit(
+            task_id,
+            EventKind::FastPathHit {
+                kind: solve.kind.clone(),
+                files_changed: solve.files_changed,
+            },
+        );
+
+        // 3. The solve's proof text is the task's only assistant item —
+        //    no tool calls ran through the loop, so nothing else joins
+        //    the transcript.
+        let assistant = Item::Assistant(AssistantMessage {
+            content: solve.note,
+            reasoning: None,
+            tool_calls: Vec::new(),
+            stop_reason: StopReason::EndTurn,
+        });
+        if let Some(store) = &self.store {
+            store
+                .append_item(&session.id, session.next_index(), &assistant)
+                .map_err(persistence)?;
+        }
+        session
+            .push_item(assistant)
+            .map_err(|error| TaskError::Internal(error.to_string()))?;
+
+        // 4. Finalize: zeroed usage, `fast_path` end reason, terminal
+        //    event, and the summary carrying the zero-invocation proof.
+        if let Some(record) = session.task_mut(task_id) {
+            record.turns = 0;
+            record.finish(
+                TerminalTaskStatus::Completed,
+                now_millis(),
+                "fast_path".to_owned(),
+            );
+        }
+        let finished = session
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .cloned();
+        if let Some(record) = finished {
+            self.persist_task(session, &record)?;
+        }
+        sink.emit(task_id, EventKind::TaskCompleted);
+        let summary = TaskSummary {
+            task_id,
+            turns: 0,
+            model_requests: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: None,
+            successful_tool_calls: 0,
+            failed_tool_calls: 0,
+            wall_time: started.elapsed(),
+            events_dropped: sink.dropped(),
+            remaining_budget: self
+                .budget
+                .remaining(&Accounting::default(), started.elapsed()),
+            last_context_census: ContextCensus::default(),
+        };
+        Ok(summary)
     }
 
     /// Finalizes a finished task: finish + persist the record, emit the
@@ -847,15 +988,45 @@ impl Agent {
 
             // a. Compile the model request from durable state (§8). The
             //    compiler owns every context decision; the loop only passes
-            //    it the inputs.
-            let compiled = self.compile_turn(
+            //    it the inputs. When even the compiler's rescue arm cannot
+            //    fit the projection and handoff compaction is armed, the
+            //    loop spends one model call on a goal-directed summary and
+            //    retries the compile on the handoff view (roadmap item
+            //    12's last resort — once per task; a second overflow is
+            //    the task's error).
+            let compiled = match self.compile_turn(
                 session,
                 task_id,
                 budget,
                 &capabilities,
                 &facts,
                 &prune_checkpoint,
-            )?;
+            ) {
+                Ok(compiled) => compiled,
+                Err(overrun @ TaskError::Context(ContextError::BudgetExceeded { .. }))
+                    if self.config.handoff_compaction
+                        && !prune_checkpoint
+                            .as_ref()
+                            .is_some_and(|frozen| frozen.handoff.is_some()) =>
+                {
+                    let Some(checkpoint) = self
+                        .attempt_handoff(session, task_id, sink, &hard, accounting, turn)
+                        .await?
+                    else {
+                        return Err(overrun);
+                    };
+                    prune_checkpoint = Some(checkpoint);
+                    self.compile_turn(
+                        session,
+                        task_id,
+                        budget,
+                        &capabilities,
+                        &facts,
+                        &prune_checkpoint,
+                    )?
+                }
+                Err(error) => return Err(error),
+            };
             // Carry the pruning checkpoint forward (ADR-011): it is task
             // state, not request state, so it lives on the loop and is fed
             // back in on the next turn. Between triggers it is unchanged,
@@ -1055,7 +1226,9 @@ impl Agent {
         accounting: &mut Accounting,
         assistant: &AssistantMessage,
     ) -> Result<bool, TaskError> {
-        if !(completion.pending() && !completion.refused && turn < self.max_turns) {
+        if !self.loop_shaping
+            || !(completion.pending() && !completion.refused && turn < self.max_turns)
+        {
             return Ok(false);
         }
         completion.refused = true;
@@ -1074,6 +1247,63 @@ impl Agent {
         accounting.turns = turn;
         accounting.sync(session, task_id);
         Ok(true)
+    }
+
+    /// The LLM handoff (roadmap item 12's last resort): builds a
+    /// deterministic digest of the task and recent history, spends one
+    /// model call asking for a goal-directed summary, and freezes it
+    /// into a pruning checkpoint whose projection is brief + handoff +
+    /// tail. The call bills like any other (usage accounted, events
+    /// emitted, retries honored). `None` when the reply is unusable —
+    /// wrong stop reason, tool calls, or empty text — in which case the
+    /// caller surfaces the original budget overrun.
+    async fn attempt_handoff(
+        &self,
+        session: &Session,
+        task_id: TaskId,
+        sink: &dyn EventSink,
+        cancellation: &CancellationToken,
+        accounting: &mut Accounting,
+        turn: u32,
+    ) -> Result<Option<PruneCheckpoint>, TaskError> {
+        let digest = handoff_digest(session);
+        let request = ModelRequest {
+            model: self.model.clone(),
+            messages: vec![
+                Message::System {
+                    text: HANDOFF_PROMPT.to_owned(),
+                },
+                Message::User { text: digest },
+            ],
+            // No tools: the summary must be plain text, and an
+            // EndTurn-with-calls reply is rejected below anyway.
+            tools: Vec::new(),
+            max_tokens: Some(HANDOFF_MAX_OUTPUT_TOKENS),
+            temperature: None,
+            stable_prefix_messages: None,
+        };
+        let response = self
+            .stream_with_retry(&request, task_id, sink, cancellation, accounting)
+            .await?;
+        accounting.usage = accounting.usage + response.usage;
+        let summary = response.message;
+        if summary.stop_reason != StopReason::EndTurn
+            || !summary.tool_calls.is_empty()
+            || summary.content.trim().is_empty()
+        {
+            return Ok(None);
+        }
+        let chars = summary.content.chars().count();
+        sink.emit(task_id, EventKind::ContextHandoff { turn, chars });
+        Ok(Some(PruneCheckpoint {
+            upto_item: session.transcript.len(),
+            stubs: Vec::new(),
+            elided_args: Vec::new(),
+            elided_users: Vec::new(),
+            elided_reasoning: Vec::new(),
+            elided_assistant_text: Vec::new(),
+            handoff: Some(summary.content),
+        }))
     }
 
     /// Streams one model request with bounded retries, emitting provisional
@@ -1233,7 +1463,7 @@ impl Agent {
         let mut runnable_indices: Vec<usize> = Vec::new();
         let mut is_runnable = vec![false; calls.len()];
         for (index, call) in calls.iter().enumerate() {
-            if !failures.refuses(call) {
+            if !(self.loop_shaping && failures.refuses(call)) {
                 runnable_indices.push(index);
                 runnable.push(call.clone());
                 is_runnable[index] = true;
@@ -1262,7 +1492,11 @@ impl Agent {
             self.tool_timeout,
         )
         .with_artifacts(self.artifacts.clone())
-        .with_recent_changes(recent_changes.to_vec())
+        .with_recent_changes(if self.loop_shaping {
+            recent_changes.to_vec()
+        } else {
+            Vec::new()
+        })
         .with_cache(Some(self.cache.clone()))
         .with_projected_calls(projected_calls);
         let batch = ToolBatch::new(&self.registry, &exposure)
@@ -1426,6 +1660,134 @@ impl CompletionGate {
 
 /// Whether a result is a green command run: successful, command-shaped
 /// (`$ …`), and reporting exit status 0.
+/// System prompt for the one-shot LLM handoff (roadmap item 12's last
+/// resort). Goal-directed by design: the summary names the objective,
+/// decisions, open problems, and relevant files, not a narrative.
+const HANDOFF_PROMPT: &str = "You are compacting an agent session that outgrew its context \
+window. Write a handoff summary the same agent can continue from as if \
+no history was lost. Include, in this order: (1) the task objective as \
+currently understood, including any re-scoping; (2) decisions already \
+made and why; (3) open problems and failed approaches, with the exact \
+errors; (4) files and paths that matter, with their current state; (5) \
+the single next step. Be terse and concrete — paths, commands, \
+identifiers, not prose. Plain text only.";
+
+/// Output ceiling for the handoff summary request.
+const HANDOFF_MAX_OUTPUT_TOKENS: u32 = 1024;
+
+/// The deterministic digest the handoff request carries: the live task
+/// brief, the session's opening brief when it differs, the trailing
+/// assistant texts, the trailing failed tool results, and every path
+/// the session touched. Fixed caps keep the digest small even when the
+/// transcript is enormous — that is the point of the handoff.
+fn handoff_digest(session: &Session) -> String {
+    let cap = |text: &str, max: usize| -> String {
+        let chars: Vec<char> = text.chars().collect();
+        if chars.len() <= max {
+            text.to_owned()
+        } else {
+            chars[..max].iter().collect()
+        }
+    };
+    let mut digest = String::new();
+
+    // The live task brief: the last user item (run_task appends the task
+    // text; elision never takes the last user item, so it is intact).
+    let last_user = session
+        .transcript
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            Item::User { text } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let brief = session.transcript.first().and_then(|item| match item {
+        Item::User { text } => Some(text.clone()),
+        _ => None,
+    });
+    digest.push_str("## Task\n");
+    digest.push_str(&cap(&last_user, 2_000));
+    digest.push('\n');
+    if let Some(brief) = brief
+        && brief != last_user
+    {
+        digest.push_str("\n## Session brief\n");
+        digest.push_str(&cap(&brief, 1_000));
+        digest.push('\n');
+    }
+
+    // Trailing assistant texts — the freshest reasoning survives.
+    let texts: Vec<&str> = session
+        .transcript
+        .iter()
+        .filter_map(|item| match item {
+            Item::Assistant(assistant)
+                if assistant.stop_reason != StopReason::ContentFilter
+                    && !assistant.content.trim().is_empty() =>
+            {
+                Some(assistant.content.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    if !texts.is_empty() {
+        digest.push_str("\n## Recent assistant messages (oldest first)\n");
+        for text in texts.iter().rev().take(4).rev() {
+            digest.push_str("- ");
+            digest.push_str(&cap(text, 500));
+            digest.push('\n');
+        }
+    }
+
+    // Trailing failed tool results — the exact errors to not repeat.
+    let failures: Vec<&str> = session
+        .transcript
+        .iter()
+        .filter_map(|item| match item {
+            Item::ToolResult(result) if result.status != ToolStatus::Success => {
+                Some(result.content.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    if !failures.is_empty() {
+        digest.push_str("\n## Recent failed tool results (oldest first)\n");
+        for content in failures.iter().rev().take(3).rev() {
+            digest.push_str("- ");
+            digest.push_str(&cap(content, 300));
+            digest.push('\n');
+        }
+    }
+
+    // Every path the session touched — deduplicated, first-seen order.
+    let mut touched: Vec<&str> = Vec::new();
+    for item in &session.transcript {
+        if let Item::ToolResult(result) = item {
+            for path in result
+                .effects
+                .files_written
+                .iter()
+                .chain(&result.effects.files_deleted)
+            {
+                if !touched.contains(&path.as_str()) {
+                    touched.push(path.as_str());
+                }
+            }
+        }
+    }
+    if !touched.is_empty() {
+        digest.push_str("\n## Files touched\n");
+        for path in touched.iter().take(40) {
+            digest.push_str("- ");
+            digest.push_str(path);
+            digest.push('\n');
+        }
+    }
+
+    digest
+}
+
 fn green_check(result: &ToolResult) -> bool {
     if !matches!(result.status, ToolStatus::Success) {
         return false;

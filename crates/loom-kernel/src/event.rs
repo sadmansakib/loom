@@ -60,7 +60,10 @@ use tokio_util::sync::CancellationToken;
 /// per-call mechanism and estimated reclaim).
 /// v4 adds `AwaitingInput` (engine idle marker after a task ends);
 /// v5 adds `TaskPaused` (graceful between-turns stop).
-pub const EVENT_SCHEMA_VERSION: u16 = 5;
+/// v6 adds `ContextHandoff` (LLM handoff compaction marker: turn and
+/// summary length).
+/// v7 adds `FastPathHit` (deterministic solve with zero model calls).
+pub const EVENT_SCHEMA_VERSION: u16 = 7;
 
 /// One observed occurrence during a task, wrapped for the wire.
 ///
@@ -122,6 +125,30 @@ pub enum EventKind {
         turn: u32,
         /// Trigger arm plus per-call attribution.
         report: PruneReport,
+    },
+    /// A deterministic fast path solved the task with zero model calls
+    /// (roadmap item 3): the engine analyzed the instruction, applied
+    /// mechanical edits, and verified them green before any provider
+    /// traffic. Emitted between `TaskStarted` and `TaskCompleted`;
+    /// the task summary reports `model_requests == 0`.
+    FastPathHit {
+        /// The analyzer's classification (`"rename"`, `"constant"`,
+        /// `"format"`), for filtering and attribution.
+        kind: String,
+        /// Files the fast path rewrote before verification.
+        files_changed: u32,
+    },
+    /// The loop spent one model call on an LLM handoff (roadmap item
+    /// 12's last resort): the projection from here on is brief +
+    /// handoff summary + tail, and the next compile retries with that
+    /// view. Emitted once per handoff — a task never hands off twice.
+    ContextHandoff {
+        /// 1-based turn whose compile blew the budget and triggered the
+        /// handoff.
+        turn: u32,
+        /// Character length of the handoff summary frozen into the
+        /// checkpoint.
+        chars: usize,
     },
     /// A model request attempt started. `attempt` is 1-based; retries
     /// emit this again with the next attempt number.

@@ -190,6 +190,11 @@ pub struct AgentConfig {
     /// Static system prompt, emitted as the stable prefix of every
     /// request (§8.1.1).
     pub system_prompt: String,
+    /// Whether the loop may spend one model call on an LLM handoff when
+    /// even the rescue arm cannot fit the projection (roadmap item 12's
+    /// last resort). Requires a checkpoint-honoring compiler — the
+    /// engine's bare arm turns both off together.
+    pub handoff_compaction: bool,
 }
 
 impl AgentConfig {
@@ -199,6 +204,7 @@ impl AgentConfig {
         Self {
             workspace_root,
             system_prompt: system_prompt.into(),
+            handoff_compaction: true,
         }
     }
 }
@@ -259,11 +265,29 @@ pub struct PruneCheckpoint {
     /// byte-stable regardless of later config changes.
     #[serde(default)]
     pub elided_args: Vec<ArgElision>,
-    /// Ordinals (0-based, in transcript order) of user items after the
-    /// task brief whose text was replaced with a stub. Ordinal 0 — the
-    /// brief — never appears here.
+    /// Ordinals (0-based, in transcript order) of superseded user
+    /// items — never ordinal 0 and never the last user item, so a live
+    /// task's brief cannot be elided out from under it — whose text
+    /// was replaced with a stub.
     #[serde(default)]
     pub elided_users: Vec<usize>,
+    /// Ordinals (0-based, among non-`ContentFilter` assistant items) of
+    /// assistant messages whose reasoning trace was dropped from the
+    /// projection (`reasoning = None`). Provider-gated — see
+    /// [`PruneConfig::elide_reasoning`](crate::context::PruneConfig).
+    #[serde(default)]
+    pub elided_reasoning: Vec<usize>,
+    /// Ordinals (0-based, among non-`ContentFilter` assistant items) of
+    /// assistant messages whose text was reduced to its leading
+    /// signature (last-resort history elision).
+    #[serde(default)]
+    pub elided_assistant_text: Vec<usize>,
+    /// The LLM-written handoff summary (roadmap item 12's last resort):
+    /// when set, the projection becomes the session's first brief, this
+    /// summary as a user item, and the transcript tail from `upto_item`
+    /// on — everything before it was summarized away.
+    #[serde(default)]
+    pub handoff: Option<String>,
 }
 
 impl PruneCheckpoint {
@@ -272,7 +296,12 @@ impl PruneCheckpoint {
     /// costs nothing.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.stubs.is_empty() && self.elided_args.is_empty() && self.elided_users.is_empty()
+        self.stubs.is_empty()
+            && self.elided_args.is_empty()
+            && self.elided_users.is_empty()
+            && self.elided_reasoning.is_empty()
+            && self.elided_assistant_text.is_empty()
+            && self.handoff.is_none()
     }
 }
 

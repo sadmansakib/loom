@@ -602,6 +602,30 @@ impl ToolRegistry {
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }
+
+    /// Consumes the registry, yielding the registered tools in order.
+    /// For embedders that filter a built registry (the bare-loop arm
+    /// keeps the primitive tools only) rather than rebuilding one.
+    pub fn into_tools(self) -> impl Iterator<Item = Box<dyn Tool>> {
+        self.tools.into_iter()
+    }
+
+    /// Builds a registry from tools that are already unique by name.
+    /// Order is preserved (the stable ordering the model sees).
+    pub fn from_tools<I>(tools: I) -> Self
+    where
+        I: IntoIterator<Item = Box<dyn Tool>>,
+    {
+        let mut registry = Self::new();
+        for tool in tools {
+            let result = registry.register(tool);
+            debug_assert!(
+                result.is_ok(),
+                "from_tools received a duplicate tool name: {result:?}"
+            );
+        }
+        registry
+    }
 }
 
 #[cfg(test)]

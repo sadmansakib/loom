@@ -103,6 +103,16 @@ pub(crate) fn test_config() -> EngineConfig {
 /// provider, the credential, or the tool registry again.
 pub struct Engine {
     agent: Agent,
+    /// The canonicalized workspace root, for the fast paths' file walk.
+    workspace: std::path::PathBuf,
+    /// The command policy the registry was built from; the fast path
+    /// verifies with the same sandbox bounds the tools run under.
+    policy: loom_tools::policy::CommandPolicy,
+    /// Whether [`Engine::run_task`] tries a deterministic fast path
+    /// before spawning the agent loop (roadmap item 3). Off in the
+    /// bare-loop arm — the A/B baseline must spend its turns like a
+    /// basic harness would.
+    fast_paths: bool,
 }
 
 /// A function that wraps the provider an open produced — built from
@@ -137,6 +147,25 @@ pub struct EngineOverrides {
     /// A context compiler built by the embedder, replacing the default
     /// pruning chain.
     pub compiler: Option<Box<dyn ContextCompiler>>,
+    /// The bare-loop arm (roadmap item 1): strips every harness lever
+    /// the full engine adds, leaving read/edit/write/shell/list plus the
+    /// plain append-only compiler — the "basic harness" baseline the
+    /// G4 claim is measured against. Concretely: no repository facts,
+    /// no pruning compiler, no completion gate, no failure-ledger
+    /// refusal, and a registry reduced to the five primitive tools.
+    /// Composition with the other overrides: an embedder-supplied
+    /// registry or compiler still wins (the eval harness pins its own
+    /// per-task registry); `bare_loop` only removes what the engine
+    /// itself would have added.
+    pub bare_loop: bool,
+    /// Overrides the fast-path default (roadmap item 3). `None` keeps
+    /// the production choice — fast paths on — so a mechanical
+    /// instruction costs zero model calls; `Some(false)` disables them
+    /// (the bare-loop arm does this implicitly). Fast paths only ever
+    /// replace the loop when the workspace's own compiler verifies the
+    /// edit green, and revert on failure, so disabling them is a
+    /// measurement choice, not a correctness one.
+    pub fast_paths: Option<bool>,
 }
 
 impl EngineOverrides {
@@ -165,6 +194,13 @@ impl EngineOverrides {
     #[must_use]
     pub fn with_compiler(mut self, compiler: Box<dyn ContextCompiler>) -> Self {
         self.compiler = Some(compiler);
+        self
+    }
+
+    /// Selects the bare-loop arm ([`EngineOverrides::bare_loop`]).
+    #[must_use]
+    pub fn bare_loop(mut self) -> Self {
+        self.bare_loop = true;
         self
     }
 }
@@ -237,14 +273,42 @@ impl Engine {
             None => provider,
         };
 
+        // One policy drives both the tool registry and the fast paths'
+        // verification runs, so a manifest rule changes them together.
+        let policy = CommandPolicy::from_manifest(&workspace)?;
         let registry = match overrides.registry {
             Some(registry) => registry,
-            None => build_registry(&CommandPolicy::from_manifest(&workspace)?)?,
+            None => {
+                let built = build_registry(&policy)?;
+                // The bare-loop arm keeps the primitive tool set only
+                // (read/list/write/edit/shell); a search index, the
+                // artifact re-fetch, and the fused verify are harness
+                // levers the baseline must run without.
+                if overrides.bare_loop {
+                    let primitives: [&str; 5] = [
+                        "read_file",
+                        "list_dir",
+                        "write_file",
+                        "edit_file",
+                        "run_command",
+                    ];
+                    ToolRegistry::from_tools(
+                        built
+                            .into_tools()
+                            .filter(|tool| primitives.contains(&tool.spec().name.as_str())),
+                    )
+                } else {
+                    built
+                }
+            }
         };
         let system_prompt = config.system_prompt.unwrap_or_else(default_system_prompt);
         // Stage-1 repository facts (2E, ADR-015): the composition root owns the
-        // I/O; the loop scans once per task through this source.
-        let facts = crate::repo::FsFactsSource::new(workspace.clone());
+        // I/O; the loop scans once per task through this source. The
+        // bare-loop arm attaches no source — the empty block is the
+        // baseline's point.
+        let facts =
+            (!overrides.bare_loop).then(|| crate::repo::FsFactsSource::new(workspace.clone()));
         let compiler: Box<dyn ContextCompiler> = match overrides.compiler {
             Some(compiler) => compiler,
             None => {
@@ -255,24 +319,35 @@ impl Engine {
                 // 1M window only holds if the estimate errs high.
                 let estimator: Arc<dyn loom_kernel::context::TokenEstimator> =
                     crate::estimate::estimator_for(&config.provider);
-                Box::new(
-                    PruningContextCompiler::new(
-                        Box::new(DefaultContextCompiler::with_estimator(estimator.clone())),
-                        PruneConfig::default(),
+                // The bare-loop arm compiles plain append-only context —
+                // no pruning, no checkpoints — so a bare run measures the
+                // levers the full chain adds.
+                if overrides.bare_loop {
+                    Box::new(DefaultContextCompiler::with_estimator(estimator))
+                } else {
+                    Box::new(
+                        PruningContextCompiler::new(
+                            Box::new(DefaultContextCompiler::with_estimator(estimator.clone())),
+                            prune_config_for(&config.provider),
+                        )
+                        .with_estimator(estimator),
                     )
-                    .with_estimator(estimator),
-                )
+                }
             }
         };
-        let mut agent = Agent::new(
-            provider,
-            compiler,
-            registry,
-            AgentConfig::new(workspace, system_prompt),
-            config.model,
-        )
-        .with_max_turns(config.max_turns)
-        .with_facts_source(Box::new(facts));
+        // The bare-loop arm also disarms the LLM handoff: the plain
+        // compiler never freezes checkpoints, so a handoff attempt there
+        // could only spend a call and fail. Both levers flip together.
+        let mut agent_config = AgentConfig::new(workspace.clone(), system_prompt);
+        if overrides.bare_loop {
+            agent_config.handoff_compaction = false;
+        }
+        let mut agent = Agent::new(provider, compiler, registry, agent_config, config.model)
+            .with_max_turns(config.max_turns)
+            .with_loop_shaping(!overrides.bare_loop);
+        if let Some(facts) = facts {
+            agent = agent.with_facts_source(Box::new(facts));
+        }
 
         // Durable sessions and artifact bodies (ADR-008, ADR-012): the same
         // database the frontend chose for accounts. `--no-save` leaves the
@@ -306,7 +381,15 @@ impl Engine {
             agent = agent.with_artifacts(Some(Arc::new(artifacts)));
         }
 
-        Ok(Self { agent })
+        Ok(Self {
+            agent,
+            workspace,
+            policy,
+            // The bare-loop arm measures a basic harness, and a basic
+            // harness does not short-circuit mechanical tasks — the
+            // fast path is a Loom lever, so it flips with the others.
+            fast_paths: overrides.fast_paths.unwrap_or(true) && !overrides.bare_loop,
+        })
     }
 
     /// Opens the engine, fetching the OpenRouter catalog first when one is
@@ -390,6 +473,42 @@ impl Engine {
         sink: &dyn EventSink,
         control: &TaskControl,
     ) -> Result<TaskSummary, TaskError> {
+        let input: String = input.into();
+        // The fast paths (roadmap item 3): a strict analyzer may solve a
+        // mechanical instruction deterministically — edits applied,
+        // compiler-verified green — with zero model calls. Any miss,
+        // declined guard, or reverted failure falls through to the
+        // agent loop over an untouched workspace, so the loop is never
+        // worse off for trying.
+        if self.fast_paths
+            && let Some(solve) =
+                loom_tools::fastpath::try_fast_path(&self.workspace, &input, &self.policy).await
+            {
+                let summary = self
+                    .agent
+                    .record_fast_path(
+                        session,
+                        input,
+                        loom_kernel::agent::FastPathSolve {
+                            kind: solve.kind.to_owned(),
+                            files_changed: solve.files_changed,
+                            note: solve.note,
+                        },
+                        sink,
+                    )
+                    .await?;
+                // Same idle marker the loop-driven path emits: the
+                // session accepts follow-up input either way.
+                if let Some(record) = session.tasks.last() {
+                    sink.emit(
+                        record.id,
+                        EventKind::AwaitingInput {
+                            session_id: session.id,
+                        },
+                    );
+                }
+                return Ok(summary);
+            }
         let outcome = self.agent.run_task(session, input, sink, control).await;
         // The engine is idle again once the task's terminal event has been
         // emitted. The marker carries the ended task's id (envelope shape)
@@ -525,6 +644,29 @@ pub fn default_system_prompt() -> String {
     )
 }
 
+/// Pruning config for a provider — the one place reasoning elision is
+/// provider-gated (roadmap item 12, deterministic half).
+///
+/// Replaying stored reasoning verbatim is a provider contract, not an
+/// optimisation, on the OpenAI wire: DeepSeek rejects a tool-bearing
+/// request whose prior assistant turns lack `reasoning_content`
+/// (live-verified 2026-10-03), so reasoning elision stays off for the
+/// OpenAI-vocabulary backends. GLM's Preserved Thinking merely gets
+/// *better* cache hits when the client echoes reasoning — dropping old
+/// traces forfeits that benefit for the affected turns but never fails
+/// the request — and Anthropic never forwards reasoning on replay at
+/// all, so for both the elision is a pure context win behind the same
+/// episodic checkpoint freeze (one cache miss per aging batch).
+fn prune_config_for(provider: &str) -> PruneConfig {
+    let mut config = PruneConfig::default();
+    if provider == loom_providers::GLM_PROVIDER_NAME
+        || provider == loom_providers::ANTHROPIC_PROVIDER_NAME
+    {
+        config.elide_reasoning = Some(8);
+    }
+    config
+}
+
 /// Why opening an engine, running a task, or persisting a session failed.
 ///
 /// Terminal *task* failures are not here: they travel as
@@ -620,7 +762,7 @@ pub enum EngineError {
 mod tests {
     use super::*;
     use futures::stream;
-    use loom_kernel::context::{AgentConfig, DefaultContextCompiler};
+    use loom_kernel::context::{AgentConfig, DefaultContextCompiler, PruneConfig};
     use loom_kernel::model::{
         ModelCapabilities, ModelError, ModelErrorKind, ModelEvent, ModelProvider, ModelRequest,
         ModelResponse, ModelStream, StopReason, Usage,
@@ -693,7 +835,167 @@ mod tests {
             "fake-model",
         )
         .with_store(Box::new(MemorySessionStore::new()));
-        Engine { agent }
+        Engine {
+            agent,
+            workspace: PathBuf::from("."),
+            policy: CommandPolicy::default(),
+            fast_paths: false,
+        }
+    }
+
+    /// A one-file cargo fixture the fast paths can rename inside.
+    fn rename_fixture(base: &std::path::Path) -> std::path::PathBuf {
+        let workspace = base.join("ws");
+        std::fs::create_dir_all(workspace.join("src")).expect("dirs");
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"fp_rename\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn parse_opts() -> u32 {\n    7\n}\n\n#[cfg(test)]\nmod tests {\n    \
+             use super::*;\n\n    #[test]\n    fn calls_the_helper() {\n        assert_eq!(parse_opts(), 7);\n    }\n}\n",
+        )
+        .expect("lib");
+        workspace
+    }
+
+    #[tokio::test]
+    async fn fast_path_solves_a_rename_with_zero_model_requests() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = rename_fixture(base.path());
+        let mut config = test_config();
+        config.workspace = workspace.clone();
+        config.db_path = base.path().join("loom.db");
+        // A scripted provider proves the negative: the queue is never
+        // drained, and the summary reports zero requests.
+        let engine = Engine::open_with(
+            config,
+            EngineOverrides {
+                provider: Some(Box::new(FakeProvider::scripted(vec![
+                    FakeProvider::end_turn_script("should never be asked"),
+                ]))),
+                ..EngineOverrides::default()
+            },
+        )
+        .expect("engine");
+
+        let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
+        let mut session = engine.new_session();
+        let summary = engine
+            .run_task(
+                &mut session,
+                "Rename parse_opts to parse_options",
+                &sink,
+                &Default::default(),
+            )
+            .await
+            .expect("fast path task");
+
+        assert_eq!(summary.model_requests, 0, "no model calls were needed");
+        assert_eq!(summary.turns, 0);
+        let kinds = drain(&mut receiver);
+        assert!(kinds.contains(&EventKind::FastPathHit {
+            kind: "rename".to_owned(),
+            files_changed: 1
+        }));
+        assert!(kinds.contains(&EventKind::TaskCompleted));
+        assert_eq!(
+            session
+                .tasks
+                .last()
+                .and_then(|task| task.end_reason.as_deref()),
+            Some("fast_path")
+        );
+        let lib = std::fs::read_to_string(workspace.join("src/lib.rs")).expect("lib");
+        assert!(lib.contains("pub fn parse_options() -> u32"));
+        assert!(!lib.contains("parse_opts"));
+    }
+
+    #[tokio::test]
+    async fn unmatched_instructions_fall_through_to_the_agent_loop() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = rename_fixture(base.path());
+        let mut config = test_config();
+        config.workspace = workspace.clone();
+        config.db_path = base.path().join("loom.db");
+        let engine = Engine::open_with(
+            config,
+            EngineOverrides {
+                provider: Some(Box::new(FakeProvider::scripted(vec![
+                    FakeProvider::end_turn_script("done"),
+                ]))),
+                ..EngineOverrides::default()
+            },
+        )
+        .expect("engine");
+
+        let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
+        let mut session = engine.new_session();
+        let summary = engine
+            .run_task(
+                &mut session,
+                "Say hello and stop.",
+                &sink,
+                &Default::default(),
+            )
+            .await
+            .expect("agent task");
+
+        assert_eq!(summary.model_requests, 1, "the agent loop ran normally");
+        let kinds = drain(&mut receiver);
+        assert!(
+            !kinds
+                .iter()
+                .any(|kind| matches!(kind, EventKind::FastPathHit { .. }))
+        );
+        assert!(kinds.contains(&EventKind::TaskCompleted));
+    }
+
+    #[tokio::test]
+    async fn fast_paths_can_be_disabled_by_override() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = rename_fixture(base.path());
+        let mut config = test_config();
+        config.workspace = workspace.clone();
+        config.db_path = base.path().join("loom.db");
+        let engine = Engine::open_with(
+            config,
+            EngineOverrides {
+                provider: Some(Box::new(FakeProvider::scripted(vec![
+                    FakeProvider::end_turn_script("done"),
+                ]))),
+                fast_paths: Some(false),
+                ..EngineOverrides::default()
+            },
+        )
+        .expect("engine");
+
+        let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
+        let mut session = engine.new_session();
+        let summary = engine
+            .run_task(
+                &mut session,
+                "Rename parse_opts to parse_options",
+                &sink,
+                &Default::default(),
+            )
+            .await
+            .expect("agent task");
+
+        // The same instruction the fast path would solve for free runs
+        // the loop instead: the override is honored.
+        assert_eq!(summary.model_requests, 1);
+        let kinds = drain(&mut receiver);
+        assert!(
+            !kinds
+                .iter()
+                .any(|kind| matches!(kind, EventKind::FastPathHit { .. }))
+        );
+        // And the workspace was left for the agent to edit.
+        let lib = std::fs::read_to_string(workspace.join("src/lib.rs")).expect("lib");
+        assert!(lib.contains("parse_opts"));
     }
 
     #[tokio::test]
@@ -921,5 +1223,35 @@ mod tests {
             _ => None,
         });
         assert_eq!(answer.as_deref(), Some("hooked"));
+    }
+
+    /// The provider gate for reasoning elision (roadmap item 12): on
+    /// for GLM (drops only a cache benefit) and Anthropic (never
+    /// forwards reasoning on replay), off for the OpenAI-vocabulary
+    /// backends where a tool-bearing request must echo
+    /// `reasoning_content` verbatim (DeepSeek 400s otherwise).
+    #[test]
+    fn prune_config_gates_reasoning_elision_by_provider() {
+        let glm = prune_config_for(loom_providers::GLM_PROVIDER_NAME);
+        assert_eq!(glm.elide_reasoning, Some(8));
+
+        let anthropic = prune_config_for(loom_providers::ANTHROPIC_PROVIDER_NAME);
+        assert_eq!(anthropic.elide_reasoning, Some(8));
+
+        let deepseek = prune_config_for(loom_providers::DEEPSEEK_PROVIDER_NAME);
+        assert_eq!(
+            deepseek.elide_reasoning, None,
+            "DeepSeek rejects replay without reasoning_content"
+        );
+
+        let openrouter = prune_config_for(loom_providers::OPENROUTER_PROVIDER_NAME);
+        assert_eq!(
+            openrouter.elide_reasoning, None,
+            "unverified OpenAI-wire behavior stays off"
+        );
+
+        // Everything else keeps the kernel defaults.
+        assert_eq!(glm.elide_turns, PruneConfig::default().elide_turns);
+        assert_eq!(glm.trigger_percent, PruneConfig::default().trigger_percent);
     }
 }

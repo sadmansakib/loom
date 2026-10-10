@@ -23,9 +23,10 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use futures::stream;
-use loom_kernel::agent::{Agent, RetryPolicy, TaskBudget, TaskControl, TaskError};
+use loom_kernel::agent::{Agent, FastPathSolve, RetryPolicy, TaskBudget, TaskControl, TaskError};
 use loom_kernel::context::{
-    AgentConfig, DefaultContextCompiler, GitState, KnownFacts, StaticFacts,
+    AgentConfig, DefaultContextCompiler, GitState, KnownFacts, PruneConfig, PruningContextCompiler,
+    StaticFacts,
 };
 use loom_kernel::event::{ChannelEventSink, EventEnvelope, EventKind};
 use loom_kernel::id::SessionId;
@@ -581,6 +582,60 @@ async fn an_unverified_finish_is_refused_once_then_accepted() {
             .any(|i| matches!(i, Item::User { text } if text.contains("Hold on")))
     );
     assert_eq!(summary.turns, 3);
+}
+
+#[tokio::test]
+async fn the_bare_loop_never_refuses_an_unverified_finish() {
+    // Roadmap item 1's bare-loop arm: with `with_loop_shaping(false)`
+    // the identical write-then-finish script must complete in two
+    // requests — no refusal turn, no injected user item — so A/B runs
+    // measure the gate's value rather than assume it.
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(WritingTool {
+            spec: spec("write"),
+            green: false,
+        }))
+        .unwrap();
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            completed(
+                assistant(
+                    "working",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_1", "write", json!({}))],
+                ),
+                usage(10, 3, None),
+            ),
+            completed(
+                assistant("done", StopReason::EndTurn, Vec::new()),
+                usage(20, 5, None),
+            ),
+        ],
+    );
+    let requests = provider.requests_handle();
+    let mut session = Session::new(SessionId::new());
+    let (sink, _receiver) = ChannelEventSink::new();
+    let control = TaskControl::new();
+    let agent = agent(provider, registry, 10).with_loop_shaping(false);
+
+    let summary = agent
+        .run_task(&mut session, "fix the bug", &sink, &control)
+        .await
+        .unwrap();
+
+    // Two model requests: write, finish. The refusal never fired.
+    assert_eq!(summary.model_requests, 2);
+    assert!(requests.lock().unwrap().len() == 2);
+    assert!(
+        !session
+            .transcript
+            .iter()
+            .any(|i| matches!(i, Item::User { text } if text.contains("Hold on"))),
+        "the bare loop must not inject a completion refusal"
+    );
+    assert_eq!(summary.turns, 2);
 }
 
 #[tokio::test]
@@ -2017,4 +2072,288 @@ async fn a_persisted_session_resumes_from_the_store() {
     assert_eq!(stored.transcript, resumed.transcript);
     assert_eq!(stored.tasks, resumed.tasks);
     assert_eq!(store.session_ids().unwrap(), vec![id]);
+}
+
+/// A mutating tool whose success result is enormous — written results
+/// are unprunable by every rescue pass, so the only way past turn 2 is
+/// the LLM handoff (roadmap item 12).
+struct HugeTool {
+    spec: ToolSpec,
+}
+
+impl Tool for HugeTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    fn call<'a>(
+        &'a self,
+        _input: Value,
+        _ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
+        // Mutating tool + success status alone: unprunable by every
+        // rescue pass, and no file effects to trip the completion
+        // gate's changed-since-green continuation.
+        Box::pin(async move {
+            Ok(ToolOutput::new(format!(
+                "wrote src/big.rs\n{}",
+                "y".repeat(300_000)
+            )))
+        })
+    }
+}
+
+/// A context window big enough for the opening turns but far too small
+/// for the huge written result, forcing a turn-2 `BudgetExceeded`.
+fn small_capabilities() -> ModelCapabilities {
+    ModelCapabilities::new(4_000)
+        .with_max_output_tokens(1_024)
+        .with_tool_calls(true)
+}
+
+fn handoff_agent(provider: FakeProvider, handoff: bool) -> Agent {
+    let mut config = AgentConfig::new(PathBuf::from("."), "you are a test agent");
+    config.handoff_compaction = handoff;
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(HugeTool { spec: spec("huge") }))
+        .unwrap();
+    Agent::new(
+        Box::new(provider),
+        Box::new(PruningContextCompiler::new(
+            Box::new(DefaultContextCompiler::default()),
+            PruneConfig::default(),
+        )),
+        registry,
+        config,
+        "fake-model",
+    )
+    .with_max_turns(10)
+    .with_retry(
+        RetryPolicy::new()
+            .with_initial_backoff(Duration::from_millis(1))
+            .with_jitter_fraction(0.0),
+    )
+}
+
+/// Item 12: when the projection cannot fit and the deterministic rescue
+/// has nothing left to reclaim, the loop buys one provider call — a
+/// goal-directed handoff — and continues on the summarized view instead
+/// of failing the task.
+#[tokio::test]
+async fn budget_overrun_with_unprunable_history_falls_through_to_handoff() {
+    let provider = FakeProvider::new(
+        small_capabilities(),
+        vec![
+            completed(
+                assistant(
+                    "calling",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_1", "huge", json!({}))],
+                ),
+                usage(10, 3, None),
+            ),
+            // The handoff call: a terse EndTurn summary.
+            completed(
+                assistant("SUMMARY: keep going", StopReason::EndTurn, Vec::new()),
+                usage(50, 20, None),
+            ),
+            // The post-handoff turn continues on the view.
+            completed(
+                assistant("done", StopReason::EndTurn, Vec::new()),
+                usage(30, 5, None),
+            ),
+        ],
+    );
+    let requests = provider.requests_handle();
+    let agent = handoff_agent(provider, true);
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let control = TaskControl::new();
+    agent
+        .run_task(&mut session, "explore the tree", &sink, &control)
+        .await
+        .unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3, "turn call, handoff, final turn");
+
+    // The handoff request is a plain two-message completion.
+    let handoff = &requests[1];
+    assert!(handoff.tools.is_empty(), "no tools on the handoff call");
+    assert_eq!(handoff.max_tokens, Some(1_024));
+    assert_eq!(handoff.messages.len(), 2);
+    assert!(matches!(&handoff.messages[0], Message::System { .. }));
+    assert!(
+        matches!(&handoff.messages[1], Message::User { text } if text.contains("## Task")),
+        "digest carries the task section"
+    );
+
+    // The final turn runs on the handoff view: brief + summary, never
+    // the huge written result.
+    let final_messages = serde_json::to_string(&requests[2].messages).unwrap();
+    assert!(final_messages.contains("explore the tree"), "brief leads");
+    assert!(
+        final_messages.contains("SUMMARY: keep going"),
+        "handoff text"
+    );
+    assert!(!final_messages.contains("yyyy"), "history summarized away");
+
+    let events = drain(&mut receiver);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EventKind::ContextHandoff { turn: 2, chars: 19 }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EventKind::TaskCompleted)),
+        "task still completes"
+    );
+}
+
+/// `handoff_compaction: false` (the engine's bare arm) keeps the
+/// deterministic-only contract: the budget error propagates.
+#[tokio::test]
+async fn handoff_disabled_propagates_the_budget_error() {
+    let provider = FakeProvider::new(
+        small_capabilities(),
+        vec![completed(
+            assistant(
+                "calling",
+                StopReason::ToolCalls,
+                vec![tool_call("call_1", "huge", json!({}))],
+            ),
+            usage(10, 3, None),
+        )],
+    );
+    let requests = provider.requests_handle();
+    let agent = handoff_agent(provider, false);
+    let mut session = Session::new(SessionId::new());
+    let (sink, _receiver) = ChannelEventSink::new();
+    let control = TaskControl::new();
+    let error = agent
+        .run_task(&mut session, "explore the tree", &sink, &control)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        TaskError::Context(loom_kernel::context::ContextError::BudgetExceeded { .. })
+    ));
+    assert_eq!(requests.lock().unwrap().len(), 1, "no handoff call spent");
+}
+
+/// The handoff is only accepted as a plain EndTurn summary: a scripted
+/// tool-call response falls through to the original budget error.
+#[tokio::test]
+async fn handoff_guard_rejects_a_scripted_tool_call_response() {
+    let provider = FakeProvider::new(
+        small_capabilities(),
+        vec![
+            completed(
+                assistant(
+                    "calling",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_1", "huge", json!({}))],
+                ),
+                usage(10, 3, None),
+            ),
+            completed(
+                assistant(
+                    "trying to keep calling",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_2", "huge", json!({}))],
+                ),
+                usage(10, 3, None),
+            ),
+        ],
+    );
+    let requests = provider.requests_handle();
+    let agent = handoff_agent(provider, true);
+    let mut session = Session::new(SessionId::new());
+    let (sink, _receiver) = ChannelEventSink::new();
+    let control = TaskControl::new();
+    let error = agent
+        .run_task(&mut session, "explore the tree", &sink, &control)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        TaskError::Context(loom_kernel::context::ContextError::BudgetExceeded { .. })
+    ));
+    assert_eq!(requests.lock().unwrap().len(), 2, "handoff rejected");
+}
+
+#[tokio::test]
+async fn record_fast_path_books_a_zero_request_completion() {
+    let provider = FakeProvider::new(capabilities(), vec![]);
+    let requests = provider.requests_handle();
+    let agent = agent(provider, registry_with("echo"), 5);
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+
+    let summary = agent
+        .record_fast_path(
+            &mut session,
+            "Rename parse_opts to parse_options",
+            FastPathSolve {
+                kind: "rename".to_owned(),
+                files_changed: 2,
+                note: "Fast path (rename): `parse_opts` → `parse_options` \
+                       across 2 file(s); verified with `cargo check`."
+                    .to_owned(),
+            },
+            &sink,
+        )
+        .await
+        .expect("recorded");
+
+    // Zero model traffic, and the proof is in the accounting.
+    assert_eq!(summary.model_requests, 0);
+    assert_eq!(summary.turns, 0);
+    assert_eq!(summary.input_tokens, 0);
+    assert_eq!(summary.output_tokens, 0);
+    assert!(requests.lock().unwrap().is_empty());
+
+    // Transcript: the instruction and the solve's note, nothing else.
+    assert_eq!(session.transcript.len(), 2);
+    assert!(matches!(session.transcript[0], Item::User { ref text } if text.contains("Rename")));
+    match &session.transcript[1] {
+        Item::Assistant(message) => {
+            assert!(message.content.contains("parse_options"));
+            assert_eq!(message.stop_reason, StopReason::EndTurn);
+            assert!(message.tool_calls.is_empty());
+        }
+        other => panic!("expected an assistant item, got {other:?}"),
+    }
+
+    // The record finishes with the fast-path end reason.
+    let record = session.tasks.last().expect("task record");
+    assert_eq!(record.status, TaskStatus::Completed);
+    assert_eq!(record.end_reason.as_deref(), Some("fast_path"));
+    assert_eq!(record.turns, 0);
+
+    // Event order: started, the hit marker, completed.
+    let kinds = drain(&mut receiver);
+    let positions: Vec<usize> = kinds
+        .iter()
+        .position(|kind| matches!(kind, EventKind::TaskStarted))
+        .into_iter()
+        .chain(
+            kinds
+                .iter()
+                .position(|kind| matches!(kind, EventKind::FastPathHit { .. })),
+        )
+        .chain(
+            kinds
+                .iter()
+                .position(|kind| matches!(kind, EventKind::TaskCompleted)),
+        )
+        .collect();
+    assert_eq!(positions, vec![0, 1, 2], "events: {kinds:?}");
 }
