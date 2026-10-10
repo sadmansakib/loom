@@ -10,6 +10,16 @@
 //! to a full pipe. A non-zero exit status is **not** an error here — the
 //! caller decides what a failing status means, so the model can always see
 //! the failure.
+//!
+//! A command that *leaks* a descendant (a test spawning a background
+//! process, then exiting itself) would otherwise pin the collection open
+//! forever: the descendant inherited the pipe write-ends, so EOF never
+//! arrives even though the direct child is gone. After the direct child
+//! exits, the readers get a short grace window; if the pipes are still
+//! held, the process group is reaped (the group belongs to this command),
+//! and a descendant that escaped reaping (it called `setsid`) gets a final
+//! bounded wait before the stream is returned truncated with an explicit
+//! marker — never a hang, and the exit status always reaches the model.
 
 use std::collections::VecDeque;
 use std::process::Stdio;
@@ -25,6 +35,22 @@ const STREAM_HEAD_BYTES: usize = MAX_TOOL_OUTPUT_BYTES;
 /// Trailing bytes kept per stream: the band of a log where a failing
 /// command's diagnosis usually lands.
 const STREAM_TAIL_BYTES: usize = MAX_TOOL_OUTPUT_BYTES;
+
+/// Grace after the direct child exits before a still-open pipe is treated
+/// as a leaked descendant holding the write-end. Normal commands reach EOF
+/// within microseconds of exit; anything still open after this window
+/// never will.
+const STREAM_EOF_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Final wait for EOF after the process group has been reaped. SIGKILL
+/// closes pipes immediately; this only bounds the pathological case of a
+/// descendant that escaped both the group and the kill.
+const STREAM_FORCED_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Marker returned for a stream whose reader never reached EOF because a
+/// descendant process held the pipe past every reap attempt.
+const HELD_PIPE_MARKER: &str =
+    "[loom: stream truncated — a descendant process held the pipe after command exit]";
 
 /// Per-command execution limits from the command policy.
 ///
@@ -125,24 +151,89 @@ pub(crate) async fn run_bounded(
         .stderr()
         .take()
         .ok_or_else(|| ToolError::Execution(String::from("cannot capture stderr pipe")))?;
-    let (stdout, stderr) = futures::join!(
-        read_capped(stdout, head_cap, tail_cap),
-        read_capped(stderr, head_cap, tail_cap)
-    );
-    let stdout =
-        stdout.map_err(|error| ToolError::Execution(format!("cannot read output: {error}")))?;
-    let stderr =
-        stderr.map_err(|error| ToolError::Execution(format!("cannot read output: {error}")))?;
+    let mut stdout_task = tokio::spawn(read_capped(stdout, head_cap, tail_cap));
+    let mut stderr_task = tokio::spawn(read_capped(stderr, head_cap, tail_cap));
+    // The direct child first: its exit status is the contract; the streams
+    // drain concurrently so the child cannot block on a full pipe.
     let status = child
         .wait()
         .await
         .map_err(|error| ToolError::Execution(format!("cannot run \"{program}\": {error}")))?;
+
+    // The child has exited. Normal commands close their pipes with it and
+    // both readers finish within microseconds. A leaked descendant holding
+    // an inherited write-end keeps EOF away — grace, then reap the group
+    // (it belongs to this command), then one final bounded wait for a
+    // holder that escaped the group entirely. Never a hang; the status is
+    // already in hand.
+    async fn join_readers(
+        a: &mut tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+        b: &mut tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    ) -> (std::io::Result<Vec<u8>>, std::io::Result<Vec<u8>>) {
+        let (stdout, stderr) = futures::future::join(&mut *a, &mut *b).await;
+        (flatten_read(stdout), flatten_read(stderr))
+    }
+    let (stdout, stderr): (std::io::Result<Vec<u8>>, std::io::Result<Vec<u8>>) =
+        match tokio::time::timeout(
+            STREAM_EOF_GRACE,
+            join_readers(&mut stdout_task, &mut stderr_task),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                // Pipes still held: reap the process group. If the group is
+                // gone (whole tree dead), the pipes would have closed — so
+                // the pgid is still live and not reused.
+                let pgid = nix::unistd::Pid::from_raw(guard.pgid);
+                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+                match tokio::time::timeout(
+                    STREAM_FORCED_GRACE,
+                    join_readers(&mut stdout_task, &mut stderr_task),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        // A holder escaped the group (setsid). Detach the
+                        // readers — dropping the handles lets them finish
+                        // quietly whenever the holder dies, their buffers
+                        // already bounded — and report truncation.
+                        drop(stdout_task);
+                        drop(stderr_task);
+                        (Ok(held_pipe_marker_bytes()), Ok(held_pipe_marker_bytes()))
+                    }
+                }
+            }
+        };
     guard.armed = false;
+    let stdout =
+        stdout.map_err(|error| ToolError::Execution(format!("cannot read output: {error}")))?;
+    let stderr =
+        stderr.map_err(|error| ToolError::Execution(format!("cannot read output: {error}")))?;
     Ok(std::process::Output {
         status,
         stdout,
         stderr,
     })
+}
+
+/// Unwraps a reader task's result, mapping a panic or an I/O failure to
+/// the same execution-error shape the old inline reads produced.
+fn flatten_read(
+    result: Result<std::io::Result<Vec<u8>>, tokio::task::JoinError>,
+) -> std::io::Result<Vec<u8>> {
+    match result {
+        Ok(result) => result,
+        Err(error) => Err(std::io::Error::other(format!(
+            "output reader task failed: {error}"
+        ))),
+    }
+}
+
+/// The truncation marker for a stream abandoned to an unreapable holder.
+fn held_pipe_marker_bytes() -> Vec<u8> {
+    format!("{HELD_PIPE_MARKER}\n").into_bytes()
 }
 
 /// Reads a child stream to EOF, keeping the first `head_cap` and the
@@ -319,5 +410,105 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(dead, "dropping the future must kill grandchildren too");
+    }
+
+    #[tokio::test]
+    async fn a_leaked_descendant_holding_the_pipes_is_reaped() {
+        use loom_kernel::tool::ToolContext;
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        // The command exits at once but its background child inherits the
+        // output pipes and lives on — the exact shape of a leaking test.
+        // Collection must still finish: grace, group reap, EOF. The odd
+        // duration doubles as the cleanup marker: it rides the holder's
+        // argv (a `# comment` would swallow the `&`).
+        let _ = std::process::Command::new("pkill")
+            .arg("-f")
+            .arg("sleep 29991")
+            .output();
+        let root = std::env::temp_dir().join("loom-exec-hold-test");
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = ToolContext::new(root, CancellationToken::new(), Duration::from_secs(120));
+        let sandbox = crate::sandbox::Sandbox::resolve(
+            &ctx.workspace_root,
+            crate::sandbox::SandboxGrants::from_rule(None),
+        );
+        let args = vec![
+            "-c".to_owned(),
+            String::from("sleep 29991 &\nexec /usr/bin/true"),
+        ];
+
+        let started = tokio::time::Instant::now();
+        let output = run_bounded("sh", &args, &ctx, &ExecLimits::default(), &sandbox)
+            .await
+            .expect("bounded run despite pipe-holding descendant");
+        // Grace (2s) + reap + drain — anything near the forced window means
+        // the reap path regressed; a hang would never return at all.
+        assert!(
+            started.elapsed() < STREAM_EOF_GRACE + STREAM_FORCED_GRACE,
+            "collection should finish shortly after the grace window"
+        );
+        assert!(output.status.success());
+        // The reap closed the pipes, so EOF arrived naturally: the stream is
+        // whole (empty), not marked truncated.
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        // Belt and braces: nothing from this test outlives it.
+        let _ = std::process::Command::new("pkill")
+            .arg("-f")
+            .arg("sleep 29991")
+            .output();
+    }
+
+    #[tokio::test]
+    async fn an_escaped_descendant_marks_the_stream_truncated() {
+        use loom_kernel::tool::ToolContext;
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        // A descendant that starts its own session survives the group reap
+        // and keeps holding the pipes; collection must give up with the
+        // truncation marker rather than hang. Perl's setsid is the portable
+        // way to escape the process group on both macOS and Linux.
+        const MARKER: &str = "loom-esc-7731";
+        let _ = std::process::Command::new("pkill")
+            .arg("-f")
+            .arg(MARKER)
+            .output();
+        let root = std::env::temp_dir().join("loom-exec-esc-test");
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = ToolContext::new(root, CancellationToken::new(), Duration::from_secs(120));
+        let sandbox = crate::sandbox::Sandbox::resolve(
+            &ctx.workspace_root,
+            crate::sandbox::SandboxGrants::from_rule(None),
+        );
+        let args = vec![
+            "-c".to_owned(),
+            format!(
+                "perl -e 'use POSIX qw(setsid); setsid; $0 = \"{MARKER}\"; sleep 3000' & \
+                 exec /usr/bin/true"
+            ),
+        ];
+
+        let started = tokio::time::Instant::now();
+        let output = run_bounded("sh", &args, &ctx, &ExecLimits::default(), &sandbox)
+            .await
+            .expect("bounded run despite escaped descendant");
+        assert!(
+            started.elapsed() < STREAM_EOF_GRACE + STREAM_FORCED_GRACE + Duration::from_secs(3),
+            "both grace windows must bound collection"
+        );
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(HELD_PIPE_MARKER),
+            "stream must be marked truncated, got: {stdout:?}"
+        );
+        // Do not leak the escaped sleeper into later tests.
+        let _ = std::process::Command::new("pkill")
+            .arg("-f")
+            .arg(MARKER)
+            .output();
     }
 }

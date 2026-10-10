@@ -425,8 +425,7 @@ pub fn bwrap_remediation(stderr: &str) -> Option<String> {
     if !stderr.lines().any(|line| line.starts_with("bwrap:")) {
         return None;
     }
-    let escape =
-        "Alternatively, set `sandbox = false` for the affected commands in \
+    let escape = "Alternatively, set `sandbox = false` for the affected commands in \
          `.loom/commands.toml` (an explicit operator opt-out).";
     if stderr.contains("setting up uid map")
         || stderr.contains("No permissions to create new namespace")
@@ -672,7 +671,10 @@ mod tests {
         let stderr = "bwrap: setting up uid map: Permission denied\n";
         let hint = bwrap_remediation(stderr).expect("uid-map denial must be annotated");
         assert!(hint.contains("user namespaces"), "{hint}");
-        assert!(hint.contains("apparmor_restrict_unprivileged_userns"), "{hint}");
+        assert!(
+            hint.contains("apparmor_restrict_unprivileged_userns"),
+            "{hint}"
+        );
         assert!(hint.contains(".loom/commands.toml"), "{hint}");
     }
 
