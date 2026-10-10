@@ -277,9 +277,62 @@ never assistant content or reasoning.
   transcript (same rules, same estimator). `BudgetExceeded` propagates
   only when nothing is prunable or the pruned view still does not fit;
   the trigger floor assumes windows of at least 64K tokens.
-- There is no summarization stage: user items, assistant content, and
-  reasoning are never reduced. A session whose non-prunable history
-  outgrows the window fails closed (roadmap: handoff compaction).
+- **History elision** (roadmap item 12, deterministic half): outside the
+  protected tail, tool-call *arguments* older than 8 turns collapse to
+  signatures (long strings become `[pruned N chars]`; short identifying
+  fields like paths survive), user items superseded by a later user
+  item age out into a one-line stub, and — where the engine's provider
+  gate allows it — assistant *reasoning* traces older than 8 turns drop
+  from the projection (`reasoning = None`). The session brief (ordinal
+  0) and the *last* user item — the live task's instructions — are
+  exempt by construction. Reasoning elision is provider-gated because
+  replaying reasoning verbatim is a wire contract, not an
+  optimisation: DeepSeek rejects tool-bearing requests whose prior
+  assistant turns lack `reasoning_content`, GLM only loses a cache
+  benefit, and Anthropic never forwards reasoning on replay — so the
+  engine enables it for GLM and Anthropic only, and the kernel default
+  keeps it off. Elisions freeze into the same checkpoint and re-apply
+  verbatim.
+- **Assistant-text elision** (roadmap item 12, CliffCompaction-style,
+  arXiv 2609.26779): outside the protected tail, an assistant message
+  older than 8 turns whose text exceeds 400 chars collapses to its
+  first 200 chars plus a ` [pruned N chars]` marker — a deterministic
+  signature, idempotent, frozen and re-applied through the same
+  checkpoint. This runs before any LLM is involved because the
+  evidence says aged assistant prose is the dominant reclaimable mass
+  and its leading signature preserves most of its value.
+- **LLM handoff, last resort.** When even the pruned view cannot fit
+  (non-prunable history outgrew the window), the loop builds a
+  goal-directed digest of the session — task, brief, recent assistant
+  messages, recent failed tool results, touched files — and makes one
+  provider call (no tools, 1024-token cap, plain-text end-turn only)
+  for a handoff summary. The frozen checkpoint then projects a *view*
+  transcript: brief, the handoff text as a fresh user item, and the
+  tail after the freeze point; ordinal-keyed elisions are skipped in
+  this view (call-id elisions still apply, they are
+  position-independent), and the checkpoint re-freezes with the
+  handoff so replays are byte-stable. One handoff per task; a second
+  overrun fails closed. Emits `ContextHandoff` (event schema v6);
+  `AgentConfig::handoff_compaction` gates it, and the engine's bare
+  arm turns it off along with loop shaping.
+- **Fast-path seam (roadmap item 3).** Before the loop starts,
+  `Engine::run_task` offers the instruction to a deterministic
+  analyzer (`loom-tools/src/fastpath.rs`): rename, constant change,
+  and format intents parsed by anchored grammars — never fuzzy. A hit
+  is a proposal, not a trust decision: guard checks (occurrence
+  bounds, identifier collision, exactly-one const site, CRLF and
+  from-value mismatches declined), snapshot of every file about to
+  change, apply, then verify through the same policy-gated sandbox as
+  `run` (`cargo fmt --check` + `cargo check` for the format path).
+  Any failure restores the snapshot and returns `None` — the
+  never-worse contract is that a miss leaves the workspace
+  byte-identical and falls through to the agent loop untouched. A hit
+  is booked by the kernel as a zero-request solve
+  (`Agent::record_fast_path`: user item, `FastPathHit` — event schema
+  v7 — assistant item with the note, `TaskCompleted` with all-zero
+  counters), so transcripts and summaries stay honest about the model
+  never being called. `EngineOverrides::fast_paths` (default on) gates
+  the seam; the bare arm turns it off with loop shaping.
 
 ---
 
@@ -484,6 +537,23 @@ in front — obtaining the OpenRouter model catalog through `engine::
 catalog` (fetch with the provider's own credential, cache beside the
 database, stale-cache fallback) when the config does not already carry
 one — so no frontend re-implements that sequencing.
+
+The user-level instructions file is a frontend concern, not an engine
+one (ADR-008: the engine never reads the environment). `loom run`
+resolves `global_instructions_path()` — `$LOOM_CONFIG_DIR`, else
+`$XDG_CONFIG_HOME/loom`, else `~/.config/loom`, else `.` — reads its
+`AGENTS.md` (missing file is a clean no-op; a 10 KiB byte bound with
+char-boundary-aware truncation keeps the prompt finite), and composes
+the system prompt once, before the engine opens: the built-in
+instruction or an explicit `--system-prompt` carries the base, and the
+global file appends as a final `## Global instructions (<path>)`
+section — it exists because the user asked for it, so it outranks
+everything but is the first thing `--no-global-instructions` removes.
+Composing at process start keeps the prompt byte-stable for the whole
+session (§8.1.1). Because the engine is never consulted, embedders and
+the eval harness (which build their own `EngineConfig`) are unaffected
+by any machine's global file; project-level `AGENTS.md` remains a
+facts-scan concern (§5.2) and needs no CLI involvement.
 
 Both opens take `EngineOverrides` (via `open_with`/`open_async_with`;
 the plain forms pass an empty one): every field is optional and `None`

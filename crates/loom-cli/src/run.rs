@@ -50,6 +50,27 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
 
     let db_path = loom_core::paths::db_path();
 
+    // Global instructions (the user-level AGENTS.md) compose once, here:
+    // the CLI is the frontend that reads configuration (ADR-008) — the
+    // engine itself never consults the environment, so the eval harness
+    // and embedders are unaffected by whatever this machine's global
+    // file says. An explicit `--system-prompt` replaces the built-in
+    // instruction, and the user's standing global file still appends —
+    // it exists because the user asked for it; `--no-global-instructions`
+    // is the escape hatch. Composing before the engine opens keeps the
+    // prompt byte-stable for the whole session (§8.1.1).
+    let global_instructions_path = loom_core::paths::global_instructions_path();
+    let system_prompt = if args.no_global_instructions {
+        args.system_prompt
+    } else {
+        let global = crate::instructions::load_global(&global_instructions_path);
+        Some(crate::instructions::merge(
+            args.system_prompt
+                .unwrap_or_else(loom_core::engine::default_system_prompt),
+            global.map(|body| (body, global_instructions_path)),
+        ))
+    };
+
     // Captured before `EngineConfig` consumes the strings: the trace
     // manifest needs the run configuration after the task ended.
     let trace_provider = args.provider.clone();
@@ -64,7 +85,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         reasoning_effort: args.reasoning_effort,
         account: args.account,
         workspace: args.workspace,
-        system_prompt: args.system_prompt,
+        system_prompt,
         max_turns: args.max_turns,
         db_path,
         persist: !args.no_save,

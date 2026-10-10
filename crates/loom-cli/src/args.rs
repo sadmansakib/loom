@@ -85,6 +85,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub no_save: bool,
 
+    /// Ignore the global AGENTS.md instructions file for this run.
+    #[arg(long)]
+    pub no_global_instructions: bool,
+
     /// Export this task's events, transcript, and a manifest under
     /// `DIR/<task-id>/` (roadmap item 20.1).
     #[arg(long, value_name = "DIR")]
@@ -209,6 +213,7 @@ mod tests {
         assert_eq!(args.max_turns, DEFAULT_MAX_TURNS);
         assert!(!args.json);
         assert!(!args.no_save);
+        assert!(!args.no_global_instructions);
     }
 
     #[test]
@@ -230,6 +235,7 @@ mod tests {
             "--max-turns",
             "3",
             "--no-save",
+            "--no-global-instructions",
             "go",
         ]);
         let Command::Run(args) = cli.command else {
@@ -241,6 +247,10 @@ mod tests {
         assert_eq!(args.account.as_deref(), Some("work"));
         assert_eq!(args.max_turns, 3);
         assert!(args.no_save);
+        assert!(
+            args.no_global_instructions,
+            "--no-global-instructions opts out of the user-level file"
+        );
     }
 
     #[test]

@@ -3,6 +3,25 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-10 — Global AGENTS.md support
+
+The harness already read project-level `AGENTS.md`/`CLAUDE.md` through
+the facts scan; the user's standing instructions had no home. `loom run`
+now resolves a config directory (`$LOOM_CONFIG_DIR` → `$XDG_CONFIG_HOME/
+loom` → `~/.config/loom`) and, when it holds an `AGENTS.md`, composes it
+into the system prompt once at startup — appended as a final
+`## Global instructions (<resolved path>)` section after the built-in
+instruction or an explicit `--system-prompt`. The file is bounded at
+10 KiB (char-boundary-aware truncation with a byte-count marker),
+a missing file is a clean no-op, and `--no-global-instructions` opts
+out for one run. Loading lives entirely in the CLI frontend: the engine
+never reads the environment (ADR-008), so embedders and the eval
+harness are unaffected by any machine's global file; project-level
+`AGENTS.md` remains a facts-scan concern (§5.2) and needs no CLI
+involvement. 13 CLI tests (+8 instructions module: missing/unreadable/
+verbatim/capped/multibyte boundary/merge identity/merge section;
++2 args parsing: flag default and opt-out; +3 load-global path cases).
+
 ## 2026-10-10 — Linux gaps: sandbox preflight, error mapping, headless keyring
 
 Two Linux failures that read as Loom bugs but are host policy now fail
@@ -32,6 +51,195 @@ falls through to the environment names as designed (§18.3) and
 AppArmor/seccomp/generic bwrap remediation classification, ordinary
 failures left unannotated); workspace suite green at 745 passing.
 
+## 2026-10-10 — Assistant-text elision and LLM handoff (roadmap item 12 complete)
+
+Aged assistant text was the final unpruned bucket, and the last-resort
+LLM handoff existed only as a roadmap line. Both shipped, in evidence
+order. First, deterministic elision (CliffCompaction's truncation beat
+summarization, arXiv 2609.26779): outside the protected tail, assistant
+text older than `elide_assistant_text` turns (default 8) exceeding
+`elide_assistant_chars` (default 400) keeps its first 200 chars plus a
+` [pruned N chars]` marker. The signature is a constant — config gates
+selection only — and idempotent, so rescue-baked and frozen re-applied
+views cannot double-elide; elisions freeze into the same
+`PruneCheckpoint` behind the same 20K-reclaim gate (additive serde
+defaults, old checkpoints replay unchanged). Second, the LLM handoff
+itself: when the pruned view still overruns the budget, the loop builds
+a goal-directed digest (task, session brief, recent assistant messages,
+recent failed tool results, touched files) and makes exactly one
+provider call — no tools, 1024-token cap, plain-text end-turn responses
+only (anything else fails closed) — then freezes a checkpoint whose
+projection is a *view*: session brief, the handoff summary as a fresh
+user item, and the transcript tail. Ordinal-keyed elisions skip the
+view (it renumbers ordinals); call-id elisions still apply. One handoff
+per task — a second overrun is a hard error — and the checkpoint
+re-freezes byte-stably. Observable as `ContextHandoff { turn, chars }`
+(event schema v6, additive). `AgentConfig::handoff_compaction` (default
+on) gates it; the engine's bare arm disables it with loop shaping, so
+the A/B arms stay honest. 758 tests (+9 pruning: elide_text shape and
+idempotence and multibyte boundary, window-gated selection, protected
+tail, frozen re-apply, handoff view construction, call-id-only frozen
+elisions in view, serde defaults; +3 agent-loop: budget-overrun falls
+through to handoff with billed usage and event, disabled propagates
+`BudgetExceeded`, guard rejects tool-call responses).
+
+## 2026-10-10 — Fast paths: zero-invocation solves (roadmap item 3)
+
+The cheapest model call is the one the harness never makes. The engine
+now runs a deterministic analyzer (`loom-tools/src/fastpath.rs`)
+*before* the agent loop on every task: rename
+(`rename X to Y`), constant change (`change/set CONST from/to LIT`),
+and format (`run rustfmt…`, 15 phrase variants) intents, parsed by
+anchored grammars with exact-case identifiers and keyword-reject lists —
+never a fuzzy guess. A hit is only a proposal: whole-workspace guard
+checks (1–500 whole-word occurrences for renames, zero collisions with
+the target identifier, exactly one `const` site, from-value match,
+CRLF declined), a byte snapshot of every file about to change, apply,
+then verification through the same policy-gated sandbox as `run`
+(`cargo fmt --check` + `cargo check`). Any failure restores the
+snapshot and the instruction falls through to the agent loop — the
+never-worse contract: on every decline/revert path the workspace is
+byte-identical to before. A hit is booked by the kernel as a
+zero-request solve: `Agent::record_fast_path` persists the user item,
+emits `FastPathHit { kind, files_changed }` (event schema v7,
+additive), books an assistant item carrying the note, and completes
+the task with all-zero counters (turns, model requests, tokens, tool
+calls). `EngineOverrides::fast_paths` (default on) gates the seam and
+the bare arm disables it with loop shaping. The eval suite grew the
+FPATH slice — FPATH1 (constant, tier s), FPATH2 (cross-file rename,
+tier s), FPATH3 (exact-file format gate, tier s) — gated like any
+other task, grammars general rather than task-shaped, so fast-path
+coverage is measured, not assumed. 802 tests (+8 analyzer: grammar
+accept/reject, word-bounded replace, literal round-trip, const-site
+detection; +1 kernel zero-request bookkeeping; +4 engine: rename
+solved with zero model requests, unmatched falls through, override
+disables; +3 offline eval task proofs; +189→189 tools suite steady).
+
+## 2026-10-10 — The eval suite learns to measure the harness (roadmap item 1)
+
+The suite graded outcomes well and harness value not at all: every
+field task was a single-fault miniature (≤251 LOC, ≤6 files, largest
+file 129 lines), nothing crossed the pruning floor, and no baseline
+existed to credit the levers against. Five recommendations shipped:
+
+- **Scale-tier corpus** — NAV1 (many-reads: 45-module units crate,
+  fault in one constant among hundreds), BIG1 (large-file: 614-line
+  lib.rs, 52 utilities), MULTI1 (cross-file: five of twelve widget
+  schema constants drifted; the fix necessarily touches five files),
+  LONG1 (heavy, long-horizon: ten-chapter interpreter spec + stubbed
+  evaluator — the only in-house task whose final request crosses the
+  64K-pruning floor, so pruning/checkpoints finally fire in eval).
+- **Bare-loop arm** — `LOOM_EVAL_BARE=1` runs the same suite on the
+  basic-harness baseline (no facts, no pruning, no completion-gate or
+  failure-ledger feedback, primitive five-tool registry; plain
+  append-only compiler). Engine seam: `EngineOverrides::bare_loop()`
+  + `Agent::with_loop_shaping(false)`; artifacts suffixed `-bare` so
+  both arms coexist. The Scaffold-Effect numbers (harness moves
+  tokens-per-solved up to 40× at flat pass rates) are only measurable
+  against exactly this baseline.
+- **Efficiency headline** — the suite economics block gains the
+  SWE-Effi / Scaffold-Effect metrics: `tokens_per_solved` (billed
+  input+output amortized per solved gated run), the
+  `expensive_failure_ratio` (share of spend on unresolved runs —
+  failures burn multiples of successes in field data), the
+  `failure_categories` vector (`end_reason` counts + `gate_failed`),
+  and `idle_turns` / `idle_turn_rate` (the no-tool-call assistant
+  turn tax), plus per-task `no_tool_turns` on every run report.
+- **Difficulty tiers** — every field task carries an `s`/`m`/`l`/`xl`
+  human-time tier; the headline reports pass rate per tier, because a
+  blended rate hides the tier cliff (84.7 % → 33.1 % easy → hard in
+  field data). B-tasks backfilled.
+- **Editor bench** — `editbench`, a deterministic token-free
+  `edit_file` micro-bench (PR-Edit's finding: editor competence
+  correlates r=0.98 with downstream resolve): unique-anchor apply
+  across 40/240/1200/3000-line buckets, ambiguity refusal, batch
+  atomicity, cross-file batches, whitespace repair, unicode
+  byte-exactness, oversize cap. Report:
+  `target/eval/report-editbench.json`; runs on every commit.
+- **Polyglot editor bench** — the same bench grew nine
+  language-shaped families: Python indentation blocks, JSON escaped
+  quotes (parse-verified), YAML/TOML indent-and-table edits, JS
+  template literals, shell quoting, a two-part CRLF case (a `\r\n`
+  anchor applies; a bare-`\n` anchor must NOT match a CRLF file — no
+  cross-ending fuzzy match), extension-less Makefiles, and one batch
+  touching `.py/.js/.sh/.json/.yaml/.toml` atomically. Shipped with
+  **POLY1**, an agent-level mixed-language outcome task (eight fixes
+  across shell/Python/JS/YAML/TOML/JSON/Make/CRLF text; gate is
+  contains-needles, `tests_green: null` — no cargo test, non-Rust
+  workspaces fully supported), so polyglot editing is measured at
+  both the editor and the agent level. The breadth sweep extends
+  both layers to every mainstream family: twelve more editor-bench
+  families (Go tabs, C `snprintf`, Java `equals`, C# coalescing,
+  Ruby heredocs, PHP interpolation, TypeScript annotations, Kotlin
+  elvis, Swift `guard let`, Postgres `$$` bodies, MySQL backticks,
+  zsh/fish/PowerShell dialects) and three gated tasks — SHELL1
+  (bash/zsh/fish/PowerShell, one real defect per dialect), DB1
+  (SQLite/Postgres/MySQL/Mongo/Redis artifacts; no engines run —
+  gates check the files), LANG1 (Go/Java/C/C#/Ruby/PHP/TypeScript/
+  Kotlin/Swift, one idiomatic defect each).
+- **Hard-gate preset** — `LOOM_EVAL_TASKS=hard-gate` expands to every
+  gated task (heavies included, labs never). The preset is derived,
+  not enumerated: a new gated task joins the release gate by
+  existing, so nothing can be silently excluded (anti-benchmaxxing).
+  Split campaigns merge without re-spend: `eval_suite_union`
+  (`--ignored`, no tokens) rebuilds a suite headline from the
+  per-task reports already on disk (`-union.json`), and in hard-gate
+  scope a missing report is a loud failure, not a silent skip.
+- **External anchor** — `cargo run -p loom-eval --bin multiswe-import`
+  bridges Multi-SWE-bench JSONL into `EXT-*` heavy tasks (clone at
+  `base_commit`, apply the test patch, gate on the instance's own
+  F2P/P2P, protect the test files), so an external comparability
+  slice is one command away; the offline proofs validate imported
+  seeds like any other task. Five Rust instances imported and
+  seed-validated (bytes ×2, rayon, clap, tracing); darwin-invalid
+  candidates (ripgrep, fd — upstream `#[cfg]`-guards macOS out of
+  their own p2p tests) dropped with reasons, never edited. Published
+  anchors for comparison live in `docs/benchmarks/published-anchors.md`.
+
+## 2026-10-10 — Provider-gated reasoning elision (roadmap item 12)
+
+Assistant reasoning traces were the last bucket stacking verbatim
+every turn — replaying them byte-exact is a provider contract once
+tools are involved (ADR-006), so the pruning compiler never touched
+them. Elision is now possible and provider-gated: with
+`PruneConfig::elide_reasoning` set (default `None`), reasoning traces
+outside the protected tail and older than the window drop from the
+projection (`reasoning = None` — a reasoning slot is either the
+provider's verbatim trace or absent, never paraphrased), freezing into
+the same `PruneCheckpoint` behind the same 20K-reclaim gate. The
+engine's provider gate turns it on only where omission is provably
+safe: GLM (dropping old traces forfeits only the Preserved-Thinking
+cache benefit for those turns) and Anthropic (its wire never forwards
+reasoning on replay, so the elision changes nothing on the wire).
+DeepSeek and the other OpenAI-vocabulary backends stay off — a
+tool-bearing request whose prior assistant turns lack
+`reasoning_content` fails with HTTP 400 (live-verified). Ordinals skip
+`ContentFilter`-stopped turns so frozen keys always match what the
+projection contains. 706 tests (+5 pruning: elide-when-enabled,
+off-by-default, filtered-turn ordinal alignment, frozen re-apply,
+attribution-once; +1 engine provider gate).
+
+## 2026-10-10 — Deterministic history elision (roadmap item 12)
+
+Tool results were the only bucket the pruning compiler ever shrank;
+tool-call arguments and superseded user items stacked verbatim forever
+— together the 28%-of-tokens bucket CliffCompaction (arXiv 2609.26779)
+measures on terminal workloads. The pruning decorator now elides them
+deterministically, zero LLM calls: outside the protected tail, arguments
+older than `elide_turns` (default 8) collapse to signatures — strings
+over `elide_arg_chars` (default 160 chars) become `[pruned N chars]`
+while short identifying fields like paths survive for re-run recovery —
+and a user item superseded by a later one ages out into a one-line stub.
+The session brief (ordinal 0) and the *last* user item — the live
+task's instructions under follow-up tasks — are exempt by construction,
+so continuation sessions never lose their brief. Elisions freeze into
+the existing `PruneCheckpoint` (verbatim argument bodies, so re-apply is
+byte-stable regardless of config drift) behind the same 20K-reclaim
+gate: one prefix-cache miss per freeze, zero while parked. Assistant
+text and reasoning remain untouched; the LLM handoff stays the last
+resort for non-prunable overflow. 700 tests (+6 pruning: arg elision,
+brief exemptions, long continuation, frozen re-apply, opt-out,
+attribution-once).
 
 ## 2026-10-10 — Artifacts lifecycle (roadmap item 17)
 

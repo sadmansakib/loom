@@ -40,3 +40,35 @@ pub fn db_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| data_dir().join("loom.db"))
 }
+
+/// Root of Loom's suggested per-user configuration directory.
+///
+/// Resolution order: `LOOM_CONFIG_DIR` → `$XDG_CONFIG_HOME/loom` →
+/// `$HOME/.config/loom`. Falls back to the current directory only when
+/// neither variable is set, so the process never panics on a stripped
+/// environment.
+///
+/// Configuration vs. data (the split with [`data_dir`]): instructions the
+/// user writes by hand — the global `AGENTS.md` today — are configuration
+/// and belong here; the database and artifacts are data and stay there.
+/// Same shape, different XDG root.
+pub fn config_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("LOOM_CONFIG_DIR") {
+        return PathBuf::from(dir);
+    }
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("loom")
+}
+
+/// Suggested path to the user's global `AGENTS.md` instructions file.
+///
+/// The engine never reads this (ADR-008): the frontend loads it, appends
+/// it to the system prompt at process start, and the eval harness — which
+/// builds its own `EngineConfig` — never sees it, so a developer's global
+/// file cannot leak into the frozen suite.
+pub fn global_instructions_path() -> PathBuf {
+    config_dir().join("AGENTS.md")
+}
