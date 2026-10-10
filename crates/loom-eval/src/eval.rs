@@ -99,7 +99,7 @@ use loom_core::kernel::model::{
 use loom_core::kernel::session::Session;
 use loom_core::kernel::tool::ToolRegistry;
 use loom_core::kernel::transcript::{AssistantMessage, Item, ToolArguments, ToolCall, ToolCallId};
-use loom_core::providers::{ReasoningEffort, model_capabilities};
+use loom_core::providers::ReasoningEffort;
 use loom_core::tools::{
     EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool, VerifyTool, WriteFileTool,
 };
@@ -519,6 +519,10 @@ impl ModelProvider for RecordingProvider {
 /// Replays recorded responses verbatim; tools still execute for real.
 struct ReplayProvider {
     model: String,
+    /// Capabilities derived from the recording itself, not from any
+    /// provider's table: the exchanges prove what the live run was
+    /// served under, so replay never disagrees with an era's provider.
+    capabilities: ModelCapabilities,
     script: Mutex<VecDeque<ModelResponse>>,
     served: AtomicUsize,
     /// How many past-the-recording turns were served. Loop-level
@@ -530,8 +534,38 @@ struct ReplayProvider {
 
 impl ReplayProvider {
     fn new(model: &str, exchanges: &[Exchange]) -> Self {
+        let tool_calls = exchanges
+            .iter()
+            .any(|e| !e.response.message.tool_calls.is_empty());
+        let parallel_tool_calls = exchanges
+            .iter()
+            .any(|e| e.response.message.tool_calls.len() > 1);
+        let reasoning = exchanges
+            .iter()
+            .any(|e| e.response.message.reasoning.is_some());
+        // Context floor: every recorded request fit the real window, so
+        // the largest one bounds it from below. The ×8 headroom (over a
+        // ~4-bytes-per-token raw-JSON estimate) keeps replay's pruning
+        // compiler from reclaiming memory the live run never reclaimed —
+        // equivalence compares transcripts, and an undersized window
+        // would prune where live did not, while an oversized one only
+        // leaves more room. 256K is the absolute floor.
+        let largest_request = exchanges
+            .iter()
+            .map(|e| {
+                serde_json::to_string(&e.request)
+                    .map(|text| text.len())
+                    .unwrap_or(0)
+            })
+            .max()
+            .unwrap_or(0);
+        let window = (largest_request as u32 / 4).saturating_mul(8).max(262_144);
         Self {
             model: model.to_owned(),
+            capabilities: ModelCapabilities::new(window)
+                .with_tool_calls(tool_calls)
+                .with_parallel_tool_calls(parallel_tool_calls)
+                .with_reasoning(reasoning),
             script: Mutex::new(exchanges.iter().map(|e| e.response.clone()).collect()),
             served: AtomicUsize::new(0),
             overruns: Arc::new(AtomicUsize::new(0)),
@@ -559,12 +593,11 @@ impl ModelProvider for ReplayProvider {
     }
 
     fn capabilities(&self, model: &str) -> Option<ModelCapabilities> {
-        // Mirror the live DeepSeek table so offline replay compiles
-        // recordings produced against the real window (deepseek-flash is
-        // 1M tokens, not the 128K this replay double used to assume).
-        (model == self.model)
-            .then(|| model_capabilities(model))
-            .flatten()
+        // Derived from the recording (see [`ReplayProvider::new`]): the
+        // exchanges are ground truth for what tool and reasoning shapes
+        // the live run served, so no provider's static table can veto a
+        // model replay actually used.
+        (model == self.model).then_some(self.capabilities)
     }
 
     fn stream<'a>(&'a self, request: &'a ModelRequest) -> ModelStream<'a> {
@@ -653,25 +686,33 @@ pub(crate) fn cost_usd(
     miss: u64,
     output: u64,
     multiplier: f64,
-) -> f64 {
+) -> Option<f64> {
     // NVIDIA NIM's free trial tier bills nothing (roadmap item 1's
-    // zero-cost candidate); the price table only prices metered models.
+    // zero-cost candidate); priced-at-zero is a known price, not a
+    // missing one.
     if provider == "nvidia" {
-        return 0.0;
+        return Some(0.0);
     }
     let prices = match model {
         "deepseek-flash" => &FLASH,
         "deepseek-v4-pro" => &PRO,
         // Free-tier OpenRouter ids price at zero by construction; the
         // provider-reported figure (preferred when present) agrees.
-        other if other.ends_with(":free") => return 0.0,
-        other => panic!("no price table for model `{other}`"),
+        other if other.ends_with(":free") => return Some(0.0),
+        // Any other model is unpriced, not an error: pricing is report
+        // metadata, and a model outside the tables must not take a run
+        // down. The report says `cost_source: "unpriced"` so the gap is
+        // auditable, and the provider-reported cost (preferred whenever
+        // the live run emits one) is unaffected.
+        _ => return None,
     };
     let per_million = |tokens: u64, price: f64| tokens as f64 / 1_000_000.0 * price;
-    multiplier
-        * (per_million(miss, prices.input_miss)
-            + per_million(hit, prices.input_hit)
-            + per_million(output, prices.output))
+    Some(
+        multiplier
+            * (per_million(miss, prices.input_miss)
+                + per_million(hit, prices.input_hit)
+                + per_million(output, prices.output)),
+    )
 }
 
 /// Filesystem-safe form of a model id — OpenRouter ids carry `/` and `:`
@@ -1249,6 +1290,25 @@ where
                 (1000.0 * hit as f64 / (hit + miss) as f64).round() / 10.0
             };
             let (multiplier, window) = price_multiplier(SystemTime::now());
+            let table_cost = cost_usd(
+                model,
+                provider_label,
+                hit,
+                miss,
+                summary.output_tokens,
+                multiplier,
+            );
+            let (cost, cost_source) = match reported_cost {
+                Some(reported) => (reported, "provider-reported"),
+                None => match table_cost {
+                    Some(table) => (table, "price-table"),
+                    // Unpriced, not free and not wrong: the model sits in
+                    // no price table and the provider reported nothing.
+                    // Zero keeps the report total meaningful; the source
+                    // label keeps the gap honest.
+                    None => (0.0, "unpriced"),
+                },
+            };
             serde_json::json!({
                 "task": task.id,
                 "model": model,
@@ -1272,14 +1332,8 @@ where
                 "wall_time_ms": summary.wall_time.as_millis() as u64,
                 "observed_wall_time_ms": observed_ms,
                 "price_window": window,
-                "cost_usd": reported_cost.unwrap_or_else(|| {
-                    cost_usd(model, provider_label, hit, miss, summary.output_tokens, multiplier)
-                }),
-                "cost_source": if reported_cost.is_some() {
-                    "provider-reported"
-                } else {
-                    "price-table"
-                },
+                "cost_usd": cost,
+                "cost_source": cost_source,
                 "compiler_census": {
                     "system_prompt": summary.last_context_census.system_prompt,
                     "repo_facts": summary.last_context_census.repo_facts,
@@ -2185,12 +2239,15 @@ async fn assert_replay_equivalence(task: &EvalTask, model: &str, exchanges: &[Ex
             .with_compiler(eval_compiler("replay"));
         Engine::open_with(eval_config(root, "replay", model, system_prompt), overrides)
     };
-    let (report, _recorded, session) = run_once(task, model, "replay", None, open).await;
-    assert!(
-        report["success"].as_bool().unwrap(),
-        "replay of {} failed: {report}",
-        task.id
-    );
+    let (_report, _recorded, session) = run_once(task, model, "replay", None, open).await;
+    // No success assert, by design: recordings capture failed runs too
+    // (max-turns grind, unfixed bugs), and replaying a failure to the
+    // same failure IS fidelity. The invariants that catch real drift are
+    // below — the replayed assistant transcript must reproduce the
+    // recording verbatim, the turn count must match, and the overrun
+    // counter must stay within the one completion-gate beat. A replay
+    // that ends for a different reason than the recording ran out of
+    // script and tripped one of those.
 
     let replayed: Vec<&AssistantMessage> = session
         .transcript
@@ -2239,10 +2296,12 @@ async fn replay_capturing(task: &EvalTask, model: &str, exchanges: &[Exchange]) 
 }
 
 /// Replays every recording on disk. Self-skips when no recordings exist
-/// (fresh checkout); `eval_live` (ignored test) creates them.
+/// (fresh checkout); `eval_live` (ignored test) creates them. Each
+/// recording replays under the model it was recorded with — the stem
+/// carries it — so mixed-era directories (provider pivots, free-tier
+/// outages) stay replayable without any environment default.
 #[tokio::test]
 async fn eval_replay_recordings() {
-    let model = std::env::var("LOOM_EVAL_MODEL").unwrap_or_else(|_| String::from("deepseek-flash"));
     let records_dir = eval_dir().join("records");
     let Ok(entries) = std::fs::read_dir(&records_dir) else {
         eprintln!(
@@ -2266,23 +2325,58 @@ async fn eval_replay_recordings() {
     }
     let all_tasks = tasks();
     for file in files {
-        let task_id = file
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.split('-').next())
-            .unwrap_or("B1");
-        let Some(task) = all_tasks.iter().find(|t| t.id == task_id) else {
-            eprintln!("{}: no pinned task `{task_id}` — skipped", file.display());
+        let Some((task, model)) = task_and_model_for(&file, &all_tasks) else {
+            eprintln!(
+                "{}: no pinned task matches the stem — skipped",
+                file.display()
+            );
             continue;
         };
         let exchanges = read_exchanges(&file);
+        if exchanges.is_empty() {
+            // The 429 era wrote one-byte shells: the request never
+            // completed, so nothing is replayable by construction.
+            eprintln!(
+                "{}: empty recording (a failed run) — skipped",
+                file.display()
+            );
+            continue;
+        }
         eprintln!(
-            "replaying {} ({} exchanges)",
+            "replaying {} [{}] ({} exchanges)",
             file.display(),
+            model,
             exchanges.len()
         );
         assert_replay_equivalence(task, &model, &exchanges).await;
     }
+}
+
+/// Splits a recording stem `<task>-<model>-<run>` into its task and
+/// model. Task ids may themselves contain dashes (`EXT-…`), so the task
+/// is the longest known id prefixing the stem and the model is the
+/// remainder — recordings from different providers and eras coexist in
+/// one directory, each replaying under the model it was recorded with.
+fn task_and_model_for<'a>(path: &Path, tasks: &'a [EvalTask]) -> Option<(&'a EvalTask, String)> {
+    let stem = path.file_stem()?.to_str()?;
+    // Drop the trailing `-<run>` counter; anything non-numeric stays
+    // (defensive against future naming).
+    let stem = stem
+        .rsplit_once('-')
+        .filter(|(_, run)| !run.is_empty() && run.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(stem, |(head, _)| head);
+    let task = tasks
+        .iter()
+        .filter(|t| {
+            stem.strip_prefix(&t.id)
+                .is_some_and(|rest| rest.starts_with('-'))
+        })
+        .max_by_key(|t| t.id.len())?;
+    let model = stem
+        .strip_prefix(&task.id)
+        .and_then(|rest| rest.strip_prefix('-'))?
+        .to_owned();
+    Some((task, model))
 }
 
 /// Offline micro-eval: recompute call quality from the session snapshots

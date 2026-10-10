@@ -48,12 +48,14 @@ pub struct RunArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// Provider adapter to use (`deepseek`, `anthropic`, `openrouter`).
-    #[arg(long, default_value = "deepseek")]
+    /// Provider adapter to use (`deepseek`, `anthropic`, `openrouter`,
+    /// `glm`, `nvidia`). Required — Loom picks no provider for you.
+    #[arg(long)]
     pub provider: String,
 
-    /// Model identifier (validated against the provider's capability table).
-    #[arg(long, default_value = "deepseek-flash")]
+    /// Model identifier (validated against the provider catalog when
+    /// reachable, else the provider's capability table). Required.
+    #[arg(long)]
     pub model: String,
 
     /// Override the provider base URL (proxies and gateways).
@@ -139,8 +141,8 @@ pub enum AuthCommand {
 /// Arguments for `loom auth login`.
 #[derive(Debug, Args)]
 pub struct LoginArgs {
-    /// Provider to authenticate.
-    #[arg(default_value = "deepseek")]
+    /// Provider to authenticate (`deepseek`, `anthropic`, `openrouter`,
+    /// `glm`, `nvidia`). Required.
     pub provider: String,
 
     /// How the secret is supplied: `key` (prompt, stored in the keychain)
@@ -175,8 +177,8 @@ pub struct UseArgs {
     /// Label or id of the account to activate.
     pub target: String,
 
-    /// Provider the account belongs to.
-    #[arg(long, default_value = "deepseek")]
+    /// Provider the account belongs to. Required.
+    #[arg(long)]
     pub provider: String,
 }
 
@@ -186,8 +188,8 @@ pub struct RemoveArgs {
     /// Label or id of the account to remove.
     pub target: String,
 
-    /// Provider the account belongs to.
-    #[arg(long, default_value = "deepseek")]
+    /// Provider the account belongs to. Required.
+    #[arg(long)]
     pub provider: String,
 }
 
@@ -202,18 +204,59 @@ mod tests {
 
     #[test]
     fn run_defaults_and_collects_task_words() {
-        let cli = parse(&["loom", "run", "find", "the", "turn", "loop"]);
+        let cli = parse(&[
+            "loom",
+            "run",
+            "--provider",
+            "nvidia",
+            "--model",
+            "z-ai/glm-5.3-flash",
+            "find",
+            "the",
+            "turn",
+            "loop",
+        ]);
         let Command::Run(args) = cli.command else {
             panic!("expected `run`");
         };
         assert_eq!(args.task, vec!["find", "the", "turn", "loop"]);
-        assert_eq!(args.provider, "deepseek");
-        assert_eq!(args.model, "deepseek-flash");
+        assert_eq!(args.provider, "nvidia");
+        assert_eq!(args.model, "z-ai/glm-5.3-flash");
         assert_eq!(args.reasoning_effort, ReasoningEffort::High);
         assert_eq!(args.max_turns, DEFAULT_MAX_TURNS);
         assert!(!args.json);
         assert!(!args.no_save);
         assert!(!args.no_global_instructions);
+    }
+
+    #[test]
+    fn run_requires_provider_and_model() {
+        let error = Cli::try_parse_from(["loom", "run", "x"]).unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains("--provider"), "{rendered}");
+        assert!(rendered.contains("--model"), "{rendered}");
+
+        let error = Cli::try_parse_from(["loom", "run", "--provider", "nvidia", "x"]).unwrap_err();
+        assert!(error.to_string().contains("--model"));
+
+        let error = Cli::try_parse_from(["loom", "run", "--model", "m", "x"]).unwrap_err();
+        assert!(error.to_string().contains("--provider"));
+    }
+
+    #[test]
+    fn auth_use_and_remove_require_their_provider() {
+        let ok = Cli::try_parse_from(["loom", "auth", "switch", "work", "--provider", "glm"]);
+        assert!(ok.is_ok());
+        let error = Cli::try_parse_from(["loom", "auth", "switch", "work"]).unwrap_err();
+        assert!(error.to_string().contains("--provider"), "{}", error);
+
+        let ok = Cli::try_parse_from(["loom", "auth", "logout", "work", "--provider", "glm"]);
+        assert!(ok.is_ok());
+        let error = Cli::try_parse_from(["loom", "auth", "logout", "work"]).unwrap_err();
+        assert!(error.to_string().contains("--provider"), "{}", error);
+
+        let error = Cli::try_parse_from(["loom", "auth", "add"]).unwrap_err();
+        assert!(error.to_string().contains("PROVIDER"), "{}", error);
     }
 
     #[test]
@@ -271,7 +314,7 @@ mod tests {
         assert_eq!(args.provider, "glm");
         assert_eq!(args.method, Method::Key);
 
-        let cli = parse(&["loom", "auth", "switch", "work"]);
+        let cli = parse(&["loom", "auth", "switch", "work", "--provider", "glm"]);
         let Command::Auth(auth) = cli.command else {
             panic!("expected `auth`");
         };
@@ -279,8 +322,9 @@ mod tests {
             panic!("expected `use`");
         };
         assert_eq!(args.target, "work");
+        assert_eq!(args.provider, "glm");
 
-        let cli = parse(&["loom", "auth", "logout", "work"]);
+        let cli = parse(&["loom", "auth", "logout", "work", "--provider", "glm"]);
         let Command::Auth(auth) = cli.command else {
             panic!("expected `auth`");
         };
@@ -288,6 +332,7 @@ mod tests {
             panic!("expected `remove`");
         };
         assert_eq!(args.target, "work");
+        assert_eq!(args.provider, "glm");
     }
 
     #[test]

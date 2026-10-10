@@ -131,7 +131,7 @@ async fn b1_read_only_repository_inspection() {
         Ok(summary) => {
             let (hit, miss) = cache_split(summary);
             let (multiplier, window) = price_multiplier(SystemTime::now());
-            let cost = cost_usd(
+            let table_cost = cost_usd(
                 &model,
                 "deepseek",
                 hit,
@@ -162,7 +162,12 @@ async fn b1_read_only_repository_inspection() {
                 "wall_time_ms": summary.wall_time.as_millis() as u64,
                 "observed_wall_time_ms": wall_time.as_millis() as u64,
                 "price_window": window,
-                "cost_usd": cost,
+                "cost_usd": table_cost.unwrap_or(0.0),
+                "cost_source": if table_cost.is_some() {
+                    "price-table"
+                } else {
+                    "unpriced"
+                },
                 "assistant_chars": assistant_chars(&session),
             })
         }

@@ -417,19 +417,36 @@ impl Engine {
         config: EngineConfig,
         overrides: EngineOverrides,
     ) -> Result<Self, EngineError> {
-        let config = if config.catalog.is_none() && config.provider == OPENROUTER_PROVIDER_NAME {
+        // The catalog is fetched for every provider, not just the
+        // catalog-driven one: capability resolution is catalog-first for
+        // the table adapters too, so a model the adapter's static table
+        // never heard of runs after a catalog refresh with no code
+        // change. The fetch always uses the OpenRouter credential of its
+        // own — a run against any other provider must not have its
+        // account or base URL steer the catalog request — and when the
+        // fetch fails, only `openrouter` runs propagate the error (their
+        // adapter cannot resolve models without a catalog); table-driven
+        // adapters fall back to their built-in rows.
+        let config = if config.catalog.is_none() {
+            let is_openrouter = config.provider == OPENROUTER_PROVIDER_NAME;
             let auth = crate::auth::Auth::open(&config.db_path)?;
-            let catalog = crate::catalog::load(
+            let account = is_openrouter.then(|| config.account.clone()).flatten();
+            let base_url = is_openrouter.then(|| config.base_url.clone()).flatten();
+            match crate::catalog::load(
                 &auth,
-                &config.provider,
-                config.account.as_deref(),
-                config.base_url.as_deref(),
+                OPENROUTER_PROVIDER_NAME,
+                account.as_deref(),
+                base_url.as_deref(),
                 &config.db_path,
             )
-            .await?;
-            EngineConfig {
-                catalog: Some(ProviderCatalog::OpenRouter(catalog)),
-                ..config
+            .await
+            {
+                Ok(catalog) => EngineConfig {
+                    catalog: Some(ProviderCatalog::OpenRouter(catalog)),
+                    ..config
+                },
+                Err(_) if !is_openrouter => config,
+                Err(error) => return Err(error),
             }
         } else {
             config
@@ -483,32 +500,32 @@ impl Engine {
         if self.fast_paths
             && let Some(solve) =
                 loom_tools::fastpath::try_fast_path(&self.workspace, &input, &self.policy).await
-            {
-                let summary = self
-                    .agent
-                    .record_fast_path(
-                        session,
-                        input,
-                        loom_kernel::agent::FastPathSolve {
-                            kind: solve.kind.to_owned(),
-                            files_changed: solve.files_changed,
-                            note: solve.note,
-                        },
-                        sink,
-                    )
-                    .await?;
-                // Same idle marker the loop-driven path emits: the
-                // session accepts follow-up input either way.
-                if let Some(record) = session.tasks.last() {
-                    sink.emit(
-                        record.id,
-                        EventKind::AwaitingInput {
-                            session_id: session.id,
-                        },
-                    );
-                }
-                return Ok(summary);
+        {
+            let summary = self
+                .agent
+                .record_fast_path(
+                    session,
+                    input,
+                    loom_kernel::agent::FastPathSolve {
+                        kind: solve.kind.to_owned(),
+                        files_changed: solve.files_changed,
+                        note: solve.note,
+                    },
+                    sink,
+                )
+                .await?;
+            // Same idle marker the loop-driven path emits: the
+            // session accepts follow-up input either way.
+            if let Some(record) = session.tasks.last() {
+                sink.emit(
+                    record.id,
+                    EventKind::AwaitingInput {
+                        session_id: session.id,
+                    },
+                );
             }
+            return Ok(summary);
+        }
         let outcome = self.agent.run_task(session, input, sink, control).await;
         // The engine is idle again once the task's terminal event has been
         // emitted. The marker carries the ended task's id (envelope shape)
@@ -911,6 +928,68 @@ mod tests {
         let lib = std::fs::read_to_string(workspace.join("src/lib.rs")).expect("lib");
         assert!(lib.contains("pub fn parse_options() -> u32"));
         assert!(!lib.contains("parse_opts"));
+    }
+
+    /// A minimal cargo fixture whose manifest pins one dependency the
+    /// fast path can bump.
+    fn dependency_fixture(base: &std::path::Path) -> std::path::PathBuf {
+        let workspace = base.join("ws");
+        std::fs::create_dir_all(workspace.join("src")).expect("dirs");
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"fp_deps\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\ntiny-dep = \"1.0.0\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(
+            workspace.join("src/main.rs"),
+            "fn main() {\n    println!(\"hello\");\n}\n",
+        )
+        .expect("main");
+        workspace
+    }
+
+    #[tokio::test]
+    async fn fast_path_solves_a_dependency_update_with_zero_model_requests() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = dependency_fixture(base.path());
+        let mut config = test_config();
+        config.workspace = workspace.clone();
+        config.db_path = base.path().join("loom.db");
+        let engine = Engine::open_with(
+            config,
+            EngineOverrides {
+                provider: Some(Box::new(FakeProvider::scripted(vec![
+                    FakeProvider::end_turn_script("should never be asked"),
+                ]))),
+                ..EngineOverrides::default()
+            },
+        )
+        .expect("engine");
+
+        let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
+        let mut session = engine.new_session();
+        let summary = engine
+            .run_task(
+                &mut session,
+                "Update the dependency tiny-dep to 2.0.0.",
+                &sink,
+                &Default::default(),
+            )
+            .await
+            .expect("fast path task");
+
+        assert_eq!(summary.model_requests, 0, "no model calls were needed");
+        assert_eq!(summary.turns, 0);
+        let kinds = drain(&mut receiver);
+        assert!(kinds.contains(&EventKind::FastPathHit {
+            kind: "dependency".to_owned(),
+            files_changed: 1
+        }));
+        assert!(kinds.contains(&EventKind::TaskCompleted));
+        let manifest = std::fs::read_to_string(workspace.join("Cargo.toml")).expect("manifest");
+        assert!(manifest.contains("tiny-dep = \"2.0.0\""));
+        assert!(!manifest.contains("1.0.0"));
     }
 
     #[tokio::test]

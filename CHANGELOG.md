@@ -3,6 +3,66 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-10 — Leaked-descendant pipe hold no longer hangs collection
+
+A command that leaks a background process (a test suite spawning `sleep`,
+then exiting itself) left the harness waiting forever: the descendant
+inherited the output-pipe write-ends, so EOF never arrived after the direct
+child exited. `run_bounded` — the one execution path behind `run_command`,
+`verify`, `fusion`, and the fast paths — now waits on the direct child
+first, gives the stream readers a 2s grace window, reaps the whole process
+group if the pipes are still held (the group belongs to the command), and
+after one final bounded wait returns any still-held stream truncated with
+an explicit marker. Never a hang; the exit status always reaches the
+model; a reaped group yields the stream whole. Two tests cover both paths
+(group-reaped holder, `setsid`-escaped holder); tools suite 202.
+
+## 2026-10-10 — Dependency-update fast paths, ecosystem routing, dynamic models
+
+Three changes land together because they close the same audit: the
+fast-path seam's second slice, format routing by ecosystem, and the
+end of hardcoded model knowledge in the frontends.
+
+**Dependency updates (fast-path slice 2).** `update/bump <crate> to
+<version>` now solves with zero model invocations on Cargo projects:
+the analyzer parses the intent, `edit_manifest` rewrites only
+`[dependencies]`/`[dev-dependencies]`/`[build-dependencies]` entries
+of the exact simple shape `name = "x.y.z"` (inline tables, dotted
+keys, `.workspace` entries decline; indent and final newline
+preserved), and the result must verify with `cargo metadata
+--no-deps --offline` before it sticks — otherwise the snapshot
+restores and the agent loop takes over, byte-identical. Ecosystem
+routing: format intents name their toolchain (`cargo fmt` vs `gofmt`
+phrasing), routed via `detect_ecosystem`; Go verifies with `gofmt -l`
++ `go build ./...`. npm/Python/Make formats decline — no
+deterministic offline verifier for the edit class — and non-Cargo
+dependency bumps decline the same way, by design. A new lab fixture
+(FPATH4, ungated until the running campaign closes) measures the
+dependency lever; engine and tools tests grew to cover the grammar,
+manifest rewrite, and zero-request e2e solve.
+
+**No hardcoded models.** Model capabilities and pricing are now
+data, resolved at open: `Engine::open_async_with` fetches the
+OpenRouter catalog for *every* provider (with the OpenRouter
+credential; OpenRouter failures propagate, others fall back to
+built-in tables — catalog wins when both know the model). Replay
+tests derive capabilities from the recording itself (window floored
+at 8× the largest serialized request; tool/parallel/reasoning flags
+from the transcript) instead of any provider table. Pricing returns
+`Option<f64>` — provider-reported when present, price table or free
+tier when known, `unpriced` (never a panic) otherwise — and report
+JSONs now carry a `cost_source` field. Replay got honest about mixed
+dirs: recordings parse as `<task>-<model>-<run>` (longest task-id
+prefix, so `EXT-` ids replay again), 429-era empty shells are
+skipped, and failed-run recordings replay to their same failure —
+fidelity is the verbatim transcript and turn counts, not success.
+
+**Required flags.** `loom run` no longer defaults `--provider
+deepseek --model deepseek-flash`: both are required, as are the
+provider arguments to `auth login|switch|logout`. Loom picks no
+provider for you; examples now say `--provider nvidia --model
+z-ai/glm-5.3-flash`.
+
 ## 2026-10-10 — Global AGENTS.md support
 
 The harness already read project-level `AGENTS.md`/`CLAUDE.md` through

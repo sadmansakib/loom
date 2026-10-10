@@ -333,6 +333,19 @@ never assistant content or reasoning.
   counters), so transcripts and summaries stay honest about the model
   never being called. `EngineOverrides::fast_paths` (default on) gates
   the seam; the bare arm turns it off with loop shaping.
+- **Fast-path seam, second slice.** The same seam now also parses
+  dependency-update intents (`update/bump <crate> to <version>`) and
+  routes format intents by ecosystem: `detect_ecosystem` picks the
+  toolchain, so `gofmt` phrasing drives `gofmt -l` + `go build ./...`
+  verification on Go manifests while the Cargo path keeps `cargo fmt
+  --check` + `cargo check`. Dependency rewrites are strict: only the
+  `[dependencies]`/`[dev-dependencies]`/`[build-dependencies]` tables,
+  only simple `name = "x.y.z"` entries (inline tables, dotted keys,
+  `.workspace` entries decline), indent and final newline preserved,
+  then `cargo metadata --no-deps --offline` verifies the manifest
+  before the change sticks. Ecosystems without a deterministic
+  offline verifier for the edit class (npm, Python, Make) decline by
+  design — the never-worse contract outranks coverage.
 
 ---
 
@@ -537,6 +550,22 @@ in front — obtaining the OpenRouter model catalog through `engine::
 catalog` (fetch with the provider's own credential, cache beside the
 database, stale-cache fallback) when the config does not already carry
 one — so no frontend re-implements that sequencing.
+
+Capability resolution is catalog-first for every provider, not just
+OpenRouter: whatever provider the config names, `open_async_with`
+fetches the catalog with the OpenRouter credential (any OpenRouter
+account the keychain holds; only OpenRouter runs scope the account and
+base URL), and `resolve_capabilities` prefers the catalog's row for
+the model, falling back to the provider's built-in table when the
+catalog is unknown, unreachable, or silent about that model. Catalog
+wins when both know the model — a catalog refresh adds models and
+corrects windows with no code change — and the failure direction is
+safe: a stale table only serves as the floor. An OpenRouter run whose
+catalog fetch fails propagates the error (the catalog is that
+provider's source of truth); every other provider degrades silently
+to its table. No model id is a default anywhere: the CLI requires
+`--provider` and `--model` explicitly, and the eval harness takes
+them from its environment.
 
 The user-level instructions file is a frontend concern, not an engine
 one (ADR-008: the engine never reads the environment). `loom run`

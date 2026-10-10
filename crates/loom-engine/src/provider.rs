@@ -25,6 +25,29 @@ use crate::engine::{EngineConfig, EngineError};
 /// failing them mid-task.
 pub(crate) const MIN_CONTEXT_TOKENS: u32 = 64 * 1024;
 
+/// Resolves the configured model's capabilities: catalog before table.
+///
+/// The catalog — supplied by the frontend or fetched by `open_async` —
+/// is the dynamic authority: refreshing it adds models with no code
+/// change, which is the point of having one. When both sources know the
+/// model, the catalog wins; a smaller advertised window than the
+/// deployment's real one only makes the compiler prune earlier (safe),
+/// while the reverse direction would overflow. The adapter's built-in
+/// table is the offline fallback — deterministic, network-free — and
+/// when neither knows the model, `None` fails loud at setup rather than
+/// guessing a window.
+fn resolve_capabilities(
+    config: &EngineConfig,
+    provider: &dyn ModelProvider,
+) -> Option<ModelCapabilities> {
+    match config.catalog.as_ref() {
+        Some(ProviderCatalog::OpenRouter(catalog)) => catalog
+            .capabilities(&config.model)
+            .or_else(|| provider.capabilities(&config.model)),
+        None => provider.capabilities(&config.model),
+    }
+}
+
 /// A constructed provider plus the capabilities resolved for the
 /// configured model.
 pub(crate) struct ProviderHandle {
@@ -73,9 +96,8 @@ fn build_deepseek(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle
     }
     let provider = DeepSeekProvider::new(provider_config)
         .map_err(|error| EngineError::Provider(Box::new(error)))?;
-    let capabilities = provider
-        .capabilities(&config.model)
-        .ok_or_else(|| unknown_model(config))?;
+    let capabilities =
+        resolve_capabilities(config, &provider).ok_or_else(|| unknown_model(config))?;
     if !capabilities.reasoning {
         return Err(EngineError::ModelWithoutReasoning {
             model: config.model.clone(),
@@ -102,9 +124,8 @@ fn build_anthropic(config: &EngineConfig, api_key: &str) -> Result<ProviderHandl
     }
     let provider = AnthropicProvider::new(provider_config)
         .map_err(|error| EngineError::Provider(Box::new(error)))?;
-    let capabilities = provider
-        .capabilities(&config.model)
-        .ok_or_else(|| unknown_model(config))?;
+    let capabilities =
+        resolve_capabilities(config, &provider).ok_or_else(|| unknown_model(config))?;
     check_window(config, &capabilities)?;
     Ok(ProviderHandle {
         provider: Box::new(provider),
@@ -125,9 +146,8 @@ fn build_glm(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, Eng
     }
     let provider = GlmProvider::new(provider_config)
         .map_err(|error| EngineError::Provider(Box::new(error)))?;
-    let capabilities = provider
-        .capabilities(&config.model)
-        .ok_or_else(|| unknown_model(config))?;
+    let capabilities =
+        resolve_capabilities(config, &provider).ok_or_else(|| unknown_model(config))?;
     if !capabilities.reasoning {
         return Err(EngineError::ModelWithoutReasoning {
             model: config.model.clone(),
@@ -153,9 +173,8 @@ fn build_nvidia(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, 
     }
     let provider = NvidiaProvider::new(provider_config)
         .map_err(|error| EngineError::Provider(Box::new(error)))?;
-    let capabilities = provider
-        .capabilities(&config.model)
-        .ok_or_else(|| unknown_model(config))?;
+    let capabilities =
+        resolve_capabilities(config, &provider).ok_or_else(|| unknown_model(config))?;
     if !capabilities.reasoning {
         return Err(EngineError::ModelWithoutReasoning {
             model: config.model.clone(),

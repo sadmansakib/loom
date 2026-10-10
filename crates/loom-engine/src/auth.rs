@@ -533,8 +533,7 @@ impl Default for KeychainBackend {
 static DEFAULT_STORE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 /// Linux: whether the fallback to the kernel keyutils store ran already.
 #[cfg(target_os = "linux")]
-static KEYUTILS_FALLBACK: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static KEYUTILS_FALLBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Installs this platform's default credential store exactly once.
 ///
@@ -636,8 +635,10 @@ fn with_store<T>(
 
 impl SecretBackend for KeychainBackend {
     fn set(&self, id: &AccountId, secret: &str) -> Result<(), AuthError> {
-        with_store(&self.service, id.as_str(), |entry| entry.set_password(secret))
-            .map_err(|error| AuthError::SecretBackend(error.to_string()))
+        with_store(&self.service, id.as_str(), |entry| {
+            entry.set_password(secret)
+        })
+        .map_err(|error| AuthError::SecretBackend(error.to_string()))
     }
 
     fn get(&self, id: &AccountId) -> Result<Option<String>, AuthError> {
@@ -649,7 +650,9 @@ impl SecretBackend for KeychainBackend {
     }
 
     fn delete(&self, id: &AccountId) -> Result<(), AuthError> {
-        match with_store(&self.service, id.as_str(), |entry| entry.delete_credential()) {
+        match with_store(&self.service, id.as_str(), |entry| {
+            entry.delete_credential()
+        }) {
             Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
             Err(error) => Err(AuthError::SecretBackend(error.to_string())),
         }
