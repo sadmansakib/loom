@@ -274,6 +274,17 @@ fn render(
         push_streams(&mut text, &raw, &stderr);
         None
     };
+    // A `bwrap:` line on a failed run means the wrapper died *before*
+    // the command executed — host policy, not the agent's command — so
+    // the output gets actionable remediation instead of reading as a
+    // defect in what was asked for. Ordinary failures match nothing
+    // and stay unannotated (docs/linux-sandbox.md).
+    if !output.status.success()
+        && let Some(remediation) = crate::sandbox::bwrap_remediation(&stderr)
+    {
+        text.push_str("\n--- sandbox ---\n");
+        text.push_str(&remediation);
+    }
     // Errors live at the tail, so keep both ends (ADR-014). The status line and
     // early output survive at the head; the last lines of stderr survive at the
     // tail; the explicit marker names what was dropped.

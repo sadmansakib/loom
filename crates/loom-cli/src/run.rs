@@ -26,6 +26,20 @@ use loom_core::engine::trace::{Outcome, TraceMeta, TraceWriter};
 /// (`130` for a user stop — cancellation or pause — `1` otherwise); only
 /// setup failures propagate as `Err`.
 pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
+    // The sandbox preflight fails at setup, not mid-task: on a host
+    // whose policy denies unprivileged user namespaces (Ubuntu 24.04+
+    // by default) every sandboxed `run_command`/`verify` would fail one
+    // by one with an opaque `bwrap:` line. On macOS and pass-through
+    // targets this is a no-op (loom_core::tools::sandbox::preflight).
+    if std::env::var_os("LOOM_SKIP_SANDBOX_PREFLIGHT").is_none()
+        && let Err(error) = loom_core::tools::sandbox::preflight()
+    {
+        anyhow::bail!(
+            "sandbox preflight failed at setup:\n{error}\n\
+             (Set LOOM_SKIP_SANDBOX_PREFLIGHT=1 to attempt the run anyway.)"
+        );
+    }
+
     // The runtime exists before the engine opens: the provider's requests
     // (and, for OpenRouter, the catalog fetch inside `open_async`) need a
     // reactor, and Ctrl-C arrives as a tokio signal.

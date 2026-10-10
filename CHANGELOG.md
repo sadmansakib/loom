@@ -3,6 +3,36 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-10 — Linux gaps: sandbox preflight, error mapping, headless keyring
+
+Two Linux failures that read as Loom bugs but are host policy now fail
+at setup with actionable fixes. First, the sandbox preflight:
+`loom run` executes the same bwrap smoke command CI uses (pid/net
+namespace + ro-bind /usr + tmpfs /tmp) before the task starts —
+`loom_core::tools::sandbox::preflight()`, a no-op on macOS — so an
+Ubuntu 24.04+ host denying unprivileged user namespaces
+(`kernel.apparmor_restrict_unprivileged_userns=1`) fails once at setup
+instead of failing every `run_command`/`verify` mid-task with a bare
+`bwrap: setting up uid map: Permission denied`. Escape hatch:
+`LOOM_SKIP_SANDBOX_PREFLIGHT=1`. Any failed command whose stderr
+carries a `bwrap:` setup signature also gets a remediation block
+appended (AppArmor per-binary `userns` profile → `bubblewrap-suid` →
+host-wide sysctl, plus container seccomp flags and the
+`.loom/commands.toml` `sandbox = false` opt-out); ordinary command
+failures are never annotated. `docs/linux-sandbox.md` carries the
+distro matrix, the AppArmor profile stanza for the loom binary, and
+both escape hatches. Second, headless credential storage: loom-engine
+now links `keyring-core` with explicit stores instead of the all-in
+`keyring` crate — macOS uses the Keychain directly; Linux starts on
+the Secret Service (persistent, needs session D-Bus) and falls back
+once, on a platform/storage failure, to the kernel keyutils store
+(always present, headless-safe, in-memory), after which resolution
+falls through to the environment names as designed (§18.3) and
+`loom auth login` still works. Five new tests (preflight no-op probe,
+AppArmor/seccomp/generic bwrap remediation classification, ordinary
+failures left unannotated); workspace suite green at 745 passing.
+
+
 ## 2026-10-10 — Artifacts lifecycle (roadmap item 17)
 
 Artifact bodies were immortal: written before the turn that references

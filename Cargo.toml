@@ -15,11 +15,11 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-# Raised from 1.85 for `keyring` 4.x (1.88), the CLI's OS-keychain backend
-# (ADR-009). Raised again from 1.88 because `uuid` 1.27 (v7 ids) declares
-# rust-version 1.89, so the floor was unsatisfiable: a 1.88 toolchain failed
-# at dependency resolution, not at compilation. Verified by building the
-# workspace on 1.89.
+# Raised from 1.85 for the `keyring-core` 1.x stack (1.88 MSRV), the CLI's
+# OS-keychain backend (ADR-009). Raised again from 1.88 because `uuid` 1.27
+# (v7 ids) declares rust-version 1.89, so the floor was unsatisfiable: a
+# 1.88 toolchain failed at dependency resolution, not at compilation.
+# Verified by building the workspace on 1.89.
 rust-version = "1.89"
 
 [workspace.dependencies]
@@ -86,9 +86,14 @@ clap = { version = "4.6.7", features = ["derive"] }
 
 # CLI state + credentials (iteration 1H pulls these forward from iteration 2,
 # ADR-008/ADR-009). `bundled` ships SQLite with FTS5/JSON1 so behaviour does
-# not depend on the system library. `keyring` uses the OS keychain by default.
+# not depend on the system library. `keyring-core` with explicit stores:
+# the macOS Keychain directly, and on Linux the Secret Service with a
+# kernel-keyutils fallback for headless hosts (no session D-Bus).
 rusqlite = { version = "0.40.2", features = ["bundled"] }
-keyring = "4.2.0"
+keyring-core = "1"
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
+linux-keyutils-keyring-store = "1"
 # Hidden secret prompt for `loom auth login` (no echo in a terminal).
 rpassword = "7.5.4"
 

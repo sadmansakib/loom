@@ -21,10 +21,20 @@ tracing = { workspace = true }
 rusqlite = { workspace = true }
 # o200k tokenizer for the engine's token estimates (kernel stays pure)
 tiktoken-rs = { workspace = true }
-keyring = { workspace = true }
+# Credential store: keyring-core with explicit per-platform stores — on
+# Linux the Secret Service with a kernel-keyutils fallback for headless
+# hosts (no session D-Bus), on macOS the Keychain directly.
+keyring-core = { workspace = true }
 uuid = { workspace = true }
 # CancellationToken crosses the driving API (§6.6).
 tokio-util = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus-secret-service-keyring-store = { workspace = true }
+linux-keyutils-keyring-store = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
