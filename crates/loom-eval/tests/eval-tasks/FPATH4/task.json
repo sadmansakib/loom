@@ -1,6 +1,6 @@
 {
   "id": "FPATH4",
-  "prompt": "Update the dependency tiny-dep to 2.0.0.",
+  "prompt": "Update the dependency bitflags to 2.0.0.",
   "tools": "coding",
   "heavy": false,
   "tier": "s",
@@ -10,7 +10,7 @@
     "contains": [
       [
         "Cargo.toml",
-        "tiny-dep = \"2.0.0\""
+        "bitflags = \"2.0.0\""
       ]
     ],
     "tests_green": 1

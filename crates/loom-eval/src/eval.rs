@@ -2231,6 +2231,62 @@ async fn outcome_gates_reject_an_untouched_workspace() {
     assert!(saw_b3, "the B3 task must exist");
 }
 
+/// The positive counterpart to the rejection test: each fast-path
+/// outcome task's canonical solve must actually pass its gate. FPATH3's
+/// solve is `cargo fmt` (the format fast path's exact action); FPATH4's
+/// is the one-line manifest bump (the dependency fast path's exact
+/// action). This keeps an exact-file gate from drifting out of reach —
+/// a hand-written expectation the real formatter no longer produces —
+/// and a tests-green gate from demanding a count a test-less suite can
+/// never report.
+#[tokio::test]
+async fn outcome_gate_solves_are_satisfiable() {
+    let mut seen = 0;
+    for task in tasks() {
+        if !matches!(task.id.as_str(), "FPATH3" | "FPATH4") {
+            continue;
+        }
+        let Some(gate) = task.gate.as_ref() else {
+            panic!("{}: must stay gated", task.id);
+        };
+        let TaskWorkspace::Copy(src) = &task.workspace else {
+            panic!("{}: must use a copy workspace", task.id);
+        };
+        let root = run_root(&task.id);
+        ensure_copy(src, &root);
+        match task.id.as_str() {
+            // The format fast path's exact action.
+            "FPATH3" => {
+                let status = std::process::Command::new("cargo")
+                    .arg("fmt")
+                    .current_dir(&root)
+                    .status()
+                    .expect("cargo fmt");
+                assert!(status.success(), "FPATH3: cargo fmt must succeed");
+            }
+            // The dependency fast path's exact action: the one-line bump.
+            "FPATH4" => {
+                let manifest = root.join("Cargo.toml");
+                let body = std::fs::read_to_string(&manifest).expect("read Cargo.toml");
+                let bumped = body.replace("bitflags = \"1.0.0\"", "bitflags = \"2.0.0\"");
+                assert_ne!(bumped, body, "FPATH4: seed must carry bitflags 1.0.0");
+                std::fs::write(&manifest, bumped).expect("write Cargo.toml");
+            }
+            _ => unreachable!(),
+        }
+        let graded = grade_gate(Some(gate), &root, None, true)
+            .await
+            .expect("gated");
+        assert_eq!(
+            graded["bug_fixed"], true,
+            "{}: the canonical solve must pass its gate: {graded}",
+            task.id
+        );
+        seen += 1;
+    }
+    assert_eq!(seen, 2, "FPATH3 and FPATH4 must both exist");
+}
+
 /// The invariant under test (V3, Invariant 10): replaying recorded
 /// responses through the real engine + real tools reproduces the recorded
 /// assistant turns verbatim in the transcript.
