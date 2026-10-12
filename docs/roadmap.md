@@ -123,7 +123,7 @@ iterations may start early where a backlog item is cheap and measured.
 | # | Iteration | Status | Backlog items |
 |---|---|---|---|
 | 1 | Core service | **Done** | — (see Shipped) |
-| 2 | Core efficiency & repository intelligence | **In progress (current)** | 1, 3✓, 4✓, 5✓ᴬ, 6✓, 7✗, 8✓ᴬ, 10✓ᴬ, 11⏸, 12⏸, 16, 17✓ |
+| 2 | Core efficiency & repository intelligence | **In progress (current)** | 1, 3✓, 4✓, 5✓ᴬ, 6✓, 7✗, 8✓ᴬ, 10✓ᴬ, 11⏸, 12✓, 16, 17✓ |
 | 3 | Intelligent subagent scheduling | Not started | 19, 21 |
 | 4 | Execution safety & richer tools | **Largely shipped early** | 2✓, 13⏸, 23 |
 | 5 | Skills & contextual knowledge | Partial (AGENTS.md facts) | 4✓ (instructions), 20.4 |
