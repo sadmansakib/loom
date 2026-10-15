@@ -33,6 +33,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::artifact::ArtifactRef;
+use crate::session::{TodoList, TodoStatus};
 use crate::store::ArtifactStore;
 use crate::tool_cache::ToolCache;
 
@@ -220,6 +221,13 @@ pub struct ToolContext {
     /// duplicates of in-view output spends context twice. Hits whose
     /// original has been compacted away fall back to the full content.
     pub projected_calls: HashSet<String>,
+    /// The session's kernel-owned todo list (roadmap item 8 phase B),
+    /// shared between the loop and the `todo` tool for one tool batch:
+    /// the loop seeds it from the session, the tool mutates it, and the
+    /// loop copies the value back before the turn ends. `None` on
+    /// contexts built without todo state — the `todo` tool then fails
+    /// with [`ToolError::Execution`] rather than silently dropping edits.
+    pub todos: Option<Arc<Mutex<TodoList>>>,
 }
 
 /// Cap on [`ToolContext::recent_changes`]: the most recent mutations are
@@ -245,6 +253,7 @@ impl std::fmt::Debug for ToolContext {
             .field("recent_changes", &recent_changes)
             .field("cache", &self.cache.is_some())
             .field("projected_calls", &self.projected_calls.len())
+            .field("todos", &self.todos.is_some())
             .finish()
     }
 }
@@ -268,6 +277,7 @@ impl ToolContext {
             recent_changes: Arc::new(Mutex::new(Vec::new())),
             cache: None,
             projected_calls: HashSet::new(),
+            todos: None,
         }
     }
 
@@ -301,6 +311,15 @@ impl ToolContext {
     #[must_use]
     pub fn with_projected_calls(mut self, projected_calls: HashSet<String>) -> Self {
         self.projected_calls = projected_calls;
+        self
+    }
+
+    /// Attaches the session's todo list for this batch (builder style,
+    /// roadmap item 8 phase B); the `todo` tool reads and mutates
+    /// through this handle and the loop copies the value back.
+    #[must_use]
+    pub fn with_todos(mut self, todos: Option<Arc<Mutex<TodoList>>>) -> Self {
+        self.todos = todos;
         self
     }
 
@@ -664,6 +683,206 @@ impl ToolRegistry {
     }
 }
 
+/// The virtual workspace-relative cell a mutating `todo` op writes.
+///
+/// The list lives in kernel session state, not the filesystem. Declaring
+/// one shared write path lets the scheduler serialize concurrent `todo`
+/// ops in model order — so assigned ids stay deterministic — while file
+/// tools never contend with them (the path is not a real file any tool
+/// reads or writes).
+const TODO_STATE_PATH: &str = ".loom/todo";
+
+/// The kernel-owned `todo` tool (roadmap item 8 phase B): create, add,
+/// mark, and read the session's plan list.
+///
+/// This is the one concrete tool the kernel itself implements: its state
+/// is per-session ([`crate::session::TodoList`]), so it must mutate
+/// through the [`ToolContext::todos`] handle the agent loop seeds from
+/// the session — a seam only the kernel can own. Every other tool stays
+/// in `loom-tools` (ADR-001).
+///
+/// Results are deliberately terse (`added 3: write tests`); the loop,
+/// not the tool, re-appends the full rendered list at the transcript
+/// tail when a batch changed it, so the model sees the current plan in
+/// every later projection without the tool result duplicating it. The
+/// `read` op is the exception — it returns the rendered block itself.
+///
+/// The input schema is hand-written rather than generated (ADR-005
+/// addendum 1 uses `schemars`, a dependency the kernel deliberately
+/// does not carry); the parser below is the source of truth and the two
+/// are pinned by unit test.
+#[derive(Debug, Default)]
+pub struct TodoTool;
+
+impl TodoTool {
+    /// Creates the tool. Stateless: the list arrives per call through
+    /// [`ToolContext::todos`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+/// The `todo` tool's input, parsed with serde (`op` selects the rest).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TodoInput {
+    /// Operation: `"create"`, `"add"`, `"mark"`, or `"read"`.
+    op: String,
+    /// Item text for `"add"`.
+    #[serde(default)]
+    text: Option<String>,
+    /// Seed texts for `"create"` (a fresh list); defaults to empty.
+    #[serde(default)]
+    items: Option<Vec<String>>,
+    /// Item id for `"mark"`.
+    #[serde(default)]
+    id: Option<String>,
+    /// Target status for `"mark"`: `pending`, `in_progress`, `done`, or
+    /// `cancelled`.
+    #[serde(default)]
+    status: Option<String>,
+}
+
+impl Tool for TodoTool {
+    fn spec(&self) -> &ToolSpec {
+        static SPEC: std::sync::OnceLock<ToolSpec> = std::sync::OnceLock::new();
+        SPEC.get_or_init(|| ToolSpec {
+            name: "todo".to_owned(),
+            description: "Manages the session's kernel-owned todo list: the plan \
+                          you are executing. Create the list when a task has \
+                          multiple steps, add steps as they are discovered, mark \
+                          them in_progress when started and done/cancelled when \
+                          settled, and read to see the current list. The current \
+                          list is re-shown at the end of the context whenever it \
+                          changes; keep it current."
+                .to_owned(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "op": {
+                        "type": "string",
+                        "enum": ["create", "add", "mark", "read"],
+                        "description": "Operation: create a fresh list (optional \
+                                        `items` seed texts), add a step (`text`), \
+                                        set a step's status (`id` + `status`), or \
+                                        read the current list."
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "The step text, for op=add."
+                    },
+                    "items": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Seed step texts, for op=create. Optional."
+                    },
+                    "id": {
+                        "type": "string",
+                        "description": "The step id to update, for op=mark."
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "in_progress", "done", "cancelled"],
+                        "description": "The status to set, for op=mark."
+                    }
+                },
+                "required": ["op"],
+                "additionalProperties": false
+            }),
+        })
+    }
+
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    fn touched_paths(&self, input: &Value) -> Option<Vec<PathTouch>> {
+        // A mutating op writes one virtual cell, serializing concurrent
+        // todo ops in model order; `read` (and anything that will fail
+        // validation) touches nothing.
+        let op = input.get("op").and_then(Value::as_str);
+        match op {
+            Some("create" | "add" | "mark") => Some(vec![PathTouch::write(TODO_STATE_PATH)]),
+            _ => Some(Vec::new()),
+        }
+    }
+
+    fn call<'a>(
+        &'a self,
+        input: Value,
+        ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
+        Box::pin(async move {
+            let input: TodoInput = serde_json::from_value(input)
+                .map_err(|error| ToolError::InvalidInput(format!("invalid arguments: {error}")))?;
+            let mut todos = ctx
+                .todos
+                .as_ref()
+                .ok_or_else(|| {
+                    ToolError::Execution("todo state is not attached to this call".to_owned())
+                })?
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match input.op.as_str() {
+                "create" => {
+                    let items = input.items.unwrap_or_default();
+                    let count = items.len();
+                    todos.replace(items);
+                    Ok(ToolOutput::new(format!(
+                        "created list with {count} item{}",
+                        if count == 1 { "" } else { "s" }
+                    )))
+                }
+                "add" => {
+                    let text = input.text.filter(|text| !text.trim().is_empty());
+                    let Some(text) = text else {
+                        return Err(ToolError::InvalidInput(
+                            "op=add requires a non-empty `text`".to_owned(),
+                        ));
+                    };
+                    let id = todos.add(text);
+                    Ok(ToolOutput::new(format!("added {id}")))
+                }
+                "mark" => {
+                    let Some(id) = input.id else {
+                        return Err(ToolError::InvalidInput(
+                            "op=mark requires an `id`".to_owned(),
+                        ));
+                    };
+                    let Some(wire) = input.status else {
+                        return Err(ToolError::InvalidInput(
+                            "op=mark requires a `status` of pending, in_progress, done, \
+                             or cancelled"
+                                .to_owned(),
+                        ));
+                    };
+                    let Some(status) = TodoStatus::parse(&wire) else {
+                        return Err(ToolError::InvalidInput(format!(
+                            "unknown status {wire:?}; use pending, in_progress, done, \
+                             or cancelled"
+                        )));
+                    };
+                    if !todos.mark(&id, status) {
+                        return Err(ToolError::InvalidInput(format!(
+                            "unknown todo id {id:?}; use `read` to see the list"
+                        )));
+                    }
+                    Ok(ToolOutput::new(format!("marked {id} as {wire}")))
+                }
+                "read" => Ok(ToolOutput::new(if todos.is_empty() {
+                    "(todo list is empty)".to_owned()
+                } else {
+                    todos.render()
+                })),
+                other => Err(ToolError::InvalidInput(format!(
+                    "unknown op {other:?}; use create, add, mark, or read"
+                ))),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,6 +1031,143 @@ mod tests {
         );
         // The first registration is untouched.
         assert_eq!(registry.len(), 1);
+    }
+
+    /// A context with a todo list attached, plus the handle to read it
+    /// back after the call — the shape the agent loop uses.
+    fn todo_ctx() -> (ToolContext, Arc<Mutex<crate::session::TodoList>>) {
+        let todos = Arc::new(Mutex::new(crate::session::TodoList::default()));
+        let ctx = ToolContext::new(
+            PathBuf::from("/tmp/workspace"),
+            CancellationToken::new(),
+            Duration::from_secs(30),
+        )
+        .with_todos(Some(todos.clone()));
+        (ctx, todos)
+    }
+
+    fn call_todo(input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let tool: Box<dyn Tool> = Box::new(TodoTool::new());
+        futures::executor::block_on(tool.call(input, ctx))
+    }
+
+    #[test]
+    fn todo_add_assigns_stable_ids_and_confirms_terse() {
+        let (ctx, todos) = todo_ctx();
+        let first =
+            call_todo(json!({"op": "add", "text": "write the test"}), &ctx).expect("add succeeds");
+        assert_eq!(first.content, "added 1");
+        let second =
+            call_todo(json!({"op": "add", "text": "fix the bug"}), &ctx).expect("add succeeds");
+        assert_eq!(second.content, "added 2");
+        let list = todos.lock().unwrap();
+        assert_eq!(list.items.len(), 2);
+        assert_eq!(list.items[0].id, "1");
+        assert_eq!(list.items[1].text, "fix the bug");
+    }
+
+    #[test]
+    fn todo_create_replaces_and_read_renders_the_list() {
+        let (ctx, todos) = todo_ctx();
+        call_todo(json!({"op": "add", "text": "stale step"}), &ctx).unwrap();
+        let created = call_todo(json!({"op": "create", "items": ["one", "two"]}), &ctx)
+            .expect("create succeeds");
+        assert_eq!(created.content, "created list with 2 items");
+
+        let read = call_todo(json!({"op": "read"}), &ctx).expect("read succeeds");
+        assert_eq!(
+            read.content, "## todo (kernel)\n- [ ] 2: one\n- [ ] 3: two",
+            "read returns the rendered block; ids never restart"
+        );
+        assert!(todos.lock().unwrap().items[0].id != "1");
+    }
+
+    #[test]
+    fn todo_mark_updates_status_and_rejects_unknown_ids() {
+        let (ctx, todos) = todo_ctx();
+        call_todo(json!({"op": "add", "text": "step"}), &ctx).unwrap();
+        for status in ["in_progress", "done", "cancelled", "pending"] {
+            let marked = call_todo(json!({"op": "mark", "id": "1", "status": status}), &ctx)
+                .expect("mark succeeds");
+            assert_eq!(marked.content, format!("marked 1 as {status}"));
+        }
+        assert_eq!(todos.lock().unwrap().items[0].status, TodoStatus::Pending);
+
+        let err = call_todo(json!({"op": "mark", "id": "9", "status": "done"}), &ctx)
+            .expect_err("unknown id");
+        assert!(err.to_string().contains("unknown todo id"), "{err:?}");
+        // A rejected mark changed nothing.
+        assert_eq!(todos.lock().unwrap().revision, 5);
+    }
+
+    #[test]
+    fn todo_rejects_a_bad_op_and_missing_fields() {
+        let (ctx, _todos) = todo_ctx();
+        for bad in [
+            json!({"op": "delete"}),
+            json!({"op": "add"}),
+            json!({"op": "add", "text": "   "}),
+            json!({"op": "mark", "id": "1"}),
+            json!({"op": "mark", "id": "1", "status": "finished"}),
+            json!({"text": "no op"}),
+            json!({"op": "read", "unexpected": true}),
+        ] {
+            let err = call_todo(bad, &ctx).expect_err("input must be rejected");
+            assert!(matches!(err, ToolError::InvalidInput(_)), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn todo_without_attached_state_fails_execution() {
+        let ctx = ToolContext::new(
+            PathBuf::from("/tmp/workspace"),
+            CancellationToken::new(),
+            Duration::from_secs(30),
+        );
+        let err = call_todo(json!({"op": "read"}), &ctx).expect_err("no todo state attached");
+        assert!(matches!(err, ToolError::Execution(_)), "{err:?}");
+    }
+
+    #[test]
+    fn todo_declares_one_virtual_write_cell_for_mutating_ops() {
+        let tool = TodoTool::new();
+        assert!(!tool.is_read_only());
+        // Mutating ops serialize against each other via one shared path.
+        for op in ["create", "add", "mark"] {
+            let touched = tool.touched_paths(&json!({"op": op})).expect("declared");
+            assert_eq!(touched.len(), 1);
+            assert_eq!(touched[0].access, PathAccess::Write);
+        }
+        // Read (and unparseable input) touches nothing.
+        assert_eq!(tool.touched_paths(&json!({"op": "read"})), Some(Vec::new()));
+        assert_eq!(tool.touched_paths(&json!({})), Some(Vec::new()));
+    }
+
+    #[test]
+    fn todo_spec_schema_matches_the_parser() {
+        // The schema is hand-written (the kernel carries no schemars);
+        // pin the shape the parser enforces so the two cannot drift.
+        let tool = TodoTool::new();
+        let parameters = tool.spec().parameters.clone();
+        assert_eq!(parameters["type"], "object");
+        assert_eq!(parameters["additionalProperties"], false);
+        assert_eq!(parameters["required"], json!(["op"]));
+        assert_eq!(
+            parameters["properties"]["op"]["enum"]
+                .as_array()
+                .map(Vec::len),
+            Some(4)
+        );
+        assert_eq!(
+            parameters["properties"]["status"]["enum"]
+                .as_array()
+                .map(Vec::len),
+            Some(4)
+        );
+        // Every advertised op parses; every op's fields exist in the schema.
+        for field in ["op", "text", "items", "id", "status"] {
+            assert!(parameters["properties"][field].is_object(), "{field}");
+        }
     }
 
     /// Second distinct tool so ordering tests are meaningful.

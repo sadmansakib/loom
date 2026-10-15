@@ -28,6 +28,8 @@
 use crate::context::PruneReport;
 use crate::id::{SessionId, TaskId};
 use crate::model::{ModelErrorKind, ModelResponse};
+use crate::session::TodoItem;
+use crate::store::SharedEventStore;
 use crate::transcript::ToolCallId;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -69,7 +71,10 @@ use tokio_util::sync::CancellationToken;
 /// or recording — fixed the model's capabilities), and
 /// `HarnessNotice` (per-command deviations such as an unconfined
 /// sandbox or a truncated stream, carried out of the tools layer).
-pub const EVENT_SCHEMA_VERSION: u16 = 8;
+/// v9 adds `TodoUpdated` (roadmap item 8 phase B: the kernel-owned todo
+/// list changed during a turn's tool batch; replaying the events
+/// reconstructs the list, and each event marks one tail re-append).
+pub const EVENT_SCHEMA_VERSION: u16 = 9;
 
 /// One observed occurrence during a task, wrapped for the wire.
 ///
@@ -255,6 +260,21 @@ pub enum EventKind {
         name: String,
         /// Correlation id of the finished call.
         call_id: ToolCallId,
+    },
+    /// The kernel-owned todo list changed during the turn's tool batch
+    /// (roadmap item 8 phase B): a `todo` create/add/mark bumped its
+    /// revision. Emitted once per turn whose batch mutated the list,
+    /// after the turn commits and after the new block is durable at the
+    /// transcript tail. The payload carries the complete list after the
+    /// change, so replaying the `TodoUpdated` events reconstructs both
+    /// the list and every tail re-append byte-stably — each event is
+    /// exactly one re-append of [`TodoList::render`]'s output.
+    TodoUpdated {
+        /// The list's revision after the change; bumped on every
+        /// mutation, never reset.
+        revision: u64,
+        /// The complete item list after the change, in list order.
+        items: Vec<TodoItem>,
     },
     /// The task reached terminal success.
     TaskCompleted,
@@ -670,6 +690,103 @@ impl<S: EventSink> EventSink for StrictSink<S> {
     }
 }
 
+/// An [`EventSink`] that persists every event it observes to an
+/// [`EventStore`] before forwarding it to a wrapped sink (roadmap item
+/// 1's open tail: persist the event stream alongside the transcript).
+///
+/// Composition: the engine wraps the frontend's sink in one of these
+/// when session persistence is on, so the durable stream sees exactly
+/// what the frontend saw — same events, same order, including the
+/// engine-level markers the driving layer emits after a task. Write
+/// cadence matches the transcript seams: **append-on-emit**, each
+/// envelope durable before it reaches the inner consumer
+/// (persist-then-forward, mirroring ADR-012's persist-then-commit).
+///
+/// The sink numbers its **own** stream (unique, strictly increasing
+/// from 0) exactly like any other sink: `sequence` is per sink, so a
+/// resumed session's second run numbers from zero again and the store
+/// orders rows by insertion, not by sequence. The send-side lock spans
+/// numbering, persist, and forward, so both the stored rows and the
+/// inner consumer see events in sequence order.
+///
+/// Persistence is best-effort (ADR-004): a store failure is counted —
+/// surfaced through [`dropped`](EventSink::dropped) alongside the inner
+/// sink's own drops — and warned once, never propagated. Observability
+/// must not fail a task, not even when its durability hiccups.
+pub struct PersistingEventSink<'a> {
+    store: SharedEventStore,
+    session: SessionId,
+    inner: &'a dyn EventSink,
+    state: Arc<PersistState>,
+}
+
+/// Shared numbering and failure state; the lock is held across one
+/// `emit` and never across an await.
+struct PersistState {
+    sequence: AtomicU64,
+    persist_failures: AtomicU64,
+    warned: AtomicBool,
+    send_lock: std::sync::Mutex<()>,
+}
+
+impl<'a> PersistingEventSink<'a> {
+    /// Wraps `inner` so every event is appended to `store` under
+    /// `session` before `inner` sees it.
+    pub fn new(store: SharedEventStore, session: SessionId, inner: &'a dyn EventSink) -> Self {
+        Self {
+            store,
+            session,
+            inner,
+            state: Arc::new(PersistState {
+                sequence: AtomicU64::new(0),
+                persist_failures: AtomicU64::new(0),
+                warned: AtomicBool::new(false),
+                send_lock: std::sync::Mutex::new(()),
+            }),
+        }
+    }
+
+    /// Events whose persistence failed so far.
+    pub fn persist_failures(&self) -> u64 {
+        self.state.persist_failures.load(Ordering::Relaxed)
+    }
+}
+
+impl EventSink for PersistingEventSink<'_> {
+    fn emit(&self, task_id: TaskId, kind: EventKind) {
+        // The lock spans numbering, persist, and forward: both the
+        // stored rows and the inner consumer observe sequence order.
+        // The critical section is tiny and never held across an await.
+        let _guard = self.state.send_lock.lock().unwrap_or_else(|poisoned| {
+            // A panic in another emitter poisoned the lock; the state
+            // it protects (counters, store) is still consistent, so
+            // keep going rather than failing the task.
+            poisoned.into_inner()
+        });
+        let sequence = self.state.sequence.fetch_add(1, Ordering::Relaxed);
+        let envelope = EventEnvelope {
+            schema_version: EVENT_SCHEMA_VERSION,
+            sequence,
+            task_id,
+            kind,
+        };
+        if let Err(error) = self.store.append_event(&self.session, &envelope) {
+            // Counted, not fatal: the event still forwards, and the
+            // task keeps running (ADR-004). Warn once, then stay quiet
+            // — the count carries the ongoing signal.
+            let failures = self.state.persist_failures.fetch_add(1, Ordering::Relaxed) + 1;
+            if !self.state.warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(failures, %error, "event persistence failed; further failures counted only");
+            }
+        }
+        self.inner.emit(envelope.task_id, envelope.kind);
+    }
+
+    fn dropped(&self) -> u64 {
+        self.persist_failures() + self.inner.dropped()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1037,6 +1154,112 @@ mod tests {
         assert_eq!(sink.dropped(), 0);
     }
 
+    /// An event store that always fails, to pin the best-effort
+    /// contract: persistence failures are counted, never propagated.
+    struct FailingStore;
+
+    impl crate::store::EventStore for FailingStore {
+        fn append_event(
+            &self,
+            _session: &SessionId,
+            _envelope: &EventEnvelope,
+        ) -> Result<(), crate::store::StoreError> {
+            Err(crate::store::StoreError::Backend("disk gone".to_owned()))
+        }
+
+        fn load_events(
+            &self,
+            _session: &SessionId,
+        ) -> Result<Vec<EventEnvelope>, crate::store::StoreError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn persisting_sink_round_trips_through_the_store() {
+        use crate::store::{EventStore, MemoryEventStore};
+
+        let session = SessionId::new();
+        let store = std::sync::Arc::new(MemoryEventStore::with_session(session));
+        let (inner, mut receiver) = ChannelEventSink::new();
+
+        let sink = PersistingEventSink::new(store.clone(), session, &inner);
+        let task = TaskId::new();
+        sink.emit(task, EventKind::TaskStarted);
+        sink.emit(task, EventKind::TurnStarted { turn: 1 });
+        sink.emit(
+            task,
+            EventKind::ModelRetry {
+                attempt: 1,
+                kind: ModelErrorKind::RateLimited,
+                delay_ms: 500,
+                response_started: false,
+            },
+        );
+
+        // The inner consumer still receives everything, in order.
+        let mut seen = 0u64;
+        while let Ok(event) = receiver.try_recv() {
+            assert_eq!(event.sequence, seen);
+            seen += 1;
+        }
+        assert_eq!(seen, 3);
+
+        // The stored stream round-trips intact: same envelopes, same
+        // order, sequence contiguous from zero.
+        let stored = store.load_events(&session).unwrap();
+        assert_eq!(stored.len(), 3);
+        for (index, event) in stored.iter().enumerate() {
+            assert_eq!(event.sequence, index as u64);
+            assert_eq!(event.task_id, task);
+            assert_eq!(event.schema_version, EVENT_SCHEMA_VERSION);
+        }
+        assert_eq!(
+            stored[2].kind,
+            EventKind::ModelRetry {
+                attempt: 1,
+                kind: ModelErrorKind::RateLimited,
+                delay_ms: 500,
+                response_started: false,
+            }
+        );
+        assert_eq!(sink.persist_failures(), 0);
+        assert_eq!(sink.dropped(), 0);
+    }
+
+    #[test]
+    fn persisting_failures_are_counted_and_never_fatal() {
+        let (inner, receiver) = ChannelEventSink::new();
+        drop(receiver); // the inner consumer is gone too: both loss paths fire
+
+        let sink =
+            PersistingEventSink::new(std::sync::Arc::new(FailingStore), SessionId::new(), &inner);
+        let task = TaskId::new();
+        sink.emit(task, EventKind::TaskStarted);
+        sink.emit(task, EventKind::TaskCompleted);
+
+        assert_eq!(sink.persist_failures(), 2);
+        assert_eq!(sink.dropped(), 4, "two persist failures + two inner drops");
+    }
+
+    #[test]
+    fn persisting_sink_delegates_drops_when_the_store_is_healthy() {
+        use crate::store::MemoryEventStore;
+
+        // A memory store cannot fail, but the session is unknown: that
+        // is a Corrupt append failure — the exact partial-outage shape
+        // the counter must catch without failing the emit.
+        let (inner, mut receiver) = ChannelEventSink::new();
+        let sink = PersistingEventSink::new(
+            std::sync::Arc::new(MemoryEventStore::new()),
+            SessionId::new(),
+            &inner,
+        );
+        sink.emit(TaskId::new(), EventKind::TaskStarted);
+        assert_eq!(sink.persist_failures(), 1, "unknown session is a failure");
+        assert!(receiver.try_recv().is_ok(), "the event still forwarded");
+    }
+
     #[test]
     fn fanout_delivers_every_event_to_every_consumer() {
         let (a, mut rx_a) = ChannelEventSink::new();
@@ -1285,5 +1508,76 @@ mod tests {
         assert_eq!(value["in_flight_tools"][0], "edit_file");
         let round: StatusSnapshot = serde_json::from_value(value).expect("round-trips");
         assert_eq!(round, snapshot);
+    }
+
+    /// Schema v9: `TodoUpdated` serializes with the snake_case tag and
+    /// the complete item list, so an NDJSON consumer can reconstruct the
+    /// session's todo state without kernel types beyond serde.
+    #[test]
+    fn todo_updated_serializes_the_full_list() {
+        let envelope = EventEnvelope {
+            schema_version: EVENT_SCHEMA_VERSION,
+            sequence: 7,
+            task_id: TaskId::new(),
+            kind: EventKind::TodoUpdated {
+                revision: 3,
+                items: vec![TodoItem {
+                    id: "1".to_owned(),
+                    text: "write the test".to_owned(),
+                    status: crate::session::TodoStatus::Done,
+                }],
+            },
+        };
+        let value = serde_json::to_value(&envelope).expect("serializes");
+        assert_eq!(value["kind"]["type"], "todo_updated");
+        assert_eq!(value["kind"]["revision"], 3);
+        assert_eq!(value["kind"]["items"][0]["id"], "1");
+        assert_eq!(value["kind"]["items"][0]["status"], "done");
+        let round: EventEnvelope = serde_json::from_value(value).expect("round-trips");
+        assert_eq!(round, envelope);
+    }
+
+    /// Roadmap item 8 phase B, replay: folding a task's `TodoUpdated`
+    /// events in sequence order reconstructs the list — and each event
+    /// corresponds to exactly one tail re-append, so a replayer renders
+    /// the same byte-stable blocks the transcript carries.
+    #[test]
+    fn todo_updated_events_replay_into_the_list_and_its_blocks() {
+        let mut live = crate::session::TodoList::default();
+        let mut emitted: Vec<EventKind> = Vec::new();
+
+        // The loop's emission shape: after each mutating batch, the
+        // event carries the whole list.
+        live.add("write the test");
+        live.add("fix the bug");
+        emitted.push(EventKind::TodoUpdated {
+            revision: live.revision,
+            items: live.items.clone(),
+        });
+        live.mark("1", crate::session::TodoStatus::Done);
+        emitted.push(EventKind::TodoUpdated {
+            revision: live.revision,
+            items: live.items.clone(),
+        });
+
+        // Replay: the last event's payload is the current list.
+        let EventKind::TodoUpdated { revision: _, items } = emitted.last().unwrap() else {
+            panic!("expected a TodoUpdated event");
+        };
+        let replayed = crate::session::TodoList {
+            items: items.clone(),
+            ..Default::default()
+        };
+        assert_eq!(replayed.items, live.items);
+        assert_eq!(
+            replayed.render(),
+            "## todo (kernel)\n- [x] 1: write the test\n- [ ] 2: fix the bug",
+            "replay renders the same byte-stable block the loop appended"
+        );
+        assert_eq!(
+            emitted.len(),
+            2,
+            "one event per change, none per quiet turn"
+        );
     }
 }

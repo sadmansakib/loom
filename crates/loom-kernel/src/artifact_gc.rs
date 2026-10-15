@@ -205,6 +205,7 @@ mod tests {
                 Item::ToolResult(result),
             ],
             tasks: Vec::new(),
+            todos: crate::session::TodoList::default(),
         };
         MemorySessionStore::with_session(session)
     }

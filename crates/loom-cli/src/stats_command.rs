@@ -5,10 +5,17 @@
 //! is [`sessions_overview`](loom_core::kernel::analytics::sessions_overview)
 //! in the kernel, so a stored session and its eval report always agree and
 //! every frontend computes identical numbers. This module owns only the
-//! presentation. What the transcript does not carry (billed usage, cache
-//! hit/miss, prune decisions) is not estimated here; those numbers exist
-//! only in live-run reports, and printing them from a transcript would be
-//! dishonest accounting.
+//! presentation. What neither the transcript nor the persisted event
+//! stream carries (billed usage, cache hit/miss) is not estimated here;
+//! those numbers exist only in live-run reports, and printing them from
+//! stored state would be dishonest accounting.
+//!
+//! The `mechanisms` section (roadmap item 1's open tail) attributes the
+//! harness's context-saving levers per mechanism: prune reports and fast
+//! paths from the persisted event stream, cache stub hits, omission
+//! markers, and repairs from the transcript. Token numbers appear only
+//! where an event payload carried them (estimator-side reclaim); every
+//! other mechanism is reported as the occurrence count it is.
 //!
 //! `--trace DIR` switches the source to exported traces instead: there
 //! the manifests carry the provider's own billed counts and the event
@@ -30,7 +37,10 @@ use anyhow::Context;
 use loom_core::engine::trace_stats::{
     attribution_line, collect, fold_totals, human_task, human_totals, task_json, totals_json,
 };
-use loom_core::kernel::analytics::{SessionStats, SessionsOverview, Spill, sessions_overview};
+use loom_core::kernel::analytics::{
+    SessionStats, SessionsOverview, Spill, mechanisms_json, mechanisms_line, mechanisms_overview,
+    sessions_overview,
+};
 use loom_core::kernel::artifact_gc::{self, GcBounds};
 use loom_core::kernel::store::ArtifactStore;
 use loom_core::store::SqliteStore;
@@ -45,6 +55,12 @@ pub fn run(args: StatsArgs) -> anyhow::Result<ExitCode> {
     let path = loom_core::paths::db_path();
     let store = SqliteStore::open(&path).with_context(|| format!("opening {}", path.display()))?;
     let overview = sessions_overview(&store, args.session.as_deref())?;
+    // Per-mechanism attribution (roadmap item 1's open tail): the
+    // persisted event stream supplies what the transcript cannot —
+    // prune reports and fast paths — while stub hits, omission markers,
+    // and repairs come from the transcript. Same id set as the rows
+    // above, so both sections describe the same sessions.
+    let mechanisms = mechanisms_overview(&store, &store, args.session.as_deref())?;
     let artifacts = artifacts_section(&store)?;
 
     if overview.rows.is_empty() && !args.json {
@@ -71,6 +87,7 @@ pub fn run(args: StatsArgs) -> anyhow::Result<ExitCode> {
                 }))
                 .collect::<Vec<_>>(),
             "totals": summarize(&overview),
+            "mechanisms": mechanisms_json(&mechanisms),
             "artifacts": artifacts_json(&artifacts),
             "note": "transcript-derived; billed usage and cache ratios live in live-run reports",
         });
@@ -100,6 +117,7 @@ pub fn run(args: StatsArgs) -> anyhow::Result<ExitCode> {
             overview.totals.spills.len(),
             saved_summary(&overview.totals),
         );
+        println!("mechanisms: {}", mechanisms_line(&mechanisms));
         println!(
             "artifacts: {} bodies, {} bytes — {} referenced, {} orphaned ({} bytes, {} reclaimable by gc)",
             artifacts.bodies,

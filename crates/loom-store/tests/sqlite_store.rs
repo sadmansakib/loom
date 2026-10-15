@@ -6,10 +6,11 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use loom_kernel::event::{EVENT_SCHEMA_VERSION, EventEnvelope, EventKind};
 use loom_kernel::id::{ArtifactId, SessionId, TaskId};
 use loom_kernel::model::StopReason;
 use loom_kernel::session::{Session, TaskRecord, TerminalTaskStatus};
-use loom_kernel::store::{ArtifactStore, SessionStore, StoreError, StoredArtifact};
+use loom_kernel::store::{ArtifactStore, EventStore, SessionStore, StoreError, StoredArtifact};
 use loom_kernel::tool::ToolEffects;
 use loom_kernel::transcript::{
     AssistantMessage, Item, ItemIndex, ToolArguments, ToolCall, ToolCallId, ToolResult, ToolStatus,
@@ -274,4 +275,178 @@ fn a_newer_schema_version_is_refused() {
         StoreError::Corrupt(message) => assert!(message.contains("newer"), "{message}"),
         other => panic!("expected a corrupt-schema error, got {other:?}"),
     }
+}
+
+/// Builds an envelope with a rich payload, proving full-fidelity
+/// round-trips (the same data a `--json` trace carries).
+fn envelope(sequence: u64, task: TaskId, kind: EventKind) -> EventEnvelope {
+    EventEnvelope {
+        schema_version: EVENT_SCHEMA_VERSION,
+        sequence,
+        task_id: task,
+        kind,
+    }
+}
+
+#[test]
+fn events_round_trip_and_survive_reopening_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("loom.db");
+    let id = SessionId::new();
+    let task = TaskId::new();
+
+    let stream: Vec<EventEnvelope> = vec![
+        envelope(0, task, EventKind::TaskStarted),
+        envelope(
+            1,
+            task,
+            EventKind::ModelCompleted {
+                response: loom_kernel::model::ModelResponse {
+                    message: AssistantMessage {
+                        content: "done".to_owned(),
+                        reasoning: None,
+                        tool_calls: vec![call("call_1", "read_file")],
+                        stop_reason: StopReason::ToolCalls,
+                    },
+                    usage: loom_kernel::model::Usage {
+                        input_tokens: 100,
+                        output_tokens: 5,
+                        cached_input_tokens: Some(3),
+                        thinking_tokens: None,
+                        cache_creation_input_tokens: None,
+                        cost_usd: None,
+                    },
+                },
+            },
+        ),
+        envelope(2, task, EventKind::TaskCompleted),
+    ];
+
+    {
+        let store = SqliteStore::open(&path).unwrap();
+        store.ensure_session(&id).unwrap();
+        for event in &stream {
+            store.append_event(&id, event).unwrap();
+        }
+    }
+
+    // Reopen: the stored stream is identical, in write order.
+    let store = SqliteStore::open(&path).unwrap();
+    let loaded = store.load_events(&id).unwrap();
+    assert_eq!(loaded, stream, "envelopes survive a full serde round-trip");
+}
+
+#[test]
+fn a_session_without_events_still_loads_and_reads_empty() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let id = SessionId::new();
+    store.ensure_session(&id).unwrap();
+    let user = Item::User {
+        text: "before events existed".to_owned(),
+    };
+    store.append_item(&id, ItemIndex::from(0), &user).unwrap();
+
+    // The additive seam: no event rows, no change to the session load.
+    let loaded = store.load(&id).unwrap().expect("session present");
+    assert_eq!(loaded.transcript.len(), 1);
+    assert!(store.load_events(&id).unwrap().is_empty());
+}
+
+#[test]
+fn a_v1_database_migrates_in_place_and_keeps_its_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("loom.db");
+
+    // Forge a v1 database the way an older build left it: v1 tables,
+    // meta pinned to 1, no `events` table.
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); \
+                 INSERT INTO meta (key, value) VALUES ('schema_version', '1'); \
+                 CREATE TABLE sessions (\
+                     id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, \
+                     lease_owner TEXT, lease_until INTEGER); \
+                 CREATE TABLE items (\
+                     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, \
+                     idx INTEGER NOT NULL, kind TEXT NOT NULL, body_json TEXT NOT NULL, \
+                     PRIMARY KEY (session_id, idx));",
+            )
+            .unwrap();
+        let id = SessionId::new();
+        let item = Item::User {
+            text: "from the old build".to_owned(),
+        };
+        connection
+            .execute(
+                "INSERT INTO sessions (id, created_at) VALUES (?1, 0)",
+                [id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO items (session_id, idx, kind, body_json) VALUES (?1, 0, 'user', ?2)",
+                rusqlite::params![id.to_string(), serde_json::to_string(&item).unwrap()],
+            )
+            .unwrap();
+    }
+
+    // Opening with this build migrates to v2 additively.
+    let store = SqliteStore::open(&path).unwrap();
+    let ids = store.session_ids().unwrap();
+    assert_eq!(ids.len(), 1);
+    let loaded = store.load(&ids[0]).unwrap().expect("old session loads");
+    assert_eq!(loaded.transcript.len(), 1, "the v1 rows survived");
+    assert!(store.load_events(&ids[0]).unwrap().is_empty());
+
+    // The migrated table accepts events.
+    store.ensure_session(&ids[0]).unwrap();
+    let task = TaskId::new();
+    store
+        .append_event(&ids[0], &envelope(0, task, EventKind::TaskStarted))
+        .unwrap();
+    assert_eq!(store.load_events(&ids[0]).unwrap().len(), 1);
+}
+
+#[test]
+fn event_rows_keep_insertion_order_across_resumed_runs() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let id = SessionId::new();
+    store.ensure_session(&id).unwrap();
+    let first = TaskId::new();
+    let second = TaskId::new();
+
+    // Two runs share the session; each sink numbers from zero, so the
+    // sequences collide and only insertion order disambiguates.
+    for task in [first, second] {
+        store
+            .append_event(&id, &envelope(0, task, EventKind::TaskStarted))
+            .unwrap();
+        store
+            .append_event(&id, &envelope(1, task, EventKind::TaskCompleted))
+            .unwrap();
+    }
+
+    let loaded = store.load_events(&id).unwrap();
+    let tasks: Vec<TaskId> = loaded.iter().map(|event| event.task_id).collect();
+    assert_eq!(
+        tasks,
+        vec![first, first, second, second],
+        "write order, not sequence order"
+    );
+}
+
+#[test]
+fn appending_an_event_for_an_unknown_session_is_a_backend_failure() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let error = store
+        .append_event(
+            &SessionId::new(),
+            &envelope(0, TaskId::new(), EventKind::TaskStarted),
+        )
+        .unwrap_err();
+    // Foreign keys are on: the events row cannot reference a missing
+    // session, exactly like items.
+    assert!(matches!(error, StoreError::Backend(_)), "{error:?}");
 }

@@ -13,10 +13,11 @@
 //! does (ADR-004, unchanged).
 
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
+use crate::event::EventEnvelope;
 use crate::id::{ArtifactId, SessionId};
 use crate::session::{PlannedTurn, Session, TaskRecord};
 use crate::transcript::{Item, ItemIndex};
@@ -131,6 +132,110 @@ pub struct ArtifactStat {
     /// same id again replaces the body but never resets this.
     pub created_at: u64,
 }
+
+/// Persists a session's observed event stream alongside its transcript.
+///
+/// The transcript stays the source of truth for session state (ADR-004);
+/// the event stream is the observability record — prune reports, fast
+/// paths, harness decisions, and the model/turn/tool timeline — that
+/// `loom stats` attributes per mechanism (roadmap item 1's open tail:
+/// "persist events alongside transcripts, so loom stats can attribute
+/// savings per mechanism").
+///
+/// Same write cadence as the transcript seams: **append-on-emit**. The
+/// transcript loop writes each item *before* the in-memory session
+/// mirrors it; the persisting event sink
+/// ([`crate::event::PersistingEventSink`]) writes each envelope as it
+/// is emitted, so a crash loses at most the tail of a burst. Unlike the
+/// transcript seams, delivery is best-effort (ADR-004): an event
+/// persistence failure is counted and surfaced through
+/// [`EventSink::dropped`](crate::event::EventSink::dropped), never
+/// propagated as a task failure — observability must not alter task
+/// semantics.
+///
+/// Rows are append-only and ordered by insertion (a monotonic
+/// position), *not* by [`EventEnvelope::sequence`]: sequence numbers
+/// are per sink, and a resumed session numbers its second run from
+/// zero again. [`EventStore::load_events`] returns envelopes in write
+/// order so consumers replay exactly what was persisted.
+pub trait EventStore: Send + Sync {
+    /// Appends one envelope to `session`'s event stream.
+    ///
+    /// The session must already exist ([`SessionStore::ensure_session`]);
+    /// durable implementations reject an unknown session the same way
+    /// [`SessionStore::append_item`] does.
+    fn append_event(&self, session: &SessionId, envelope: &EventEnvelope)
+    -> Result<(), StoreError>;
+
+    /// Loads a session's event stream in write order; empty when the
+    /// session never persisted events (every session predating this
+    /// seam, and any run whose persistence was off).
+    fn load_events(&self, session: &SessionId) -> Result<Vec<EventEnvelope>, StoreError>;
+}
+
+/// In-memory [`EventStore`] for tests and embedding without a database.
+///
+/// Mirrors the SQLite implementation's contract: rows keep insertion
+/// order, and appending to an unknown session is [`StoreError::Corrupt`]
+/// (the durable store enforces the same rule with a foreign key).
+#[derive(Default)]
+pub struct MemoryEventStore {
+    events: Mutex<HashMap<SessionId, Vec<EventEnvelope>>>,
+}
+
+impl MemoryEventStore {
+    /// Creates an empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records that a session exists, before its first event is
+    /// appended (the mirror of [`SessionStore::ensure_session`]).
+    pub fn ensure_session(&self, session: &SessionId) {
+        let Ok(mut guard) = self.events.lock() else {
+            return; // poisoned: a silent skip, like the tool cache
+        };
+        guard.entry(*session).or_default();
+    }
+
+    /// Creates a store already accepting events for `session`.
+    #[must_use]
+    pub fn with_session(session: SessionId) -> Self {
+        let store = Self::new();
+        store.ensure_session(&session);
+        store
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, HashMap<SessionId, Vec<EventEnvelope>>>, StoreError> {
+        self.events
+            .lock()
+            .map_err(|_| StoreError::Backend("event store lock poisoned".to_owned()))
+    }
+}
+
+impl EventStore for MemoryEventStore {
+    fn append_event(
+        &self,
+        session: &SessionId,
+        envelope: &EventEnvelope,
+    ) -> Result<(), StoreError> {
+        let mut guard = self.lock()?;
+        let rows = guard
+            .get_mut(session)
+            .ok_or_else(|| StoreError::Corrupt(format!("unknown session {session}")))?;
+        rows.push(envelope.clone());
+        Ok(())
+    }
+
+    fn load_events(&self, session: &SessionId) -> Result<Vec<EventEnvelope>, StoreError> {
+        Ok(self.lock()?.get(session).cloned().unwrap_or_default())
+    }
+}
+
+/// A shared, clone-safe handle to an [`EventStore`], the shape the
+/// persisting event sink keeps.
+pub type SharedEventStore = Arc<dyn EventStore>;
 
 /// Stores artifact bodies addressed by [`ArtifactId`] (ADR-012).
 ///
@@ -434,6 +539,68 @@ mod tests {
     fn loading_an_unknown_session_is_none() {
         let store = MemorySessionStore::new();
         assert!(store.load(&SessionId::new()).unwrap().is_none());
+    }
+
+    #[test]
+    fn memory_event_store_round_trips_in_write_order() {
+        use crate::event::{EventEnvelope, EventKind};
+        use crate::id::TaskId;
+
+        let id = SessionId::new();
+        let store = MemoryEventStore::with_session(id);
+        assert!(
+            store.load_events(&id).unwrap().is_empty(),
+            "a session without events is empty, not an error"
+        );
+
+        let task = TaskId::new();
+        let envelope = |sequence, kind| EventEnvelope {
+            schema_version: crate::event::EVENT_SCHEMA_VERSION,
+            sequence,
+            task_id: task,
+            kind,
+        };
+        // Two runs share the session: sequences restart, write order wins.
+        store
+            .append_event(&id, &envelope(0, EventKind::TaskStarted))
+            .unwrap();
+        store
+            .append_event(&id, &envelope(0, EventKind::TaskStarted))
+            .unwrap();
+        store
+            .append_event(&id, &envelope(1, EventKind::TaskCompleted))
+            .unwrap();
+
+        let loaded = store.load_events(&id).unwrap();
+        assert_eq!(loaded.len(), 3);
+        let sequences: Vec<u64> = loaded.iter().map(|event| event.sequence).collect();
+        assert_eq!(
+            sequences,
+            vec![0, 0, 1],
+            "insertion order, not sequence order"
+        );
+        assert_eq!(loaded[0].task_id, task);
+        assert_eq!(loaded[2].kind, EventKind::TaskCompleted);
+    }
+
+    #[test]
+    fn memory_event_store_rejects_an_unknown_session() {
+        use crate::event::{EventEnvelope, EventKind};
+        use crate::id::TaskId;
+
+        let store = MemoryEventStore::new();
+        let error = store
+            .append_event(
+                &SessionId::new(),
+                &EventEnvelope {
+                    schema_version: crate::event::EVENT_SCHEMA_VERSION,
+                    sequence: 0,
+                    task_id: TaskId::new(),
+                    kind: EventKind::TaskStarted,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, StoreError::Corrupt(_)));
     }
 
     #[test]

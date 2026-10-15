@@ -1087,6 +1087,12 @@ impl Agent {
                             "ToolCalls stop reason without tool calls".to_owned(),
                         ));
                     }
+                    // The session's todo list travels through the batch as
+                    // a shared handle the `todo` tool mutates (roadmap
+                    // item 8 phase B); the snapshot below is copied back
+                    // after the turn commits.
+                    let todo_revision = session.todos.revision;
+                    let todos = Arc::new(Mutex::new(session.todos.clone()));
                     let results = self
                         .execute_batch(
                             &assistant.tool_calls,
@@ -1098,6 +1104,7 @@ impl Agent {
                             accounting,
                             &mut failures,
                             &recent_changes(session),
+                            Arc::clone(&todos),
                         )
                         .await;
                     // The gate learns from every result before the turn
@@ -1112,6 +1119,26 @@ impl Agent {
                     self.commit(session, assistant, results)?;
                     accounting.turns = turn;
                     accounting.sync(session, task_id);
+                    // Copy the (possibly mutated) todo state back, and —
+                    // only when it changed — re-append the rendered list
+                    // at the transcript tail. This runs before the
+                    // cancellation check on purpose: a changed list is
+                    // durable state the next session load must see.
+                    let todos = todos
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    if todos.revision != todo_revision {
+                        session.todos = todos;
+                        self.append_todo_block(session)?;
+                        sink.emit(
+                            task_id,
+                            EventKind::TodoUpdated {
+                                revision: session.todos.revision,
+                                items: session.todos.items.clone(),
+                            },
+                        );
+                    }
                     if control.is_cancelled() {
                         return Err(TaskError::Cancelled);
                     }
@@ -1452,6 +1479,7 @@ impl Agent {
         accounting: &mut Accounting,
         failures: &mut FailureLedger,
         recent_changes: &[String],
+        todos: Arc<Mutex<crate::session::TodoList>>,
     ) -> Vec<ToolResult> {
         let exposure = ToolExposure::from_names(request.tools.iter().map(|spec| spec.name.clone()));
 
@@ -1498,7 +1526,8 @@ impl Agent {
             Vec::new()
         })
         .with_cache(Some(self.cache.clone()))
-        .with_projected_calls(projected_calls);
+        .with_projected_calls(projected_calls)
+        .with_todos(Some(todos));
         let batch = ToolBatch::new(&self.registry, &exposure)
             .with_max_concurrency(self.max_tool_concurrency);
         let ran = batch.execute(&runnable, &context).await;
@@ -1599,6 +1628,36 @@ impl Agent {
                 .upsert_task(&session.id, record)
                 .map_err(persistence)?;
         }
+        Ok(())
+    }
+
+    /// Re-appends the current todo list at the transcript tail (roadmap
+    /// item 8 phase B): the loop's half of the tail projection rule.
+    ///
+    /// Called only when a turn's tool batch changed the list, so the
+    /// freshest plan block lands at the tail exactly at the moments it
+    /// changed — never duplicated on quiet turns. Because the transcript
+    /// is append-only, the projected prefix stays byte-identical for
+    /// provider caching, and every earlier block simply rides in
+    /// history (where the pruning compiler's user elision may eventually
+    /// reclaim it — the last user item, which a fresh block is, is
+    /// protected). Persist-then-commit like every other item; an empty
+    /// list projects nothing.
+    fn append_todo_block(&self, session: &mut Session) -> Result<(), TaskError> {
+        if session.todos.is_empty() {
+            return Ok(());
+        }
+        let block = Item::User {
+            text: session.todos.render(),
+        };
+        if let Some(store) = &self.store {
+            store
+                .append_item(&session.id, session.next_index(), &block)
+                .map_err(persistence)?;
+        }
+        session
+            .push_item(block)
+            .map_err(|error| TaskError::Internal(error.to_string()))?;
         Ok(())
     }
 }
@@ -1709,14 +1768,19 @@ fn handoff_digest(session: &Session) -> String {
     };
     let mut digest = String::new();
 
-    // The live task brief: the last user item (run_task appends the task
-    // text; elision never takes the last user item, so it is intact).
+    // The live task brief: the last user item that is real input
+    // (run_task appends the task text; elision never takes the last
+    // user item, so it is intact). Kernel-appended todo blocks
+    // (roadmap item 8) are projection artifacts, not instructions —
+    // skip them so the digest's brief is never the plan list itself.
     let last_user = session
         .transcript
         .iter()
         .rev()
         .find_map(|item| match item {
-            Item::User { text } => Some(text.clone()),
+            Item::User { text } if !text.starts_with(crate::session::TODO_BLOCK_HEADER) => {
+                Some(text.clone())
+            }
             _ => None,
         })
         .unwrap_or_default();

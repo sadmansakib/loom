@@ -123,8 +123,26 @@ fn project_messages(
         facts_tokens = estimate_serialized(estimator, &message);
         messages.push(message);
     }
-    for item in &session.transcript {
+    // Tail projection rule (roadmap item 8 phase B): the todo list travels
+    // as kernel-appended user blocks at the transcript tail. Only the
+    // newest block is model-visible — earlier blocks are durable state
+    // (the pruning compiler's user elision may reclaim them) but the model
+    // always sees exactly one authoritative plan, per the loop's contract.
+    let last_todo = session
+        .transcript
+        .iter()
+        .rposition(|item| {
+            matches!(item, Item::User { text } if text.starts_with(crate::session::TODO_BLOCK_HEADER))
+        });
+    for (index, item) in session.transcript.iter().enumerate() {
         let message = match item {
+            Item::User { text } if text.starts_with(crate::session::TODO_BLOCK_HEADER) => {
+                if Some(index) == last_todo {
+                    Some(Message::User { text: text.clone() })
+                } else {
+                    None
+                }
+            }
             Item::User { text } => Some(Message::User { text: text.clone() }),
             Item::Assistant(assistant) => {
                 if assistant.stop_reason == crate::model::StopReason::ContentFilter {

@@ -15,7 +15,10 @@
 //! (ADR-004): each item's serde form is stored verbatim in `items.body_json`
 //! and is the row the loader reconstructs sessions from. Schema v1 ships
 //! without FTS — `items.kind` is stored so a future search index (Iteration
-//! 3, ADR-010) can be built without re-reading rows.
+//! 3, ADR-010) can be built without re-reading rows. Schema v2 adds the
+//! `events` table: the observed event stream persisted alongside the
+//! transcript (one envelope's serde form per row, insertion-ordered), so
+//! `loom stats` can attribute savings per mechanism from a stored session.
 //!
 //! # Ordering
 //!

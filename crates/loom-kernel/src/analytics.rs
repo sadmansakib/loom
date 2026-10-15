@@ -31,9 +31,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::event::{EventEnvelope, EventKind};
 use crate::id::SessionId;
 use crate::session::Session;
-use crate::store::{SessionStore, StoreError};
+use crate::store::{EventStore, SessionStore, StoreError};
 use crate::transcript::{Item, ToolFailure, ToolStatus};
 
 /// Per-tool counters derived from one transcript.
@@ -305,6 +306,248 @@ pub fn sessions_overview(
     Ok(overview)
 }
 
+/// Per-mechanism attribution for one session (roadmap item 1's open
+/// tail: "persist events alongside transcripts, so `loom stats` can
+/// attribute savings per mechanism").
+///
+/// Semantics are labeled honestly and split by what the data can carry:
+///
+/// * **Measured (estimator-side)** — `reclaimed_tokens_estimate` comes
+///   from `context_pruned` event payloads, the same estimator-side
+///   numbers the pruning compiler reports. They were never billed, and
+///   the field says so in its name.
+/// * **Counted (occurrences)** — every other field is a plain count.
+///   The mechanisms whose payloads carry no token delta (cache stubs,
+///   omission markers, repairs) are reported as the occurrences they
+///   are, never as fabricated token savings.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MechanismStats {
+    /// `context_pruned` events (pruning + stub elision freezes).
+    pub prune_events: u64,
+    /// Tool calls stubbed by those events (sum of per-report calls).
+    pub pruned_calls: u64,
+    /// Estimator-side reclaimed tokens, summed over prune reports.
+    /// Measured by the estimator, never billed.
+    pub reclaimed_tokens_estimate: u64,
+    /// `context_handoff` events (the LLM-handoff elision of last
+    /// resort, roadmap item 12).
+    pub handoffs: u64,
+    /// Tool-cache stub hits: results served as
+    /// `unchanged since call <id>` while the original stayed in the
+    /// projection (roadmap item 6). Counted from the transcript.
+    pub stub_hits: u64,
+    /// Counted omission markers in tool results: the explicit
+    /// `… [N bytes omitted]` / `[... N more X omitted]` family of
+    /// evidence-shaping and output-filter reductions (ADR-014).
+    pub omission_markers: u64,
+    /// Calls the harness repaired before or during execution (the same
+    /// effects-derived count as [`SessionStats::repairs`]).
+    pub repairs: u64,
+    /// `fast_path_hit` events: deterministic solves with zero model
+    /// requests (roadmap item 3).
+    pub fast_path_hits: u64,
+    /// Files the fast paths rewrote across those solves.
+    pub fast_path_files_changed: u64,
+}
+
+impl MechanismStats {
+    /// Adds `other` into `self`, counter by counter.
+    pub fn add(&mut self, other: &MechanismStats) {
+        self.prune_events += other.prune_events;
+        self.pruned_calls += other.pruned_calls;
+        self.reclaimed_tokens_estimate += other.reclaimed_tokens_estimate;
+        self.handoffs += other.handoffs;
+        self.stub_hits += other.stub_hits;
+        self.omission_markers += other.omission_markers;
+        self.repairs += other.repairs;
+        self.fast_path_hits += other.fast_path_hits;
+        self.fast_path_files_changed += other.fast_path_files_changed;
+    }
+
+    /// True when every counter is zero — a session where no mechanism
+    /// observed anything worth reporting.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The cache-stub prefix the tool engine serves on a repeat read whose
+/// original result is still projected unstubbed (roadmap item 6;
+/// `agent::tools::cached_result` formats the full line as
+/// `unchanged since call <id>`).
+const STUB_PREFIX: &str = "unchanged since call ";
+
+/// The omission-marker suffix shared by every member of the
+/// explicit-omission family (ADR-014): the per-tool output budgets'
+/// `... [N bytes omitted]`, the command streams' head+tail cuts, the
+/// per-command reducers' `[... N more X omitted]`, and evidence
+/// shaping's `... [N more … omitted]` caps. Mirrored here as a literal
+/// because the kernel sits below `loom-tools`; when the marker family
+/// grows a new shape, this moves with it.
+const OMISSION_MARKER: &str = "omitted]";
+
+/// Counts the omission markers inside one tool result's content.
+fn count_omission_markers(content: &str) -> u64 {
+    content.matches(OMISSION_MARKER).count() as u64
+}
+
+/// Computes [`MechanismStats`] for one session from its two durable
+/// records: the transcript (stub hits, omission markers, repairs) and
+/// the persisted event stream (prunes, handoffs, fast paths).
+///
+/// Pure: one pass over each input, no I/O, no clocks. An empty event
+/// slice is legitimate — every session that predates event persistence,
+/// or ran with it off — and only the transcript-derived counters move.
+#[must_use]
+pub fn session_mechanisms(session: &Session, events: &[EventEnvelope]) -> MechanismStats {
+    let mut stats = MechanismStats::default();
+
+    for item in &session.transcript {
+        let Item::ToolResult(result) = item else {
+            continue;
+        };
+        if result.content.starts_with(STUB_PREFIX) {
+            stats.stub_hits += 1;
+        }
+        stats.omission_markers += count_omission_markers(&result.content);
+        stats.repairs += result.effects.repairs.len() as u64;
+    }
+
+    for envelope in events {
+        match &envelope.kind {
+            EventKind::ContextPruned { report, .. } => {
+                stats.prune_events += 1;
+                stats.pruned_calls += report.calls.len() as u64;
+                stats.reclaimed_tokens_estimate += report.reclaimed_tokens;
+            }
+            EventKind::ContextHandoff { .. } => stats.handoffs += 1,
+            EventKind::FastPathHit { files_changed, .. } => {
+                stats.fast_path_hits += 1;
+                stats.fast_path_files_changed += u64::from(*files_changed);
+            }
+            _ => {}
+        }
+    }
+
+    stats
+}
+
+/// Folds mechanism attribution across every session in the store,
+/// optionally keeping only the ones whose id contains `filter` — the
+/// same id set and ordering policy as [`sessions_overview`], so the two
+/// reports always describe the same rows.
+///
+/// Sessions and events are separate seams (a store may implement
+/// either); both come from the same database in every current frontend.
+pub fn mechanisms_overview(
+    sessions: &dyn SessionStore,
+    events: &dyn EventStore,
+    filter: Option<&str>,
+) -> Result<MechanismStats, StoreError> {
+    let mut ids = sessions.session_ids()?;
+    ids.sort();
+
+    let mut totals = MechanismStats::default();
+    for id in ids {
+        if let Some(filter) = filter
+            && !id.to_string().contains(filter)
+        {
+            continue;
+        }
+        // A session that fails to load fails the pass, exactly like
+        // `sessions_overview`: silently skipping would undercount.
+        let Some(session) = sessions.load(&id)? else {
+            continue;
+        };
+        let stream = events.load_events(&id)?;
+        totals.add(&session_mechanisms(&session, &stream));
+    }
+    Ok(totals)
+}
+
+/// The JSON block for a mechanisms report, with the semantics note that
+/// keeps counted fields from being read as token deltas.
+pub fn mechanisms_json(stats: &MechanismStats) -> Value {
+    serde_json::json!({
+        "prune_events": stats.prune_events,
+        "pruned_calls": stats.pruned_calls,
+        "reclaimed_tokens_estimate": stats.reclaimed_tokens_estimate,
+        "handoffs": stats.handoffs,
+        "stub_hits": stats.stub_hits,
+        "omission_markers": stats.omission_markers,
+        "repairs": stats.repairs,
+        "fast_path_hits": stats.fast_path_hits,
+        "fast_path_files_changed": stats.fast_path_files_changed,
+        "note": "reclaimed_tokens_estimate is estimator-side (never billed); \
+                 every other field is an occurrence count",
+    })
+}
+
+/// One human-readable mechanisms line: only the mechanisms that fired,
+/// each labeled by what it actually measured.
+#[must_use]
+pub fn mechanisms_line(stats: &MechanismStats) -> String {
+    let mut parts = Vec::new();
+    if stats.fast_path_hits > 0 {
+        parts.push(format!(
+            "{} fast-path solve{} ({} file{}, zero model calls)",
+            stats.fast_path_hits,
+            if stats.fast_path_hits == 1 { "" } else { "s" },
+            stats.fast_path_files_changed,
+            if stats.fast_path_files_changed == 1 {
+                ""
+            } else {
+                "s"
+            },
+        ));
+    }
+    if stats.prune_events > 0 {
+        parts.push(format!(
+            "{} prune{} ({} call{} stubbed, ~{} tok estimator-side)",
+            stats.prune_events,
+            if stats.prune_events == 1 { "" } else { "s" },
+            stats.pruned_calls,
+            if stats.pruned_calls == 1 { "" } else { "s" },
+            stats.reclaimed_tokens_estimate,
+        ));
+    }
+    if stats.handoffs > 0 {
+        parts.push(format!(
+            "{} handoff{}",
+            stats.handoffs,
+            if stats.handoffs == 1 { "" } else { "s" },
+        ));
+    }
+    if stats.stub_hits > 0 {
+        parts.push(format!(
+            "{} cache stub hit{} (\"unchanged since call\")",
+            stats.stub_hits,
+            if stats.stub_hits == 1 { "" } else { "s" },
+        ));
+    }
+    if stats.omission_markers > 0 {
+        parts.push(format!(
+            "{} omission marker{}",
+            stats.omission_markers,
+            if stats.omission_markers == 1 { "" } else { "s" }
+        ));
+    }
+    if stats.repairs > 0 {
+        parts.push(format!(
+            "{} repair{}",
+            stats.repairs,
+            if stats.repairs == 1 { "" } else { "s" },
+        ));
+    }
+    if parts.is_empty() {
+        "none observed".to_owned()
+    } else {
+        parts.join(", ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +598,7 @@ mod tests {
             id: crate::id::SessionId::new(),
             transcript: items,
             tasks: Vec::new(),
+            todos: crate::session::TodoList::default(),
         }
     }
 
@@ -575,5 +819,187 @@ mod tests {
         // The fold must carry repairs too, or store-wide totals would
         // silently report zero.
         assert_eq!(overview.totals.repairs, 1);
+    }
+
+    /// A synthetic event stream exercising every mechanism-bearing
+    /// kind — built in-test, no network, no provider.
+    fn mechanism_events() -> Vec<EventEnvelope> {
+        use crate::context::{PruneReport, PruneTrigger, PrunedCall, StubReason};
+        use crate::event::EVENT_SCHEMA_VERSION;
+        use crate::id::TaskId;
+
+        let task = TaskId::new();
+        let envelope = |sequence, kind| EventEnvelope {
+            schema_version: EVENT_SCHEMA_VERSION,
+            sequence,
+            task_id: task,
+            kind,
+        };
+        vec![
+            envelope(0, EventKind::TaskStarted),
+            envelope(
+                1,
+                EventKind::ContextPruned {
+                    turn: 4,
+                    report: PruneReport {
+                        trigger: PruneTrigger::AgeMask,
+                        calls: vec![
+                            PrunedCall {
+                                call_id: "c1".to_owned(),
+                                reason: StubReason::TurnAge,
+                                reclaimed_tokens: 120,
+                            },
+                            PrunedCall {
+                                call_id: "c2".to_owned(),
+                                reason: StubReason::TurnAge,
+                                reclaimed_tokens: 80,
+                            },
+                        ],
+                        reclaimed_tokens: 200,
+                    },
+                },
+            ),
+            envelope(
+                2,
+                EventKind::FastPathHit {
+                    kind: "rename".to_owned(),
+                    files_changed: 2,
+                },
+            ),
+            envelope(
+                3,
+                EventKind::ContextHandoff {
+                    turn: 9,
+                    chars: 4_000,
+                },
+            ),
+            // Kinds with no mechanism attribution are ignored.
+            envelope(4, EventKind::TaskCompleted),
+        ]
+    }
+
+    #[test]
+    fn session_mechanisms_counts_each_mechanism_honestly() {
+        let mut stubbed = ok_result("b", "unchanged since call a");
+        stubbed.effects = ToolEffects::none().with_repair("matched after trimming");
+        let items = vec![
+            Item::Assistant(assistant(
+                "go",
+                vec![
+                    call("a", "read_file", json!({"path": "x"})),
+                    call("b", "read_file", json!({"path": "x"})),
+                    call("c", "run_command", json!({"program": "git"})),
+                ],
+            )),
+            Item::ToolResult(ok_result("a", "contents")),
+            Item::ToolResult(stubbed),
+            // One result carrying two markers: a byte cut and a
+            // reducer's counted cap.
+            Item::ToolResult(ok_result(
+                "c",
+                "commit 1\n[... 5 more commits omitted]\n... [300 bytes omitted] ...\ncommit 7",
+            )),
+        ];
+        let stats = session_mechanisms(&session(items), &mechanism_events());
+
+        // Event-derived: prunes with estimator-side tokens, handoff,
+        // fast path.
+        assert_eq!(stats.prune_events, 1);
+        assert_eq!(stats.pruned_calls, 2);
+        assert_eq!(stats.reclaimed_tokens_estimate, 200);
+        assert_eq!(stats.handoffs, 1);
+        assert_eq!(stats.fast_path_hits, 1);
+        assert_eq!(stats.fast_path_files_changed, 2);
+        // Transcript-derived: one stub hit, two markers, one repair.
+        assert_eq!(stats.stub_hits, 1);
+        assert_eq!(stats.omission_markers, 2);
+        assert_eq!(stats.repairs, 1);
+    }
+
+    #[test]
+    fn a_session_without_events_still_counts_transcript_mechanisms() {
+        // Every session predating event persistence loads like this:
+        // no stream, but the transcript's mechanisms still attribute.
+        let items = vec![
+            Item::Assistant(assistant(
+                "go",
+                vec![call("b", "read_file", json!({"path": "x"}))],
+            )),
+            Item::ToolResult(ok_result("b", "unchanged since call a")),
+        ];
+        let stats = session_mechanisms(&session(items), &[]);
+        assert_eq!(stats.stub_hits, 1);
+        assert_eq!(stats.omission_markers, 0);
+        assert!(
+            !stats.is_empty(),
+            "the transcript mechanisms still attribute"
+        );
+    }
+
+    #[test]
+    fn mechanisms_overview_folds_across_the_store_and_filters() {
+        use crate::store::{MemoryEventStore, MemorySessionStore};
+
+        let events = MemoryEventStore::new();
+        let store = MemorySessionStore::new();
+
+        // Seed two sessions through the store's own seams, one with a
+        // persisted stream and one without.
+        let with_stream = SessionId::new();
+        store.ensure_session(&with_stream).unwrap();
+        events.ensure_session(&with_stream);
+        for envelope in mechanism_events() {
+            events.append_event(&with_stream, &envelope).unwrap();
+        }
+        let mut plain_session = Session::new(SessionId::new());
+        store.ensure_session(&plain_session.id).unwrap();
+        let planned = plain_session
+            .plan_turn(
+                assistant("go", vec![call("b", "read_file", json!({"path": "x"}))]),
+                vec![ok_result("b", "unchanged since call a")],
+            )
+            .unwrap();
+        store.append_turn(&plain_session.id, &planned).unwrap();
+        plain_session.apply_planned_turn(planned);
+        let plain = plain_session.id;
+
+        let totals = mechanisms_overview(&store, &events, None).unwrap();
+        assert_eq!(totals.prune_events, 1);
+        assert_eq!(totals.reclaimed_tokens_estimate, 200);
+        assert_eq!(totals.fast_path_hits, 1);
+        // The stub hit from the event-less session folded in too.
+        assert_eq!(totals.stub_hits, 1);
+
+        // The filter narrows to the same id set `sessions_overview`
+        // would keep.
+        let only_plain = mechanisms_overview(&store, &events, Some(&plain.to_string())).unwrap();
+        assert_eq!(only_plain.prune_events, 0);
+        assert_eq!(only_plain.stub_hits, 1);
+
+        let none = mechanisms_overview(&store, &events, Some("no-such-id")).unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn mechanisms_json_and_line_label_their_semantics() {
+        let stats = session_mechanisms(&session(Vec::new()), &mechanism_events());
+        let report = mechanisms_json(&stats);
+        assert_eq!(report["prune_events"], 1);
+        assert_eq!(report["reclaimed_tokens_estimate"], 200);
+        assert_eq!(report["stub_hits"], 0);
+        assert!(
+            report["note"]
+                .as_str()
+                .expect("note")
+                .contains("occurrence count"),
+            "counted fields must be labeled as counts, not tokens"
+        );
+
+        let line = mechanisms_line(&stats);
+        assert!(line.contains("~200 tok estimator-side"), "{line}");
+        assert!(line.contains("1 fast-path solve"), "{line}");
+        assert!(!line.contains("stub hit"), "{line}");
+
+        assert_eq!(mechanisms_line(&MechanismStats::default()), "none observed");
     }
 }

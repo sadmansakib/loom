@@ -13,11 +13,11 @@ use loom_kernel::agent::{Agent, TaskControl, TaskError, TaskSummary};
 use loom_kernel::context::{
     AgentConfig, ContextCompiler, DefaultContextCompiler, PruneConfig, PruningContextCompiler,
 };
-use loom_kernel::event::{EventKind, EventSink};
+use loom_kernel::event::{EventKind, EventSink, PersistingEventSink};
 use loom_kernel::id::SessionId;
 use loom_kernel::model::ModelProvider;
 use loom_kernel::session::Session;
-use loom_kernel::store::StoreError;
+use loom_kernel::store::{SharedEventStore, StoreError};
 use loom_kernel::tool::ToolRegistry;
 use loom_providers::{OPENROUTER_PROVIDER_NAME, ProviderCatalog, ReasoningEffort};
 use loom_store::SqliteStore;
@@ -119,6 +119,12 @@ pub struct Engine {
     resolution: Option<(&'static str, String)>,
     /// Guards the one-shot emission of the resolution events.
     notices_flushed: std::sync::OnceLock<()>,
+    /// The event-stream persistence seam (roadmap item 1's open tail):
+    /// when the engine persists sessions, it also persists every
+    /// observed event append-on-emit, so `loom stats` can attribute
+    /// savings per mechanism from a stored session. `None` when
+    /// `persist` was off — the stream stays in-memory only.
+    events: Option<SharedEventStore>,
 }
 
 /// A function that wraps the provider an open produced — built from
@@ -292,21 +298,11 @@ impl Engine {
                 let built = build_registry(&policy)?;
                 // The bare-loop arm keeps the primitive tool set only
                 // (read/list/write/edit/shell); a search index, the
-                // artifact re-fetch, and the fused verify are harness
-                // levers the baseline must run without.
+                // artifact re-fetch, the fused verify, and the
+                // kernel-owned todo list are harness levers the baseline
+                // must run without.
                 if overrides.bare_loop {
-                    let primitives: [&str; 5] = [
-                        "read_file",
-                        "list_dir",
-                        "write_file",
-                        "edit_file",
-                        "run_command",
-                    ];
-                    ToolRegistry::from_tools(
-                        built
-                            .into_tools()
-                            .filter(|tool| primitives.contains(&tool.spec().name.as_str())),
-                    )
+                    bare_registry(built)
                 } else {
                     built
                 }
@@ -367,6 +363,11 @@ impl Engine {
             let store = SqliteStore::open(config.db_path.clone()).map_err(EngineError::Session)?;
             let artifacts =
                 SqliteStore::open(config.db_path.clone()).map_err(EngineError::Session)?;
+            // The event-stream persistence seam shares the database
+            // (schema v2's `events` table) and the same write cadence
+            // as the transcript: append-on-emit, best-effort — a store
+            // failure counts drops and never fails the task.
+            let events = SqliteStore::open(config.db_path.clone()).map_err(EngineError::Session)?;
 
             // The lifecycle pass (roadmap 2.17), best-effort at open: the
             // transcript scan marks the live set, then only unreferenced
@@ -389,19 +390,29 @@ impl Engine {
 
             agent = agent.with_store(Box::new(store));
             agent = agent.with_artifacts(Some(Arc::new(artifacts)));
+            Ok(Self {
+                agent,
+                workspace,
+                policy,
+                // The bare-loop arm measures a basic harness, and a basic
+                // harness does not short-circuit mechanical tasks — the
+                // fast path is a Loom lever, so it flips with the others.
+                fast_paths: overrides.fast_paths.unwrap_or(true) && !overrides.bare_loop,
+                resolution: Some(resolution),
+                notices_flushed: std::sync::OnceLock::new(),
+                events: Some(Arc::new(events)),
+            })
+        } else {
+            Ok(Self {
+                agent,
+                workspace,
+                policy,
+                fast_paths: overrides.fast_paths.unwrap_or(true) && !overrides.bare_loop,
+                resolution: Some(resolution),
+                notices_flushed: std::sync::OnceLock::new(),
+                events: None,
+            })
         }
-
-        Ok(Self {
-            agent,
-            workspace,
-            policy,
-            // The bare-loop arm measures a basic harness, and a basic
-            // harness does not short-circuit mechanical tasks — the
-            // fast path is a Loom lever, so it flips with the others.
-            fast_paths: overrides.fast_paths.unwrap_or(true) && !overrides.bare_loop,
-            resolution: Some(resolution),
-            notices_flushed: std::sync::OnceLock::new(),
-        })
     }
 
     /// Opens the engine, fetching the OpenRouter catalog first when one is
@@ -480,6 +491,11 @@ impl Engine {
 
     /// Runs one task against `session`, emitting events to `sink`.
     ///
+    /// When the engine was opened with persistence, the sink is wrapped
+    /// so every event is also appended to the session's durable event
+    /// stream (append-on-emit, best-effort) before `sink` sees it — the
+    /// same events, the same order, one durable copy.
+    ///
     /// Cancellation is cooperative through `cancellation`. Success returns a
     /// [`TaskSummary`]; every other terminal state — including cancellation —
     /// returns a [`TaskError`], and the persisted [`Session`] carries the same
@@ -496,6 +512,30 @@ impl Engine {
     /// every committed item was persisted), [`TaskControl::pause`] stops at
     /// the next turn boundary with the in-flight turn fully committed.
     pub async fn run_task(
+        &self,
+        session: &mut Session,
+        input: impl Into<String>,
+        sink: &dyn EventSink,
+        control: &TaskControl,
+    ) -> Result<TaskSummary, TaskError> {
+        // Event persistence (roadmap item 1's open tail): when the
+        // engine persists sessions it persists the observed event
+        // stream alongside them, append-on-emit, best-effort. The
+        // wrapper sits above everything this method (and the loop
+        // under it) emits, so the stored stream is the complete run —
+        // including the engine-level markers below.
+        match &self.events {
+            Some(store) => {
+                let persisting = PersistingEventSink::new(store.clone(), session.id, sink);
+                self.drive_task(session, input, &persisting, control).await
+            }
+            None => self.drive_task(session, input, sink, control).await,
+        }
+    }
+
+    /// [`Engine::run_task`]'s body, driven against whichever sink the
+    /// persistence wrapper produced.
+    async fn drive_task(
         &self,
         session: &mut Session,
         input: impl Into<String>,
@@ -663,7 +703,11 @@ pub struct Continuation {
 /// Read-only tools first, so the prompt prefix stays stable; the mutating
 /// tools follow and force the tool engine's sequential mode (§10).
 /// `run_command` runs under the workspace's command policy (manifest
-/// `.loom/commands.toml`, else the shipped `cargo`-only default).
+/// `.loom/commands.toml`, else the shipped `cargo`-only default). The
+/// kernel-owned `todo` tool (roadmap item 8 phase B) registers last: it
+/// mutates kernel session state, not files, and joining here — rather
+/// than being re-registered by embedders — keeps one wiring for every
+/// frontend. The bare-loop arm filters it back out ([`bare_registry`]).
 fn build_registry(policy: &CommandPolicy) -> Result<ToolRegistry, EngineError> {
     let mut registry = ToolRegistry::new();
     let mut register = |name: &'static str, tool: Box<dyn loom_kernel::tool::Tool>| {
@@ -685,7 +729,28 @@ fn build_registry(policy: &CommandPolicy) -> Result<ToolRegistry, EngineError> {
         Box::new(RunCommandTool::with_policy(policy.clone())),
     )?;
     register("verify", Box::new(VerifyTool::with_policy(policy.clone())))?;
+    register("todo", Box::new(loom_kernel::tool::TodoTool::new()))?;
     Ok(registry)
+}
+
+/// The bare-loop registry: the primitive tools a basic harness offers
+/// (read/list/write/edit/shell), filtered out of the built set. Anything
+/// else the full engine registers — search, the artifact refetch, the
+/// fused verify, the kernel-owned `todo` list — is a harness lever the
+/// baseline must run without.
+fn bare_registry(built: ToolRegistry) -> ToolRegistry {
+    const PRIMITIVES: [&str; 5] = [
+        "read_file",
+        "list_dir",
+        "write_file",
+        "edit_file",
+        "run_command",
+    ];
+    ToolRegistry::from_tools(
+        built
+            .into_tools()
+            .filter(|tool| PRIMITIVES.contains(&tool.spec().name.as_str())),
+    )
 }
 
 /// The built-in instruction; overridable with `--system-prompt`.
@@ -912,6 +977,7 @@ mod tests {
             fast_paths: false,
             resolution: None,
             notices_flushed: std::sync::OnceLock::new(),
+            events: None,
         }
     }
 
@@ -1096,6 +1162,68 @@ mod tests {
             model: "deepseek-flash".to_owned(),
             source: "provider-table".to_owned()
         }));
+    }
+
+    #[tokio::test]
+    async fn a_persisted_run_also_persists_its_event_stream() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = rename_fixture(base.path());
+        let mut config = test_config();
+        config.workspace = workspace;
+        config.db_path = base.path().join("loom.db");
+        config.persist = true;
+        let engine = Engine::open_with(
+            config,
+            EngineOverrides {
+                provider: Some(Box::new(FakeProvider::scripted(vec![
+                    FakeProvider::end_turn_script("done"),
+                ]))),
+                ..EngineOverrides::default()
+            },
+        )
+        .expect("engine");
+
+        let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
+        let mut session = engine.new_session();
+        let summary = engine
+            .run_task(
+                &mut session,
+                "Say hello and stop.",
+                &sink,
+                &Default::default(),
+            )
+            .await
+            .expect("task");
+        assert_eq!(summary.model_requests, 1);
+        let _ = drain(&mut receiver);
+
+        // The durable stream carries the same run: task lifecycle,
+        // authoritative completion, and the engine's idle marker, in
+        // emission order with contiguous per-run sequences.
+        use loom_kernel::store::EventStore;
+        let store = loom_store::SqliteStore::open(base.path().join("loom.db")).expect("store");
+        let events = store.load_events(&session.id).expect("events");
+        assert!(events.len() >= 4, "expected a full stream, got {events:?}");
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|event| match &event.kind {
+                EventKind::TaskStarted => "task_started",
+                EventKind::ModelCompleted { .. } => "model_completed",
+                EventKind::TaskCompleted => "task_completed",
+                EventKind::AwaitingInput { .. } => "awaiting_input",
+                EventKind::FastPathDeclined { .. } => "fast_path_declined",
+                EventKind::CapabilitiesResolved { .. } => "capabilities_resolved",
+                EventKind::HarnessNotice { .. } => "harness_notice",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds.first(), Some(&"task_started"));
+        assert!(kinds.contains(&"model_completed"));
+        assert!(kinds.contains(&"task_completed"));
+        assert_eq!(kinds.last(), Some(&"awaiting_input"));
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event.sequence, index as u64, "one run numbers contiguously");
+        }
     }
 
     #[tokio::test]
@@ -1573,5 +1701,37 @@ mod tests {
         // Everything else keeps the kernel defaults.
         assert_eq!(glm.elide_turns, PruneConfig::default().elide_turns);
         assert_eq!(glm.trigger_percent, PruneConfig::default().trigger_percent);
+    }
+
+    /// Roadmap item 8 phase B: the kernel-owned `todo` tool is a
+    /// full-registry lever. The full engine exposes it; the bare-loop
+    /// arm — the basic-harness baseline — must keep excluding it
+    /// (bare = read/list/write/edit/shell).
+    #[test]
+    fn todo_tool_is_exposed_in_the_full_registry_and_excluded_from_bare() {
+        let built = build_registry(&CommandPolicy::default()).expect("built-in registry");
+        let full: Vec<&str> = built.specs().map(|spec| spec.name.as_str()).collect();
+        assert!(
+            full.contains(&"todo"),
+            "the full registry must expose the kernel todo tool: {full:?}"
+        );
+
+        let bare_registry = bare_registry(built);
+        let bare: Vec<&str> = bare_registry
+            .specs()
+            .map(|spec| spec.name.as_str())
+            .collect();
+        assert!(!bare.contains(&"todo"), "the bare arm must not: {bare:?}");
+        assert_eq!(
+            bare,
+            [
+                "read_file",
+                "list_dir",
+                "write_file",
+                "edit_file",
+                "run_command"
+            ],
+            "the bare arm is exactly the five primitives, in order"
+        );
     }
 }

@@ -9,7 +9,7 @@ use loom_kernel::store::StoreError;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// The schema version this build writes and understands.
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 
 /// `meta` holds bookkeeping, not application data (`schema_version`).
 const META: &str = "\
@@ -61,6 +61,34 @@ CREATE TABLE IF NOT EXISTS artifacts (
 CREATE INDEX IF NOT EXISTS artifacts_sha256 ON artifacts (sha256);
 ";
 
+/// Version 2: the persisted event stream (roadmap item 1's open tail).
+///
+/// One row per emitted [`EventEnvelope`](loom_kernel::event::EventEnvelope):
+/// `body_json` is the envelope's authoritative serde form — the same
+/// shape `events.ndjson` traces carry — so a stored stream and an
+/// exported trace deserialize identically. Rows order by the
+/// autoincremented `position` (insertion order), *not* by the
+/// envelope's `sequence`: sequence numbers are per sink and a resumed
+/// session numbers its second run from zero again. `task_id` is
+/// denormalised the way `items.kind` is, for future per-task filters.
+/// Additive: a v1 database migrates up in place, and a session without
+/// event rows loads exactly as before.
+const V2: &str = "\
+CREATE TABLE IF NOT EXISTS events (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    position   INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id    TEXT NOT NULL,
+    body_json  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS events_session ON events (session_id, position);
+";
+
+/// The ordered migration chain, oldest step first. Each step is
+/// idempotent (`IF NOT EXISTS`) so a fresh file and an upgrade run the
+/// same statements.
+const STEPS: &[&str] = &[V1, V2];
+
 /// Brings `connection` to [`SCHEMA_VERSION`], refusing a newer file.
 pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
     connection.execute_batch(META).map_err(backend)?;
@@ -86,11 +114,12 @@ pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
         Some(version) if version > SCHEMA_VERSION => Err(StoreError::Corrupt(format!(
             "database schema v{version} is newer than this build (v{SCHEMA_VERSION})"
         ))),
-        // Fresh file, or a version older than this build: apply v1 (idempotent
-        // `IF NOT EXISTS`) and record the version. A future migration chain
-        // inserts steps between here and the version write.
+        // Fresh file, or a version older than this build: walk every
+        // step (idempotent) and record the version this build writes.
         _ => {
-            connection.execute_batch(V1).map_err(backend)?;
+            for step in STEPS {
+                connection.execute_batch(step).map_err(backend)?;
+            }
             connection
                 .execute(
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?1) \

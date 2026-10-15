@@ -4,9 +4,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use loom_kernel::event::EventEnvelope;
 use loom_kernel::id::{ArtifactId, SessionId};
-use loom_kernel::session::{PlannedTurn, Session, TaskRecord};
-use loom_kernel::store::{ArtifactStat, ArtifactStore, SessionStore, StoreError, StoredArtifact};
+use loom_kernel::session::{PlannedTurn, Session, TaskRecord, TodoList};
+use loom_kernel::store::{
+    ArtifactStat, ArtifactStore, EventStore, SessionStore, StoreError, StoredArtifact,
+};
 use loom_kernel::transcript::{Item, ItemIndex};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -328,10 +331,15 @@ impl SessionStore for SqliteStore {
             }
         }
 
+        // The kernel-owned todo list is not item-keyed: a session
+        // rebuilt from items starts with an empty list. The transcript's
+        // appended todo blocks keep the model's view intact, and the
+        // `TodoUpdated` event stream reconstructs the list for replay.
         Ok(Some(Session {
             id: *session,
             transcript,
             tasks,
+            todos: TodoList::default(),
         }))
     }
 
@@ -349,6 +357,43 @@ impl SessionStore for SqliteStore {
             ids.push(raw.parse::<SessionId>().map_err(corrupt)?);
         }
         Ok(ids)
+    }
+}
+
+impl EventStore for SqliteStore {
+    fn append_event(
+        &self,
+        session: &SessionId,
+        envelope: &EventEnvelope,
+    ) -> Result<(), StoreError> {
+        let body = serde_json::to_string(envelope).map_err(backend)?;
+        let connection = self.lock()?;
+        // `position` is assigned by SQLite (AUTOINCREMENT), so the row
+        // order is insertion order even when a resumed session's
+        // envelope sequences restart from zero.
+        connection
+            .execute(
+                "INSERT INTO events (session_id, task_id, body_json) VALUES (?1, ?2, ?3)",
+                params![session.to_string(), envelope.task_id.to_string(), body],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn load_events(&self, session: &SessionId) -> Result<Vec<EventEnvelope>, StoreError> {
+        let connection = self.lock()?;
+        let mut query = connection
+            .prepare("SELECT body_json FROM events WHERE session_id = ?1 ORDER BY position ASC")
+            .map_err(backend)?;
+        let rows = query
+            .query_map([session.to_string()], |row| row.get::<_, String>(0))
+            .map_err(backend)?;
+        let mut events = Vec::new();
+        for row in rows {
+            let body = row.map_err(backend)?;
+            events.push(serde_json::from_str::<EventEnvelope>(&body).map_err(corrupt)?);
+        }
+        Ok(events)
     }
 }
 

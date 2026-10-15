@@ -34,7 +34,7 @@ use loom_kernel::model::{
     Message, ModelCapabilities, ModelError, ModelErrorKind, ModelEvent, ModelProvider,
     ModelRequest, ModelResponse, ModelStream, StopReason, Usage,
 };
-use loom_kernel::session::{PlannedTurn, Session, TaskRecord, TaskStatus};
+use loom_kernel::session::{PlannedTurn, Session, TaskRecord, TaskStatus, TodoStatus};
 use loom_kernel::store::{MemorySessionStore, SessionStore, StoreError};
 use loom_kernel::tool::{
     CommandEffect, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolRegistry, ToolSpec,
@@ -2356,4 +2356,204 @@ async fn record_fast_path_books_a_zero_request_completion() {
         )
         .collect();
     assert_eq!(positions, vec![0, 1, 2], "events: {kinds:?}");
+}
+
+/// Roadmap item 8 phase B: the kernel-owned `todo` tool through the real
+/// loop — the tail projection rule.
+///
+/// The current list is re-appended as a user item at the transcript tail
+/// only when a turn's tool batch changed it, so:
+///
+/// * the request compiled right after a change ends with the fresh block;
+/// * every earlier request is a byte-identical *prefix* of every later
+///   one (the append-only transcript keeps the provider prefix cache
+///   valid);
+/// * a quiet turn — a batch that did not touch the list — appends
+///   nothing and still extends the projection by pure prefix growth.
+#[tokio::test]
+async fn todo_list_re_appends_at_the_tail_only_when_changed() {
+    // Registry: the real kernel tool plus a read-only echo for the quiet
+    // turn. The todo tool mutates, so its calls serialize in model order
+    // (the virtual write cell), which is what makes two adds in one
+    // batch assign ids deterministically.
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(loom_kernel::tool::TodoTool::new()))
+        .unwrap();
+    registry
+        .register(Box::new(FakeTool {
+            spec: spec("echo"),
+            read_only: true,
+        }))
+        .unwrap();
+
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            // Turn 1: two adds in one batch.
+            completed(
+                assistant(
+                    "planning",
+                    StopReason::ToolCalls,
+                    vec![
+                        tool_call("call_1", "todo", json!({"op": "add", "text": "step one"})),
+                        tool_call("call_2", "todo", json!({"op": "add", "text": "step two"})),
+                    ],
+                ),
+                usage(10, 3, None),
+            ),
+            // Turn 2: a mark — the list changes again.
+            completed(
+                assistant(
+                    "working",
+                    StopReason::ToolCalls,
+                    vec![tool_call(
+                        "call_3",
+                        "todo",
+                        json!({"op": "mark", "id": "1", "status": "done"}),
+                    )],
+                ),
+                usage(20, 4, None),
+            ),
+            // Turn 3: a quiet batch — no todo call, so no new block.
+            completed(
+                assistant(
+                    "checking",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_4", "echo", json!({"q": "hi"}))],
+                ),
+                usage(30, 5, None),
+            ),
+            // Turn 4: done.
+            completed(
+                assistant("done", StopReason::EndTurn, Vec::new()),
+                usage(40, 6, None),
+            ),
+        ],
+    );
+    let requests = provider.requests_handle();
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let agent = agent(provider, registry, 10);
+
+    let mut session = Session::new(SessionId::new());
+    let summary = agent
+        .run_task(&mut session, "do the thing", &sink, &TaskControl::default())
+        .await
+        .expect("task completes");
+    assert_eq!(summary.turns, 4);
+
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 4);
+
+    // Count the todo blocks in a request's projection.
+    let todo_blocks = |request: &ModelRequest| -> Vec<String> {
+        request
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::User { text } if text.starts_with("## todo (kernel)") => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+
+    // Turn 1's compile ran before any todo op: no block.
+    assert!(todo_blocks(&requests[0]).is_empty(), "no list existed yet");
+
+    // Turn 2's compile, after the two adds: exactly one fresh block at
+    // the tail, with both steps pending and stable ids.
+    let first_block = todo_blocks(&requests[1]);
+    assert_eq!(
+        first_block,
+        vec!["## todo (kernel)\n- [ ] 1: step one\n- [ ] 2: step two".to_owned()],
+        "the changed list is re-appended once, at the tail"
+    );
+    assert!(matches!(
+        requests[1].messages.last(),
+        Some(Message::User { text }) if text.starts_with("## todo (kernel)")
+    ));
+
+    // Turn 3's compile, after the mark: the new block at the tail, and
+    // the entire previous request is a byte-identical prefix.
+    let second_block = todo_blocks(&requests[2]);
+    assert_eq!(
+        second_block,
+        vec!["## todo (kernel)\n- [x] 1: step one\n- [ ] 2: step two".to_owned()]
+    );
+    let is_todo_block = |message: &Message| matches!(message, Message::User { text } if text.starts_with("## todo (kernel)"));
+    let projected: Vec<_> = requests[1]
+        .messages
+        .iter()
+        .filter(|message| !is_todo_block(message))
+        .collect();
+    let extension: Vec<_> = requests[2]
+        .messages
+        .iter()
+        .filter(|message| !is_todo_block(message))
+        .collect();
+    assert_eq!(projected, extension[..projected.len()]);
+    assert_eq!(
+        extension.len() - projected.len(),
+        2,
+        "a changed list adds its assistant turn and its tool result"
+    );
+    assert!(
+        requests[2].messages.iter().all(|message| {
+            !matches!(message, Message::User { text } if text.starts_with("## todo (kernel)"))
+                || *message == *requests[2].messages.last().unwrap()
+        }),
+        "only the newest todo block is projected (tail projection rule)"
+    );
+
+    // Turn 4's compile, after the quiet echo turn: no new block, and the
+    // previous request is again a pure prefix extension (modulo the
+    // tail-projected todo block, which may shift as history elides).
+    assert_eq!(
+        todo_blocks(&requests[3]),
+        second_block,
+        "an unchanged list is not re-appended"
+    );
+    let projected_3: Vec<_> = requests[2]
+        .messages
+        .iter()
+        .filter(|message| !is_todo_block(message))
+        .collect();
+    let extension_3: Vec<_> = requests[3]
+        .messages
+        .iter()
+        .filter(|message| !is_todo_block(message))
+        .collect();
+    assert_eq!(
+        projected_3,
+        extension_3[..projected_3.len()],
+        "a quiet turn grows the projection by prefix only"
+    );
+    assert_eq!(
+        extension_3.len() - projected_3.len(),
+        2,
+        "the quiet turn adds its assistant turn and its tool result"
+    );
+
+    // Session state: the tool's mutations were copied back.
+    assert_eq!(session.todos.items.len(), 2);
+    assert_eq!(session.todos.items[0].status, TodoStatus::Done);
+    // Transcript: one appended block per change (two total), each after
+    // the turn that caused it.
+    let appended = session
+        .transcript
+        .iter()
+        .filter(|item| matches!(item, Item::User { text } if text.starts_with("## todo (kernel)")))
+        .count();
+    assert_eq!(appended, 2, "one durable block per change");
+
+    // Events: exactly one TodoUpdated per changing turn, none for the
+    // quiet turn, between the tool events and the terminal ones.
+    let kinds = drain(&mut receiver);
+    let updates = kinds
+        .iter()
+        .filter(|kind| matches!(kind, EventKind::TodoUpdated { .. }))
+        .count();
+    assert_eq!(updates, 2, "events: {kinds:?}");
 }

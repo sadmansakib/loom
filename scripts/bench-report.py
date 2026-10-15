@@ -3,9 +3,11 @@
 
 Reads one or more report-suite-<model>[-arm][-union].json files (as
 written by eval_live / eval_suite_union) and prints a markdown summary:
-headline, per-tier table, failure categories, economics, per-task rows.
-When two files share a model but differ in arm, an A/B delta section
-closes the report. Stdlib only; deterministic output.
+headline, per-tier table, per-model comparison table (when the suite
+carries a `models` section — old reports without one render unchanged),
+failure categories, economics, per-task rows. When two files share a
+model but differ in arm, an A/B delta section closes the report.
+Stdlib only; deterministic output.
 """
 
 from __future__ import annotations
@@ -52,6 +54,20 @@ def render_one(r: dict) -> list[str]:
             out.append(
                 f"| {t.get('tier')} | {t.get('solved')}/{t.get('runs')}"
                 f" | {fmt_pct(t.get('rate'))} |"
+            )
+        out.append("")
+
+    # Per-model comparison dimension: present only when gated runs named
+    # their model (suites merged across models); absent in old reports.
+    models = r.get("models") or {}
+    if models:
+        out.append("| model | solved/runs | rate |")
+        out.append("|---|---|---|")
+        for model_id in sorted(models):
+            m = models[model_id]
+            out.append(
+                f"| `{model_id}` | {m.get('solved')}/{m.get('runs')}"
+                f" | {fmt_pct(m.get('rate'))} |"
             )
         out.append("")
 
