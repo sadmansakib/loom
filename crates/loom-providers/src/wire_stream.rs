@@ -194,7 +194,16 @@ pub(crate) async fn send_request(
             };
             Err(ModelError::new(kind, format!("request failed: {error}")))
         }
-        Ok(Ok(response)) => Ok(response),
+        Ok(Ok(response)) => {
+            // Live-stall forensics (NIM, 2026-10-15): no request-send
+            // logging existed, so a silently stalled stream left nothing
+            // to correlate against frozen socket byte counts.
+            tracing::debug!(
+                status = %response.status(),
+                "sse response headers received"
+            );
+            Ok(response)
+        }
     }
 }
 

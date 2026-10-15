@@ -343,6 +343,66 @@ fn tasks() -> Vec<EvalTask> {
     loaded
 }
 
+/// Shared request meter for the live runner: a fractional token bucket
+/// refilled at `refill_per_sec`, small burst capacity. Free tiers rate
+/// limit by requests/minute (NVIDIA NIM: 40 rpm), so the bucket sizes
+/// the eval's total request rate regardless of task concurrency.
+struct TokenBucket {
+    tokens: f64,
+    capacity: f64,
+    refill_per_sec: f64,
+    updated: Instant,
+}
+
+async fn bucket_acquire(bucket: &Arc<Mutex<TokenBucket>>) {
+    loop {
+        let wait = {
+            let mut b = bucket.lock().unwrap();
+            let now = Instant::now();
+            b.tokens = (b.tokens + now.duration_since(b.updated).as_secs_f64() * b.refill_per_sec)
+                .min(b.capacity);
+            b.updated = now;
+            if b.tokens >= 1.0 {
+                b.tokens -= 1.0;
+                0.0
+            } else {
+                (1.0 - b.tokens) / b.refill_per_sec
+            }
+        };
+        if wait == 0.0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs_f64(wait.min(5.0))).await;
+    }
+}
+
+/// Waits for a bucket permit before the first byte of the wrapped
+/// provider's stream is polled. The kernel's own RateLimited retry
+/// policy stays the backstop for provider-side throttling this bucket
+/// misses.
+struct ThrottledProvider {
+    inner: Box<dyn ModelProvider>,
+    bucket: Arc<Mutex<TokenBucket>>,
+}
+
+impl ModelProvider for ThrottledProvider {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn capabilities(&self, model: &str) -> Option<ModelCapabilities> {
+        self.inner.capabilities(model)
+    }
+
+    fn stream<'a>(&'a self, request: &'a ModelRequest) -> ModelStream<'a> {
+        let bucket = Arc::clone(&self.bucket);
+        Box::pin(
+            futures::stream::once(async move { bucket_acquire(&bucket).await })
+                .flat_map(move |()| self.inner.stream(request)),
+        )
+    }
+}
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -860,6 +920,34 @@ fn bare_registry(tools: ToolSet) -> ToolRegistry {
             .into_tools()
             .filter(|tool| PRIMITIVES.contains(&tool.spec().name.as_str())),
     )
+}
+
+/// Roadmap item 8 phase B: the kernel-owned `todo` tool is a full-arm
+/// lever (plan enforcement is part of what the full harness measures),
+/// and the bare arm — the basic-harness baseline — must keep excluding
+/// it. This is a pure registry-construction check: no provider, no
+/// workspace, no network.
+#[test]
+fn bare_registry_excludes_the_kernel_todo_tool() {
+    for tools in [ToolSet::ReadOnly, ToolSet::Coding, ToolSet::ReadEdit] {
+        let registry = bare_registry(tools);
+        let names: Vec<&str> = registry.specs().map(|spec| spec.name.as_str()).collect();
+        assert!(
+            !names.contains(&"todo"),
+            "the bare arm must never expose the todo tool: {names:?}"
+        );
+        assert!(
+            names.iter().all(|name| [
+                "read_file",
+                "list_dir",
+                "write_file",
+                "edit_file",
+                "run_command"
+            ]
+            .contains(name)),
+            "the bare arm is the primitive set only: {names:?}"
+        );
+    }
 }
 
 /// The engine overrides for one eval arm. The full arm keeps the
@@ -1391,6 +1479,16 @@ where
 #[tokio::test]
 #[ignore = "live: needs DEEPSEEK_API_KEY (or OPENROUTER_API_KEY); spends real tokens"]
 async fn eval_live() {
+    // Provider/stream diagnostics reach stderr in the live harness just
+    // like the CLI (RUST_LOG; default quiet) — the runner is the one
+    // place a silent provider stall is undiagnosable without them.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
     let provider_name =
         std::env::var("LOOM_EVAL_PROVIDER").unwrap_or_else(|_| String::from("deepseek"));
     let model = std::env::var("LOOM_EVAL_MODEL").unwrap_or_else(|_| String::from("deepseek-flash"));
@@ -1416,6 +1514,15 @@ async fn eval_live() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
+    // Bounded task-level concurrency (default 1 = the sequential
+    // behavior). Runs within a task stay sequential: each task wipes and
+    // re-copies its own run root per run, so same-task runs must not
+    // overlap; different tasks use disjoint roots.
+    let concurrency: usize = std::env::var("LOOM_EVAL_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+        .max(1);
     // Measurement mode: a baseline run must survive a failed run and still
     // write every remaining task's report plus the suite headline. Strict
     // (asserting every run green) stays the default — that is the CI
@@ -1459,73 +1566,162 @@ async fn eval_live() {
     // OpenRouter model ids carry `/` and `:` — every artifact filename
     // embeds the model, so files use this slug instead.
     let file_model = slug(&model);
-    let mut suite: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
-    for task in &all_tasks {
-        if let Some(only) = &only
-            && !only.iter().any(|id| id.as_str() == task.id)
-        {
-            continue;
-        }
-        // Hard gate: everything that carries a gate, lab benches never.
-        if hard_gate && !hard_gate_keeps(task) {
-            continue;
-        }
-        // Heavy (long-context) tasks run only when explicitly named or
-        // under the hard gate: the default suite bounds time and cost.
-        if task.heavy && only.is_none() && !hard_gate {
-            continue;
-        }
-        let mut reports = Vec::new();
-        for run in 1..=runs {
-            // The recording hook wraps whichever provider the engine
-            // builds (credential-resolved, catalog-aware) — the eval
-            // observes production wiring instead of reproducing it.
-            let exchanges = Arc::new(Mutex::new(Vec::new()));
-            let hook_exchanges = Arc::clone(&exchanges);
-            let hook = Arc::new(move |built: Box<dyn ModelProvider>| {
-                Box::new(RecordingProvider {
-                    inner: built,
-                    exchanges: Arc::clone(&hook_exchanges),
-                }) as Box<dyn ModelProvider>
-            }) as ProviderHook;
-            let overrides = eval_overrides(&provider_name, task.tools, hook, bare);
-            let provider_label = provider_name.clone();
-            let open_provider = provider_name.clone();
-            let open_model = model.clone();
-            let open = |root: PathBuf, system_prompt: Option<String>| async move {
-                Engine::open_async_with(
-                    eval_config(root, &open_provider, &open_model, system_prompt),
-                    overrides,
-                )
-                .await
-            };
-            let (report, recorded, session) =
-                run_once(task, &model, &provider_label, Some(exchanges), open).await;
-            eprintln!(
-                "{} [{arm}] run {}/{}: success={} bug_fixed={}",
-                task.id, run, runs, report["success"], report["gate"]["bug_fixed"]
-            );
-            std::fs::write(
-                records_dir.join(format!("{}-{file_model}{file_arm}-{run}.jsonl", task.id)),
-                recorded
-                    .iter()
-                    .map(|e| serde_json::to_string(e).unwrap())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-                    + "\n",
-            )
-            .unwrap();
-            std::fs::write(
-                sessions_dir.join(format!(
-                    "{}-{file_model}{file_arm}-{run}.session.json",
-                    task.id
-                )),
-                serde_json::to_string(&session).unwrap(),
-            )
-            .unwrap();
-            reports.push(report);
-        }
+    // Task selection first, then scheduling: the same filters as before,
+    // collected so the runner can schedule tasks instead of walking
+    // them in order.
+    let selected: Vec<&EvalTask> = all_tasks
+        .iter()
+        .filter(|task| {
+            if let Some(only) = &only
+                && !only.iter().any(|id| id.as_str() == task.id)
+            {
+                return false;
+            }
+            // Hard gate: everything that carries a gate, lab benches never.
+            if hard_gate && !hard_gate_keeps(task) {
+                return false;
+            }
+            // Heavy (long-context) tasks run only when explicitly named or
+            // under the hard gate: the default suite bounds time and cost.
+            if task.heavy && only.is_none() && !hard_gate {
+                return false;
+            }
+            true
+        })
+        .collect();
 
+    // Optional shared request meter across every concurrent run. Size
+    // LOOM_EVAL_RPM under the provider cap (e.g. 36 against NVIDIA NIM's
+    // 40 rpm) so the kernel's RateLimited retry stays a backstop.
+    let bucket = std::env::var("LOOM_EVAL_RPM")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|rpm| *rpm > 0.0)
+        .map(|rpm| {
+            Arc::new(Mutex::new(TokenBucket {
+                tokens: rpm.min(8.0),
+                capacity: 8.0,
+                refill_per_sec: rpm / 60.0,
+                updated: Instant::now(),
+            }))
+        });
+
+    // Run-index-major scheduling: every task completes run N before any
+    // starts run N+1, so a rate-limit wall or a kill leaves a complete
+    // 1-run sweep (then 2-run, ...) — medians arrive early and nothing
+    // is half-finished. Tasks run concurrently up to
+    // LOOM_EVAL_CONCURRENCY; runs within a task stay sequential because
+    // each task wipes and re-copies its own run root per run.
+    let by_task: Arc<Mutex<std::collections::HashMap<String, Vec<serde_json::Value>>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    for run in 1..=runs {
+        futures::stream::iter(&selected)
+            .for_each_concurrent(concurrency, |task| {
+                let task: &EvalTask = task;
+                let records_dir = records_dir.clone();
+                let sessions_dir = sessions_dir.clone();
+                let by_task = Arc::clone(&by_task);
+                let bucket = bucket.clone();
+                let model = model.clone();
+                let open_provider = provider_name.clone();
+                let provider_label = provider_name.clone();
+                let file_model = file_model.clone();
+                async move {
+                    // The recording hook wraps whichever provider the engine
+                    // builds (credential-resolved, catalog-aware) — the eval
+                    // observes production wiring instead of reproducing it.
+                    let exchanges = Arc::new(Mutex::new(Vec::new()));
+                    let hook_exchanges = Arc::clone(&exchanges);
+                    let hook_bucket = bucket.clone();
+                    let hook = Arc::new(move |built: Box<dyn ModelProvider>| {
+                        let inner: Box<dyn ModelProvider> = match &hook_bucket {
+                            Some(bucket) => Box::new(ThrottledProvider {
+                                inner: built,
+                                bucket: Arc::clone(bucket),
+                            }),
+                            None => built,
+                        };
+                        Box::new(RecordingProvider {
+                            inner,
+                            exchanges: Arc::clone(&hook_exchanges),
+                        }) as Box<dyn ModelProvider>
+                    }) as ProviderHook;
+                    let overrides = eval_overrides(&open_provider, task.tools, hook, bare);
+                    let open_model = model.clone();
+                    let open = |root: PathBuf, system_prompt: Option<String>| async move {
+                        Engine::open_async_with(
+                            eval_config(root, &open_provider, &open_model, system_prompt),
+                            overrides,
+                        )
+                        .await
+                    };
+                    // Per-run watchdog: a live NIM stall (2026-10-15)
+                    // wedged whole sweeps forever; a run that exceeds
+                    // LOOM_EVAL_RUN_TIMEOUT_SECS (default 1800) fails
+                    // the run instead of hanging the sweep. Heavy tier-l
+                    // tasks should raise it.
+                    let watchdog = std::time::Duration::from_secs(
+                        std::env::var("LOOM_EVAL_RUN_TIMEOUT_SECS")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(1800),
+                    );
+                    let attempt = run_once(task, &model, &provider_label, Some(exchanges), open);
+                    let (report, recorded, session) =
+                        match tokio::time::timeout(watchdog, attempt).await {
+                            Ok((report, recorded, session)) => (report, recorded, Some(session)),
+                            Err(_) => (
+                                serde_json::json!({
+                                    "success": false,
+                                    "error": "run watchdog timeout",
+                                    "gate": serde_json::Value::Null,
+                                }),
+                                Vec::new(),
+                                None,
+                            ),
+                        };
+                    eprintln!(
+                        "{} [{arm}] run {run}/{runs}: success={} bug_fixed={}",
+                        task.id, report["success"], report["gate"]["bug_fixed"]
+                    );
+                    std::fs::write(
+                        records_dir.join(format!("{}-{file_model}{file_arm}-{run}.jsonl", task.id)),
+                        recorded
+                            .iter()
+                            .map(|e| serde_json::to_string(e).unwrap())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                            + "\n",
+                    )
+                    .unwrap();
+                    if let Some(session) = session {
+                        std::fs::write(
+                            sessions_dir.join(format!(
+                                "{}-{file_model}{file_arm}-{run}.session.json",
+                                task.id
+                            )),
+                            serde_json::to_string(&session).unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    by_task
+                        .lock()
+                        .unwrap()
+                        .entry(task.id.to_owned())
+                        .or_default()
+                        .push(report);
+                }
+            })
+            .await;
+    }
+
+    let by_task = Arc::try_unwrap(by_task)
+        .expect("eval runner holds the only map reference")
+        .into_inner()
+        .unwrap();
+    let mut suite: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
+    for task in selected {
+        let reports = by_task.get(task.id.as_str()).cloned().unwrap_or_default();
         let report = serde_json::json!({
             "harness": "eval 2A",
             "arm": arm,
@@ -1686,7 +1882,12 @@ async fn eval_suite_union() {
 /// (`end_reason` for transcript failures, `gate_failed` for runs that
 /// finished but did not fix); `idle_turns` sums the no-tool-call
 /// assistant turns; `by_tier` stratifies the pass rate by the task's
-/// human-time tier, because a blended rate hides the tier cliff.
+/// human-time tier, because a blended rate hides the tier cliff; and
+/// `models` groups gated outcomes by the model id each run itself
+/// names — the per-model comparison dimension (roadmap item 1's
+/// remaining half), authoritative even in a suite merged across
+/// models. The section is absent when no gated run carries a model id
+/// (pre-schema reports), so old artifacts render unchanged.
 fn suite_headline(
     model: &str,
     mode: &str,
@@ -1709,6 +1910,11 @@ fn suite_headline(
     let mut all_turns = 0u64;
     let mut categories: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     let mut tiers: std::collections::BTreeMap<String, (u64, u64)> =
+        std::collections::BTreeMap::new();
+    // model id → (gated runs, gated solved): the comparison dimension.
+    // Keyed by `runs[].model` — the label the run itself carries — so a
+    // suite merged across models or campaigns stays attributable.
+    let mut models: std::collections::BTreeMap<String, (u64, u64)> =
         std::collections::BTreeMap::new();
     let mut category = |run: &serde_json::Value| {
         if !run["success"].as_bool().unwrap_or(false) {
@@ -1758,6 +1964,17 @@ fn suite_headline(
         };
         per_task.insert(id.clone(), entry);
         for run in reports {
+            // Per-model tally first: gated runs only (lab benches carry
+            // no comparable outcome), grouped under the model the run
+            // names. Runs without a model id contribute nothing, which
+            // is what keeps old reports section-free.
+            if run.get("gate").is_some_and(|g| !g.is_null())
+                && let Some(model_id) = run["model"].as_str()
+            {
+                let slot = models.entry(model_id.to_owned()).or_default();
+                slot.0 += 1;
+                slot.1 += u64::from(run["gate"]["bug_fixed"].as_bool().unwrap_or(false));
+            }
             let cost = run["cost_usd"].as_f64().unwrap_or(0.0);
             total_cost += cost;
             let run_gated_unsolved = run.get("gate").is_some_and(|g| !g.is_null())
@@ -1794,7 +2011,7 @@ fn suite_headline(
         })
     };
     let round4 = |v: f64| (v * 1e4).round() / 1e4;
-    serde_json::json!({
+    let mut headline = serde_json::json!({
         "model": model,
         "mode": mode,
         "arm": arm,
@@ -1843,7 +2060,30 @@ fn suite_headline(
                 "note": "micro-eval totals over all runs incl. failures",
             },
         },
-    })
+    });
+    // The per-model section is additive and only ever written when some
+    // gated run named a model — an absent key (not a null) is the
+    // backward-compatibility contract for pre-model-schema reports.
+    if !models.is_empty() {
+        let section = models
+            .iter()
+            .map(|(model_id, (runs, solved))| {
+                (
+                    model_id.clone(),
+                    serde_json::json!({
+                        "runs": runs,
+                        "solved": solved,
+                        "rate": *solved as f64 / *runs as f64,
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>();
+        headline
+            .as_object_mut()
+            .unwrap()
+            .insert("models".to_owned(), serde_json::Value::Object(section));
+    }
+    headline
 }
 
 #[test]
@@ -2015,6 +2255,173 @@ fn suite_headline_handles_an_empty_or_all_lab_suite() {
     assert_eq!(
         headline["economics"]["total_cost_usd"],
         serde_json::json!(0.01)
+    );
+}
+
+/// The per-model comparison dimension (roadmap item 1): gated outcomes
+/// group under the model id each run itself names, across tasks — so a
+/// suite merged from several models' per-task reports (the union path)
+/// stays attributable without any caller-side bookkeeping.
+#[test]
+fn suite_headline_groups_gate_outcomes_by_model() {
+    let run = |model: &str, solved: bool| {
+        serde_json::json!({
+            "model": model,
+            "success": true,
+            "turns": 5,
+            "cost_usd": 0.01,
+            "gate": {"bug_fixed": solved},
+        })
+    };
+    let suite = vec![
+        (
+            "B2".to_owned(),
+            vec![run("alpha", true), run("alpha", false), run("beta", true)],
+        ),
+        (
+            "B3".to_owned(),
+            vec![run("alpha", false), run("beta", true)],
+        ),
+        // Lab runs name their model too but carry no gate, and the
+        // section compares gate outcomes — gamma must not appear.
+        (
+            "B1".to_owned(),
+            vec![serde_json::json!({"model": "gamma", "success": true, "turns": 3})],
+        ),
+    ];
+    let headline = suite_headline("alpha", "strict", "full", &suite);
+    let models = headline["models"].as_object().expect("models section");
+    assert_eq!(models.len(), 2, "alpha and beta only: {models:?}");
+    assert_eq!(
+        models["alpha"],
+        serde_json::json!({"runs": 3, "solved": 1, "rate": 1.0 / 3.0})
+    );
+    assert_eq!(
+        models["beta"],
+        serde_json::json!({"runs": 2, "solved": 2, "rate": 1.0})
+    );
+    assert!(!models.contains_key("gamma"));
+    // The blended headline is unchanged by the new section.
+    assert_eq!(headline["gated_runs"], serde_json::json!(5));
+    assert_eq!(headline["gated_solved"], serde_json::json!(3));
+}
+
+/// Old reports (runs that predate the per-run `model` field) still
+/// aggregate: the models section is absent — not null — so renderers
+/// treat it as optional and old artifacts render unchanged.
+#[test]
+fn suite_headline_omits_models_section_for_old_reports() {
+    let suite = vec![(
+        "B2".to_owned(),
+        vec![serde_json::json!({
+            "success": true,
+            "turns": 4,
+            "gate": {"bug_fixed": true},
+        })],
+    )];
+    let headline = suite_headline("m", "strict", "full", &suite);
+    assert_eq!(headline["gated_runs"], serde_json::json!(1));
+    assert_eq!(headline["gated_solved"], serde_json::json!(1));
+    assert!(
+        headline.get("models").is_none(),
+        "no run carries a model id — the section must be absent, not null"
+    );
+}
+
+/// `scripts/bench-report.py` renders the per-model comparison table
+/// when the suite carries a `models` section, and an old-format suite
+/// without one still renders (backward-compatible). Offline: synthetic
+/// JSON under the scratch target dir, one stdlib-only script, no
+/// network. Self-skips when no python3 is on PATH, the same contract
+/// as the replay tests skipping without recordings.
+#[test]
+fn bench_report_renders_per_model_comparison() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping bench_report_renders_per_model_comparison: no python3 on PATH");
+        return;
+    }
+    let script = workspace_root().join("scripts").join("bench-report.py");
+    let scratch = std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| workspace_root().join("target"))
+        .join("agents")
+        .join("permodel")
+        .join("scratch")
+        .join("bench-report");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let mut with_models = serde_json::json!({
+        "model": "alpha",
+        "mode": "strict",
+        "arm": "full",
+        "gated_runs": 3,
+        "gated_solved": 1,
+        "pass_rate": 1.0 / 3.0,
+        "tasks": {"B2": {"kind": "field", "runs": 3, "solved": 1, "rate": 1.0 / 3.0}},
+    });
+    with_models["models"] = serde_json::json!({
+        "alpha": {"runs": 3, "solved": 1, "rate": 1.0 / 3.0},
+        "beta": {"runs": 2, "solved": 2, "rate": 1.0},
+    });
+    let without_models = serde_json::json!({
+        "model": "alpha",
+        "mode": "strict",
+        "arm": "full",
+        "gated_runs": 3,
+        "gated_solved": 1,
+        "pass_rate": 1.0 / 3.0,
+        "tasks": {"B2": {"kind": "field", "runs": 3, "solved": 1, "rate": 1.0 / 3.0}},
+    });
+    let with_path = scratch.join("suite-with-models.json");
+    let without_path = scratch.join("suite-without-models.json");
+    std::fs::write(
+        &with_path,
+        serde_json::to_string_pretty(&with_models).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &without_path,
+        serde_json::to_string_pretty(&without_models).unwrap(),
+    )
+    .unwrap();
+    let render = |path: &Path| -> String {
+        let output = std::process::Command::new("python3")
+            .arg(&script)
+            .arg(path)
+            .output()
+            .expect("python3 (probed above)");
+        assert!(
+            output.status.success(),
+            "bench-report.py failed on {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let rendered = render(&with_path);
+    assert!(
+        rendered.contains("| model | solved/runs | rate |"),
+        "per-model table header missing:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("| `alpha` | 1/3 | 33.3% |"),
+        "alpha row missing:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("| `beta` | 2/2 | 100.0% |"),
+        "beta row missing:\n{rendered}"
+    );
+    let old = render(&without_path);
+    assert!(
+        !old.contains("| model |"),
+        "old-format suite must not grow a models table:\n{old}"
+    );
+    assert!(
+        old.contains("pass rate: 1/3"),
+        "old-format suite still renders its headline:\n{old}"
     );
 }
 
@@ -2540,7 +2947,7 @@ fn eval_micro_walks_recorded_sessions() {
         slot.3 += stats.totals.failed;
         slot.4 += stats.malformed_calls;
     }
-    for (model, (entries, turns, calls, failed, malformed)) in by_model {
+    for (model, (entries, turns, calls, failed, malformed)) in &by_model {
         let report = serde_json::json!({
             "harness": "eval 2A micro",
             "model": model,
@@ -2562,6 +2969,37 @@ fn eval_micro_walks_recorded_sessions() {
             path.display()
         );
     }
+    // The per-model comparison dimension (roadmap item 1), micro half:
+    // one artifact with every model side by side — the same totals the
+    // per-model files carry, keyed by model id — so cross-model deltas
+    // read without diffing files. Absent model data never reaches here
+    // (the walker self-skips without session snapshots).
+    let comparison = serde_json::json!({
+        "harness": "eval 2A micro",
+        "models": by_model
+            .iter()
+            .map(|(model, (entries, turns, calls, failed, malformed))| {
+                (
+                    model.clone(),
+                    serde_json::json!({
+                        "sessions": entries.len(),
+                        "turns": turns,
+                        "calls": calls,
+                        "failed": failed,
+                        "malformed_calls": malformed,
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>(),
+        "note": "per-model totals recomputed offline from records/sessions; per-model detail in report-micro-<model>.json",
+    });
+    let path = eval_dir().join("report-micro.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&comparison).unwrap()).unwrap();
+    eprintln!(
+        "micro comparison across {} models — wrote {}",
+        by_model.len(),
+        path.display()
+    );
 }
 
 /// Synthetic two-turn script (no network, no recordings): a `read_file`

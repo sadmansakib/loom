@@ -117,6 +117,9 @@ LOOM_EVAL_TASKS=B1,B16,B17        # subset; unset = all non-heavy tasks
 LOOM_EVAL_RUNS=5                  # runs per task (default 5)
 LOOM_EVAL_TOLERATE_FAILURES=1     # measurement mode; default strict
 LOOM_EVAL_BARE=1                  # bare-loop arm; default full
+LOOM_EVAL_CONCURRENCY=16          # tasks in parallel (default 1 = sequential)
+LOOM_EVAL_RPM=36                  # shared requests/min meter across all runs
+LOOM_EVAL_RUN_TIMEOUT_SECS=1800 # per-run watchdog; stalled run fails instead of hanging
 cargo test -p loom-eval eval::eval_live -- --ignored --nocapture
 ```
 
@@ -135,6 +138,15 @@ dollars) — check the dashboard before a full-suite run.
 `LOOM_EVAL_PROVIDER=nvidia` targets NVIDIA NIM's free-trial tier the
 same way (keychain account or `NVIDIA_API_KEY`; prices at $0 by
 construction), which is roadmap item 1's zero-cost candidate.
+
+Scheduling: sweeps are run-index-major (every task completes run N
+before any starts run N+1), so an interrupted run leaves a complete
+N-run sweep, not N half-finished tasks. Tasks run concurrently up to
+`LOOM_EVAL_CONCURRENCY`; runs within a task stay sequential (each task
+wipes and re-copies its own run root). `LOOM_EVAL_RPM` meters the
+total request rate across all concurrent runs — size it under the
+provider cap (e.g. 36 against NVIDIA NIM's 40 rpm); the kernel's
+RateLimited retry remains the backstop.
 
 - **Strict mode** (default): asserts every run green and every gate
   solved — the CI contract.
