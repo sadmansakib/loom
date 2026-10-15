@@ -14,7 +14,7 @@ This document has three layers:
 1. **Vision** — goals, principles, and the iteration sequence (stable;
    changes need an ADR-level reason).
 2. **Status** — what is shipped and verified in the codebase today.
-3. **Backlog** — numbered, evidence-gated items (1–23), each mapped to an
+3. **Backlog** — numbered, evidence-gated items (1–25), each mapped to an
    iteration, the goals it serves, and the seam it plugs into.
 
 It is a roadmap, not a promise. The companion `architecture.md` describes
@@ -124,14 +124,14 @@ iterations may start early where a backlog item is cheap and measured.
 |---|---|---|---|
 | 1 | Core service | **Done** | — (see Shipped) |
 | 2 | Core efficiency & repository intelligence | **In progress (current)** | 1, 3✓, 4✓, 5✓ᴬ, 6✓, 7✗, 8✓ᴬ, 10✓ᴬ, 11⏸, 12✓, 16, 17✓ |
-| 3 | Intelligent subagent scheduling | Not started | 19, 21 |
+| 3 | Intelligent subagent scheduling | Not started | 19, 21, 24 |
 | 4 | Execution safety & richer tools | **Largely shipped early** | 2✓, 13⏸, 23 |
 | 5 | Skills & contextual knowledge | Partial (AGENTS.md facts) | 4✓ (instructions), 20.4 |
 | 6 | MCP & LSP integration | Not started | 18 |
 | 7 | Plugin system | Future scope | — |
 | 8 | Intelligent model routing | Not started; prerequisites in place | 9⏸, 14✓ |
 | 9 | Learning & self-optimization | Not started; data path partial | 1, 20 |
-| — | Product surface (cross-cutting) | Partial | 15, 22 |
+| — | Product surface (cross-cutting) | Partial | 15, 22, 25 |
 
 Legend: ✓ shipped · ✓ᴬ phase A shipped, remainder open · ✗ skipped on
 evidence · ⏸ deferred on evidence (revisit trigger recorded in the item).
@@ -233,7 +233,8 @@ context. Modes: research, review, verification, implementation —
 Lifecycle: spawn, run, observe, redirect, cancel, complete. The scheduler
 lives above `Agent::run_task`, never inside the turn loop. First step is
 item 19 (one read-only scout, one level deep); item 21 only after 19
-shows delegation pays.
+shows delegation pays. Item 24 (best-of-N sampling) is the test-time
+sibling: parallel rollouts of the *same* task, no delegation semantics.
 
 ### Iteration 4 — Execution safety & richer tools
 
@@ -569,6 +570,14 @@ reproduces them.
      failure-category vector (`end_reason` counts plus `gate_failed`),
      and idle turns / idle-turn rate (the no-tool-call assistant turn
      tax);
+     **Preamble tokens per turn** as a headline economics metric
+     (system prompt + tool schemas billed on every step): the harness-cost
+     study (arXiv 2610.04433) found fixed per-step preamble × step count
+     dominates harness cost differences (16.5K Claude Code vs 830
+     mini-SWE-agent), while pass-rate deltas were mostly noise — this is
+     the discriminating metric for any future tool-menu or
+     system-prompt growth, and it is already computable from the
+     per-source census. Track it in the economics block going forward;
    - ~~per-tool, per-model **failure-mode micro-evals** (edit-apply
      success, malformed-call rate, repeated-call rate) as release
      gates~~ — shipped offline half: every run report (success or
@@ -793,6 +802,15 @@ reproduces them.
     what a schedule needs to observe its own cost. The schedule itself
     (a kernel-side effort policy emitting those in-turn notes) remains
     open, gated on item 1.
+   **Routing slice zero (planned):** task-*start* model selection — a
+   trivial classifier (task text → difficulty tier) that picks the model
+   before `Agent` construction. Needs no Iteration-8 ADR because the
+   model-fixed-per-task invariant is untouched: the invariant governs
+   mid-task swaps, and selection happens before the first request.
+   Evidence: LangChain reports 64% median cost cut with no quality loss
+   from start-of-thread routing (hypothesis until Loom's eval
+   reproduces). Blocked on item 1's funded-model prerequisite like the
+   rest of this item.
 10. **Pruning, phase 2** (G2).
     - **Turn-age masking**: stub read-only results older than K turns
       even below the window trigger — SWE-agent's last-5-observations
@@ -906,9 +924,16 @@ reproduces them.
      handoff per task; a second overrun fails closed. Emits
      `ContextHandoff` (event schema v6); gated by
      `AgentConfig::handoff_compaction` and disabled in the engine's
-     bare arm. Remaining nicety, not scope: provider-native compaction
-     (Anthropic `compact_20260112`) when an adapter gains it — the
-     in-house path above is the default everywhere today.
+     bare arm. Remaining nicety, not scope: provider-native
+     context editing when an adapter gains it — Anthropic
+     `compact_20260112` (auto-triggers at a token threshold) and
+     `clear_tool_uses_20250919` (server-side tool-result clearing, the
+     same shape as Loom's stubs; caveat: invalidates prompt-cache
+     prefixes, so it belongs behind the same 20K-reclaim gate), plus
+     `context_management.compact_threshold` and the stateless
+     `/responses/compact` endpoint on the OpenAI-compatible side (free
+     reach for four of five adapters) — the in-house path above is the
+     default everywhere today.
 13. **Background commands** (G1, G2). Long builds and tests run
     detached; the runtime injects a completion notice at the next turn
     boundary instead of blocking a turn on them (Sema Code, Crush). Seam:
@@ -1018,13 +1043,49 @@ reproduces them.
     4. lessons: recurring failure→fix pairs mined from history into
        short, expiring rules injected through the facts block (gptme
        lessons, `rtk learn`). This is the long-term memory item; the
-       hard part is staleness and eviction, not storage.
+       hard part is staleness and eviction, not storage. Implementation
+       reference: the provider-native memory-tool shape (Anthropic
+       `memory_20260818` context edit; Claude Code's agent-written
+       `MEMORY.md`) is the same pattern at the file level — plain files
+       under model control, injected through a seam Loom already has.
 21. **Parallel orchestration.** Worktree-per-agent isolation with a
     merge path, above the engine. Only after item 19 shows delegation
     pays.
 22. **Frontends.** A TUI or desktop client, additive once resume ships.
 23. **Distributed verification.** Remote or containerized `verify`
     runners with the same evidence contract.
+24. **Best-of-N task-time sampling** (G1, G9). Fork the prepared
+    workspace snapshot into N independent child agents (same model,
+    varied approach hints), run them concurrently in the existing OS
+    sandbox, and select the first rollout whose deterministic outcome
+    gate passes — the gate, not the model, judges. Evidence: RTV +
+    summary-conditioned refinement lifted Opus 4.5 from 70.9%→77.6%
+    SWE-bench Verified and 46.9%→59.1% Terminal-Bench v2.0 while
+    halving steps (arXiv 2604.16529); S*-style hybrid
+    parallel+iterative allocation beat majority vote by 10–16 pp
+    (arXiv 2502.14382). Caveats that shape the design: weak selectors
+    can make fixed Best-of-3 *worse* than Best-of-1 (arXiv 2608.03961)
+    — using the deterministic gate as the selector avoids that failure
+    mode entirely; grading must use tests the agent cannot edit
+    (Loom's gate already does); N multiplies tokens, so start at N=2-3
+    on hard-gate failures only (adaptive budgeting, not fixed N), and
+    measure tokens-per-*solved*-task, not per run. Prerequisites all
+    shipped: byte-stable projection, sandbox fork, deterministic gates,
+    usage accounting. Sibling of item 21 (parallel rollouts, no
+    delegation semantics); blocked on item 1's funded model like
+    everything that multiplies spend. Seam: the engine composing N
+    child `Agent`s above `Agent::run_task`, same as item 19.
+25. **Queued user steering** (G1, G2). Let a user queue a message
+    while a task runs; the runtime delivers it as the next user item at
+    the next turn boundary, before projection compile — so the census
+    and replay stay byte-stable and the eval harness is unaffected.
+    Distinct from item 15's pause (`AwaitingInput`): no stop, an
+    injected instruction the model sees on its next turn. This is the
+    steering seam every leading interactive agent (Claude Code, Codex)
+    exposes; composing with the pause path means no new lifecycle
+    states. Blocked on the interactive CLI surface (item 15 remainder,
+    item 22). Seam: turn assembly next to item 13's deferred
+    turn-boundary notices.
 
 ### Deliberately not planned
 
@@ -1048,6 +1109,11 @@ Each would add surface without evidence it serves the goals (G8):
 - **More per-provider tokenizers.** o200k covers the OpenAI-compatible
   providers and a scaled o200k covers Anthropic; usage calibration
   (item 10) closes the remaining gap if measurement ever shows one.
+- **Image/multimodal input.** No leading-harness evidence that images
+  move coding-agent outcomes on text-shaped benchmarks, and every
+  model-visible byte would bypass the text census and elision machinery.
+  Revisit trigger: an eval task class that provably needs image input
+  (UI screenshots, architecture diagrams) on a multimodal funded model.
 
 ### Open questions
 
