@@ -17,6 +17,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 # gitignore-aware directory walk (search) and line matching
 ignore = { workspace = true }
+# syntax guard (roadmap item 5 phase B): parse edited files before write
+tree-sitter = { workspace = true }
+tree-sitter-rust = { workspace = true }
 regex = { workspace = true }
 # process-group control for spawned commands (kill the tree on timeout)
 process-wrap = { workspace = true }

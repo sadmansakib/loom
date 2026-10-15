@@ -107,17 +107,19 @@ fn bench_root() -> PathBuf {
 /// anchor block at a position that is not the first or last line, so a
 /// wrong-location match would be detectable.
 fn fixture(root: &Path, name: &str, lines: u64) -> (PathBuf, String, String, String) {
+    let ident = name.replace(['.', '-'], "_"); // filename → valid Rust ident
     let path = root.join(name);
-    let anchor = format!("fn anchor_{name}() -> u32 {{\n    {name}_SEED // target line\n}}\n");
+    let anchor = format!("fn anchor_{ident}() -> u32 {{\n    {ident}_SEED // target line\n}}\n");
     let mut text = String::with_capacity(64 * lines as usize);
     for i in 0..lines {
         if i == lines / 2 {
             text.push_str(&anchor);
         }
-        text.push_str(&format!("fn filler_{name}_{i:06}() -> u32 {{ {i} }}\n"));
+        text.push_str(&format!("fn filler_{ident}_{i:06}() -> u32 {{ {i} }}\n"));
     }
     std::fs::write(&path, &text).expect("write fixture");
-    let replacement = format!("fn anchor_{name}() -> u32 {{\n    {name}_EDITED // replaced\n}}\n");
+    let replacement =
+        format!("fn anchor_{ident}() -> u32 {{\n    {ident}_EDITED // replaced\n}}\n");
     (path, text, anchor, replacement)
 }
 
@@ -185,12 +187,12 @@ async fn editbench_the_editor_holds_its_invariants() {
         let (path, _text, _anchor, _replacement) = fixture(&root, "ambiguous.rs", 240);
         let dup_at = 30usize;
         let dup_line =
-            "fn anchor_ambiguous.rs() -> u32 {\n    ambiguous.rs_SEED // target line\n}\n";
+            "fn anchor_ambiguous_rs() -> u32 {\n    ambiguous_rs_SEED // target line\n}\n";
         let mut text = std::fs::read_to_string(&path).expect("fixture readable");
         let dup_insert = dup_line.to_string();
         text.insert_str(dup_at * 40, &dup_insert);
         std::fs::write(&path, &text).expect("write duplicated fixture");
-        let anchor = "fn anchor_ambiguous.rs() -> u32 {\n    ambiguous.rs_SEED // target line\n}\n";
+        let anchor = "fn anchor_ambiguous_rs() -> u32 {\n    ambiguous_rs_SEED // target line\n}\n";
         let input = json!({
             "path": "ambiguous.rs",
             "old_string": anchor,

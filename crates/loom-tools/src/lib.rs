@@ -23,6 +23,7 @@ mod run_command;
 pub mod sandbox;
 mod schema;
 mod search;
+pub mod syntax;
 mod text;
 mod verify;
 mod window;

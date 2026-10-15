@@ -1,13 +1,23 @@
 //! The `search` tool: gitignore-aware regex line search.
 //!
-//! Ignore handling is delegated to the `ignore` crate. One divergence
-//! from git is inherited and documented rather than fixed: a negation
-//! (`!foo/`) in a nested `.gitignore` re-includes that directory for
-//! the whole walk, where git cannot re-include a path under an
-//! excluded parent directory. See the `scoped_search_nearest_ignore_file_wins`
-//! test for the concrete case.
+//! Ignore handling is delegated to the `ignore` crate, with ignore
+//! files between the workspace root and the scope applied by hand so a
+//! scoped search matches a whole-workspace search. On nested
+//! negations the walk now matches git (a nested `!gen/` beats a root
+//! `gen/` because no *parent directory* of the path is excluded;
+//! git's real cannot-re-include rule bites only under an excluded
+//! parent dir, where this walk prunes descent like git) — pinned by
+//! `whole_tree_walk_matches_git_on_nested_negation` and
+//! `repo_shaped_tree_scoped_and_whole_agree` (item 16). One deliberate
+//! divergence remains and is documented rather than fixed: the scoped
+//! walk consults only ignore files *down to the scope*, so a whitelist
+//! in a file *inside* the scope cannot re-include what an ancestor
+//! rule excludes — stricter than git's descent. See §9.2 below and the
+//! `scoped_whitelist_below_scope_is_pruned` test for the concrete
+//! case.
 
 use futures::future::BoxFuture;
+use ignore::Match as IgnoreMatch;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use loom_kernel::tool::{PathTouch, Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
 use regex::Regex;
@@ -184,7 +194,7 @@ fn search_tree(
     // would make results machine-dependent. `.parents(false)` keeps the
     // crate from auto-loading this chain itself (it would root them at
     // the CWD and mis-anchor path-style rules), so it is loaded by hand
-    // and compiled against the workspace root.
+    // and each file is compiled against its own directory (§9.2).
     let mut ancestors = Vec::new();
     let mut dir = scope.parent();
     while let Some(d) = dir {
@@ -196,14 +206,14 @@ fn search_tree(
         }
         dir = d.parent();
     }
-    // Collected deepest-first (walking up from the scope); reverse so the
-    // workspace root's file is added first. `ignore`'s `Gitignore` is
-    // last-match-wins, so shallowest-first reproduces git's
-    // nearest-file-wins precedence. Before this reverse, a root `gen/`
-    // rule overrode a nearer `!gen/` and scoped searches silently
-    // dropped files git — and a whole-tree search — keeps.
-    ancestors.reverse();
-    let ancestor_matcher = build_ancestor_matcher(&ancestors, rel_base)?;
+    // Collected deepest-first (walking up from the scope) — the chain
+    // order `build_ancestor_matchers` preserves: the DEEPEST ancestor
+    // file is consulted first, so a nearer `!gen/` beats a root `gen/`
+    // exactly like git's nearest-file-wins. Before this chain existed
+    // as a per-file pass, a root `gen/` rule overrode a nearer `!gen/`
+    // and scoped searches silently dropped files git — and a
+    // whole-tree search — keeps.
+    let ancestor_matchers = build_ancestor_matchers(&ancestors)?;
 
     // Discovery determinism: only ignore files INSIDE the workspace
     // participate. `.parents(false)` (the default) prevents the crate
@@ -224,20 +234,35 @@ fn search_tree(
         .parents(false)
         .require_git(false)
         .sort_by_file_name(|a, b| a.cmp(b));
-    if let Some(matcher) = &ancestor_matcher {
-        // Root-relative match against absolute entry paths, so a
-        // `src/gen/` rule anchors the same way for a whole-tree search
-        // and a `src` scoped search. The directory (not its contents) is
-        // what the filter sees; filtering the entry prunes the whole
-        // subtree before descent.
-        let rel_base_owned = rel_base.to_path_buf();
-        let matcher = matcher.clone();
+    if !ancestor_matchers.is_empty() {
+        // Each matcher strips its own root from the absolute entry
+        // path, so a root `src/gen/` rule anchors at the workspace root
+        // and a nested `/gen/` rule anchors at its own directory — the
+        // same anchoring the whole-tree walk uses. The directory (not
+        // its contents) is what the filter sees; filtering the entry
+        // prunes the whole subtree before descent. Pinned by the item-16
+        // tests (`nested_path_styled_rule_anchors_at_its_own_directory`,
+        // `repo_shaped_tree_scoped_and_whole_agree`).
+        let matchers = ancestor_matchers.clone();
         builder.filter_entry(move |entry| {
-            let Ok(rel) = entry.path().strip_prefix(&rel_base_owned) else {
-                return true;
-            };
             let is_dir = entry.file_type().is_some_and(|ty| ty.is_dir());
-            !matcher.matched(rel, is_dir).is_ignore()
+            // Deepest ancestor with an opinion wins; a shallower file
+            // cannot overrule it, mirroring the walker's own
+            // per-directory precedence (and git).
+            //
+            // `matched_path_or_any_parents` (not `matched`): a dir-only
+            // rule like `/gen/` never matches a bare file entry, so
+            // `matched` would leak `gen/out.rs` in a scoped walk — the
+            // whole-tree walk only prunes it because it hits the `gen`
+            // directory entry first. Matching the entry *and* each parent
+            // (as a directory) replicates the walker's prune-at-dir
+            // semantics after the fact for scoped roots whose ignored
+            // ancestors sit at or above the walk root.
+            let verdict = matchers
+                .iter()
+                .map(|matcher| matcher.matched_path_or_any_parents(entry.path(), is_dir))
+                .find(|verdict| !verdict.is_none());
+            !matches!(verdict, Some(IgnoreMatch::Ignore(_)))
         });
     }
     let walker = builder.build();
@@ -356,41 +381,51 @@ fn capped_line(line: &str) -> String {
     format!("{}…", &line[..cut])
 }
 
-/// Builds a single matcher over `ancestor` ignore files (shallowest
-/// first), compiled against the workspace root (`rel_base`) — not the
-/// shallowest file's own directory — so path-style rules (e.g.
-/// `src/gen/`) match the same relative path a whole-tree search
-/// produces, keeping scoped and whole-tree results consistent
-/// regardless of the CWD or the scope's depth.
+/// Builds one matcher per ancestor ignore file, deepest first, each
+/// compiled against its own directory — the workspace root's file
+/// against the workspace root, a nested file against its own parent
+/// directory — exactly where git anchors them. A single merged matcher
+/// (item 16) anchored everything at the workspace root, so a path-style
+/// rule in a *nested* ancestor file (`src/.gitignore` saying `/gen/`)
+/// matched `<root>/gen` instead of `src/gen`: a scoped search inside
+/// `src/gen` then reported files git — and a whole-tree search —
+/// ignore. Per-file rooting keeps scoped and whole-tree results
+/// consistent regardless of the CWD or the scope's depth.
 ///
-/// Scope still exists: `ignore`'s `Gitignore` is last-match-wins across
-/// all added files, so a root `*.log` + nearer `!keep.log` (git: kept)
-/// is pruned by this filter. The scoped walk is therefore stricter than
-/// git about negations (§9.2). The whole-tree walk runs inside the
-/// walker's own (differently anchored) ignore handling.
+/// One deliberate divergence remains (§9.2): the filter only consults
+/// files between the workspace root and the scope. A whitelist in an
+/// ignore file *inside* the scope (say `src/.gitignore` `!keep.log`
+/// under a root `*.log`, scope `src`) cannot rescue the file the way
+/// git's descent would — the ancestor filter prunes it first. The
+/// scoped walk is therefore stricter than git about negations; pinned
+/// by `scoped_whitelist_below_scope_is_pruned` (item 16).
 ///
-/// `None` when no ancestor ignore file exists.
-fn build_ancestor_matcher(
-    ancestors: &[std::path::PathBuf],
-    rel_base: &Path,
-) -> Result<Option<Gitignore>, String> {
-    if ancestors.is_empty() {
-        return Ok(None);
-    }
-    // The matcher root is the workspace root, so every rule in every
-    // ancestor file anchors against the same relative path a whole-tree
-    // search produces.
-    let mut builder = GitignoreBuilder::new(rel_base);
+/// Empty when no ancestor ignore file exists.
+fn build_ancestor_matchers(ancestors: &[std::path::PathBuf]) -> Result<Vec<Gitignore>, String> {
+    let mut matchers = Vec::new();
     for file in ancestors {
-        if file.is_file()
-            && let Some(err) = builder.add(file)
-        {
-            return Err(format!("cannot read ignore file {}: {err}", file.display()));
+        if !file.is_file() {
+            continue;
         }
+        // Anchor matchers at ABSOLUTE roots: entry paths from the walker
+        // are absolute, and `matched()` strips each matcher's own root as
+        // a common prefix. A relative root (e.g. `src` for scope
+        // `src/gen`) leaves that prefix unaligned, so anchored `/gen/`
+        // rules silently never match in scoped searches (§9.2).
+        let abs = file
+            .canonicalize()
+            .map_err(|_| format!("cannot resolve {}", file.display()))?;
+        let root = abs.parent().unwrap_or_else(|| Path::new("."));
+        let mut builder = GitignoreBuilder::new(root);
+        if let Some(err) = builder.add(&abs) {
+            return Err(format!("cannot read ignore file {}: {err}", abs.display()));
+        }
+        let matcher = builder
+            .build()
+            .map_err(|err| format!("cannot compile ignore files: {err}"))?;
+        matchers.push(matcher);
     }
-    Ok(Some(builder.build().map_err(|err| {
-        format!("cannot compile ignore files: {err}")
-    })?))
+    Ok(matchers)
 }
 
 /// Reads at most `MAX_FILE_BYTES + 1` bytes (the extra byte only
@@ -720,12 +755,12 @@ mod tests {
     async fn scoped_search_nearest_ignore_file_wins() {
         // Round-6: with two ancestor ignore files, git precedence says
         // the DEEPER file wins (`!gen/` re-includes what root `gen/`
-        // excluded). Before the ancestors.reverse() fix the root rule
-        // was compiled last (last-match-wins) and the scoped search
+        // excluded). Before the ancestor chain was consulted
+        // deepest-first, the root rule won and the scoped search
         // dropped `src/gen/`, diverging from git and the whole-tree
-        // search. Scope sits two levels below the root, so the matcher
-        // must also anchor against the workspace root, not the nearest
-        // ancestor dir.
+        // search. Scope sits two levels below the root, so the nested
+        // file's rules must also anchor against its own directory,
+        // not the workspace root.
         let (guard, root) = temp_root();
         let base = guard.path();
         std::fs::write(base.join(".gitignore"), "gen/\n").expect("write");
@@ -747,18 +782,211 @@ mod tests {
             .await
             .expect("ok");
         // Deeper `!gen/` must win in the scoped search (nearest-file
-        // wins after the ancestors.reverse() fix). The whole-tree walk
-        // is left as-is here: `ignore`'s negation is not directory-scoped
-        // (its `!gen/` re-includes `gen/` for the whole walk), so it
-        // reports both `src/gen/out.rs` and `src/lib.rs`. Real git would
-        // prune `src/gen/` (it cannot re-include under an excluded
-        // directory), so the whole-tree search is *looser* than git here
-        // — that is the `ignore` crate's behavior, not this fix's concern.
+        // wins in the ancestor chain). The whole-tree walk agrees:
+        // real git also keeps `src/gen/out.rs` here (verified with
+        // `git check-ignore`) — git's cannot-re-include rule applies
+        // only when a *parent directory* of the path is excluded, and
+        // neither `src` nor the root is. The walk pins that parity in
+        // `whole_tree_walk_matches_git_on_nested_negation`.
         assert_eq!(scoped.content, "src/gen/out.rs:1: needle");
         assert_eq!(
             whole.content,
             "src/gen/out.rs:1: needle\nsrc/lib.rs:1: needle"
         );
+    }
+
+    #[tokio::test]
+    async fn whole_tree_walk_matches_git_on_nested_negation() {
+        // Item 16: pin the whole-tree walk against real git for the
+        // documented negation case — root `gen/` plus `src/.gitignore`
+        // `!gen/`. `git check-ignore` keeps `src/gen/out.rs` (the
+        // nested whitelist wins; no parent directory of the path is
+        // excluded), so both hits survive. The header's old claim that
+        // the `ignore` crate is looser than git here was wrong: git
+        // only refuses to re-include under an excluded parent
+        // directory, which is pinned in
+        // `repo_shaped_tree_scoped_and_whole_agree` below.
+        let (guard, root) = temp_root();
+        let base = guard.path();
+        std::fs::write(base.join(".gitignore"), "gen/\n").expect("write");
+        std::fs::create_dir_all(base.join("src/gen")).expect("mkdir");
+        std::fs::write(base.join("src/.gitignore"), "!gen/\n").expect("write");
+        std::fs::write(base.join("src/gen/out.rs"), b"needle\n").expect("write");
+        std::fs::write(base.join("src/lib.rs"), b"needle\n").expect("write");
+
+        let output = search(&root, json!({"pattern": "needle"}))
+            .await
+            .expect("ok");
+        assert_eq!(
+            output.content,
+            "src/gen/out.rs:1: needle\nsrc/lib.rs:1: needle"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_whitelist_below_scope_is_pruned() {
+        // Item 16, §9.2 — the one DELIBERATE divergence from git, now
+        // pinned: a whitelist in an ignore file *inside* the scope
+        // (`src/.gitignore` `!keep.log`) cannot rescue a file an
+        // ancestor rule excludes (root `*.log`). The ancestor filter
+        // only consults files down to the scope and prunes first, so
+        // the scoped walk is STRICTER than git, which re-includes
+        // `src/keep.log` during descent. Whole-tree and git agree.
+        let (guard, root) = temp_root();
+        let base = guard.path();
+        std::fs::write(base.join(".gitignore"), "*.log\n").expect("write");
+        std::fs::create_dir(base.join("src")).expect("mkdir");
+        std::fs::write(base.join("src/.gitignore"), "!keep.log\n").expect("write");
+        std::fs::write(base.join("src/keep.log"), b"needle\n").expect("write");
+        std::fs::write(base.join("keep.log"), b"needle\n").expect("write");
+
+        let whole = search(&root, json!({"pattern": "needle"}))
+            .await
+            .expect("ok");
+        // Nested whitelist wins during descent: git parity.
+        assert_eq!(whole.content, "src/keep.log:1: needle");
+
+        let scoped = search(&root, json!({"pattern": "needle", "path": "src"}))
+            .await
+            .expect("ok");
+        // §9.2 divergence: the root `*.log` ancestor filter prunes
+        // `src/keep.log`; the below-scope whitelist never runs.
+        assert_eq!(scoped.content, "");
+    }
+
+    #[tokio::test]
+    async fn chained_ignores_subdir_overrides_parent() {
+        // Item 16: chained ignore files — a subdir's `.gitignore`
+        // overriding its parent's. Git (verified): the deeper
+        // `!build/` wins, so `src/build/gen.rs` is kept while the
+        // root `build/` dir stays ignored.
+        let (guard, root) = temp_root();
+        let base = guard.path();
+        std::fs::write(base.join(".gitignore"), "build/\n").expect("write");
+        std::fs::create_dir_all(base.join("src/build")).expect("mkdir");
+        std::fs::create_dir(base.join("build")).expect("mkdir");
+        std::fs::write(base.join("src/.gitignore"), "!build/\n").expect("write");
+        std::fs::write(base.join("src/build/gen.rs"), b"needle\n").expect("write");
+        std::fs::write(base.join("src/lib.rs"), b"needle\n").expect("write");
+        std::fs::write(base.join("build/rootgen.rs"), b"needle\n").expect("write");
+
+        let whole = search(&root, json!({"pattern": "needle"}))
+            .await
+            .expect("ok");
+        assert_eq!(
+            whole.content,
+            "src/build/gen.rs:1: needle\nsrc/lib.rs:1: needle"
+        );
+
+        // Scope inside the whitelist's reach: both ignore files are
+        // ancestors, nearest-file-wins in the ancestor chain keeps the
+        // file — same as git and the whole-tree walk.
+        let deep = search(&root, json!({"pattern": "needle", "path": "src/build"}))
+            .await
+            .expect("ok");
+        assert_eq!(deep.content, "src/build/gen.rs:1: needle");
+
+        // Scope at `src`: the `!build/` whitelist lives below the
+        // scope, so the root `build/` ancestor filter prunes
+        // `src/build` — the §9.2 strictness divergence.
+        let scoped = search(&root, json!({"pattern": "needle", "path": "src"}))
+            .await
+            .expect("ok");
+        assert_eq!(scoped.content, "src/lib.rs:1: needle");
+    }
+
+    #[tokio::test]
+    async fn nested_path_styled_rule_anchors_at_its_own_directory() {
+        // Item 16 bug fix: a path-style rule in a NESTED ignore file
+        // anchors at that file's directory, in every scope. Git
+        // (verified): `src/.gitignore` `/gen/` ignores `src/gen/` but
+        // leaves a root-level `gen/` alone. The pre-fix merged matcher
+        // anchored every ancestor rule at the workspace root, so a
+        // `src/gen` scoped search leaked `src/gen/out.rs` that git —
+        // and the whole-tree walk — ignore.
+        let (guard, root) = temp_root();
+        let base = guard.path();
+        std::fs::create_dir_all(base.join("src/gen")).expect("mkdir");
+        std::fs::create_dir(base.join("gen")).expect("mkdir");
+        std::fs::write(base.join("src/.gitignore"), "/gen/\n").expect("write");
+        std::fs::write(base.join("src/gen/out.rs"), b"needle\n").expect("write");
+        std::fs::write(base.join("src/lib.rs"), b"needle\n").expect("write");
+        std::fs::write(base.join("gen/rootgen.rs"), b"needle\n").expect("write");
+
+        let whole = search(&root, json!({"pattern": "needle"}))
+            .await
+            .expect("ok");
+        // `src/gen/out.rs` ignored (git parity); root `gen/` untouched.
+        assert_eq!(
+            whole.content,
+            "gen/rootgen.rs:1: needle\nsrc/lib.rs:1: needle"
+        );
+
+        // The nested rule is an ancestor of `src/gen` — the scoped
+        // walk must prune exactly like the whole-tree walk.
+        let scoped = search(&root, json!({"pattern": "needle", "path": "src/gen"}))
+            .await
+            .expect("ok");
+        assert_eq!(scoped.content, "");
+
+        // At `src` the rule sits below the scope and the walker loads
+        // it itself (its own anchoring), so this scope agrees too.
+        let here = search(&root, json!({"pattern": "needle", "path": "src"}))
+            .await
+            .expect("ok");
+        assert_eq!(here.content, "src/lib.rs:1: needle");
+    }
+
+    #[tokio::test]
+    async fn repo_shaped_tree_scoped_and_whole_agree() {
+        // Item 16: a real-repo-shaped tree — root ignores `target/`
+        // and `*.log`, `vendor/.gitignore` anchors `/third_party/`
+        // and whitelists `!kept.rs`, and `target/.gitignore` attempts
+        // a re-include. All assertions verified against real git.
+        let (guard, root) = temp_root();
+        let base = guard.path();
+        std::fs::create_dir(base.join("src")).expect("mkdir");
+        std::fs::create_dir_all(base.join("target/debug")).expect("mkdir");
+        std::fs::create_dir_all(base.join("vendor/third_party")).expect("mkdir");
+        std::fs::write(base.join(".gitignore"), "target/\n*.log\n").expect("write");
+        std::fs::write(base.join("vendor/.gitignore"), "/third_party/\n!kept.rs\n").expect("write");
+        std::fs::write(base.join("target/.gitignore"), "!important.rs\n").expect("write");
+        std::fs::write(base.join("src/main.rs"), b"needle\n").expect("write");
+        std::fs::write(base.join("target/debug/x.rs"), b"needle\n").expect("write");
+        std::fs::write(base.join("target/important.rs"), b"needle\n").expect("write");
+        std::fs::write(base.join("vendor/third_party/a.rs"), b"needle\n").expect("write");
+        std::fs::write(base.join("vendor/kept.rs"), b"needle\n").expect("write");
+        std::fs::write(base.join("app.log"), b"needle\n").expect("write");
+
+        let whole = search(&root, json!({"pattern": "needle"}))
+            .await
+            .expect("ok");
+        // `target/` is pruned before descent, so `target/important.rs`
+        // cannot re-include — git's cannot-re-include-under-excluded-
+        // parent rule, which the walk reproduces. `vendor/third_party/`
+        // is ignored by its own anchored rule, `vendor/kept.rs`
+        // re-included by its own whitelist.
+        assert_eq!(
+            whole.content,
+            "src/main.rs:1: needle\nvendor/kept.rs:1: needle"
+        );
+
+        let vendor = search(&root, json!({"pattern": "needle", "path": "vendor"}))
+            .await
+            .expect("ok");
+        assert_eq!(vendor.content, "vendor/kept.rs:1: needle");
+
+        // Pre-fix, this scope leaked `vendor/third_party/a.rs`: the
+        // merged ancestor matcher anchored `/third_party/` at the
+        // workspace root. Per-file anchoring prunes it, like git and
+        // the whole-tree walk.
+        let third_party = search(
+            &root,
+            json!({"pattern": "needle", "path": "vendor/third_party"}),
+        )
+        .await
+        .expect("ok");
+        assert_eq!(third_party.content, "");
     }
 
     #[tokio::test]

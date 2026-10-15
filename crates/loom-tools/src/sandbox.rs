@@ -86,6 +86,11 @@ pub(crate) struct Sandbox {
     /// writable so registry locks and caches work; without it a plain
     /// `cargo build` cannot run at all.
     cargo_home: Option<PathBuf>,
+    /// Cargo target dir (`CARGO_TARGET_DIR`) when set — writable so
+    /// cargo's own build locks and artifacts resolve under the sandbox
+    /// even when the build root lies elsewhere (e.g. a temp-dir crate
+    /// that still targets the real repo's scratch).
+    cargo_target_dir: Option<PathBuf>,
 }
 
 impl Sandbox {
@@ -101,6 +106,11 @@ impl Sandbox {
         let cargo_home = std::env::var_os("CARGO_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")));
+        // Same tolerance for the cargo target dir: when `CARGO_TARGET_DIR`
+        // is set it must be writable (its debug/.cargo-build-lock is opened
+        // by every cargo invocation), even if it sits outside the workspace
+        // being sandboxed — a temp-dir crate targeting the repo's scratch.
+        let cargo_target_dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
         // The cargo home is legitimately absent (a container's first
         // `cargo` run creates it, and `rustup` installs elsewhere on many
         // hosts). It is kept in the set either way: it is bound with
@@ -111,14 +121,19 @@ impl Sandbox {
             workspace,
             temp,
             cargo_home,
+            cargo_target_dir,
         }
     }
 
-    /// The writable set: workspace, temp, cargo home, then grants.
+    /// The writable set: workspace, temp, cargo home, cargo target
+    /// dir, then grants.
     fn writable(&self) -> Vec<PathBuf> {
         let mut dirs = vec![self.workspace.clone(), self.temp.clone()];
         if let Some(cargo_home) = &self.cargo_home {
             dirs.push(cargo_home.clone());
+        }
+        if let Some(cargo_target_dir) = &self.cargo_target_dir {
+            dirs.push(cargo_target_dir.clone());
         }
         dirs.extend(self.grants.extra_writable.iter().cloned());
         dirs

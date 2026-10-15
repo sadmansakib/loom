@@ -396,6 +396,18 @@ fn apply_edits(root: &Path, edits: &[(PathBuf, String, String)]) -> Result<EditO
             }
         }
     }
+    // Syntax guard (roadmap item 5 phase B): every candidate buffer
+    // must parse before anything reaches the disk, so a batch that
+    // would leave any file unparsable refuses as a whole — nothing is
+    // written, exactly like a failed match.
+    for (path, text) in &files {
+        crate::syntax::guard(path, text).map_err(|err| {
+            ToolError::InvalidInput(format!(
+                "refusing to write \"{}\": {err}",
+                workspace_relative(root, path)
+            ))
+        })?;
+    }
     // Every edit matched exactly once: write everything back.
     for (path, text) in &files {
         std::fs::write(path, text)
@@ -618,6 +630,9 @@ mod tests {
 
     #[tokio::test]
     async fn batch_edits_can_span_files() {
+        // The fixtures are bare words in `.rs` files — not Rust items,
+        // so the syntax guard would refuse them; disabled here only.
+        let _disabled = crate::syntax::testing::disable_guard();
         let (guard, root) = temp_root();
         std::fs::write(guard.path().join("a.rs"), b"alpha\n").expect("seed a");
         std::fs::write(guard.path().join("b.rs"), b"beta\n").expect("seed b");
@@ -675,6 +690,105 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(guard.path().join("a.rs")).expect("read a"),
             "alpha\n"
+        );
+    }
+
+    // env_lock serializes guard state; holding it across the awaited call is the point.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_edit_producing_broken_rust_is_refused() {
+        let _lock = crate::syntax::testing::env_lock();
+        let (guard, root) = temp_root();
+        std::fs::write(guard.path().join("f.rs"), b"fn add() {}\n").expect("seed");
+        let err = edit(
+            &root,
+            json!({"path": "f.rs", "old_string": "fn add() {}", "new_string": "fn add( {}"}),
+        )
+        .await
+        .expect_err("guard refuses the unparsable candidate");
+        assert!(
+            matches!(&err, ToolError::InvalidInput(msg)
+                if msg.contains("refusing to write \"f.rs\"") && msg.contains("syntax error at line")),
+            "{err:?}"
+        );
+        // Refused before the write: the file is untouched.
+        assert_eq!(
+            std::fs::read_to_string(guard.path().join("f.rs")).expect("read"),
+            "fn add() {}\n"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_batch_where_any_edit_breaks_syntax_writes_nothing() {
+        let _lock = crate::syntax::testing::env_lock();
+        let (guard, root) = temp_root();
+        std::fs::write(guard.path().join("f.rs"), "fn one() {}\nfn two() {}\n").expect("seed");
+        let err = edit(
+            &root,
+            json!({
+                "path": "f.rs",
+                "edits": [
+                    {"old_string": "fn one() {}", "new_string": "fn uno() {}"},
+                    {"old_string": "fn two() {}", "new_string": "fn two( {}"}
+                ]
+            }),
+        )
+        .await
+        .expect_err("second edit's candidate fails the guard");
+        assert!(
+            matches!(&err, ToolError::InvalidInput(msg) if msg.contains("syntax error at line")),
+            "{err:?}"
+        );
+        // Atomic: the first edit matched, but nothing reached the disk.
+        assert_eq!(
+            std::fs::read_to_string(guard.path().join("f.rs")).expect("read"),
+            "fn one() {}\nfn two() {}\n"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn non_rust_edits_bypass_the_syntax_guard() {
+        let _lock = crate::syntax::testing::env_lock();
+        let (guard, root) = temp_root();
+        std::fs::write(guard.path().join("note.txt"), b"hello\n").expect("seed");
+        let output = edit(
+            &root,
+            json!({"path": "note.txt", "old_string": "hello", "new_string": "(( not rust"}),
+        )
+        .await
+        .expect("guard only knows .rs");
+        assert!(
+            output.content.starts_with("edited note.txt"),
+            "{}",
+            output.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(guard.path().join("note.txt")).expect("read"),
+            "(( not rust\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disabled_guard_allows_a_broken_edit() {
+        let _disabled = crate::syntax::testing::disable_guard();
+        let (guard, root) = temp_root();
+        std::fs::write(guard.path().join("f.rs"), b"fn add() {}\n").expect("seed");
+        let output = edit(
+            &root,
+            json!({"path": "f.rs", "old_string": "fn add() {}", "new_string": "fn add( {}"}),
+        )
+        .await
+        .expect("disabled guard allows the write");
+        assert!(
+            output.content.starts_with("edited f.rs"),
+            "{}",
+            output.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(guard.path().join("f.rs")).expect("read"),
+            "fn add( {}\n"
         );
     }
 

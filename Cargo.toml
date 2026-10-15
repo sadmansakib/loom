@@ -23,6 +23,10 @@ license = "MIT"
 rust-version = "1.89"
 
 [workspace.dependencies]
+# syntax guard (roadmap item 5 phase B): parse-before-write refusal for
+# edit_file/write_file; grammars are per-language, Rust first.
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
 # internal crates
 loom-kernel = { path = "crates/loom-kernel" }
 loom-store = { path = "crates/loom-store" }
