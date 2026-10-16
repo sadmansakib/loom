@@ -836,8 +836,16 @@ async fn persistent_tool_calls_hit_the_turn_limit() {
         .unwrap_err();
 
     assert!(matches!(error, TaskError::MaxTurns { max_turns: 3 }));
-    // user + 3 (assistant + result) turns.
-    assert_eq!(session.transcript.len(), 7);
+    // user + 3 x (assistant + result), plus the turn-budget notice the
+    // loop injects once at three fifths of the budget (turn 2 of 3).
+    assert_eq!(session.transcript.len(), 8);
+    assert!(
+        session
+            .transcript
+            .iter()
+            .any(|item| matches!(item, Item::User { text } if text.contains("of 3 turns"))),
+        "the turn-budget notice is part of the transcript"
+    );
     let record = &session.tasks[0];
     assert_eq!(record.status, TaskStatus::Failed);
     assert_eq!(record.turns, 3);

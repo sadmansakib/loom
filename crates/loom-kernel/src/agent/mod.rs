@@ -64,6 +64,23 @@ fn zero_progress_due(turns_since_mutation: u32, nudged: bool) -> bool {
     !nudged && turns_since_mutation >= ZERO_PROGRESS_TURNS
 }
 
+/// The share of the turn budget after which the loop tells the model how
+/// much of it it has spent (three fifths).
+const LATE_BUDGET_NUMERATOR: u32 = 3;
+const LATE_BUDGET_DENOMINATOR: u32 = 5;
+
+/// Whether the turn-budget nudge is due: the run has spent this share of
+/// its turns and has not been told yet.
+///
+/// [`zero_progress_due`] counts turns since the last successful mutating
+/// call, so it can never fire while the model keeps editing — every
+/// successful edit resets its counter, and a run that churns through
+/// edits hears nothing at all. This notice counts turns only and fires
+/// at most once, while a change of approach is still affordable.
+fn late_budget_due(turn: u32, max_turns: u32, nudged: bool) -> bool {
+    !nudged && turn * LATE_BUDGET_DENOMINATOR >= max_turns * LATE_BUDGET_NUMERATOR
+}
+
 /// Default output-token reservation: the share of the context window held
 /// back for the model's reply (§8). Used verbatim when the model reports
 /// no output limit, and as the floor of the automatic derivation
@@ -1005,6 +1022,9 @@ impl Agent {
         // a successful mutating call, and whether this stall was nudged.
         let mut turns_since_mutation: u32 = 0;
         let mut nudged = false;
+        // Turn-budget nudge state: whether this run has been told how much
+        // of its turn budget it has spent.
+        let mut late_nudged = false;
 
         for turn in 1..=self.max_turns {
             // A pause requested before the task or during the previous
@@ -1057,13 +1077,38 @@ impl Agent {
             // ZERO_PROGRESS_TURNS turns without changing a file, say so
             // once, in the model's own input stream — persist-then-commit
             // like steering, so this turn's compile sees it.
-            if zero_progress_due(turns_since_mutation, nudged) {
+            let stalled = zero_progress_due(turns_since_mutation, nudged);
+            if stalled {
                 nudged = true;
                 let notice = Item::User {
                     text: format!(
                         "No file has changed in the last {turns_since_mutation} turns. Stop \
                          exploring and land the best patch you can now: change the workspace \
                          with write_file or edit_file, then verify it with cargo."
+                    ),
+                };
+                if let Some(store) = &self.store {
+                    store
+                        .append_item(&session.id, session.next_index(), &notice)
+                        .map_err(persistence)?;
+                }
+                session
+                    .push_item(notice)
+                    .map_err(|error| TaskError::Internal(error.to_string()))?;
+            }
+            // The turn-budget nudge: the zero-progress nudge above can never
+            // fire while the model keeps editing, because every successful
+            // edit resets its counter, so a run that churns through edits
+            // hears nothing at all. This notice counts turns only and fires
+            // at most once, while a change of approach is still affordable.
+            if !stalled && late_budget_due(turn, self.max_turns, late_nudged) {
+                late_nudged = true;
+                let notice = Item::User {
+                    text: format!(
+                        "You have used {turn} of {} turns. If the same check is still failing, \
+                         stop repeating the same edit: re-read the whole failure output, say \
+                         what it proves, and change approach.",
+                        self.max_turns
                     ),
                 };
                 if let Some(store) = &self.store {
@@ -2210,7 +2255,8 @@ mod tests {
     use super::{
         CompletionGate, DEFAULT_RESERVED_OUTPUT_TOKENS, MAX_RESERVED_OUTPUT_TOKENS,
         OutputReservation, ZERO_PROGRESS_TURNS, append_failure_hint, completion_refusal,
-        derive_reserved_output_tokens, green_check, visible_call_ids, zero_progress_due,
+        derive_reserved_output_tokens, green_check, late_budget_due, visible_call_ids,
+        zero_progress_due,
     };
     use crate::model::{Message, ModelCapabilities, ModelRequest, StopReason};
     use crate::session::Session;
@@ -2225,6 +2271,20 @@ mod tests {
         assert!(zero_progress_due(ZERO_PROGRESS_TURNS + 5, false));
         // Already nudged: one reminder per stall, not one per turn.
         assert!(!zero_progress_due(ZERO_PROGRESS_TURNS + 5, true));
+    }
+
+    #[test]
+    fn the_turn_budget_nudge_fires_once_at_three_fifths() {
+        // A churning run never changes `turns_since_mutation`, so the
+        // zero-progress nudge cannot reach it; this one counts turns.
+        assert!(!late_budget_due(0, 50, false));
+        assert!(!late_budget_due(29, 50, false));
+        assert!(late_budget_due(30, 50, false));
+        assert!(late_budget_due(50, 50, false));
+        // Already nudged: one reminder per run.
+        assert!(!late_budget_due(40, 50, true));
+        // A single-turn budget is due immediately.
+        assert!(late_budget_due(1, 1, false));
     }
 
     #[test]
