@@ -146,16 +146,28 @@ impl NvidiaProvider {
 }
 
 /// Capability table from the NIM model pages (fetched 2026-10-09,
-/// live-checked the same day): every pinned row is 1M context with
-/// tools and reasoning, output capped at Z.ai's documented 131,072.
-/// Parallel tool calls are not documented, so calls serialize. The
-/// DeepSeek V4 deployments that once shared the catalog returned
-/// HTTP 410 (end-of-life 2026-08/2026-09) on live verification and
-/// are deliberately absent. Unknown ids resolve to `None` (loud
-/// unknown-model failure, not a silently wrong row).
+/// live-checked the same day; the Nemotron row was added 2026-10-16
+/// after a live HTTP 200 check): every pinned row is 1M context with
+/// tools and reasoning, output capped at Z.ai's documented 131,072
+/// (for Nemotron the cap is a conservative ceiling — NIM accepted a
+/// 200k `max_tokens` request). Parallel tool calls are not
+/// documented, so calls serialize. The DeepSeek V4 deployments that
+/// once shared the catalog returned HTTP 410 (end-of-life
+/// 2026-08/2026-09) on live verification and are deliberately
+/// absent. Unknown ids resolve to `None` (loud unknown-model
+/// failure, not a silently wrong row).
 pub fn model_capabilities(model: &str) -> Option<ModelCapabilities> {
     let limits = match model {
         "z-ai/glm-5.3" | "z-ai/glm-5.3-flash" => ModelCapabilities::new(1_048_576)
+            .with_max_output_tokens(131_072)
+            .with_tool_calls(true)
+            .with_parallel_tool_calls(false)
+            .with_reasoning(true),
+        // Nemotron 3 Super (120B total / 12B active): 1M context per
+        // the NIM model page, reasoning on by default, tool calling
+        // trained and live-verified. Measured ~2.4 s per call on NIM,
+        // which is what makes it usable as a bulk eval model.
+        "nvidia/nemotron-3-super-120b-a12b" => ModelCapabilities::new(1_048_576)
             .with_max_output_tokens(131_072)
             .with_tool_calls(true)
             .with_parallel_tool_calls(false)
@@ -272,7 +284,11 @@ mod tests {
 
     #[test]
     fn capability_table_current_models() {
-        for model in ["z-ai/glm-5.3", "z-ai/glm-5.3-flash"] {
+        for model in [
+            "z-ai/glm-5.3",
+            "z-ai/glm-5.3-flash",
+            "nvidia/nemotron-3-super-120b-a12b",
+        ] {
             let caps = model_capabilities(model).expect("known model");
             assert_eq!(caps.max_context_tokens, 1_048_576, "{model}");
             assert!(caps.tool_calls && caps.reasoning, "{model}");
@@ -319,11 +335,13 @@ mod tests {
     fn non_forced_deployments_pass_every_effort_through() {
         // The DeepSeek V4 ids are end-of-life on NIM but stand in for
         // any future non-forced deployment: `effort_for`'s else branch
-        // passes every effort through, `none` included.
+        // passes every effort through, `none` included. Nemotron 3
+        // Super is a live non-forced row, so it is checked too.
         for model in [
             "deepseek-ai/deepseek-v4-pro",
             "deepseek-ai/deepseek-v4-pro-0813",
             "deepseek-ai/deepseek-v4-flash",
+            "nvidia/nemotron-3-super-120b-a12b",
         ] {
             assert_eq!(effort_for(model, ReasoningEffort::None), "none", "{model}");
             assert_eq!(effort_for(model, ReasoningEffort::Low), "low", "{model}");

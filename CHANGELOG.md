@@ -3,6 +3,27 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-16 — NIM capability table pins Nemotron 3 Super
+
+The eval corpus needs a provider route that is both fast and unfiltered,
+and neither existing option qualified: NIM's GLM-5.3 deployments answer in
+60–180 s per completion, and the OpenRouter account's content filter
+rejects any request body containing a dotted-quad literal with HTTP 403,
+which the kernel classifies as non-retryable `auth` — 72 of the 142
+imported Multi-SWE-bench tasks carry such a literal in their sources.
+
+`nvidia/nemotron-3-super-120b-a12b` measured ~2.4 s per call on NIM and
+accepts IP literals plus Loom's injected `reasoning_effort`, but the
+kernel fails any model missing from the provider's capability table
+(`model X is unknown to the provider`), so the NIM table now pins it.
+
+- `nvidia::model_capabilities` gains a Nemotron 3 Super row (1M context,
+  tools, reasoning, 131,072-token output ceiling — NIM accepted a 200k
+  request, so the cap is conservative). The row is not forced-thinking,
+  so `effort_for` passes the requested effort through unchanged.
+- `capability_table_current_models` and
+  `non_forced_deployments_pass_every_effort_through` cover the new row.
+
 ## 2026-10-16 — Retry-After hint clamped to the backoff ceiling
 
 The retry policy honoured a provider `Retry-After` hint verbatim, uncapped
