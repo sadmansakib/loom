@@ -709,7 +709,19 @@ fn assemble_call(partial: &PartialToolCall, id_prefix: &str) -> Result<ToolCall,
     let arguments_value = if partial.arguments.trim().is_empty() {
         Value::Object(Default::default())
     } else {
-        serde_json::from_str(&partial.arguments).map_err(|_| ModelErrorKind::Protocol)?
+        match serde_json::from_str::<Value>(&partial.arguments) {
+            // Some models double-encode the object as a JSON *string*
+            // (`"{\"path\":\"x\"}"`). Unwrap it: the inner object is
+            // what the model meant, and rejecting it would raise a
+            // non-retryable `Protocol` error that costs the whole run.
+            Ok(Value::String(inner)) => {
+                serde_json::from_str(&inner).unwrap_or(Value::String(inner))
+            }
+            // An explicit `null` means the same as an absent string.
+            Ok(Value::Null) => Value::Object(Default::default()),
+            Ok(value) => value,
+            Err(_) => return Err(ModelErrorKind::Protocol),
+        }
     };
     let arguments =
         ToolArguments::try_from(arguments_value).map_err(|_| ModelErrorKind::Protocol)?;
@@ -897,6 +909,54 @@ mod tests {
             ..Default::default()
         }));
         acc
+    }
+
+    // A model that double-encodes the arguments object as a JSON string
+    // (`"{\"path\":\"x\"}"`) must not cost the run a non-retryable
+    // `Protocol` error; the object inside is what the model meant.
+    #[test]
+    fn assemble_call_unwraps_double_encoded_arguments() {
+        let call = assemble_call(
+            &PartialToolCall {
+                id: Some("call-1".to_owned()),
+                name: Some("read_file".to_owned()),
+                arguments: "\"{\\\"path\\\":\\\"src/lib.rs\\\"}\"".to_owned(),
+            },
+            "p",
+        )
+        .expect("double-encoded arguments assemble");
+        assert_eq!(call.arguments["path"], "src/lib.rs");
+    }
+
+    // An explicit `null` means the same as an absent arguments string.
+    #[test]
+    fn assemble_call_treats_null_arguments_as_empty() {
+        let call = assemble_call(
+            &PartialToolCall {
+                id: Some("call-2".to_owned()),
+                name: Some("list_files".to_owned()),
+                arguments: "null".to_owned(),
+            },
+            "p",
+        )
+        .expect("null arguments assemble");
+        assert_eq!(*call.arguments, serde_json::json!({}));
+    }
+
+    // Genuinely unparseable text is still a protocol violation: the
+    // coercion above is a recovery, not a loosening of the contract.
+    #[test]
+    fn assemble_call_still_rejects_arguments_that_are_not_json() {
+        let error = assemble_call(
+            &PartialToolCall {
+                id: Some("call-3".to_owned()),
+                name: Some("read_file".to_owned()),
+                arguments: "not json".to_owned(),
+            },
+            "p",
+        )
+        .expect_err("unparseable arguments stay an error");
+        assert_eq!(error, ModelErrorKind::Protocol);
     }
 
     fn finished(mut acc: ChunkAccumulator, reason: &str) -> ChunkAccumulator {
