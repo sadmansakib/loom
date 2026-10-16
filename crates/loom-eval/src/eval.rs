@@ -903,6 +903,20 @@ fn bare_loop() -> bool {
     })
 }
 
+/// 1.5 measurement arm: `LOOM_EVAL_MAX_TURNS=N` overrides the loop's turn
+/// budget for the eval only. Absent — or unparsable, or zero — keeps the
+/// product default, so a missing knob cannot silently change what the
+/// eval measures. The default itself is never raised here: a higher
+/// budget is a hypothesis to test with this knob, not a new product
+/// setting.
+fn max_turns() -> u32 {
+    std::env::var("LOOM_EVAL_MAX_TURNS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|turns| *turns > 0)
+        .unwrap_or(DEFAULT_MAX_TURNS)
+}
+
 /// The bare-loop registry: the primitive tools a basic harness offers
 /// (read/list/write/edit/shell), intersected with the task's set — a
 /// ReadEdit task keeps its read/edit shape, a Coding task loses
@@ -1001,7 +1015,7 @@ pub(crate) fn eval_config(
         account: None,
         workspace: root,
         system_prompt,
-        max_turns: DEFAULT_MAX_TURNS,
+        max_turns: max_turns(),
         db_path: loom_core::paths::db_path(),
         persist: false,
         catalog: None,
@@ -1916,13 +1930,29 @@ fn suite_headline(
     // suite merged across models or campaigns stays attributable.
     let mut models: std::collections::BTreeMap<String, (u64, u64)> =
         std::collections::BTreeMap::new();
+    // A run that died on the wire (transport, HTTP, auth) or was killed
+    // by the watchdog (`gate: null`, so `end_reason` is `unknown`) never
+    // produced a verdict about the agent. Counting it with `gate_failed`
+    // or `max_turns` would read as "the agent tried and could not" —
+    // exactly the comparison the published tables are not making — so
+    // infra failures are tallied apart from the agent's own negatives.
+    // Genuine negatives are never re-run; infra failures may be.
+    let is_infra_failure = |reason: &str| matches!(reason, "model_error" | "unknown");
+    let mut infra_failures: u64 = 0;
+    let mut agent_negatives: u64 = 0;
     let mut category = |run: &serde_json::Value| {
         if !run["success"].as_bool().unwrap_or(false) {
             let reason = run["end_reason"].as_str().unwrap_or("unknown").to_owned();
+            if is_infra_failure(&reason) {
+                infra_failures += 1;
+            } else {
+                agent_negatives += 1;
+            }
             *categories.entry(reason).or_default() += 1;
         } else if run.get("gate").is_some_and(|g| !g.is_null())
             && !run["gate"]["bug_fixed"].as_bool().unwrap_or(false)
         {
+            agent_negatives += 1;
             *categories.entry(String::from("gate_failed")).or_default() += 1;
         }
     };
@@ -2027,6 +2057,8 @@ fn suite_headline(
             serde_json::json!({"tier": tier, "runs": runs, "solved": solved, "rate": *solved as f64 / *runs as f64})
         }).collect::<Vec<_>>(),
         "failure_categories": categories,
+        "infra_failures": infra_failures,
+        "agent_negatives": agent_negatives,
         "economics": {
             "total_cost_usd": (total_cost * 1e4).round() / 1e4,
             "usd_per_solved": if gated_solved == 0 { serde_json::json!(null) } else {
@@ -2084,6 +2116,42 @@ fn suite_headline(
             .insert("models".to_owned(), serde_json::Value::Object(section));
     }
     headline
+}
+
+#[test]
+fn suite_headline_separates_infra_failures_from_agent_negatives() {
+    let died = |reason: &str| {
+        serde_json::json!({
+            "success": false,
+            "end_reason": reason,
+            "turns": 4,
+            "cost_usd": 0.01,
+        })
+    };
+    let suite = vec![(
+        "B1".to_owned(),
+        vec![
+            // Transport/HTTP death: no verdict about the agent.
+            died("model_error"),
+            // Exhausted its turns: the agent's own negative.
+            died("max_turns"),
+            // Finished and billed without fixing: the agent's too.
+            serde_json::json!({
+                "success": true,
+                "turns": 20,
+                "cost_usd": 0.02,
+                "gate": {"bug_fixed": false},
+                "micro": {"totals": {"failed": 1, "calls": 8}},
+            }),
+        ],
+    )];
+    let headline = suite_headline("m", "strict", "full", &suite);
+    assert_eq!(headline["infra_failures"], serde_json::json!(1));
+    assert_eq!(headline["agent_negatives"], serde_json::json!(2));
+    assert_eq!(
+        headline["failure_categories"],
+        serde_json::json!({"model_error": 1, "max_turns": 1, "gate_failed": 1})
+    );
 }
 
 #[test]
@@ -2153,6 +2221,10 @@ fn suite_headline_computes_pass_rate_and_economics() {
         headline["failure_categories"],
         serde_json::json!({"gate_failed": 1})
     );
+    // The only death here is the agent's own gate failure; nothing is
+    // attributed to infrastructure.
+    assert_eq!(headline["infra_failures"], serde_json::json!(0));
+    assert_eq!(headline["agent_negatives"], serde_json::json!(1));
 
     let econ = &headline["economics"];
     assert_eq!(econ["total_cost_usd"], serde_json::json!(0.06));
@@ -2531,6 +2603,7 @@ fn aggregates_from(reports: &[serde_json::Value]) -> serde_json::Value {
 /// additionally proven fixable in place: applying the one-line real fix
 /// flips every declared test to passing.
 #[test]
+#[ignore = "clones and cargo-tests every task workspace; run with --ignored"]
 fn bugfix_seeds_fail_their_gates() {
     for task in tasks() {
         let Some(TaskGate::Bugfix(spec)) = task.gate.as_ref() else {
