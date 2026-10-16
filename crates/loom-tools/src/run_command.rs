@@ -128,8 +128,103 @@ struct RunInput {
     /// policy escalates it.
     program: String,
     /// Arguments, one array entry each.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "args_from_value")]
     args: Vec<String>,
+}
+
+/// Accepts the documented array form and, leniently, the two shapes a
+/// model actually emits: the array's own JSON text (`"[--version]"`)
+/// and a bare command line (`--version --quiet`). The coercion is
+/// deliberate — every accepted shape has one unambiguous reading, and
+/// a rejected shape costs the model a whole turn to retry.
+fn args_from_value<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::Array(items) => items
+            .into_iter()
+            .map(|item| match item {
+                Value::String(text) => Ok(text),
+                Value::Number(number) => Ok(number.to_string()),
+                Value::Bool(flag) => Ok(flag.to_string()),
+                other => Err(D::Error::custom(format!(
+                    "args entries must be strings, got {}",
+                    json_kind(&other)
+                ))),
+            })
+            .collect(),
+        Value::String(text) => Ok(match serde_json::from_str::<Vec<String>>(&text) {
+            Ok(words) => words,
+            Err(_) => split_args(&text),
+        }),
+        other => Err(D::Error::custom(format!(
+            "args must be an array of strings, got {}",
+            json_kind(&other)
+        ))),
+    }
+}
+
+/// One-word name for a JSON value's kind, for coercion errors.
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// Splits a command line the way a shell would tokenize it — whitespace
+/// separates, quotes group, a backslash escapes the next character —
+/// with no expansion, substitution, or globbing. Used only when `args`
+/// arrives as one string that is not JSON array text.
+fn split_args(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut started = false;
+    let mut quote: Option<char> = None;
+    let mut characters = text.chars();
+    while let Some(character) = characters.next() {
+        match quote {
+            Some(mark) if character == mark => quote = None,
+            Some(_) => {
+                current.push(character);
+                started = true;
+            }
+            None => match character {
+                '\'' | '"' => {
+                    quote = Some(character);
+                    started = true;
+                }
+                '\\' => {
+                    if let Some(escaped) = characters.next() {
+                        current.push(escaped);
+                        started = true;
+                    }
+                }
+                character if character.is_whitespace() => {
+                    if started {
+                        words.push(std::mem::take(&mut current));
+                        started = false;
+                    }
+                }
+                character => {
+                    current.push(character);
+                    started = true;
+                }
+            },
+        }
+    }
+    if started {
+        words.push(current);
+    }
+    words
 }
 
 impl Tool for RunCommandTool {
@@ -141,19 +236,48 @@ impl Tool for RunCommandTool {
         false
     }
 
+    /// A parse failure here is overwhelmingly a wrong argument shape
+    /// rather than a wrong value, so name the shape the model should send.
+    fn failure_hint(&self, failure: loom_kernel::transcript::ToolFailure) -> Option<String> {
+        match failure {
+            loom_kernel::transcript::ToolFailure::InvalidInput => Some(
+                "expected fields: program (bare executable name), args (array of strings)"
+                    .to_owned(),
+            ),
+            _ => None,
+        }
+    }
+
     fn call<'a>(
         &'a self,
         input: Value,
         ctx: &'a ToolContext,
     ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
         Box::pin(async move {
-            let input: RunInput = serde_json::from_value(input)
+            let mut input: RunInput = serde_json::from_value(input)
                 .map_err(|err| ToolError::InvalidInput(format!("invalid arguments: {err}")))?;
+            // A path-qualified program is normally the same program the
+            // model means, so keep the bare name when it resolves on
+            // PATH (`/usr/bin/cargo` behaves like `cargo`). Only a
+            // basename that is not on PATH stays an error.
+            let mut normalized = None;
             if input.program.contains('/') || input.program.contains('\\') {
-                return Err(ToolError::InvalidInput(format!(
-                    "program \"{}\" must be a bare executable name, not a path",
-                    input.program
-                )));
+                let original = input.program.clone();
+                match std::path::Path::new(&original)
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                {
+                    Some(base) if resolve_in_path(base).is_some() => {
+                        input.program = base.to_owned();
+                        normalized = Some(original);
+                    }
+                    _ => {
+                        return Err(ToolError::InvalidInput(format!(
+                            "program \"{}\" must be a bare executable name, not a path",
+                            input.program
+                        )));
+                    }
+                }
             }
             // The sandbox wrapper reports a missing program as an opaque
             // non-zero exit; resolve bare names on PATH first so the
@@ -202,6 +326,15 @@ impl Tool for RunCommandTool {
                 &recent_changes,
                 ctx,
             );
+            if let Some(original) = normalized {
+                rendered = rendered.with_notice(loom_kernel::tool::ToolNotice::new(
+                    "program.normalized",
+                    format!(
+                        "\"{original}\" normalized to the bare name \"{}\"",
+                        input.program
+                    ),
+                ));
+            }
             if !sandbox.confined() {
                 rendered = rendered.with_notice(loom_kernel::tool::ToolNotice::new(
                     "sandbox.passthrough",
@@ -544,13 +677,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn path_qualified_program_is_invalid_input() {
+    async fn path_qualified_program_is_normalized_to_its_basename() {
         let (_guard, root) = temp_root();
-        let tool = RunCommandTool::with_allowed(["/bin/echo"]);
-        let err = run(&tool, &root, json!({"program": "/bin/echo"}))
+        let tool = RunCommandTool::with_allowed(["echo"]);
+        let output = run(&tool, &root, json!({"program": "/bin/echo"}))
             .await
-            .expect_err("path");
+            .expect("path with a resolvable basename runs");
+        assert!(
+            output.content.contains("exit status: 0"),
+            "{}",
+            output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn path_qualified_program_without_a_path_entry_is_invalid_input() {
+        let (_guard, root) = temp_root();
+        let tool = RunCommandTool::with_allowed(["loom-no-such-program"]);
+        let err = run(
+            &tool,
+            &root,
+            json!({"program": "/opt/loom-no-such-program"}),
+        )
+        .await
+        .expect_err("path");
         assert!(matches!(err, ToolError::InvalidInput(msg) if msg.contains("bare executable")));
+    }
+
+    #[tokio::test]
+    async fn args_as_json_array_text_is_coerced() {
+        let (_guard, root) = temp_root();
+        let tool = RunCommandTool::with_allowed(["echo"]);
+        let output = run(
+            &tool,
+            &root,
+            json!({"program": "echo", "args": "[\"hello\", \"world\"]"}),
+        )
+        .await
+        .expect("coerced");
+        assert!(output.content.contains("hello world"), "{}", output.content);
+    }
+
+    #[tokio::test]
+    async fn args_as_command_line_text_is_coerced() {
+        let (_guard, root) = temp_root();
+        let tool = RunCommandTool::with_allowed(["echo"]);
+        let output = run(
+            &tool,
+            &root,
+            json!({"program": "echo", "args": "hello \"wide world\""}),
+        )
+        .await
+        .expect("coerced");
+        assert!(
+            output.content.contains("hello wide world"),
+            "{}",
+            output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn args_entries_are_coerced_to_strings() {
+        let (_guard, root) = temp_root();
+        let tool = RunCommandTool::with_allowed(["echo"]);
+        let output = run(&tool, &root, json!({"program": "echo", "args": [1, true]}))
+            .await
+            .expect("coerced");
+        assert!(output.content.contains("1 true"), "{}", output.content);
+    }
+
+    #[tokio::test]
+    async fn args_of_a_nested_shape_is_invalid_input() {
+        let (_guard, root) = temp_root();
+        let tool = RunCommandTool::with_allowed(["echo"]);
+        let err = run(&tool, &root, json!({"program": "echo", "args": {"a": 1}}))
+            .await
+            .expect_err("object");
+        assert!(
+            matches!(err, ToolError::InvalidInput(ref msg) if msg.contains("args must be an array")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

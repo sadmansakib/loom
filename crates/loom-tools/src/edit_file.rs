@@ -310,6 +310,69 @@ fn trimmed_match(text: &str, old: &str) -> Option<usize> {
     text.find(trimmed)
 }
 
+/// The near-miss probe (roadmap item 6's second half): an anchor that
+/// matches nothing usually means the model remembered the shape of the
+/// line but not its current text. Points at where that first line still
+/// occurs — or, failing that, at the closest current line — so the next
+/// attempt re-reads instead of guessing again. `None` when nothing is
+/// close enough, so the caller keeps its plain error.
+fn near_miss_hint(text: &str, old: &str) -> Option<String> {
+    let probe = old.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let wanted = probe.split_whitespace().collect::<Vec<_>>().join(" ");
+    if wanted.is_empty() {
+        return None;
+    }
+    let mut occurrences = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.contains(&wanted) {
+            occurrences.push(index + 1);
+            if occurrences.len() == 3 {
+                break;
+            }
+        }
+    }
+    if !occurrences.is_empty() {
+        let lines = occurrences
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!(
+            " (its first line still occurs at line {lines}; re-read the file and copy its current text)"
+        ));
+    }
+    let probe_len = probe.chars().count();
+    let mut closest: Option<(usize, usize, &str)> = None;
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let common = probe
+            .chars()
+            .zip(trimmed.chars())
+            .take_while(|(anchor, current)| anchor == current)
+            .count();
+        let shorter = probe_len.min(trimmed.chars().count());
+        if common < 8 || common * 2 < shorter {
+            continue;
+        }
+        let better = match closest {
+            None => true,
+            Some((best, _, _)) => common > best,
+        };
+        if better {
+            closest = Some((common, index + 1, trimmed));
+        }
+    }
+    closest.map(|(_, line, current)| {
+        format!(
+            " (the nearest line is {line}: `{current}`; re-read the file and copy its current text)"
+        )
+    })
+}
+
 /// The `edited …` success line: one file gets the occurrence count,
 /// several get the per-file rollup.
 fn edit_detail(resolved: &[(String, String)], per_file_counts: &[usize]) -> String {
@@ -379,10 +442,11 @@ fn apply_edits(root: &Path, edits: &[(PathBuf, String, String)]) -> Result<EditO
                         prefix(index)
                     ));
                 } else {
-                    return Err(ToolError::InvalidInput(format!(
-                        "{}old_string not found in file",
-                        prefix(index)
-                    )));
+                    let mut message = format!("{}old_string not found in file", prefix(index));
+                    if let Some(hint) = near_miss_hint(text, old) {
+                        message.push_str(&hint);
+                    }
+                    return Err(ToolError::InvalidInput(message));
                 }
             }
             (1, Some(start)) => {
@@ -570,13 +634,42 @@ mod tests {
         .await
         .expect_err("two trimmed matches must not be repaired");
         match err {
-            ToolError::InvalidInput(msg) => assert_eq!(msg, "old_string not found in file"),
+            ToolError::InvalidInput(msg) => {
+                assert!(msg.starts_with("old_string not found in file"), "{msg}");
+                assert!(msg.contains("still occurs at line 1, 2"), "{msg}");
+            }
             other => panic!("expected InvalidInput, got {other:?}"),
         }
         // Nothing was written.
         assert_eq!(
             std::fs::read_to_string(guard.path().join("f.rs")).expect("read"),
             "fn a() {}\nfn a() {}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_anchor_reports_the_nearest_current_line() {
+        let (guard, root) = temp_root();
+        std::fs::write(guard.path().join("f.rs"), b"fn add() {}\n").expect("seed");
+        let err = edit(
+            &root,
+            json!({"path": "f.rs", "old_string": "fn add() { 1 }", "new_string": "x"}),
+        )
+        .await
+        .expect_err("stale anchor");
+        match err {
+            ToolError::InvalidInput(msg) => {
+                assert!(msg.starts_with("old_string not found in file"), "{msg}");
+                assert!(
+                    msg.contains("the nearest line is 1: `fn add() {}`"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(guard.path().join("f.rs")).expect("read"),
+            "fn add() {}\n"
         );
     }
 
