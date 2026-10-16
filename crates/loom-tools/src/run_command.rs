@@ -157,10 +157,7 @@ where
                 ))),
             })
             .collect(),
-        Value::String(text) => Ok(match serde_json::from_str::<Vec<String>>(&text) {
-            Ok(words) => words,
-            Err(_) => split_args(&text),
-        }),
+        Value::String(text) => Ok(split_args_lenient(&text)),
         other => Err(D::Error::custom(format!(
             "args must be an array of strings, got {}",
             json_kind(&other)
@@ -178,6 +175,25 @@ fn json_kind(value: &Value) -> &'static str {
         Value::Array(_) => "an array",
         Value::Object(_) => "an object",
     }
+}
+
+/// Splits `args` that arrived as one string, tolerating the two near-array
+/// shapes the model actually emits: a leading `=` before the array
+/// (`"=[\"ls\", \"-l\"]"`) and a bracketed list whose inner tokens are not
+/// quoted (`"[test, r2574, --quiet]"`). Each has exactly one reading, and
+/// rejecting it costs a turn to retry.
+fn split_args_lenient(text: &str) -> Vec<String> {
+    let trimmed = text.trim().trim_start_matches('=').trim();
+    if let Some(inner) = trimmed
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        // Valid JSON array text never reaches here — `args_from_value`
+        // parses it first — so the separators are commas that the model
+        // left unquoted; `split_args` still honours any quotes present.
+        return split_args(&inner.replace(',', " "));
+    }
+    split_args(trimmed)
 }
 
 /// Splits a command line the way a shell would tokenize it — whitespace
@@ -238,6 +254,15 @@ impl Tool for RunCommandTool {
 
     /// A parse failure here is overwhelmingly a wrong argument shape
     /// rather than a wrong value, so name the shape the model should send.
+    /// A build or test run outlives the engine's default 120 s budget:
+    /// 7 of the 124 tool failures in the pre-fix sweep were this tool
+    /// timing out there, each one a turn spent on a half-finished
+    /// `cargo test`. A `[[command]]` policy rule that names a
+    /// `timeout_secs` still caps that program more tightly.
+    fn timeout(&self) -> Option<Duration> {
+        Some(Duration::from_secs(600))
+    }
+
     fn failure_hint(&self, failure: loom_kernel::transcript::ToolFailure) -> Option<String> {
         match failure {
             loom_kernel::transcript::ToolFailure::InvalidInput => Some(
@@ -284,7 +309,9 @@ impl Tool for RunCommandTool {
             // model gets the same "cannot run" either way.
             if resolve_in_path(&input.program).is_none() {
                 return Err(ToolError::Execution(format!(
-                    "cannot run \"{}\": not found on PATH",
+                    "cannot run \"{}\": not found on PATH (no shell here: pass an \
+                     executable name and separate `args`; there is no `cd`, so use \
+                     workspace-relative paths)",
                     input.program
                 )));
             }
@@ -756,6 +783,38 @@ mod tests {
         assert!(
             matches!(err, ToolError::InvalidInput(ref msg) if msg.contains("args must be an array")),
             "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn args_with_a_leading_equals_before_an_array_are_coerced() {
+        let (_guard, root) = temp_root();
+        let tool = RunCommandTool::with_allowed(["echo"]);
+        let output = run(
+            &tool,
+            &root,
+            json!({"program": "echo", "args": "=[\"hello\", \"world\"]"}),
+        )
+        .await
+        .expect("coerced");
+        assert!(output.content.contains("hello world"), "{}", output.content);
+    }
+
+    #[tokio::test]
+    async fn args_as_a_bracketed_list_without_quotes_are_coerced() {
+        let (_guard, root) = temp_root();
+        let tool = RunCommandTool::with_allowed(["echo"]);
+        let output = run(
+            &tool,
+            &root,
+            json!({"program": "echo", "args": "[hello, wide world]"}),
+        )
+        .await
+        .expect("coerced");
+        assert!(
+            output.content.contains("hello wide world"),
+            "{}",
+            output.content
         );
     }
 

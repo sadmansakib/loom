@@ -132,6 +132,15 @@ pub async fn execute_call(
             None,
         );
     }
+    // A tool may declare a longer budget than the engine default: a full
+    // `cargo test` outlives 120 s, and 7 of the 124 tool failures in the
+    // pre-fix sweep were `run_command` timing out at exactly that cap.
+    // Shadowing the context keeps the tool's own view of its budget and
+    // the enforcement below in agreement.
+    let ctx = ctx
+        .clone()
+        .with_timeout(tool.timeout().unwrap_or(ctx.timeout));
+
     if ctx.cancellation.is_cancelled() {
         return cancelled_result(call, false);
     }
@@ -143,14 +152,14 @@ pub async fn execute_call(
     // must not serve (mutating tools, wildcards, write-declaring reads).
     let cacheable = cacheable_reads(tool, &call.arguments);
     if let Some(reads) = &cacheable
-        && let Some(result) = cached_result(reads, call, ctx).await
+        && let Some(result) = cached_result(reads, call, &ctx).await
     {
         return result;
     }
 
     let mut timed = std::pin::pin!(timeout(
         ctx.timeout,
-        tool.call(call.arguments.clone().into(), ctx)
+        tool.call(call.arguments.clone().into(), &ctx)
     ));
     let mut cancelled = std::pin::pin!(ctx.cancellation.cancelled());
     match future::select(cancelled.as_mut(), timed.as_mut()).await {
@@ -162,9 +171,9 @@ pub async fn execute_call(
             // V14). `store` itself refuses outputs with effects, and the
             // signature is computed on a blocking thread, outside the lock.
             if let Some(reads) = &cacheable {
-                cache_result(reads, call, &output, ctx).await;
+                cache_result(reads, call, &output, &ctx).await;
             }
-            let (content, truncated, effects, artifact, notices) = bound(output, ctx);
+            let (content, truncated, effects, artifact, notices) = bound(output, &ctx);
             let mut result = finish(
                 call,
                 ToolStatus::Success,
@@ -209,7 +218,7 @@ pub async fn execute_call(
 /// `error: unknown tool "…"` content with the registered names in
 /// registration order (the §9.3 example format).
 fn unknown_tool_content(registry: &ToolRegistry, name: &str) -> String {
-    if registry.is_empty() {
+    let mut content = if registry.is_empty() {
         format!("error: unknown tool \"{name}\"; no tools registered")
     } else {
         let names: Vec<&str> = registry.specs().map(|spec| spec.name.as_str()).collect();
@@ -217,7 +226,25 @@ fn unknown_tool_content(registry: &ToolRegistry, name: &str) -> String {
             "error: unknown tool \"{name}\"; available: {}",
             names.join(", ")
         )
+    };
+    // A stop-like name is the model reaching for another harness's
+    // `finish`; the tool list alone does not say what replaces it (three
+    // such calls in the pre-fix sweep).
+    if is_stop_like(name) {
+        content.push_str(
+            "\nThere is no tool for ending a task: a turn ends by replying with no tool call.",
+        );
     }
+    content
+}
+
+/// Whether an unknown tool name is the model trying to stop the run
+/// (SWE-agent spells it `finish`) rather than a mistyped tool.
+fn is_stop_like(name: &str) -> bool {
+    matches!(
+        name,
+        "finish" | "done" | "submit" | "complete" | "task_complete"
+    )
 }
 
 /// Serves a repeat read-only call from the cache (ADR-018, V14).
@@ -1058,6 +1085,27 @@ mod tests {
         .await;
         assert_eq!(result.status, ToolStatus::Error(ToolFailure::UnknownTool));
         assert!(result.effects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_call_stop_like_unknown_tool_says_how_to_end() {
+        let registry = registry(vec![MockTool::text("read_file", "ok")]);
+        let exposure = ToolExposure::from_names(["read_file"]);
+        let token = CancellationToken::new();
+        let ctx = test_ctx(Duration::from_secs(5), &token);
+        let started = AtomicBool::new(false);
+        let result = execute_call(&registry, &exposure, &make_call("finish"), &ctx, &started).await;
+        assert_eq!(result.status, ToolStatus::Error(ToolFailure::UnknownTool));
+        assert!(
+            result.content.contains("available: read_file"),
+            "{}",
+            result.content
+        );
+        assert!(
+            result.content.contains("replying with no tool call"),
+            "{}",
+            result.content
+        );
     }
 
     #[tokio::test]

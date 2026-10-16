@@ -170,6 +170,18 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// An optional execution budget for one call of this tool, overriding
+    /// the engine's default.
+    ///
+    /// A tool that shells out to a build or a test suite needs minutes
+    /// where a read needs a second: the default budget killed
+    /// `run_command` mid-`cargo test` seven times in the pre-fix sweep,
+    /// each one a turn spent on nothing. Returning `None` keeps the
+    /// engine default, which stays the backstop for every other tool.
+    fn timeout(&self) -> Option<Duration> {
+        None
+    }
+
     /// Executes the tool.
     ///
     /// The returned future is *not* required to observe
@@ -299,6 +311,17 @@ impl ToolContext {
     #[must_use]
     pub fn with_artifacts(mut self, artifacts: Option<Arc<dyn ArtifactStore>>) -> Self {
         self.artifacts = artifacts;
+        self
+    }
+
+    /// Replaces this call's execution budget (builder style).
+    ///
+    /// The engine applies the tool's own declared budget through this
+    /// before the call is timed, so the tool and the enforcement agree on
+    /// one number.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 

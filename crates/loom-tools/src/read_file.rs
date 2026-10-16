@@ -20,6 +20,17 @@ use crate::window::{self, DEFAULT_LIMIT};
 #[derive(Debug, Default)]
 pub struct ReadFileTool;
 
+/// Reads `offset` leniently: the model reaches for 0-based or negative
+/// values, and both mean "from the first line" — rejecting them costs a
+/// turn and buys nothing (five such calls in the pre-fix sweep).
+fn offset_from_value<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<i64>::deserialize(deserializer)?;
+    Ok(raw.map(|n| if n < 1 { 1 } else { n as usize }))
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -27,7 +38,7 @@ struct ReadInput {
     /// Workspace-relative file path.
     path: String,
     /// First line to return, 1-based.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "offset_from_value")]
     #[schemars(range(min = 1))]
     offset: Option<usize>,
     /// Maximum lines to return; defaults to the whole file.
@@ -69,15 +80,8 @@ impl Tool for ReadFileTool {
         Box::pin(async move {
             let input: ReadInput = serde_json::from_value(input)
                 .map_err(|err| ToolError::InvalidInput(format!("invalid arguments: {err}")))?;
-            let offset = match input.offset {
-                None => 1,
-                Some(0) => {
-                    return Err(ToolError::InvalidInput(
-                        "offset must be at least 1".to_owned(),
-                    ));
-                }
-                Some(n) => n,
-            };
+            // `offset_from_value` already clamped anything below 1.
+            let offset = input.offset.unwrap_or(1);
             let limit = match input.limit {
                 None => DEFAULT_LIMIT,
                 Some(0) => {
@@ -225,12 +229,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_zero_offset_or_limit_is_invalid_input() {
+    async fn a_zero_or_negative_offset_reads_from_the_first_line() {
+        let (guard, root) = temp_root();
+        std::fs::write(guard.path().join("zero.txt"), "one\ntwo\nthree\n").expect("write");
+        for offset in [0, -20] {
+            let output = read(&root, json!({"path": "zero.txt", "offset": offset}))
+                .await
+                .expect("a sub-1 offset starts at the first line");
+            assert!(
+                output.content.contains("one"),
+                "offset {offset} must start at line 1"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_zero_limit_is_invalid_input() {
         let (_guard, root) = temp_root();
-        let err = read(&root, json!({"path": "f.txt", "offset": 0}))
-            .await
-            .expect_err("zero offset");
-        assert!(matches!(err, ToolError::InvalidInput(msg) if msg.contains("offset")));
         let err = read(&root, json!({"path": "f.txt", "limit": 0}))
             .await
             .expect_err("zero limit");
