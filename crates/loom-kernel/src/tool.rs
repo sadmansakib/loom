@@ -157,6 +157,19 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// An optional, tool-specific remediation hint for a failed call.
+    ///
+    /// The loop always appends a generic next-step hint to a failure the
+    /// model will see. A tool that knows the shape of its own governing
+    /// mistakes — the argument fields it expects, the anchor it needs —
+    /// may replace that generic text with something more useful; returning
+    /// `None` keeps the generic text. A refusal (`RepeatedCall`) is never
+    /// overridable: the tool was not invoked, so it has nothing to say.
+    fn failure_hint(&self, failure: crate::transcript::ToolFailure) -> Option<String> {
+        let _ = failure;
+        None
+    }
+
     /// Executes the tool.
     ///
     /// The returned future is *not* required to observe

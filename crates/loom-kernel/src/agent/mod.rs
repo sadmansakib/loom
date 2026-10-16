@@ -47,6 +47,23 @@ use tools::{MAX_TOOL_OUTPUT_BYTES, ToolBatch, ToolExposure};
 /// configured.
 pub const DEFAULT_MAX_TURNS: u32 = 50;
 
+/// The zero-progress nudge: consecutive turns without a successful
+/// mutating tool call after which the loop tells the model to stop
+/// exploring and land its patch.
+///
+/// Turn-count based on purpose. A *semantic* stuck-detector (repeated
+/// reasoning, unchanged plan) fires while the model is still working and
+/// its false positives cost more than the nudge buys; counting turns
+/// since the workspace last changed cannot misfire that way, and the
+/// nudge itself only adds a message — it never refuses a call.
+pub const ZERO_PROGRESS_TURNS: u32 = 12;
+
+/// Whether the zero-progress nudge is due: enough turns have passed
+/// without a change, and this stall has not been nudged yet.
+fn zero_progress_due(turns_since_mutation: u32, nudged: bool) -> bool {
+    !nudged && turns_since_mutation >= ZERO_PROGRESS_TURNS
+}
+
 /// Default output-token reservation: the share of the context window held
 /// back for the model's reply (§8). Used verbatim when the model reports
 /// no output limit, and as the floor of the automatic derivation
@@ -984,6 +1001,11 @@ impl Agent {
         // races against I/O.
         let hard = control.hard_token();
 
+        // Zero-progress nudge state (item 1.3): consecutive turns without
+        // a successful mutating call, and whether this stall was nudged.
+        let mut turns_since_mutation: u32 = 0;
+        let mut nudged = false;
+
         for turn in 1..=self.max_turns {
             // A pause requested before the task or during the previous
             // turn's tool batch stops here: the in-flight turn has fully
@@ -1030,6 +1052,28 @@ impl Agent {
                         messages: steered.len() as u32,
                     },
                 );
+            }
+            // The zero-progress nudge (item 1.3): once this run has spent
+            // ZERO_PROGRESS_TURNS turns without changing a file, say so
+            // once, in the model's own input stream — persist-then-commit
+            // like steering, so this turn's compile sees it.
+            if zero_progress_due(turns_since_mutation, nudged) {
+                nudged = true;
+                let notice = Item::User {
+                    text: format!(
+                        "No file has changed in the last {turns_since_mutation} turns. Stop \
+                         exploring and land the best patch you can now: change the workspace \
+                         with write_file or edit_file, then verify it with cargo."
+                    ),
+                };
+                if let Some(store) = &self.store {
+                    store
+                        .append_item(&session.id, session.next_index(), &notice)
+                        .map_err(persistence)?;
+                }
+                session
+                    .push_item(notice)
+                    .map_err(|error| TaskError::Internal(error.to_string()))?;
             }
             // a. Compile the model request from durable state (§8). The
             //    compiler owns every context decision; the loop only passes
@@ -1159,11 +1203,33 @@ impl Agent {
                     for result in &results {
                         completion.note(result);
                     }
+                    // Zero-progress bookkeeping (item 1.3): a successful
+                    // mutating call is progress; anything else is another
+                    // turn spent looking. Computed before the commit, which
+                    // takes the assistant message and the results by value.
+                    let mutated =
+                        assistant
+                            .tool_calls
+                            .iter()
+                            .zip(&results)
+                            .any(|(call, result)| {
+                                result.status == ToolStatus::Success
+                                    && self
+                                        .registry
+                                        .get(&call.name)
+                                        .is_some_and(|tool| !tool.is_read_only())
+                            });
                     // A batch interrupted by cancellation still commits its
                     // completed results plus cancelled fillers (§6.1, §10).
                     self.commit(session, assistant, results)?;
                     accounting.turns = turn;
                     accounting.sync(session, task_id);
+                    if mutated {
+                        turns_since_mutation = 0;
+                        nudged = false;
+                    } else {
+                        turns_since_mutation += 1;
+                    }
                     // Copy the (possibly mutated) todo state back, and —
                     // only when it changed — re-append the rendered list
                     // at the transcript tail. This runs before the
@@ -1605,7 +1671,11 @@ impl Agent {
                 ToolStatus::Error(kind) => {
                     accounting.failed_tool_calls += 1;
                     failures.record(call);
-                    append_failure_hint(&mut result.content, kind);
+                    let tool_hint = self
+                        .registry
+                        .get(&call.name)
+                        .and_then(|tool| tool.failure_hint(kind));
+                    append_failure_hint(&mut result.content, kind, tool_hint);
                 }
                 // A cancelled call is neither a success nor a failure of the
                 // tool; the task outcome records the cancellation.
@@ -2032,8 +2102,8 @@ fn visible_call_ids(request: &ModelRequest, stubbed: &[String]) -> HashSet<Strin
 /// Appends a deterministic next-step hint to a failure the model will see.
 /// The engine (`execute_call`) is untouched, so its content contract is
 /// unchanged; the loop layers guidance on top.
-fn append_failure_hint(content: &mut String, kind: ToolFailure) {
-    let hint = match kind {
+fn append_failure_hint(content: &mut String, kind: ToolFailure, tool_hint: Option<String>) {
+    let generic = match kind {
         ToolFailure::InvalidInput => {
             "Hint: correct the arguments described above before calling again."
         }
@@ -2049,6 +2119,9 @@ fn append_failure_hint(content: &mut String, kind: ToolFailure) {
         // The refusal result already explains itself.
         ToolFailure::RepeatedCall => return,
     };
+    // A tool that knows the shape of its own governing mistakes says
+    // something more specific than the loop's generic text.
+    let hint = tool_hint.as_deref().unwrap_or(generic);
     // The engine bounded `content` before this, so reserve room for the hint
     // and keep the result within the same output bound.
     let needed = hint.len() + 1;
@@ -2136,13 +2209,58 @@ fn duration_millis(duration: Duration) -> u64 {
 mod tests {
     use super::{
         CompletionGate, DEFAULT_RESERVED_OUTPUT_TOKENS, MAX_RESERVED_OUTPUT_TOKENS,
-        OutputReservation, completion_refusal, derive_reserved_output_tokens, green_check,
-        visible_call_ids,
+        OutputReservation, ZERO_PROGRESS_TURNS, append_failure_hint, completion_refusal,
+        derive_reserved_output_tokens, green_check, visible_call_ids, zero_progress_due,
     };
     use crate::model::{Message, ModelCapabilities, ModelRequest, StopReason};
     use crate::session::Session;
-    use crate::transcript::{Item, ToolResult, ToolStatus};
+    use crate::transcript::{Item, ToolFailure, ToolResult, ToolStatus};
     use std::collections::HashSet;
+
+    #[test]
+    fn the_zero_progress_nudge_waits_for_the_threshold_and_fires_once() {
+        assert!(!zero_progress_due(0, false));
+        assert!(!zero_progress_due(ZERO_PROGRESS_TURNS - 1, false));
+        assert!(zero_progress_due(ZERO_PROGRESS_TURNS, false));
+        assert!(zero_progress_due(ZERO_PROGRESS_TURNS + 5, false));
+        // Already nudged: one reminder per stall, not one per turn.
+        assert!(!zero_progress_due(ZERO_PROGRESS_TURNS + 5, true));
+    }
+
+    #[test]
+    fn a_tool_supplied_hint_replaces_the_generic_text() {
+        let mut content = String::from("invalid input: shape");
+        append_failure_hint(
+            &mut content,
+            ToolFailure::InvalidInput,
+            Some("expected fields: program, args".to_owned()),
+        );
+        assert_eq!(
+            content,
+            "invalid input: shape\nexpected fields: program, args"
+        );
+    }
+
+    #[test]
+    fn without_a_tool_hint_the_generic_text_is_used() {
+        let mut content = String::from("invalid input: shape");
+        append_failure_hint(&mut content, ToolFailure::InvalidInput, None);
+        assert_eq!(
+            content,
+            "invalid input: shape\nHint: correct the arguments described above before calling again."
+        );
+    }
+
+    #[test]
+    fn a_refusal_never_carries_a_hint() {
+        let mut content = String::from("refused: the same call again");
+        append_failure_hint(
+            &mut content,
+            ToolFailure::RepeatedCall,
+            Some("never shown".to_owned()),
+        );
+        assert_eq!(content, "refused: the same call again");
+    }
 
     #[test]
     fn auto_honors_a_declared_output_maximum_up_to_the_hard_cap() {
