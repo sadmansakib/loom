@@ -17,7 +17,7 @@ use crate::model::ModelError;
 ///
 /// The policy is consulted once per failed attempt: [`should_retry`] decides
 /// whether another attempt is allowed, and [`delay`] returns the backoff to
-/// wait first, honouring a provider `retry_after` hint.
+/// wait first, honouring a provider `retry_after` hint within `max_backoff`.
 ///
 /// [`should_retry`]: RetryPolicy::should_retry
 /// [`delay`]: RetryPolicy::delay
@@ -115,11 +115,14 @@ impl RetryPolicy {
     ///
     /// A provider `retry_after` hint overrides the computed backoff and is
     /// used unjittered: it is the server telling us when to come back
-    /// (§6.3).
+    /// (§6.3). The hint is still clamped to [`RetryPolicy::with_max_backoff`]
+    /// so a throttling provider cannot park a request indefinitely: an
+    /// uncapped hint can otherwise sleep past the caller's whole budget
+    /// (observed as 30-minute eval stalls, 2026-10-16).
     #[must_use]
     pub fn delay(&self, attempt: u32, error: &ModelError) -> Duration {
         if let Some(retry_after) = error.retry_after {
-            return retry_after;
+            return retry_after.min(self.max_backoff);
         }
         self.jitter(self.backoff(attempt))
     }
@@ -222,6 +225,15 @@ mod tests {
         let with_hint =
             error(ModelErrorKind::RateLimited).with_retry_after(Duration::from_millis(123));
         assert_eq!(policy.delay(1, &with_hint), Duration::from_millis(123));
+    }
+
+    #[test]
+    fn retry_after_is_clamped_to_max_backoff() {
+        // A throttling provider must not be able to park a request past the
+        // caller's budget: an uncapped hint caused 30-minute eval stalls.
+        let policy = RetryPolicy::default(); // max_backoff = 30 s
+        let huge = error(ModelErrorKind::RateLimited).with_retry_after(Duration::from_secs(3600));
+        assert_eq!(policy.delay(1, &huge), Duration::from_secs(30));
     }
 
     #[test]

@@ -3,6 +3,51 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-16 — Retry-After hint clamped to the backoff ceiling
+
+The retry policy honoured a provider `Retry-After` hint verbatim, uncapped
+by `max_backoff`. That let a throttling provider park a request past the
+caller's entire budget: an eval sweep against a free tier stalled in
+30-minute watchdog holes (`LOOM_EVAL_RUN_TIMEOUT_SECS`), writing empty
+records, because a single oversized hint outlasted the run timeout. The
+hint is still used unjittered — the server is telling us when to come
+back — but it is now clamped to the policy's backoff ceiling.
+
+- `RetryPolicy::delay` returns `retry_after.min(max_backoff)` instead of
+  the raw hint; the computed backoff path is unchanged.
+- New test `retry_after_is_clamped_to_max_backoff` pins the ceiling; the
+  existing `retry_after_overrides_the_computed_backoff` still passes
+  because a hint below the ceiling is honoured exactly.
+
+## 2026-10-16 — A content stall is now a first-class failure
+
+A streaming provider could park a request forever without producing a
+single model event: keep-alive comments and empty `data:` heartbeats
+arrive as body chunks, so they reset the byte-level idle window, but the
+SSE decoder dispatches no event for them. An eval sweep hit exactly this
+against a free tier — every stalled run burned the full 30-minute
+watchdog (`LOOM_EVAL_RUN_TIMEOUT_SECS`) and wrote an empty record.
+
+`TimeoutConfig` gains a fourth window, `stall` (default 120 s), and
+`wire_stream` now measures it from the last *dispatched* SSE event:
+whatever `idle` sees, a stream that only pings is dead. With
+`max_attempts` four, a silent provider now fails as a retryable
+transport error in minutes instead of being killed by the caller's
+watchdog.
+
+- `TimeoutConfig::stall` (default `120 s`); `TimeoutConfig` is a public
+  struct with public fields, so external literal construction must add
+  the field.
+- `wire_stream`'s `State::Body` tracks `last_progress` and bounds each
+  read by `min(idle, remaining_until_stall)`; expiry yields a retryable
+  `ModelErrorKind::Transport`, "stall timeout: no SSE event within the
+  configured window (keep-alive pings do not count as progress)".
+- `ingest_chunk` now returns an `Ingested { saw_done, progressed }`, so
+  only a dispatched data event resets the stall window.
+- New test `keep_alive_only_stream_trips_the_stall_timeout` pins a
+  keep-alive-only stream against the stall window; the idle window is
+  deliberately smaller in it, proving the two are distinct.
+
 ## 2026-10-10 — Surfaced decisions: harness black boxes become events
 
 Three under-the-hood decisions the harness made silently are now events

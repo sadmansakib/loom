@@ -122,6 +122,10 @@ enum State<P: WireEndpoint> {
         accumulator: Box<ChunkAccumulator>,
         pending: VecDeque<ModelEvent>,
         saw_done: bool,
+        /// Instant of the last *dispatched* SSE event; the content-stall
+        /// window measures from here, so keep-alive comments and empty
+        /// heartbeats (which dispatch nothing) do not reset it.
+        last_progress: tokio::time::Instant,
     },
     /// Terminal: `Completed` emitted or error yielded.
     Done,
@@ -277,17 +281,28 @@ fn eof_is_done(saw_done: bool, decoder: &SseDecoder) -> bool {
         || (decoder.pending_event().is_none() && is_unterminated_done_line(decoder.pending_line()))
 }
 
+/// Outcome of ingesting one body chunk.
+struct Ingested {
+    /// `[DONE]` was seen; the response is final.
+    saw_done: bool,
+    /// At least one SSE data event was dispatched — real content
+    /// progress, the thing the content-stall window measures. A
+    /// keep-alive comment or an empty `data:` heartbeat dispatches none.
+    progressed: bool,
+}
+
 /// Ingests one body chunk: decodes SSE events, parses each data chunk
 /// into the accumulator, and extends `pending` with the display deltas.
-/// Returns the updated `saw_done`; decode failures and unparseable
-/// chunks are non-retryable protocol errors.
+/// Reports the updated `saw_done` and whether any event was dispatched;
+/// decode failures and unparseable chunks are non-retryable protocol
+/// errors.
 fn ingest_chunk(
     decoder: &mut SseDecoder,
     accumulator: &mut ChunkAccumulator,
     pending: &mut VecDeque<ModelEvent>,
     saw_done: bool,
     chunk: &[u8],
-) -> Result<bool, ModelError> {
+) -> Result<Ingested, ModelError> {
     let events = match decoder.push_bytes(chunk) {
         Ok(events) => events,
         // Oversized pending event: misbehaving or hostile endpoint,
@@ -299,12 +314,16 @@ fn ingest_chunk(
             ));
         }
     };
+    let progressed = !events.is_empty();
     for event in events {
         if event.data == DONE_MARKER {
             // Anything after [DONE] in the same body read is trailing
             // junk (some proxies append it); the response is final,
             // stop ingesting.
-            return Ok(true);
+            return Ok(Ingested {
+                saw_done: true,
+                progressed,
+            });
         }
         let parsed: ChatChunk = match serde_json::from_str(&event.data) {
             Ok(parsed) => parsed,
@@ -317,7 +336,10 @@ fn ingest_chunk(
         };
         pending.extend(accumulator.ingest(parsed));
     }
-    Ok(saw_done)
+    Ok(Ingested {
+        saw_done,
+        progressed,
+    })
 }
 
 /// One unfold step: `Ok((None, next))` transitions without emitting,
@@ -375,6 +397,7 @@ async fn step<P: WireEndpoint>(
                     accumulator: Box::new(ChunkAccumulator::default()),
                     pending: VecDeque::new(),
                     saw_done: false,
+                    last_progress: tokio::time::Instant::now(),
                 },
             ))
         }
@@ -385,6 +408,7 @@ async fn step<P: WireEndpoint>(
             mut accumulator,
             mut pending,
             mut saw_done,
+            mut last_progress,
         } => {
             if let Some(event) = pending.pop_front() {
                 return Some((
@@ -396,6 +420,7 @@ async fn step<P: WireEndpoint>(
                         accumulator,
                         pending,
                         saw_done,
+                        last_progress,
                     },
                 ));
             }
@@ -407,8 +432,26 @@ async fn step<P: WireEndpoint>(
                     State::Done,
                 ));
             }
-            let idle = provider.timeouts().idle;
-            match tokio::time::timeout(idle, body_stream.next()).await {
+            // Two windows bound this read: the idle window measures raw
+            // byte flow (keep-alive comments reset it), the stall window
+            // measures dispatched events (they do not). Whichever expiry
+            // comes first decides the error.
+            let timeouts = provider.timeouts();
+            let stall_remaining = timeouts.stall.saturating_sub(last_progress.elapsed());
+            let window = timeouts.idle.min(stall_remaining);
+            let content_stall = stall_remaining <= timeouts.idle;
+            match tokio::time::timeout(window, body_stream.next()).await {
+                Err(_) if content_stall => {
+                    log_finish_reason(&accumulator);
+                    Some((
+                        Err(ModelError::new(
+                            ModelErrorKind::Transport,
+                            "stall timeout: no SSE event within the configured window \
+                             (keep-alive pings do not count as progress)",
+                        )),
+                        State::Done,
+                    ))
+                }
                 Err(_) => {
                     log_finish_reason(&accumulator);
                     Some((
@@ -460,7 +503,12 @@ async fn step<P: WireEndpoint>(
                         saw_done,
                         &chunk,
                     ) {
-                        Ok(updated) => saw_done = updated,
+                        Ok(ingested) => {
+                            saw_done = ingested.saw_done;
+                            if ingested.progressed {
+                                last_progress = tokio::time::Instant::now();
+                            }
+                        }
                         Err(error) => {
                             log_finish_reason(&accumulator);
                             return Some((Err(error), State::Done));
@@ -475,6 +523,7 @@ async fn step<P: WireEndpoint>(
                             accumulator,
                             pending,
                             saw_done,
+                            last_progress,
                         },
                     ))
                 }

@@ -26,6 +26,14 @@ pub struct TimeoutConfig {
     /// therefore between SSE events; keep-alive comments arrive as
     /// chunks and reset this too.
     pub idle: Duration,
+    /// Maximum gap between *dispatched SSE events* — real model
+    /// progress. Unlike [`idle`](Self::idle), a chunk that dispatches no
+    /// event (a keep-alive comment, or an empty `data:` heartbeat) does
+    /// not reset this: a provider that pings without ever producing
+    /// content is stalled, not alive. Closes the hang where a
+    /// keep-alive-only stream reset the byte-level idle window forever
+    /// (observed as 30-minute eval watchdog holes, 2026-10-16).
+    pub stall: Duration,
 }
 
 impl Default for TimeoutConfig {
@@ -34,6 +42,7 @@ impl Default for TimeoutConfig {
             connect: Duration::from_secs(30),
             header: Duration::from_secs(300),
             idle: Duration::from_secs(300),
+            stall: Duration::from_secs(120),
         }
     }
 }
@@ -112,6 +121,7 @@ mod tests {
         assert_eq!(timeouts.connect, Duration::from_secs(30));
         assert_eq!(timeouts.header, Duration::from_secs(300));
         assert_eq!(timeouts.idle, Duration::from_secs(300));
+        assert_eq!(timeouts.stall, Duration::from_secs(120));
     }
 
     #[test]

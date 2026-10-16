@@ -743,6 +743,7 @@ async fn header_stall_is_retryable_transport() {
         connect: Duration::from_secs(5),
         header: Duration::from_millis(100),
         idle: Duration::from_secs(5),
+        stall: Duration::from_secs(5),
     };
     let events =
         collect(provider_at(&format!("http://{addr}"), timeouts).stream(&plain_request())).await;
@@ -783,6 +784,7 @@ async fn idle_stall_is_retryable_transport() {
         connect: Duration::from_secs(5),
         header: Duration::from_secs(5),
         idle: Duration::from_millis(100),
+        stall: Duration::from_secs(5),
     };
     let events =
         collect(provider_at(&format!("http://{addr}"), timeouts).stream(&plain_request())).await;
@@ -792,6 +794,64 @@ async fn idle_stall_is_retryable_transport() {
     assert!(
         error.message.contains("idle"),
         "should name the idle phase: {}",
+        error.message
+    );
+}
+
+#[tokio::test]
+async fn keep_alive_only_stream_trips_the_stall_timeout() {
+    // A gateway can hold the connection open and drip keep-alive
+    // comments forever without ever dispatching an SSE data event:
+    // bytes keep arriving (so the byte-level idle window never fires)
+    // while no model progress is made. The content-stall window must
+    // catch that.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+            .await
+            .unwrap();
+        // Only comments: each resets the idle window, none is an event.
+        for _ in 0..100 {
+            if socket.write_all(b": keep-alive\n\n").await.is_err() {
+                return;
+            }
+            if socket.flush().await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut buf = [0u8; 64];
+        while let Ok(read) = socket.read(&mut buf).await {
+            if read == 0 {
+                break;
+            }
+        }
+    });
+
+    // The 20 ms keep-alive cadence sits well inside the 50 ms idle
+    // window, so only the content-stall window can fire — and it must.
+    let timeouts = TimeoutConfig {
+        connect: Duration::from_secs(5),
+        header: Duration::from_secs(5),
+        idle: Duration::from_millis(50),
+        stall: Duration::from_millis(300),
+    };
+    let events = tokio::time::timeout(
+        Duration::from_secs(10),
+        collect(provider_at(&format!("http://{addr}"), timeouts).stream(&plain_request())),
+    )
+    .await
+    .expect("stream hung: the stall timeout never fired");
+
+    let error = expect_error(events);
+    assert_eq!(error.kind, ModelErrorKind::Transport);
+    assert!(error.is_retryable());
+    assert!(
+        error.message.contains("stall"),
+        "should name the stalled phase: {}",
         error.message
     );
 }
@@ -873,6 +933,7 @@ async fn stalled_error_body_asserts_kind(
         connect: Duration::from_secs(5),
         header: Duration::from_secs(5),
         idle: Duration::from_millis(100),
+        stall: Duration::from_secs(5),
     };
     let events =
         collect(provider_at(&format!("http://{addr}"), timeouts).stream(&plain_request())).await;
