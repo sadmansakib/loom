@@ -76,8 +76,12 @@ impl Tool for WriteFileTool {
             let moved_display = display.clone();
             tokio::task::spawn_blocking(move || -> Result<(), ToolError> {
                 // Syntax guard (roadmap item 5 phase B): refuse the
-                // candidate before anything reaches the disk.
-                crate::syntax::guard(&moved_path, &content).map_err(|err| {
+                // candidate before anything reaches the disk. A file the
+                // grammar already cannot read (no file yet, or a legacy
+                // buffer that fails to parse) must not block the write:
+                // the guard only refuses a buffer it is making worse.
+                let previous = std::fs::read_to_string(&moved_path).unwrap_or_default();
+                crate::syntax::guard_against(&previous, &content, &moved_path).map_err(|err| {
                     ToolError::InvalidInput(format!("refusing to write \"{moved_display}\": {err}"))
                 })?;
                 write_file(&moved_path, content.as_bytes()).map_err(|err| {
@@ -228,6 +232,30 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(guard.path().join("src/lib.rs")).expect("read"),
             "pub fn one() -> u32 { 1 }\n"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn overwriting_a_legacy_try_macro_file_is_allowed() {
+        let _lock = crate::syntax::testing::env_lock();
+        let (guard, root) = temp_root();
+        // The previous text already fails this grammar, so the guard has
+        // nothing to protect: refusing here would only lock the model out.
+        std::fs::write(
+            guard.path().join("a.rs"),
+            b"fn a() {\n    let mmap = try!(self.mmap(&paths));\n}\n",
+        )
+        .expect("seed");
+        write(
+            &root,
+            json!({"path": "a.rs", "content": "fn b() {\n    let mmap = try!(self.mmap(&paths));\n}\n"}),
+        )
+        .await
+        .expect("a file the grammar cannot read must stay writable");
+        assert_eq!(
+            std::fs::read_to_string(guard.path().join("a.rs")).expect("read"),
+            "fn b() {\n    let mmap = try!(self.mmap(&paths));\n}\n"
         );
     }
 

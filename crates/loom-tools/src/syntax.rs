@@ -97,6 +97,25 @@ pub fn guard(path: &Path, candidate: &str) -> Result<(), SyntaxGuardError> {
     }
 }
 
+/// Guards an edit: refuses only when the candidate introduces a parse
+/// error the text it replaces did not already have.
+///
+/// The guard's job is to stop a model from making a file *more* broken,
+/// never to demand that a file the grammar cannot read suddenly become
+/// parsable. Some files legitimately fail this grammar — 2015-era Rust
+/// full of `try!(…)` calls is the measured case, where tree-sitter reads
+/// `try` as the keyword for a 2018 try-block and errors on the `(` — and
+/// for those, refusing every write would lock the model out of the file
+/// with a message pointing at a line it never touched. So when
+/// `previous` already fails to parse, the guard fails open, exactly as
+/// it does for a language it cannot reason about at all.
+pub fn guard_against(previous: &str, candidate: &str, path: &Path) -> Result<(), SyntaxGuardError> {
+    if !syntax_guard_enabled() || guard(path, previous).is_err() {
+        return Ok(());
+    }
+    guard(path, candidate)
+}
+
 /// Preorder walk for the first ERROR/MISSING node in document order.
 /// `has_error` on the root already told us one exists; this finds
 /// where the first one starts so the refusal can point at it.
@@ -265,5 +284,32 @@ mod tests {
     fn the_test_override_disables_the_guard() {
         let _disabled = testing::disable_guard();
         assert!(guard(Path::new("f.rs"), "fn broken( {").is_ok());
+    }
+
+    #[test]
+    fn editing_a_file_that_already_fails_to_parse_is_allowed() {
+        let _lock = testing::env_lock();
+        // 2015-era `try!(…)` defeats this grammar. The guard must not
+        // lock the model out of such a file with an error at a line it
+        // never touched.
+        let legacy = "fn a() {\n    let mmap = try!(self.mmap(&paths));\n}\n";
+        assert!(
+            guard(Path::new("f.rs"), legacy).is_err(),
+            "the grammar really does reject try!()"
+        );
+        assert!(guard_against(legacy, legacy, Path::new("f.rs")).is_ok());
+    }
+
+    #[test]
+    fn an_edit_that_breaks_a_parsable_file_is_still_refused() {
+        let _lock = testing::env_lock();
+        assert!(guard_against("fn ok() {}\n", "fn broken( {}\n", Path::new("f.rs")).is_err());
+    }
+
+    #[test]
+    fn a_new_file_is_guarded_like_any_other() {
+        let _lock = testing::env_lock();
+        assert!(guard_against("", "fn broken( {}\n", Path::new("f.rs")).is_err());
+        assert!(guard_against("", "fn ok() {}\n", Path::new("f.rs")).is_ok());
     }
 }

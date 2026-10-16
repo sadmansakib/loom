@@ -247,10 +247,10 @@ struct EditOutcome {
 /// ledger should refuse a blind repeat (ADR-020).
 fn load_edit_files(
     edits: &[(PathBuf, String, String)],
-) -> Result<Vec<(PathBuf, String)>, ToolError> {
-    let mut files: Vec<(PathBuf, String)> = Vec::new();
+) -> Result<Vec<(PathBuf, String, String)>, ToolError> {
+    let mut files: Vec<(PathBuf, String, String)> = Vec::new();
     for (path, _, _) in edits {
-        if files.iter().any(|(p, _)| p == path) {
+        if files.iter().any(|(p, _, _)| p == path) {
             continue;
         }
         let size = std::fs::metadata(path)
@@ -268,7 +268,10 @@ fn load_edit_files(
         })?;
         let text = String::from_utf8(bytes)
             .map_err(|_| ToolError::Execution(String::from("file is not valid UTF-8")))?;
-        files.push((path.clone(), text));
+        // The untouched text rides along so the syntax guard below can
+        // tell a genuine breakage from a file that already failed to
+        // parse before this edit.
+        files.push((path.clone(), text.clone(), text));
     }
     Ok(files)
 }
@@ -415,7 +418,7 @@ fn apply_edits(root: &Path, edits: &[(PathBuf, String, String)]) -> Result<EditO
     let mut spans: Vec<Vec<(usize, usize)>> = vec![Vec::new(); files.len()];
     let mut repairs: Vec<String> = Vec::new();
     for (index, (path, old, new)) in edits.iter().enumerate() {
-        let file_idx = match files.iter().position(|(p, _)| p == path) {
+        let file_idx = match files.iter().position(|(p, _, _)| p == path) {
             Some(idx) => idx,
             None => {
                 // Unreachable: `load_edit_files` inserted every edit's
@@ -426,7 +429,7 @@ fn apply_edits(root: &Path, edits: &[(PathBuf, String, String)]) -> Result<EditO
                 )));
             }
         };
-        let text = &mut files[file_idx].1;
+        let text = &mut files[file_idx].2;
         if old.is_empty() {
             return Err(ToolError::InvalidInput(format!(
                 "{}old_string must not be empty",
@@ -464,8 +467,8 @@ fn apply_edits(root: &Path, edits: &[(PathBuf, String, String)]) -> Result<EditO
     // must parse before anything reaches the disk, so a batch that
     // would leave any file unparsable refuses as a whole — nothing is
     // written, exactly like a failed match.
-    for (path, text) in &files {
-        crate::syntax::guard(path, text).map_err(|err| {
+    for (path, original, text) in &files {
+        crate::syntax::guard_against(original, text, path).map_err(|err| {
             ToolError::InvalidInput(format!(
                 "refusing to write \"{}\": {err}",
                 workspace_relative(root, path)
@@ -473,13 +476,13 @@ fn apply_edits(root: &Path, edits: &[(PathBuf, String, String)]) -> Result<EditO
         })?;
     }
     // Every edit matched exactly once: write everything back.
-    for (path, text) in &files {
+    for (path, _, text) in &files {
         std::fs::write(path, text)
             .map_err(|err| ToolError::Execution(format!("cannot write: {err}")))?;
     }
     let resolved: Vec<(String, String)> = files
         .iter()
-        .map(|(path, text)| (workspace_relative(root, path), text.clone()))
+        .map(|(path, _, text)| (workspace_relative(root, path), text.clone()))
         .collect();
     let per_file_counts: Vec<usize> = spans.iter().map(Vec::len).collect();
     let mut echoes = Vec::new();
@@ -808,6 +811,31 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(guard.path().join("f.rs")).expect("read"),
             "fn add() {}\n"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_edit_to_legacy_try_macro_code_is_allowed() {
+        let _lock = crate::syntax::testing::env_lock();
+        let (guard, root) = temp_root();
+        // This grammar rejects every `try!(…)`, so before the fix the
+        // guard refused any write here, at a line the model never
+        // touched, locking it out of the whole file.
+        std::fs::write(
+            guard.path().join("f.rs"),
+            b"fn a() {\n    let mmap = try!(self.mmap(&paths));\n}\n",
+        )
+        .expect("seed");
+        edit(
+            &root,
+            json!({"path": "f.rs", "old_string": "fn a()", "new_string": "fn b()"}),
+        )
+        .await
+        .expect("a file the grammar cannot read must stay editable");
+        assert_eq!(
+            std::fs::read_to_string(guard.path().join("f.rs")).expect("read"),
+            "fn b() {\n    let mmap = try!(self.mmap(&paths));\n}\n"
         );
     }
 
