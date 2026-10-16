@@ -15,3 +15,8 @@ loom-tools = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# examples/frontend.rs only: a minimal driving process around the facade.
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }

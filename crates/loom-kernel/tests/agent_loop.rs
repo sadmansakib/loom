@@ -2557,3 +2557,98 @@ async fn todo_list_re_appends_at_the_tail_only_when_changed() {
         .count();
     assert_eq!(updates, 2, "events: {kinds:?}");
 }
+
+/// A tool that queues steering mid-batch and completes normally — the
+/// queued message must land in the transcript at the next turn boundary
+/// and be visible to that turn's compiled request (item 25).
+struct SteeringTool {
+    spec: ToolSpec,
+    control: TaskControl,
+}
+
+impl Tool for SteeringTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+    fn is_read_only(&self) -> bool {
+        true
+    }
+    fn call<'a>(
+        &'a self,
+        input: Value,
+        _ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
+        self.control.steer("actually, prefer the second option");
+        Box::pin(async move { Ok(ToolOutput::new(format!("echo: {input}"))) })
+    }
+}
+
+/// Steering queued during a turn's tool batch joins the transcript at the
+/// next boundary: one `SteeringApplied` event, and the second request's
+/// messages contain the steered user text.
+#[tokio::test]
+async fn steering_queued_mid_batch_is_applied_at_the_next_turn_boundary() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            completed(
+                assistant(
+                    "",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_1", "echo", json!({ "q": "hi" }))],
+                ),
+                usage(20, 5, None),
+            ),
+            completed(
+                assistant("done", StopReason::EndTurn, Vec::new()),
+                usage(30, 7, None),
+            ),
+        ],
+    );
+    let requests = provider.requests_handle();
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let control = TaskControl::new();
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(SteeringTool {
+            spec: spec("echo"),
+            control: control.clone(),
+        }))
+        .unwrap();
+    let agent = agent(provider, registry, 10);
+
+    agent
+        .run_task(&mut session, "run the tool", &sink, &control)
+        .await
+        .unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "both turns spent");
+    let second = &requests[1];
+    assert!(
+        second.messages.iter().any(|message| matches!(
+            message,
+            Message::User { text } if text.contains("prefer the second option")
+        )),
+        "the steered text must reach the second turn's compile"
+    );
+    // user, assistant(call), tool result, steered user, final assistant.
+    assert_eq!(session.transcript.len(), 5);
+
+    let kinds = drain(&mut receiver);
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| matches!(
+                kind,
+                EventKind::SteeringApplied {
+                    turn: 2,
+                    messages: 1
+                }
+            ))
+            .count(),
+        1,
+        "events: {kinds:?}"
+    );
+}

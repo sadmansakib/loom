@@ -26,6 +26,22 @@
 //! directly, receiving events through [`kernel::event::EventSink`] with no IPC
 //! and no serialization on the hot path. The serializable event protocol is
 //! retained only as the optional out-of-process seam for a future server.
+//!
+//! # Stability contract
+//!
+//! Two tiers, so frontends can build on loom before every crate's API
+//! settles (ADR-021):
+//!
+//! - **Stable** — everything re-exported at this crate's root: the
+//!   driving API (`Engine` and friends) and the control/observation
+//!   surface (`TaskControl`, `EventSink`, `EventKind`, `Session`, ids).
+//!   A change here is a breaking change and bumps `loom-core`'s minor
+//!   version. The event wire schema is versioned separately
+//!   ([`kernel::event::EVENT_SCHEMA_VERSION`]).
+//! - **Rolling** — the `kernel`, `engine`, `providers`, `tools`, and
+//!   `store` module aliases. They re-export the workspace crates for
+//!   in-repo frontends and early adopters; anything under them may
+//!   change until the facade's `0.2` release.
 
 pub mod paths;
 
@@ -39,4 +55,12 @@ pub use loom_tools as tools;
 // `loom_core::Engine`. Driving-API types are imported from the root, not
 // through the `engine` alias; module-scoped APIs stay behind the aliases
 // (`loom_core::kernel::…`, `loom_core::engine::auth::…`).
-pub use loom_engine::{Engine, EngineConfig, EngineError, ReasoningEffort};
+pub use loom_engine::{Engine, EngineConfig, EngineError, EngineOverrides, ReasoningEffort};
+
+// The stable frontend surface: the control and observation types every
+// frontend needs to drive a task. Same stability promise as the driving
+// API — changes here are breaking and bump `loom-core`'s minor version.
+pub use loom_kernel::agent::{TaskControl, TaskSummary};
+pub use loom_kernel::event::{EventEnvelope, EventKind, EventSink};
+pub use loom_kernel::id::{SessionId, TaskId};
+pub use loom_kernel::session::Session;

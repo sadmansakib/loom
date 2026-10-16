@@ -985,13 +985,14 @@ reproduces them.
     window's budget math errs toward pruning early rather than
     sending an over-window request.
 15. **CLI session resume.** Listing, selection, continuation, and
-    transcript export (also the input for item 19). The core seam
-    shipped 2026-10-09: `Engine::continue_session` plus the
-    `AwaitingInput` event, and stopping is two-granularity through
-    `TaskControl` (`cancel` aborts mid-flight, `pause` stops at the
-    next turn boundary with the in-flight turn committed — one Ctrl-C
-    pauses, a second cancels) — remaining work is the CLI command
-    surface.
+    transcript export (also the input for item 19). **Shipped 2026-10-16**:
+    `Engine::continue_session` + `AwaitingInput` event (2026-10-09), then the
+    CLI surface — `loom sessions` lists persisted sessions (id, transcript
+    length, last-task status, straight from `SqliteStore`, no provider/credentials
+    needed) and `loom run --session ID TASK…` reappends to that session,
+    reusing every `run` flag. A live smoke resumed a completed session into a
+    new task end to end. Transcript *export* remains (folded into item 20's
+    `--trace`).
 16. **Search parity.** Adopt the `ignore` crate's matcher for chained
     gitignore files or pin the documented negation-precedence
     divergence with real-repository fixtures.
@@ -1051,7 +1052,12 @@ reproduces them.
 21. **Parallel orchestration.** Worktree-per-agent isolation with a
     merge path, above the engine. Only after item 19 shows delegation
     pays.
-22. **Frontends.** A TUI or desktop client, additive once resume ships.
+22. **Frontends.** A TUI or desktop client. The facade contract is now
+    ready: `loom-core` roots a stable surface (driving API + `TaskControl`/
+    `EventSink`/`EventKind`/`Session`/ids) with a documented semver split
+    from the rolling crate aliases (ADR-021), and `examples/frontend.rs`
+    shows the full drive loop — open, subscribe, steer, summarize. Resume +
+    steering are both shipped, so a frontend is purely additive.
 23. **Distributed verification.** Remote or containerized `verify`
     runners with the same evidence contract.
 24. **Best-of-N task-time sampling** (G1, G9). Fork the prepared
@@ -1075,17 +1081,16 @@ reproduces them.
     delegation semantics); blocked on item 1's funded model like
     everything that multiplies spend. Seam: the engine composing N
     child `Agent`s above `Agent::run_task`, same as item 19.
-25. **Queued user steering** (G1, G2). Let a user queue a message
-    while a task runs; the runtime delivers it as the next user item at
-    the next turn boundary, before projection compile — so the census
-    and replay stay byte-stable and the eval harness is unaffected.
-    Distinct from item 15's pause (`AwaitingInput`): no stop, an
-    injected instruction the model sees on its next turn. This is the
-    steering seam every leading interactive agent (Claude Code, Codex)
-    exposes; composing with the pause path means no new lifecycle
-    states. Blocked on the interactive CLI surface (item 15 remainder,
-    item 22). Seam: turn assembly next to item 13's deferred
-    turn-boundary notices.
+25. **Queued user steering** (G1, G2). **Shipped 2026-10-16** — the
+    `TaskControl::steer` seam queues user messages on the control (shared via
+    `Arc` across clones); the turn loop drains them at each turn boundary and
+    appends them persist-then-commit before that turn's compile, so census,
+    replay, and the eval harness stay byte-stable and unaffected. New event
+    schema **v10** adds `SteeringApplied { turn, messages }` (one per
+    non-empty boundary drain, after `TurnStarted`). Distinct from item 15's
+    pause: no stop, an injected instruction the model sees next turn. The CLI
+    does not yet expose an interactive feed — it remains a library seam for
+    future frontends (item 22).
 
 ### Deliberately not planned
 

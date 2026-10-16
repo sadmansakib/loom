@@ -28,6 +28,8 @@ pub enum Command {
     Run(Box<RunArgs>),
     /// Manage saved provider credentials (`loom.db` + OS keychain).
     Auth(AuthArgs),
+    /// List persisted sessions (`loom.db`), oldest first.
+    Sessions,
     /// Transcript analytics over stored sessions (or exported traces).
     Stats(StatsArgs),
 }
@@ -95,6 +97,12 @@ pub struct RunArgs {
     /// `DIR/<task-id>/` (roadmap item 20.1).
     #[arg(long, value_name = "DIR")]
     pub trace: Option<std::path::PathBuf>,
+
+    /// Continue a persisted session instead of starting a new one
+    /// (roadmap item 15): the task input is appended to that session's
+    /// transcript and the loop runs to its next stopping point.
+    #[arg(long, value_name = "ID")]
+    pub session: Option<String>,
 }
 
 /// Arguments for `loom auth`.

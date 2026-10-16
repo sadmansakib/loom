@@ -74,7 +74,9 @@ use tokio_util::sync::CancellationToken;
 /// v9 adds `TodoUpdated` (roadmap item 8 phase B: the kernel-owned todo
 /// list changed during a turn's tool batch; replaying the events
 /// reconstructs the list, and each event marks one tail re-append).
-pub const EVENT_SCHEMA_VERSION: u16 = 9;
+/// v10 adds `SteeringApplied` (item 25: queued user messages joined
+/// the transcript at a turn boundary).
+pub const EVENT_SCHEMA_VERSION: u16 = 10;
 
 /// One observed occurrence during a task, wrapped for the wire.
 ///
@@ -275,6 +277,18 @@ pub enum EventKind {
         revision: u64,
         /// The complete item list after the change, in list order.
         items: Vec<TodoItem>,
+    },
+    /// Queued user steering joined the transcript at this turn's
+    /// boundary (item 25): every message drained from
+    /// [`TaskControl::steer`](crate::agent::TaskControl::steer) was
+    /// appended as a user item — persist-then-commit — before the
+    /// turn's compile, so the model sees it this turn. Emitted once
+    /// per boundary with a non-empty drain, after `TurnStarted`.
+    SteeringApplied {
+        /// 1-based turn whose compile will see the messages.
+        turn: u32,
+        /// How many queued messages were applied.
+        messages: u32,
     },
     /// The task reached terminal success.
     TaskCompleted,

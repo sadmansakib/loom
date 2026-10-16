@@ -1446,11 +1446,13 @@ dependencies = [
 name = "loom-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "loom-engine",
  "loom-kernel",
  "loom-providers",
  "loom-store",
  "loom-tools",
+ "tokio",
 ]
 
 [[package]]

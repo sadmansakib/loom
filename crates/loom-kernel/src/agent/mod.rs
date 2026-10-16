@@ -240,6 +240,10 @@ pub struct TaskControl {
     hard: CancellationToken,
     /// The graceful stop, observed only at turn boundaries.
     soft: CancellationToken,
+    /// Queued user steering (item 25): appended to the transcript at
+    /// the next turn boundary. `Arc` so clones share one queue,
+    /// matching token semantics.
+    steering: Arc<Mutex<Vec<String>>>,
 }
 
 impl TaskControl {
@@ -272,6 +276,17 @@ impl TaskControl {
         self.soft.is_cancelled()
     }
 
+    /// Queue a user message for the running task (item 25). Applied at
+    /// the next turn boundary — appended to the transcript as a user
+    /// item before the turn's compile — never mid-turn. Messages
+    /// queued while paused survive until the resumed task's next
+    /// boundary.
+    pub fn steer(&self, message: impl Into<String>) {
+        let Ok(mut queue) = self.steering.lock() else {
+            return; // poisoned: a silent skip, like the event store
+        };
+        queue.push(message.into());
+    }
     /// The hard-stop token, for callers that wire a cancellation into
     /// existing `CancellationToken` consumers (tool contexts, stream
     /// selects). The pause has no token form on purpose: it is a
@@ -288,6 +303,7 @@ impl From<CancellationToken> for TaskControl {
         Self {
             hard,
             soft: CancellationToken::new(),
+            steering: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -986,6 +1002,35 @@ impl Agent {
 
             sink.emit(task_id, EventKind::TurnStarted { turn });
 
+            // Queued user steering (item 25): drained once per turn
+            // boundary and appended — persist-then-commit, exactly as a
+            // task's opening input — so this turn's compile sees it.
+            // Never mid-turn: the in-flight reply is never reordered.
+            let steered: Vec<String> = match control.steering.lock() {
+                // poisoned: drop the batch, like the event store's skips
+                Ok(mut queue) => std::mem::take(&mut *queue),
+                Err(_) => Vec::new(),
+            };
+            if !steered.is_empty() {
+                for text in &steered {
+                    let user = Item::User { text: text.clone() };
+                    if let Some(store) = &self.store {
+                        store
+                            .append_item(&session.id, session.next_index(), &user)
+                            .map_err(persistence)?;
+                    }
+                    session
+                        .push_item(user)
+                        .map_err(|error| TaskError::Internal(error.to_string()))?;
+                }
+                sink.emit(
+                    task_id,
+                    EventKind::SteeringApplied {
+                        turn,
+                        messages: steered.len() as u32,
+                    },
+                );
+            }
             // a. Compile the model request from durable state (§8). The
             //    compiler owns every context decision; the loop only passes
             //    it the inputs. When even the compiler's rescue arm cannot

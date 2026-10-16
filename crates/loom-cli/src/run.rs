@@ -144,7 +144,6 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         catalog: None,
     }))?;
 
-    let mut session = engine.new_session();
     let input = args.task.join(" ");
 
     let decision_log = DecisionLog::default();
@@ -155,7 +154,28 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let control = TaskControl::new();
     let signal = runtime.spawn(ctrl_c_ladder(control.clone()));
 
-    let outcome = runtime.block_on(engine.run_task(&mut session, input, &sink, &control));
+    // Resume (item 15): with `--session` the engine loads the persisted
+    // transcript, appends the input, and runs to the next stopping point;
+    // `continue_session` returns the advanced session even when the task
+    // failed, so the trace export still has a transcript to write.
+    let (session, outcome) = match args.session.as_deref() {
+        Some(id) => {
+            let id = id
+                .parse()
+                .context("parsing --session (expected an id from `loom sessions`)")?;
+            let continuation = runtime
+                .block_on(engine.continue_session(&id, input, &sink, &control))
+                .map_err(|error| {
+                    anyhow::Error::new(error).context(format!("resuming session {id}"))
+                })?;
+            (continuation.session, continuation.outcome)
+        }
+        None => {
+            let mut session = engine.new_session();
+            let outcome = runtime.block_on(engine.run_task(&mut session, input, &sink, &control));
+            (session, outcome)
+        }
+    };
     let tracer = join_consumers(sink, signal, renderer_thread, tracer_thread);
     print_decisions(&decision_log);
 
