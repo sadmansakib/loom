@@ -302,6 +302,12 @@ fn primary_span(message: &serde_json::Value) -> Option<Location> {
 pub fn libtest_failures(output: &str) -> Vec<TestFailure> {
     let mut failures = Vec::new();
     let mut current: Option<TestFailure> = None;
+    // A panic message spans every line up to the blank line that ends the
+    // section body. A diff-style `assert_eq!` failure prints its compared
+    // values there, so stopping at the first line leaves the model with
+    // nothing to act on but a blind re-edit; the whole message is kept and
+    // `clip` collapses and bounds it at render time.
+    let mut message_done = false;
     for line in output.lines() {
         if let Some(name) = section_name(line) {
             if let Some(failure) = current.take() {
@@ -312,6 +318,7 @@ pub fn libtest_failures(output: &str) -> Vec<TestFailure> {
                 message: String::new(),
                 location: None,
             });
+            message_done = false;
             continue;
         }
         let Some(failure) = current.as_mut() else {
@@ -323,12 +330,27 @@ pub fn libtest_failures(output: &str) -> Vec<TestFailure> {
             failure.location = Some(location);
             continue;
         }
-        if failure.message.is_empty() && !line.trim().is_empty() {
-            let trimmed = line.trim();
-            if !trimmed.starts_with("note:") && !trimmed.starts_with("----") {
-                failure.message = trimmed.to_owned();
-            }
+        if message_done {
+            continue;
         }
+        let trimmed = line.trim();
+        if trimmed.starts_with("note:") {
+            message_done = true;
+            continue;
+        }
+        if trimmed.is_empty() {
+            // A blank line ends the section body; the libtest trailer that
+            // follows must not be swallowed into the message.
+            message_done = !failure.message.is_empty();
+            continue;
+        }
+        if trimmed.starts_with("----") {
+            continue;
+        }
+        if !failure.message.is_empty() {
+            failure.message.push('\n');
+        }
+        failure.message.push_str(trimmed);
     }
     if let Some(failure) = current.take() {
         failures.push(failure);
@@ -825,6 +847,35 @@ test result: FAILED. 1 passed; 1 failed
                 .message
                 .contains("assertion `left == right` failed")
         );
+    }
+
+    #[test]
+    fn libtest_failure_keeps_the_multi_line_panic_message() {
+        let output = "\
+---- payment::rejects_negative stdout ----
+thread 'payment::rejects_negative' panicked at src/payment/validator.rs:42:5:
+assertion `left == right` failed
+  left: 200
+ right: 400
+note: run with `RUST_BACKTRACE=1` for a backtrace
+
+failures:
+    payment::rejects_negative
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored
+";
+        let failures = libtest_failures(output);
+        assert_eq!(failures.len(), 1);
+        let message = &failures[0].message;
+        for expected in [
+            "assertion `left == right` failed",
+            "left: 200",
+            "right: 400",
+        ] {
+            assert!(message.contains(expected), "{expected} missing: {message}");
+        }
+        assert!(!message.contains("note:"), "{message}");
+        assert!(!message.contains("test result"), "{message}");
     }
 
     #[test]
