@@ -123,7 +123,7 @@ iterations may start early where a backlog item is cheap and measured.
 | # | Iteration | Status | Backlog items |
 |---|---|---|---|
 | 1 | Core service | **Done** | — (see Shipped) |
-| 2 | Core efficiency & repository intelligence | **In progress (current)** | 1, 3✓, 4✓, 5✓ᴬ, 6✓, 7✗, 8✓ᴬ, 10✓ᴬ, 11⏸, 12✓, 16, 17✓ |
+| 2 | Core efficiency & repository intelligence | **In progress (current)** | 1, 3✓, 4✓, 5✓, 6✓, 7✗, 8✓, 10✓ᴬ, 11⏸, 12✓, 16✓, 17✓ |
 | 3 | Intelligent subagent scheduling | Not started | 19, 21, 24 |
 | 4 | Execution safety & richer tools | **Largely shipped early** | 2✓, 13⏸, 23 |
 | 5 | Skills & contextual knowledge | Partial (AGENTS.md facts) | 4✓ (instructions), 20.4 |
@@ -598,10 +598,15 @@ reproduces them.
      derived — see item 1); the per-model comparison dimension remains;
    - `loom stats`: what each mechanism saved — pruning, tool-cache hits,
      evidence shaping, output filters — from the events already
-     recorded (RTK's `gain`). Shipped transcript half (`loom stats`
-     reports turns, per-tool call quality, edit acceptance, repeats,
-     spill savings from any stored session); mechanism attribution
-     needs persisted events, not just transcripts.
+     recorded (RTK's `gain`). **Shipped 2026-10-17**: the transcript
+     half had been reporting turns, per-tool call quality, edit
+     acceptance, repeats, and spill savings from any stored session,
+     but mechanism attribution was waiting on persisted events rather
+     than transcripts. Those events now exist (store schema v2), and
+     `mechanisms_overview(&store, &store, …)` folds prune reports and
+     fast-path hits out of the event stream while stub hits, omission
+     markers, and repairs still come from the transcript — same id set,
+     so both sections describe the same sessions.
    - **Funded low-variance eval model** — the gating prerequisite.
      The free tier's variance (B9: 6–40 turns on identical config)
      sits above most levers, so items 4, 5, 6, 8, and 10 shipped on
@@ -658,7 +663,10 @@ reproduces them.
      ambiguity refusal, batch atomicity, and the oversize cap on every
      commit.
    - **Persist events** alongside transcripts (also item 20.1), so
-     `loom stats` can attribute savings per mechanism.
+     `loom stats` can attribute savings per mechanism. ~~Shipped
+     2026-10-17.~~ Store schema v2 writes the observed event stream
+     alongside the transcript, and item 1's `loom stats` section above
+     is the consumer.
    Seam: the live eval reports and the event stream.
 2. **Sandboxed shell** (G1, G2, G3) — **shipped 2026-10-08**. Strong
    models working through a
@@ -727,8 +735,16 @@ reproduces them.
    edit-heavy tasks (B3/B4/B6, 1 run each, free tier): all solved,
    turns 27 → 21, input tokens −21%, post-edit re-reads 1 across three
    runs (corpus baseline ≈ 4/run), batch form adopted on first contact.
-   Syntax guard (tree-sitter) deferred: heavy dependency; the verify
-   fusion already covers Rust parse failures.
+   **Syntax guard shipped 2026-10-16 (phase B)** — which overtook the
+   deferral rather than resolving it. `crates/loom-tools/src/syntax.rs`
+   parses the file with rust-tree-sitter *before* the write, so a
+   malformed edit is refused at the boundary instead of after a failed
+   build; `LOOM_SYNTAX_GUARD=0` opts out. The dependency that was once
+   "too heavy" turned out cheaper than the round trip it replaces: a
+   locally-parsing edit costs no turn, while a `cargo check` that fails
+   afterwards costs the whole check-plus-read cycle. The verify fusion
+   still covers what a parser cannot see (type errors, behaviour), so
+   both halves stand.
 6. **Pre-dispatch call repair and cheap re-reads** (G2, G3, G4).
    - Repair malformed tool calls before dispatch: argument aliases
      (`path`/`file_path`), stringified JSON objects, whitespace-padded
@@ -782,7 +798,16 @@ reproduces them.
    satisfies it in one step). A/B on the free tier: the refusal fired
    exactly once on the checkless canary (+2 turns) and never on the
    synthesis task — the gate is cheap insurance, not a turn-saver. The
-   `todo` tool stays deferred.
+   **`todo` tool shipped 2026-10-17 (phase B)**, which overtook the
+   deferral above. The tool is kernel-owned (not a provider tool spec),
+   which is the point: the goal is loop state, not a capability the
+   model may ignore or the bare arm may drop. State lives at
+   `.loom/todo` (`TODO_STATE_PATH`) and the runtime re-appends the
+   current list under a stable `TODO_BLOCK_HEADER` ("## todo (kernel)")
+   when it changes, so the goal never sinks into mid-history. Event
+   schema v9 and per-mechanism stats landed with it; the bare arm
+   excludes the tool on purpose (a basic harness does not get one), and
+   that exclusion is pinned.
 
 ### Mid term — context and model policy
 
@@ -1025,6 +1050,22 @@ reproduces them.
 16. **Search parity.** Adopt the `ignore` crate's matcher for chained
     gitignore files or pin the documented negation-precedence
     divergence with real-repository fixtures.
+    **Shipped 2026-10-16** — the item offered a fork (adopt the
+    matcher, or pin the divergence) and took the second branch for the
+    one case where the two disagree, while adopting the matcher for
+    everything else. `search.rs` compiles one `Gitignore` per ancestor
+    `.gitignore` between the workspace root and the scope, deepest-first
+    so the nearest file wins exactly as git resolves it, and applies them
+    through the walk's `filter_entry`. Six tests pin the behaviour on
+    repo-shaped fixtures: `whole_tree_walk_matches_git_on_nested_negation`,
+    `chained_ignores_subdir_overrides_parent`,
+    `nested_path_styled_rule_anchors_at_its_own_directory`,
+    `repo_shaped_tree_scoped_and_whole_agree`,
+    `scoped_search_nearest_ignore_file_wins`, and the one deliberate
+    divergence — `scoped_whitelist_below_scope_is_pruned`. A whitelist
+    inside the scope cannot re-include what an ancestor excludes; that
+    is *stricter* than git, and it is pinned rather than left implicit
+    because a quieter strictness is a property, not a bug.
 17. **Artifacts lifecycle.** Reference counting from live transcripts,
     an age/size-bounded GC, and a size-reporting command.
     **Shipped 2026-10-10** — `ArtifactStore` grew `list`/`delete`
