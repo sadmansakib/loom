@@ -180,6 +180,19 @@ turns per solved mean/median, idle turns and idle-turn rate, the
 token-weighted cache-read ratio over successful runs, and the
 transcript-derived tool-failure rate).
 
+The pass-rate denominator counts **verdict-bearing** runs: graded, and
+not lost to infrastructure. The grader evaluates the workspace however
+a run ended, so a run killed by the wire or by the per-run watchdog can
+still carry a gate — those runs are excluded, because grading a crashed
+run awards solves to crashes and charges crashes to the agent. The
+headline reports `attempted_runs` alongside `gated_runs`, and each field
+task reports `attempted` and `infra` beside its `rate`, so a denominator
+thinned by flaky infrastructure stays visible instead of silently
+flattering the rate. Infra runs are the `model_error`,
+`watchdog_timeout`, and legacy unlabeled (`unknown`) reasons; they are
+tallied apart from agent negatives and may be re-run, and the agent's
+own negatives (`max_turns`, `gate_failed`, …) are never re-run.
+
 ## Micro-evals (call quality from the transcript)
 
 Every run report — success or failure — embeds a `micro` block computed

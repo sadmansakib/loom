@@ -3,6 +3,75 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-18 — Pass rate counts verdicts, not graded crashes
+
+The suite headline reported `pass_rate` 0.8932 = 92/103. Both numbers were
+wrong, because `suite_headline` used two taxonomies in one function: the
+`category` closure correctly routed a failed run to `model_error`/`unknown`
+(so it counted as *infrastructure*), while the `gated` filter that builds the
+pass-rate denominator selected on `gate` presence alone. `grade_gate` grades
+the workspace no matter how a run ended, so a run that died mid-flight still
+carried a `gate` and landed in the denominator — a 402, a dropped connection,
+or a watchdog kill was scored as though the agent had tried and failed.
+
+Measured over all 115 runs then on disk: 7 `model_error` runs were being
+counted as *solves* because the grader happened to pass them (one awarded
+`bug_fixed: true` on a run with `turns: None`), 4 more as agent failures, and
+12 watchdog kills were dropped under an invented `unknown` label — the
+watchdog report wrote `success`/`error`/`gate` but no `end_reason`, so
+`unwrap_or("unknown")` manufactured it. The per-`models` tally carried the
+identical bug, and that is roadmap item 1's headline comparison dimension.
+
+- `end_reason`, `is_infra_run`, and `is_verdict_run` split the two
+  populations. `is_infra_run` returns false immediately when `success` is
+  true, because a successful run's absent `end_reason` is the normal shape,
+  not `unknown`. The denominator is now verdict-bearing runs only.
+- The watchdog report carries `end_reason: "watchdog_timeout"` (plus task,
+  model, provider, tier), so a kill is attributable instead of anonymous.
+- New visibility keys: `attempted_runs` at the suite level, and per-task
+  `attempted` / `infra` in both the field and lab branches, so a task whose
+  runs were all infrastructure stays visible.
+- Corrected against the same corpus: `gated_runs` 103 → 92, `gated_solved`
+  92 → 85, `pass_rate` 0.8932 → 0.9239, `infra_failures` 23, `agent_negatives` 7.
+- Two pins. The pre-existing
+  `suite_headline_separates_infra_failures_from_agent_negatives` used
+  infrastructure runs with *no* `gate`, so it validated the category tally
+  and never exercised the denominator at all — the blind spot. The new
+  `suite_headline_excludes_graded_infra_failures_from_pass_rate` puts a graded
+  crash in the denominator and asserts it is excluded;
+  `suite_headline_treats_an_unlabeled_failure_as_infrastructure` pins the
+  unlabeled case.
+
+On a live run this is immediately legible: a single B3 run against OpenRouter
+reported `attempted_runs: 1, gated_runs: 0, pass_rate: null,
+infra_failures: 1, failure_categories: {model_error: 1}` — an HTTP 402
+("requires more credits") shown as infrastructure rather than as an agent
+negative.
+
+## 2026-10-18 — The layering rules are now enforced, not just documented
+
+`architecture.md` §1 claims dependencies "point strictly downward" and that
+provider and tool specifics "cannot leak into the kernel by construction". No
+test checked it. The only layering guard in the workspace pinned the binary to
+the facade (`loom-cli/tests/facade.rs`, ADR-021); nothing watched the six
+other crates, so adding a workspace dependency anywhere would have left the
+suite green.
+
+Cargo does catch one shape by accident — wiring the kernel to a crate that
+already depends on it is a cycle, and the build fails. Three shapes it does
+not: dev-dependency cycles (legal to cargo by design, still an inversion),
+facade bypasses that are not cycles (`loom-eval` reaching `loom-engine`
+directly resolves fine and quietly routes the harness around the public
+surface every embedder uses), and silently dropped policy (removing
+`unsafe_code = "forbid"` from the workspace lints fails no build at all).
+
+`crates/loom-kernel/tests/workspace_boundary.rs` covers the whole graph:
+kernel on no workspace crate, the three implementation crates on the kernel
+alone, the composition root not reaching the facade above it, cli and eval on
+the facade alone, and both halves of the unsafe policy (the root setting and
+the kernel's opt-in — either alone would pass on a broken inheritance). All
+six were verified to fail on a deliberately introduced violation.
+
 ## 2026-10-16 — NIM capability table pins Nemotron 3 Super
 
 The eval corpus needs a provider route that is both fast and unfiltered,

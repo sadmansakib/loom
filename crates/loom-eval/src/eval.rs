@@ -1754,8 +1754,24 @@ async fn eval_live() {
                         match tokio::time::timeout(watchdog, attempt).await {
                             Ok((report, recorded, session)) => (report, recorded, Some(session)),
                             Err(_) => (
+                                // The reason is stamped here rather
+                                // than left to a downstream default:
+                                // an absent `end_reason` renders as
+                                // `unknown`, which is indistinguishable
+                                // from a report that simply lost the
+                                // field — and `unknown` counts as
+                                // infrastructure, so the run would be
+                                // excluded from the denominator with no
+                                // explanation. `task`/`model`/`tier` ride
+                                // along so the kill stays attributable to
+                                // a task, a model, and a tier.
                                 serde_json::json!({
+                                    "task": task.id,
+                                    "model": model,
+                                    "provider": provider_label,
                                     "success": false,
+                                    "tier": task.tier,
+                                    "end_reason": "watchdog_timeout",
                                     "error": "run watchdog timeout",
                                     "gate": serde_json::Value::Null,
                                 }),
@@ -1958,6 +1974,16 @@ async fn eval_suite_union() {
 /// Builds the suite headline from per-task run reports — pure, so a unit
 /// test can pin the economics math without a live run.
 ///
+/// **The pass-rate population.** `gated_runs` counts *verdict-bearing*
+/// runs: graded, and not lost to infrastructure (see [`is_infra_run`]).
+/// The grader evaluates the workspace however a run ended, so a run
+/// killed by the wire or the watchdog can still carry a `gate`; those
+/// runs are excluded, because grading a crashed run awards solves to
+/// crashes and charges crashes to the agent. `attempted_runs` reports
+/// everything the suite spent, and each field task carries `attempted`
+/// and `infra` beside its `rate`, so a denominator thinned by flaky
+/// infrastructure is visible instead of silently flattering the number.
+///
 /// Beyond the pass rate it carries the release-gate economics:
 /// spend per solved run, turns per solved run, the token-weighted
 /// cache-read ratio over successful runs, and the transcript-derived
@@ -1979,6 +2005,42 @@ async fn eval_suite_union() {
 /// remaining half), authoritative even in a suite merged across
 /// models. The section is absent when no gated run carries a model id
 /// (pre-schema reports), so old artifacts render unchanged.
+/// The run's recorded end reason. Reports written before the watchdog
+/// stamped one — and any run torn down before its reason reached the
+/// report — fall back to `unknown`, which [`is_infra_run`] treats as
+/// infrastructure: an unlabeled run never earned an agent verdict.
+fn end_reason(run: &serde_json::Value) -> &str {
+    run["end_reason"].as_str().unwrap_or("unknown")
+}
+
+/// True when the run died outside the agent's control: the wire (transport,
+/// HTTP, auth), the per-run watchdog, or a teardown that never stamped a
+/// reason. Such a run **may still carry a `gate`** — the grader evaluates
+/// the workspace however the run ended, so a run that died on turn 1 of 40
+/// can be graded `bug_fixed: true` off whatever it had already written.
+/// Grading a crashed run therefore says nothing about agent capability:
+/// it awards solves to crashes and charges crashes to the agent. These
+/// runs are excluded from `pass_rate`, `by_tier`, and `models`, and may be
+/// re-run. The agent's own negatives (`max_turns`, `budget_exhausted`,
+/// `gate_failed`, …) are not infrastructure and are never re-run.
+fn is_infra_run(run: &serde_json::Value) -> bool {
+    // A run that reported success has already cleared the agent; absence
+    // of an `end_reason` is the normal shape of a successful run.
+    if run["success"].as_bool().unwrap_or(false) {
+        return false;
+    }
+    matches!(
+        end_reason(run),
+        "model_error" | "watchdog_timeout" | "unknown"
+    )
+}
+
+/// A run that produced a real verdict about the agent: graded, and not
+/// lost to infrastructure.
+fn is_verdict_run(run: &serde_json::Value) -> bool {
+    run.get("gate").is_some_and(|g| !g.is_null()) && !is_infra_run(run)
+}
+
 fn suite_headline(
     model: &str,
     mode: &str,
@@ -2007,20 +2069,13 @@ fn suite_headline(
     // suite merged across models or campaigns stays attributable.
     let mut models: std::collections::BTreeMap<String, (u64, u64)> =
         std::collections::BTreeMap::new();
-    // A run that died on the wire (transport, HTTP, auth) or was killed
-    // by the watchdog (`gate: null`, so `end_reason` is `unknown`) never
-    // produced a verdict about the agent. Counting it with `gate_failed`
-    // or `max_turns` would read as "the agent tried and could not" —
-    // exactly the comparison the published tables are not making — so
-    // infra failures are tallied apart from the agent's own negatives.
-    // Genuine negatives are never re-run; infra failures may be.
-    let is_infra_failure = |reason: &str| matches!(reason, "model_error" | "unknown");
     let mut infra_failures: u64 = 0;
     let mut agent_negatives: u64 = 0;
+    let mut attempted_runs = 0usize;
     let mut category = |run: &serde_json::Value| {
         if !run["success"].as_bool().unwrap_or(false) {
-            let reason = run["end_reason"].as_str().unwrap_or("unknown").to_owned();
-            if is_infra_failure(&reason) {
+            let reason = end_reason(run).to_owned();
+            if is_infra_run(run) {
                 infra_failures += 1;
             } else {
                 agent_negatives += 1;
@@ -2034,12 +2089,23 @@ fn suite_headline(
         }
     };
     for (id, reports) in suite {
-        let gated: Vec<&serde_json::Value> = reports
-            .iter()
-            .filter(|r| r.get("gate").is_some_and(|g| !g.is_null()))
-            .collect();
+        // The pass-rate denominator: graded runs that actually reached the
+        // agent. `gate` presence alone is not enough — a run killed by the
+        // wire or the watchdog is still graded, and letting it in both
+        // inflates the numerator (a crash that had already written the fix)
+        // and deflates the apparent rate (a crash that had not).
+        let gated: Vec<&serde_json::Value> = reports.iter().filter(|r| is_verdict_run(r)).collect();
+        attempted_runs += reports.len();
         let entry = if gated.is_empty() {
-            serde_json::json!({"kind": "lab", "runs": reports.len()})
+            serde_json::json!({
+                "kind": "lab",
+                "runs": reports.len(),
+                // No verdict-bearing run at all — a lab task by
+                // construction, or a field task whose every run was lost
+                // to infrastructure. Either way the spend is visible here.
+                "attempted": reports.len(),
+                "infra": reports.iter().filter(|r| is_infra_run(r)).count(),
+            })
         } else {
             let solved = gated
                 .iter()
@@ -2067,15 +2133,19 @@ fn suite_headline(
                 "runs": gated.len(),
                 "solved": solved,
                 "rate": solved as f64 / gated.len() as f64,
+                // What `runs` withheld: the attempts this task spent on
+                // infrastructure, so a thin denominator is visible next to
+                // the rate it produced instead of hiding behind it.
+                "attempted": reports.len(),
+                "infra": reports.iter().filter(|r| is_infra_run(r)).count(),
             })
         };
         per_task.insert(id.clone(), entry);
         for run in reports {
-            // Per-model tally first: gated runs only (lab benches carry
-            // no comparable outcome), grouped under the model the run
-            // names. Runs without a model id contribute nothing, which
-            // is what keeps old reports section-free.
-            if run.get("gate").is_some_and(|g| !g.is_null())
+            // Per-model tally: verdict-bearing runs only, grouped under the
+            // model the run names. Runs without a model id contribute
+            // nothing, which is what keeps old reports section-free.
+            if is_verdict_run(run)
                 && let Some(model_id) = run["model"].as_str()
             {
                 let slot = models.entry(model_id.to_owned()).or_default();
@@ -2125,6 +2195,7 @@ fn suite_headline(
         "tasks": per_task,
         "gated_runs": gated_runs,
         "gated_solved": gated_solved,
+        "attempted_runs": attempted_runs,
         "pass_rate": if gated_runs == 0 {
             serde_json::json!(null)
         } else {
@@ -2228,6 +2299,91 @@ fn suite_headline_separates_infra_failures_from_agent_negatives() {
     assert_eq!(
         headline["failure_categories"],
         serde_json::json!({"model_error": 1, "max_turns": 1, "gate_failed": 1})
+    );
+}
+
+#[test]
+fn suite_headline_excludes_graded_infra_failures_from_the_pass_rate() {
+    // A run killed by the wire or the watchdog is still graded: the
+    // grader evaluates the workspace however the run ended. Both
+    // directions corrupt the rate — the crash that had already written
+    // the fix would be counted as a solve, the crash that had not as an
+    // agent failure — and neither says anything about agent capability,
+    // so both must leave the denominator. The live suite report this
+    // pins had 11 such runs inside its 0.893.
+    let crashed = |fixed: bool, reason: &str| {
+        serde_json::json!({
+            "success": false,
+            "end_reason": reason,
+            "turns": 1,
+            "cost_usd": 0.01,
+            "gate": {"bug_fixed": fixed},
+        })
+    };
+    let completed = |fixed: bool| {
+        serde_json::json!({
+            "success": true,
+            "turns": 20,
+            "cost_usd": 0.02,
+            "gate": {"bug_fixed": fixed},
+        })
+    };
+    let suite = vec![(
+        "B1".to_owned(),
+        vec![
+            completed(true),
+            completed(true),
+            completed(false),
+            crashed(true, "model_error"),
+            crashed(false, "model_error"),
+            // Watchdog kill: ungated, and now carrying its own reason
+            // instead of rendering as `unknown`.
+            serde_json::json!({"success": false, "end_reason": "watchdog_timeout"}),
+        ],
+    )];
+    let headline = suite_headline("m", "strict", "full", &suite);
+    // Only the three completed runs are verdicts: 2 solved of 3.
+    assert_eq!(headline["attempted_runs"], serde_json::json!(6));
+    assert_eq!(headline["gated_runs"], serde_json::json!(3));
+    assert_eq!(headline["gated_solved"], serde_json::json!(2));
+    assert_eq!(headline["agent_negatives"], serde_json::json!(1));
+    assert_eq!(headline["infra_failures"], serde_json::json!(3));
+    assert_eq!(
+        headline["failure_categories"],
+        serde_json::json!({
+            "model_error": 2,
+            "watchdog_timeout": 1,
+            "gate_failed": 1,
+        })
+    );
+    // The per-task row shows what the rate withheld.
+    let task = &headline["tasks"]["B1"];
+    assert_eq!(task["runs"], serde_json::json!(3));
+    assert_eq!(task["attempted"], serde_json::json!(6));
+    assert_eq!(task["infra"], serde_json::json!(3));
+}
+
+#[test]
+fn suite_headline_treats_an_unlabeled_failure_as_infrastructure() {
+    // Pre-watchdog-stamp reports, and any run torn down before its reason
+    // reached the report, have no `end_reason`. Those are infrastructure,
+    // not agent negatives — and they must not masquerade as a solve.
+    let suite = vec![(
+        "B1".to_owned(),
+        vec![
+            serde_json::json!({"success": false, "gate": {"bug_fixed": true}}),
+            serde_json::json!({"success": false}),
+            serde_json::json!({"success": true, "gate": {"bug_fixed": true}}),
+        ],
+    )];
+    let headline = suite_headline("m", "strict", "full", &suite);
+    assert_eq!(headline["gated_runs"], serde_json::json!(1));
+    assert_eq!(headline["gated_solved"], serde_json::json!(1));
+    assert_eq!(headline["infra_failures"], serde_json::json!(2));
+    // A success with no reason is the normal shape, never `unknown`.
+    assert_eq!(
+        headline["failure_categories"],
+        serde_json::json!({"unknown": 2})
     );
 }
 

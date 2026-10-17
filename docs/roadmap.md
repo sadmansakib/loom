@@ -162,8 +162,11 @@ Planned GLM support differs from the original plan: Loom targets the
 **metered Z.ai API**, never the GLM Coding Plan subscription endpoint
 (a non-API product; custom-harness use risks an account ban — see the
 warnings in the loom-eval harness). Shipped adapters are
-DeepSeek, OpenRouter, Anthropic, GLM, and NVIDIA (wiremock-verified against the
-Z.ai spec; no funded key yet for live runs).
+DeepSeek, OpenRouter, Anthropic, GLM, and NVIDIA. The GLM adapter
+remains wiremock-verified against the Z.ai spec with no direct Z.ai
+key configured; GLM-5.3 is nonetheless reachable and live today
+through OpenRouter on a metered paid key (2026-10-18), which is the
+path the eval uses.
 
 ### Iteration 2 — Core efficiency & repository intelligence (current)
 
@@ -305,13 +308,19 @@ Current iteration:     2 (core efficiency), with iteration 4 tools shipped early
 Language:              Rust (stable), 8 crates, unsafe forbidden
 Shipped providers:     DeepSeek, OpenRouter (free + paid), Anthropic, GLM,
                       NVIDIA (NIM hosted inference)
-GLM status:            metered Z.ai API, wiremock-verified (no funded key)
-NVIDIA status:         NIM free-trial tier (no credit card), live-verified against
-                      z-ai/glm-5.3 (2026-10-09); DeepSeek V4 NIM rows EOL'd
-Eval models in use:    OpenRouter free tier (high variance); DeepSeek key drained;
-                      NVIDIA NIM free tier (live-verified, ready for N≥5 sweeps)
+GLM status:            reachable via OpenRouter (z-ai/glm-5.3, metered, live-
+                      verified 2026-10-18); the direct Z.ai API is still
+                      wiremock-only (no Z.ai key on this machine)
+NVIDIA status:         NIM adapter shipped and wiremock-verified, but the
+                      z-ai/glm-5.3 completion endpoint stopped answering
+                      (HTTP 000 at 45s and 120s, 2026-10-18) while the
+                      catalog still lists 81 models; DeepSeek V4 NIM rows EOL'd
+Eval models in use:    OpenRouter metered paid tier (z-ai/glm-5.3, live 200);
+                      DeepSeek key drained; NVIDIA NIM unusable today
 Primary target:        successful work per model invocation
-Biggest open risk:     N=1 measurements below the noise floor (see item 1)
+Biggest open risk:     N=1 measurements below the noise floor (see item 1),
+                      now compounded by eval budget: the OpenRouter account
+                      holds ~$0.04 of its $15 credit (see item 1)
 ```
 
 ---
@@ -598,22 +607,33 @@ reproduces them.
      sits above most levers, so items 4, 5, 6, 8, and 10 shipped on
      N=1 A/Bs that do not meet the maintenance bar (N ≥ 5 medians).
      Once funded: re-baseline and re-run those A/Bs at N ≥ 5, and
-     record which claims survive. Candidate models (checked 2026-10-09):
-      GLM-5.3 via the metered Z.ai API ($1.40/M input, $4.40/M output,
-      $0.26/M cached input; 95.4% SWE-bench Verified any-scaffold; 1M
-      context) — the same provider the current-state block already
-      plans, so one funded key unblocks both; or DeepSeek V4 Pro
-      ($1.32/$3.96; 96.4%). Budget scale: 15 field tasks at N=5 is ~75
-      runs; at a cache-heavy 0.3-1M input tokens per run plus output, a
-      full sweep lands in the tens of dollars — the blocker was never
-      the price, it is having a metered key wired into the eval at all.
-      A third candidate costs nothing at all: NVIDIA's NIM free-trial
-      tier (no credit card) hosts z-ai/glm-5.3 at 1M context —
-      live-verified 2026-10-09 with a real streaming session — so a
-      free `NVIDIA_API_KEY` may satisfy this prerequisite within its
-      per-model rate limits, and the N≥5 sweep then paces itself
-      instead of paying. (The NIM catalog's DeepSeek V4 deployments
-      hit end-of-life 2026-08/2026-09 and are no longer candidates.)
+     record which claims survive. **Status 2026-10-18: the credential
+     is wired and the model is live; the account balance is the
+     blocker.** OpenRouter serves `z-ai/glm-5.3` on a metered *paid*
+     key (`is_free_tier: false`), resolved through the saved keychain
+     account, and a real streaming eval turn returns HTTP 200. What
+     is exhausted is credit: `$15` granted, `$14.963` spent, so a
+     live run dies with HTTP 402 *"requires more credits, or fewer
+     max_tokens"* (`report-B3-z-ai-glm-5.3.json`). The measured
+     prices are ~$0.06/M prompt and $4.40/M output, so at the
+     suite's cache-heavy shape (~16.4K tokens per solved run, 84%
+     cache read) one run costs **~$0.03** and the 150-run full-vs-bare
+     sweep (15 tasks × N=5 × 2 arms) costs **~$4.40**. A ~$5 top-up
+     clears it. The account also carries a **$1/day guardrail**
+     (`workspace_default_member` + `workspace_default_key`, daily,
+     `spend_usd: 0` at reset), so even funded the sweep paces itself
+     across ~5 days unless the guardrail is raised — `LOOM_EVAL_RPM`
+     meters requests, and the daily budget is the coarser ceiling.
+     Candidate alternatives, re-checked 2026-10-18: the direct Z.ai
+     API is still wiremock-only (no Z.ai key on this machine);
+     DeepSeek is drained (`is_available: false`); **NVIDIA NIM is no
+     longer a zero-cost candidate** — the adapter is shipped and
+     wiremock-verified, and `/v1/models` still lists 81 models
+     including `z-ai/glm-5.3`, but `POST /v1/chat/completions` returns
+     nothing (HTTP 000 at both 45s and 120s). That outage is the
+     cause of all 11 `model_error` records in the on-disk corpus: the
+     infra failures were a dead endpoint, not sampling noise, and the
+     new `is_infra_run` classification is what makes them legible.
    - ~~**Basic-harness baseline and model tiers**~~ (G4, G5, G9) —
      shipped 2026-10-10, the A/B half: `LOOM_EVAL_BARE=1` runs the
      same suite on the bare loop (read/list/write/edit/shell only; no
@@ -622,13 +642,18 @@ reproduces them.
      coexist. Engine seam: `EngineOverrides::bare_loop()` +
      `Agent::with_loop_shaping(false)`. The funded A/B runs moved
      2026-10-10 to NVIDIA NIM (z-ai/glm-5.3, free tier, keychain
-     credential) after the DeepSeek key drained mid-run (HTTP 402);
-     both arms (full + bare) on the
-     hard gate at N=5 — numbers in CHANGELOG and
-     `docs/benchmarks/`. That is the test of the G4
-     claim that Loom raises a weaker model's success rate, and the
-     input model profiles (item 9) need. Also shipped alongside: the
-     deterministic **editor bench** (`editbench`, token-free, PR-Edit
+     credential) after the DeepSeek key drained mid-run (HTTP 402).
+     **The A/B was never actually executed**: there is no `-bare`
+     report in `target/eval/`, so the G4 claim that Loom raises a
+     weaker model's success rate is still unmeasured. NIM went dark
+     afterward (above), so the arms now wait on OpenRouter credit
+     rather than on engineering — the arm is shipped, pinned by
+     `bare_registry_excludes_the_kernel_todo_tool`, and
+     `suite_headline` already reads `arm: "bare"`. The number this
+     must produce is the G4/G5 headline in `docs/benchmarks/`: the
+     claim that Loom raises a weaker model's success rate, which the
+     input model profiles (item 9) also need. Also shipped alongside:
+     the deterministic **editor bench** (`editbench`, token-free, PR-Edit
      style) pinning `edit_file` competence across file sizes,
      ambiguity refusal, batch atomicity, and the oversize cap on every
      commit.
@@ -854,9 +879,13 @@ reproduces them.
      carry the git snapshot and tree, and eval fixtures are fresh workspaces
      (git-diff opener ≈ no-op). The lever is below the free-model variance
      floor — B9 spans 6–40 turns on identical config — so an A/B cannot
-     demonstrate benefit, and the suite sits at 13/14 gated. Revisit when a
-     funded low-variance model is wired in or the corpus grows dirty-repo
-     tasks.
+     demonstrate benefit, and the suite sits at 13/14 gated. The first
+     revisit trigger is now half-met: a low-variance model is reachable
+     (OpenRouter `z-ai/glm-5.3`, live) but the account has no credit for
+     an N≥5 sweep (item 1), so the A/B still cannot be paid for. Revisit
+     when eval budget is restored or the corpus grows dirty-repo tasks —
+     the second trigger is the stronger one, since the deferral's real
+     cause was task shape, not variance.
 12. **Handoff compaction** (G2). The last resort when non-prunable
     history outgrows the window: instead of recursive in-place
     summarization (which Codex reports degrades accuracy), generate a

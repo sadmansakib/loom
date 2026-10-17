@@ -735,7 +735,10 @@ Five adapters ship:
   already replays assistant `reasoning_content` verbatim, which is the
   client-side obligation that mode carries. Its usage block sticks to
   the OpenAI-standard shapes, so this adapter adds no usage-dialect
-  code at all. Verified by wiremock, not live: no funded key.
+  code at all. Verified by wiremock; no direct Z.ai key is
+   configured on this machine. The model itself is reachable today
+   through OpenRouter (`z-ai/glm-5.3`), which serves the same
+   adapter family and returns HTTP 200.
 - **NVIDIA** — NIM hosted inference (`integrate.api.nvidia.com/v1`),
   OpenAI-compatible. Model ids are `publisher/model` (`z-ai/glm-5.3`,
   `z-ai/glm-5.3-flash`); a built-in capability table covers the live
@@ -753,6 +756,15 @@ Five adapters ship:
   tool call, reasoning stream, usage, cache-write accounting); the
   free trial tier requires no credit card and is the standing
   zero-cost candidate for the eval backlog (roadmap item 1).
+  SUPERSEDED 2026-10-18: that endpoint stopped serving
+  completions. `/v1/models` still answers with 81 models (including
+  `z-ai/glm-5.3`), but `POST /v1/chat/completions` returns no
+  response — HTTP 000, no payload, at both 45s and 120s client
+  timeouts. A healthy catalog with hanging completions is an
+  outage, not a config error. It caused every `model_error` in the
+  on-disk eval corpus (11 of 115 runs), so NIM is no longer the
+  zero-cost candidate; the eval's OpenRouter account is the live
+  path (roadmap item 1).
 - **Anthropic** — the messages API, not the OpenAI wire: system as a
   top-level param, `tool_use`/`tool_result` content blocks,
   `thinking_delta` reasoning capture, and Anthropic's error taxonomy.
