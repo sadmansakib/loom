@@ -69,6 +69,12 @@
 //! and `report-<task>-<model>.json`. When recording a baseline, copy the
 //! report into `docs/benchmarks/`.
 //!
+//! A run lost to infrastructure (the wire, the per-run watchdog, a teardown
+//! before it could stamp a reason) never measured the agent, so it is
+//! excluded from `pass_rate` — and then re-measured by the retry pass
+//! (`LOOM_EVAL_INFRA_RETRIES`, default 1) rather than left as a hole in the
+//! sample. Agent negatives are never re-run.
+//!
 //! **Never point this at the GLM Coding Plan** (docs/roadmap.md, "Current state").
 
 // A test harness: panicking on a setup failure is the intended behavior.
@@ -1558,6 +1564,273 @@ where
     (report, recorded, session)
 }
 
+/// The invariant wiring for one live run: everything that does not vary
+/// between runs of the same task, hoisted so [`execute_run`] and the
+/// infrastructure-retry pass in [`retry_infra_runs`] build the *same*
+/// engine. A retry that re-derived this wiring could silently differ from
+/// the run it replaces (a different throttle, a different arm), and the
+/// replacement would no longer be measuring the same thing.
+#[derive(Clone)]
+struct RunPlan {
+    model: String,
+    provider: String,
+    file_model: String,
+    file_arm: String,
+    arm: String,
+    runs: usize,
+    bare: bool,
+    bucket: Option<Arc<Mutex<TokenBucket>>>,
+    records_dir: PathBuf,
+    sessions_dir: PathBuf,
+}
+
+/// Runs one (task, run) pair end to end: builds the engine through the
+/// recorded/throttled provider hook, arms the per-run watchdog, writes the
+/// durable artifacts (record JSONL + session snapshot), prunes the scratch
+/// run root, and returns the report.
+///
+/// The record and session are the durable artifacts; the run root is
+/// scratch that the gate filled with a `cargo test` build tree, so it is
+/// deleted as soon as both are written.
+async fn execute_run(task: &EvalTask, run: usize, plan: &RunPlan) -> serde_json::Value {
+    let RunPlan {
+        model,
+        provider,
+        file_model,
+        file_arm,
+        arm,
+        runs,
+        bare,
+        bucket,
+        records_dir,
+        sessions_dir,
+    } = plan;
+    let exchanges = Arc::new(Mutex::new(Vec::new()));
+    let hook_exchanges = Arc::clone(&exchanges);
+    let hook_bucket = bucket.clone();
+    let hook = Arc::new(move |built: Box<dyn ModelProvider>| {
+        let inner: Box<dyn ModelProvider> = match &hook_bucket {
+            Some(bucket) => Box::new(ThrottledProvider {
+                inner: built,
+                bucket: Arc::clone(bucket),
+            }),
+            None => built,
+        };
+        Box::new(RecordingProvider {
+            inner,
+            exchanges: Arc::clone(&hook_exchanges),
+        }) as Box<dyn ModelProvider>
+    }) as ProviderHook;
+    let overrides = eval_overrides(provider, task.tools, hook, *bare);
+    // `run_once` takes an `FnOnce`: the engine overrides move into the
+    // single closure invocation rather than being cloned per attempt.
+    let open_model = model.clone();
+    let open_provider = provider.clone();
+    let open = move |root: PathBuf, system_prompt: Option<String>| {
+        let overrides = overrides;
+        let open_model = open_model.clone();
+        let open_provider = open_provider.clone();
+        async move {
+            Engine::open_async_with(
+                eval_config(root, &open_provider, &open_model, system_prompt),
+                overrides,
+            )
+            .await
+        }
+    };
+    // Per-run watchdog: a live NIM stall (2026-10-15) wedged whole sweeps
+    // forever; a run that exceeds LOOM_EVAL_RUN_TIMEOUT_SECS (default
+    // 1800) fails the run instead of hanging the sweep. Heavy tier-l
+    // tasks should raise it.
+    let watchdog = std::time::Duration::from_secs(
+        std::env::var("LOOM_EVAL_RUN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1800),
+    );
+    let provider_label = provider.clone();
+    let attempt = run_once(task, model, &provider_label, Some(exchanges), open);
+    let (report, recorded, session) = match tokio::time::timeout(watchdog, attempt).await {
+        Ok((report, recorded, session)) => (report, recorded, Some(session)),
+        Err(_) => (
+            // The reason is stamped here rather than left to a downstream
+            // default: an absent `end_reason` renders as `unknown`, which
+            // is indistinguishable from a report that simply lost the
+            // field — and `unknown` counts as infrastructure, so the run
+            // would be excluded from the denominator with no explanation.
+            // `task`/`model`/`tier` ride along so the kill stays
+            // attributable to a task, a model, and a tier.
+            serde_json::json!({
+                "task": task.id,
+                "model": model,
+                "provider": provider_label,
+                "success": false,
+                "tier": task.tier,
+                "end_reason": "watchdog_timeout",
+                "error": "run watchdog timeout",
+                "gate": serde_json::Value::Null,
+            }),
+            Vec::new(),
+            None,
+        ),
+    };
+    eprintln!(
+        "{} [{arm}] run {run}/{runs}: success={} bug_fixed={}",
+        task.id, report["success"], report["gate"]["bug_fixed"]
+    );
+    let root = run_root(task.id.as_str());
+    let body = recorded
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    write_artifact(
+        &records_dir.join(format!("{}-{file_model}{file_arm}-{run}.jsonl", task.id)),
+        &body,
+        &root,
+    );
+    if let Some(session) = session {
+        write_artifact(
+            &sessions_dir.join(format!(
+                "{}-{file_model}{file_arm}-{run}.session.json",
+                task.id
+            )),
+            &serde_json::to_string(&session).unwrap(),
+            &root,
+        );
+    }
+    prune_run_root(&root);
+    report
+}
+
+/// The maximum number of re-measurements a single infrastructure-lost run
+/// gets, from `LOOM_EVAL_INFRA_RETRIES` (default 1, `0` disables the pass).
+///
+/// The bound is per run, not per sweep: a provider that is down should cost
+/// one wasted request per slot, not N. A dead endpoint (NIM on 2026-10-18)
+/// therefore doubles nothing — every retry fails the same way and the run is
+/// still reported as infrastructure, which is the honest outcome.
+fn infra_retries() -> usize {
+    infra_retries_from(std::env::var("LOOM_EVAL_INFRA_RETRIES").ok().as_deref())
+}
+
+/// `infra_retries` over an explicit value. An unparseable setting falls back
+/// to the default rather than to 0: a typo must not silently turn retries
+/// off, which would leave the sample holes exactly where they were.
+fn infra_retries_from(value: Option<&str>) -> usize {
+    value
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+}
+
+/// The slots the retry pass will re-measure: one entry per
+/// infrastructure-lost run, carrying the reason it replaces.
+///
+/// Selection is exactly [`is_infra_run`], so the pass can never re-roll an
+/// agent negative. Run indices are the *positions* in each task's report
+/// vector, which the scheduler pushes in run order; [`retry_infra_runs`]
+/// converts them back to 1-based run numbers.
+fn infra_retry_slots(
+    selected: &[&EvalTask],
+    by_task: &Arc<Mutex<std::collections::HashMap<String, Vec<serde_json::Value>>>>,
+) -> Vec<(String, usize, String)> {
+    let map = by_task.lock().unwrap();
+    let mut pending = Vec::new();
+    for task in selected {
+        let Some(reports) = map.get(task.id.as_str()) else {
+            continue;
+        };
+        for (index, report) in reports.iter().enumerate() {
+            if is_infra_run(report) {
+                pending.push((task.id.to_owned(), index, end_reason(report).to_owned()));
+            }
+        }
+    }
+    pending
+}
+
+/// Re-measures every run the first sweep lost to infrastructure.
+///
+/// A run that died on the wire, on the watchdog, or before it could stamp a
+/// reason never measured the agent: [`is_infra_run`] excludes it from
+/// `pass_rate`, so leaving it there does not corrupt the number — it just
+/// shrinks the sample. On the 2026-10-17 corpus that was 23 of 115 attempts
+/// (20%), which is large enough to turn every headline into a sample size
+/// nobody trusts. Each such slot gets `LOOM_EVAL_INFRA_RETRIES` extra
+/// attempts through the *same* [`RunPlan`], and the retry's report replaces
+/// the original in place.
+///
+/// Only infrastructure is retried, never an agent negative: `max_turns`,
+/// `budget_exhausted`, and `gate_failed` are the measurements, and
+/// re-rolling them until they pass would be grading the harness's luck.
+///
+/// The replacement keeps a `retried_from` breadcrumb naming the reason it
+/// replaces, so a repaired run is distinguishable from one that succeeded
+/// first time — the sweep's cost and flakiness story stays readable.
+async fn retry_infra_runs(
+    selected: &[&EvalTask],
+    plan: &RunPlan,
+    by_task: &Arc<Mutex<std::collections::HashMap<String, Vec<serde_json::Value>>>>,
+) {
+    let budget = infra_retries();
+    if budget == 0 {
+        return;
+    }
+    // Snapshot the slots to repair: (task id, run index within the task's
+    // report vector, reason being replaced). Collected under one lock and
+    // retried outside it — a retry re-enters the map to swap its report in.
+    let pending = infra_retry_slots(selected, by_task);
+    if pending.is_empty() {
+        return;
+    }
+    let tasks: std::collections::HashMap<&str, &EvalTask> =
+        selected.iter().map(|t| (t.id.as_str(), *t)).collect();
+    eprintln!(
+        "retrying {} infrastructure-lost run(s) ({budget} attempt(s) each)",
+        pending.len()
+    );
+    let mut repaired = 0usize;
+    for (task_id, index, previous) in &pending {
+        let Some(task) = tasks.get(task_id.as_str()).copied() else {
+            continue;
+        };
+        // Runs within a task stay sequential: each run wipes and re-copies
+        // that task's run root, so two retries of one task cannot overlap.
+        let attempt = execute_run(task, index + 1, plan).await;
+        // Decided before `attempt` is moved into the map, using the same
+        // predicate the headline uses. A retry that came back infrastructure
+        // means the endpoint is down, and the run stays reported as
+        // infrastructure — an honest measurement of a broken provider rather
+        // than a hole in the sample.
+        let still_infra = is_infra_run(&attempt);
+        let reason = end_reason(&attempt).to_owned();
+        let mut map = by_task.lock().unwrap();
+        if let Some(reports) = map.get_mut(task_id.as_str())
+            && let Some(slot) = reports.get_mut(*index)
+        {
+            let mut replacement = attempt;
+            if let Some(object) = replacement.as_object_mut() {
+                object.insert("retried_from".to_owned(), serde_json::json!(previous));
+            }
+            *slot = replacement;
+        }
+        drop(map);
+        if still_infra {
+            eprintln!(
+                "warning: {task_id} run {} still lost to {reason}",
+                index + 1
+            );
+        } else {
+            repaired += 1;
+        }
+    }
+    eprintln!(
+        "retry pass: repaired {repaired} of {} infrastructure-lost run(s)",
+        pending.len()
+    );
+}
+
 /// N live runs of every runnable task, recordings + aggregates to disk.
 #[tokio::test]
 #[ignore = "live: needs DEEPSEEK_API_KEY (or OPENROUTER_API_KEY); spends real tokens"]
@@ -1697,120 +1970,32 @@ async fn eval_live() {
     // each task wipes and re-copies its own run root per run.
     let by_task: Arc<Mutex<std::collections::HashMap<String, Vec<serde_json::Value>>>> =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
+    // One plan for the whole sweep. The main loop clones it per run, and the
+    // retry pass below reuses it verbatim, so a repaired run is wired
+    // exactly like the run it replaces.
+    let plan = RunPlan {
+        model: model.clone(),
+        provider: provider_name.clone(),
+        file_model: file_model.clone(),
+        file_arm: file_arm.to_owned(),
+        arm: arm.to_owned(),
+        runs,
+        bare,
+        bucket,
+        records_dir: records_dir.clone(),
+        sessions_dir: sessions_dir.clone(),
+    };
     for run in 1..=runs {
         futures::stream::iter(&selected)
             .for_each_concurrent(concurrency, |task| {
                 let task: &EvalTask = task;
-                let records_dir = records_dir.clone();
-                let sessions_dir = sessions_dir.clone();
                 let by_task = Arc::clone(&by_task);
-                let bucket = bucket.clone();
-                let model = model.clone();
-                let open_provider = provider_name.clone();
-                let provider_label = provider_name.clone();
-                let file_model = file_model.clone();
+                let plan = plan.clone();
                 async move {
                     // The recording hook wraps whichever provider the engine
                     // builds (credential-resolved, catalog-aware) — the eval
                     // observes production wiring instead of reproducing it.
-                    let exchanges = Arc::new(Mutex::new(Vec::new()));
-                    let hook_exchanges = Arc::clone(&exchanges);
-                    let hook_bucket = bucket.clone();
-                    let hook = Arc::new(move |built: Box<dyn ModelProvider>| {
-                        let inner: Box<dyn ModelProvider> = match &hook_bucket {
-                            Some(bucket) => Box::new(ThrottledProvider {
-                                inner: built,
-                                bucket: Arc::clone(bucket),
-                            }),
-                            None => built,
-                        };
-                        Box::new(RecordingProvider {
-                            inner,
-                            exchanges: Arc::clone(&hook_exchanges),
-                        }) as Box<dyn ModelProvider>
-                    }) as ProviderHook;
-                    let overrides = eval_overrides(&open_provider, task.tools, hook, bare);
-                    let open_model = model.clone();
-                    let open = |root: PathBuf, system_prompt: Option<String>| async move {
-                        Engine::open_async_with(
-                            eval_config(root, &open_provider, &open_model, system_prompt),
-                            overrides,
-                        )
-                        .await
-                    };
-                    // Per-run watchdog: a live NIM stall (2026-10-15)
-                    // wedged whole sweeps forever; a run that exceeds
-                    // LOOM_EVAL_RUN_TIMEOUT_SECS (default 1800) fails
-                    // the run instead of hanging the sweep. Heavy tier-l
-                    // tasks should raise it.
-                    let watchdog = std::time::Duration::from_secs(
-                        std::env::var("LOOM_EVAL_RUN_TIMEOUT_SECS")
-                            .ok()
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or(1800),
-                    );
-                    let attempt = run_once(task, &model, &provider_label, Some(exchanges), open);
-                    let (report, recorded, session) =
-                        match tokio::time::timeout(watchdog, attempt).await {
-                            Ok((report, recorded, session)) => (report, recorded, Some(session)),
-                            Err(_) => (
-                                // The reason is stamped here rather
-                                // than left to a downstream default:
-                                // an absent `end_reason` renders as
-                                // `unknown`, which is indistinguishable
-                                // from a report that simply lost the
-                                // field — and `unknown` counts as
-                                // infrastructure, so the run would be
-                                // excluded from the denominator with no
-                                // explanation. `task`/`model`/`tier` ride
-                                // along so the kill stays attributable to
-                                // a task, a model, and a tier.
-                                serde_json::json!({
-                                    "task": task.id,
-                                    "model": model,
-                                    "provider": provider_label,
-                                    "success": false,
-                                    "tier": task.tier,
-                                    "end_reason": "watchdog_timeout",
-                                    "error": "run watchdog timeout",
-                                    "gate": serde_json::Value::Null,
-                                }),
-                                Vec::new(),
-                                None,
-                            ),
-                        };
-                    eprintln!(
-                        "{} [{arm}] run {run}/{runs}: success={} bug_fixed={}",
-                        task.id, report["success"], report["gate"]["bug_fixed"]
-                    );
-                    // The record and the session are the durable artifacts;
-                    // the run root is scratch that the gate filled with a
-                    // `cargo test` build tree, so it is deleted as soon as
-                    // both are written.
-                    let root = run_root(task.id.as_str());
-                    let body = recorded
-                        .iter()
-                        .map(|e| serde_json::to_string(e).unwrap())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                        + "\n";
-                    write_artifact(
-                        &records_dir
-                            .join(format!("{}-{file_model}{file_arm}-{run}.jsonl", task.id)),
-                        &body,
-                        &root,
-                    );
-                    if let Some(session) = session {
-                        write_artifact(
-                            &sessions_dir.join(format!(
-                                "{}-{file_model}{file_arm}-{run}.session.json",
-                                task.id
-                            )),
-                            &serde_json::to_string(&session).unwrap(),
-                            &root,
-                        );
-                    }
-                    prune_run_root(&root);
+                    let report = execute_run(task, run, &plan).await;
                     by_task
                         .lock()
                         .unwrap()
@@ -1821,6 +2006,8 @@ async fn eval_live() {
             })
             .await;
     }
+
+    retry_infra_runs(&selected, &plan, &by_task).await;
 
     let by_task = Arc::try_unwrap(by_task)
         .expect("eval runner holds the only map reference")
@@ -3495,4 +3682,117 @@ fn run_roots_are_pruned_by_default_and_kept_on_request() {
     assert!(!pruned.exists(), "the default is to delete the run root");
 
     std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// Builds the report map the retry pass reads: one entry per task, each a
+/// run vector in scheduler order.
+fn retry_map(
+    runs: &[(&str, Vec<serde_json::Value>)],
+) -> Arc<Mutex<std::collections::HashMap<String, Vec<serde_json::Value>>>> {
+    Arc::new(Mutex::new(
+        runs.iter()
+            .map(|(id, reports)| ((*id).to_owned(), reports.clone()))
+            .collect(),
+    ))
+}
+
+/// A run lost on the wire, graded anyway (the shape that made 7 NIM
+/// failures count as solves before the pass-rate fix).
+fn wire_death() -> serde_json::Value {
+    serde_json::json!({
+        "task": "B2", "model": "z-ai/glm-5.3", "provider": "nvidia",
+        "success": false, "tier": "s", "end_reason": "model_error",
+        "error": "request failed", "gate": {"bug_fixed": true},
+    })
+}
+
+/// The agent's own negative: the run completed and the work was wrong.
+/// Re-rolling this until it passed would grade the harness's luck, not the
+/// agent's capability.
+fn agent_negative() -> serde_json::Value {
+    serde_json::json!({
+        "task": "B2", "model": "z-ai/glm-5.3", "provider": "openrouter",
+        "success": false, "end_reason": "max_turns",
+        "error": "turn budget exhausted", "gate": {"bug_fixed": false},
+    })
+}
+
+#[test]
+fn the_retry_pass_re_measures_only_infrastructure_losses() {
+    let task = dummy_task("B2", false, true);
+    let other = dummy_task("B3", false, true);
+    let map = retry_map(&[
+        (
+            "B2",
+            vec![
+                serde_json::json!({"task": "B2", "success": true}),
+                wire_death(),
+                agent_negative(),
+                serde_json::json!({
+                    "task": "B2", "success": false,
+                    "end_reason": "watchdog_timeout", "error": "run watchdog timeout",
+                }),
+            ],
+        ),
+        (
+            "B3",
+            vec![serde_json::json!({"task": "B3", "success": true})],
+        ),
+    ]);
+
+    let slots = infra_retry_slots(&[&task, &other], &map);
+    let selected: Vec<_> = slots
+        .iter()
+        .map(|(id, index, reason)| (id.as_str(), *index, reason.as_str()))
+        .collect();
+
+    // Exactly the two infrastructure losses on B2. The max_turns run is the
+    // agent's answer, not a broken wire, and a success is never retried.
+    assert_eq!(
+        selected,
+        vec![("B2", 1, "model_error"), ("B2", 3, "watchdog_timeout")],
+        "only infrastructure is re-measured"
+    );
+    // The slot index is the position in the run vector; the caller turns it
+    // back into a 1-based run number, so run 2 must be re-run as run 2 and
+    // not as "the second infra failure".
+    assert_eq!(
+        slots
+            .iter()
+            .map(|(_, index, _)| index + 1)
+            .collect::<Vec<_>>(),
+        vec![2, 4],
+        "the retry reuses the original run number, which names its artifact"
+    );
+}
+
+#[test]
+fn the_retry_pass_leaves_a_fully_measured_sweep_alone() {
+    let task = dummy_task("B2", false, true);
+    let map = retry_map(&[(
+        "B2",
+        vec![
+            serde_json::json!({"task": "B2", "success": true, "gate": {"bug_fixed": true}}),
+            serde_json::json!({"task": "B2", "success": true, "gate": {"bug_fixed": false}}),
+        ],
+    )]);
+
+    assert!(
+        infra_retry_slots(&[&task], &map).is_empty(),
+        "a clean sweep spends nothing on retries; a gate failure is a measurement"
+    );
+}
+
+#[test]
+fn infra_retries_default_to_one_and_respect_the_knob() {
+    // The env is process-global and other tests read it, so this asserts the
+    // parse contract rather than mutating shared state.
+    assert_eq!(infra_retries_from(None), 1, "one re-measurement by default");
+    assert_eq!(infra_retries_from(Some("0")), 0, "0 disables the pass");
+    assert_eq!(infra_retries_from(Some("3")), 3);
+    assert_eq!(
+        infra_retries_from(Some("not-a-number")),
+        1,
+        "an unparseable value falls back to the default rather than skipping retries"
+    );
 }

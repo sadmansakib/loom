@@ -120,6 +120,7 @@ LOOM_EVAL_BARE=1                  # bare-loop arm; default full
 LOOM_EVAL_CONCURRENCY=16          # tasks in parallel (default 1 = sequential)
 LOOM_EVAL_RPM=36                  # shared requests/min meter across all runs
 LOOM_EVAL_RUN_TIMEOUT_SECS=1800 # per-run watchdog; stalled run fails instead of hanging
+LOOM_EVAL_INFRA_RETRIES=1     # re-measurements per infrastructure-lost run; 0 disables
 cargo test -p loom-eval eval::eval_live -- --ignored --nocapture
 ```
 
@@ -192,6 +193,29 @@ flattering the rate. Infra runs are the `model_error`,
 `watchdog_timeout`, and legacy unlabeled (`unknown`) reasons; they are
 tallied apart from agent negatives and may be re-run, and the agent's
 own negatives (`max_turns`, `gate_failed`, …) are never re-run.
+
+### The infrastructure retry pass
+
+After the sweep, every run that lost to infrastructure gets
+`LOOM_EVAL_INFRA_RETRIES` extra attempts (default 1, `0` disables), and the
+retry's report replaces the original in place. Excluding those runs keeps
+`pass_rate` honest; it does not shrink the sample. On the 2026-10-17
+corpus 23 of 115 attempts (20%) were infrastructure losses, which is enough
+to leave every headline reporting a sample size nobody trusts.
+
+The retry is the **same** [`RunPlan`](eval.rs) the first sweep used — same
+arm, same throttle, same watchdog — so a repaired run is wired like the run
+it replaces. It reuses the original run number, so the retry overwrites the
+same record and session artifact, and the replacement carries a
+`retried_from` field naming the reason it replaces.
+
+Only infrastructure is retried. A `max_turns` or `gate_failed` run is the
+measurement, not a broken wire: re-rolling it until it passed would grade
+the harness's luck instead of the agent's capability. A retry that comes
+back infrastructure too means the endpoint is down — the run stays reported
+as infrastructure (the honest measurement of a broken provider rather than
+a hole in the sample) and the pass prints a per-run warning. The retry is
+also bounded: a dead provider costs one wasted request per slot, not N.
 
 ## Micro-evals (call quality from the transcript)
 

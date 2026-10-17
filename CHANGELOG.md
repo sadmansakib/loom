@@ -3,6 +3,42 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-18 — The eval re-measures its own infrastructure losses
+
+Excluding infrastructure from `pass_rate` (the previous entry) keeps the rate
+honest but shrinks the sample: on the 2026-10-17 corpus, 23 of 115 attempts
+(20%) were lost to the wire, the watchdog, or a teardown before the run could
+stamp a reason. Every headline therefore reported a denominator nobody could
+trust. The comment on `is_infra_run` promised "infra failures may be re-run"
+and no code did it.
+
+- `execute_run` is now the single per-run body of `eval_live`, driven by a
+  `RunPlan`. Both the first sweep and the retry pass build the engine from it,
+  so a repaired run is wired exactly like the run it replaces — same arm, same
+  throttle, same watchdog. A retry that re-derived that wiring could silently
+  differ, and the replacement would no longer be measuring the same thing.
+- `retry_infra_runs` re-measures each infrastructure-lost slot
+  `LOOM_EVAL_INFRA_RETRIES` times (default 1, `0` disables) and swaps the
+  report in place, carrying a `retried_from` breadcrumb naming the reason it
+  replaces. It reuses the original run number, so the retry overwrites the same
+  record and session artifact.
+- **Agent negatives are never retried.** `max_turns`, `budget_exhausted`, and
+  `gate_failed` are the measurements; re-rolling them until they passed would
+  grade the harness's luck rather than the agent's capability. Selection is
+  `is_infra_run` itself, not a second copy of the predicate.
+- A retry that comes back infrastructure means the endpoint is down. The run
+  stays reported as infrastructure — the honest measurement of a broken
+  provider rather than a hole in the sample — and the pass warns per run. The
+  retry budget is per slot, not per sweep, so a dead provider costs one wasted
+  request per slot rather than N.
+- Three pins. `execute_run` reaches the network, so the tests target the pure
+  seam: `infra_retry_slots` must pick exactly the `model_error` and
+  `watchdog_timeout` runs and leave a `max_turns` run and every success alone;
+  a fully measured sweep must yield no slots at all; and `infra_retries_from`
+  must treat an unparseable value as the default rather than as `0`, since a
+  typo silently disabling retries would leave the holes exactly where they
+  were.
+
 ## 2026-10-18 — Pass rate counts verdicts, not graded crashes
 
 The suite headline reported `pass_rate` 0.8932 = 92/103. Both numbers were
