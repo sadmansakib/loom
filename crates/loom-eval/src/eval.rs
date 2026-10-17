@@ -478,6 +478,75 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Whether a task's run workspace should survive its run. Default is to
+/// delete it: the gate runs `cargo test` with the run root as its working
+/// directory, so every root accumulates a full build tree (hundreds of MB
+/// per task) that nothing else reclaims — the growth that filled the disk
+/// and aborted the 2026-10-16 sweep. Set `LOOM_EVAL_KEEP_RUN_ROOTS=1` to
+/// keep the trees for post-mortem inspection instead. (Unrelated to
+/// `LOOM_EVAL_PRUNE`, which selects the context-pruning arm.)
+fn run_roots_kept(value: Option<&str>) -> bool {
+    match value {
+        None => false,
+        Some(raw) => {
+            let value = raw.trim();
+            !value.is_empty()
+                && !matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                )
+        }
+    }
+}
+
+/// Deletes a task's run root once its artifacts are durable. Best effort:
+/// a missing root is expected on a re-run, and a failed delete only warns,
+/// because a run that already produced its record must not be failed by
+/// cleanup.
+fn prune_run_root_when(run_root: &Path, keep: bool) {
+    if keep || !run_root.exists() {
+        return;
+    }
+    if let Err(error) = std::fs::remove_dir_all(run_root) {
+        eprintln!(
+            "warning: could not prune run root {}: {error}",
+            run_root.display()
+        );
+    }
+}
+
+/// `prune_run_root_when` honouring `LOOM_EVAL_KEEP_RUN_ROOTS`.
+fn prune_run_root(run_root: &Path) {
+    let keep = run_roots_kept(std::env::var("LOOM_EVAL_KEEP_RUN_ROOTS").ok().as_deref());
+    prune_run_root_when(run_root, keep);
+}
+
+/// Writes a per-task artifact without letting a full disk abort the sweep
+/// (2026-10-16: one `StorageFull` on this exact write unwound all of
+/// `eval_live` after 19 of 142 tasks). On `StorageFull` the run root is
+/// pruned — its build tree is the space the retry needs — and the write is
+/// retried once; any remaining error is reported and the sweep continues.
+fn write_artifact(path: &Path, body: &str, run_root: &Path) {
+    match std::fs::write(path, body) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::StorageFull => {
+            eprintln!(
+                "warning: {}: no space left; pruning {} and retrying once",
+                path.display(),
+                run_root.display()
+            );
+            prune_run_root_when(run_root, false);
+            if let Err(error) = std::fs::write(path, body) {
+                eprintln!(
+                    "warning: still could not write {} after pruning: {error}",
+                    path.display()
+                );
+            }
+        }
+        Err(error) => eprintln!("warning: could not write {}: {error}", path.display()),
+    }
+}
+
 // --------------------------------------------------------------- census ---
 
 /// Per-source attribution for one request, in **exact serialized bytes**
@@ -1698,26 +1767,34 @@ async fn eval_live() {
                         "{} [{arm}] run {run}/{runs}: success={} bug_fixed={}",
                         task.id, report["success"], report["gate"]["bug_fixed"]
                     );
-                    std::fs::write(
-                        records_dir.join(format!("{}-{file_model}{file_arm}-{run}.jsonl", task.id)),
-                        recorded
-                            .iter()
-                            .map(|e| serde_json::to_string(e).unwrap())
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                            + "\n",
-                    )
-                    .unwrap();
+                    // The record and the session are the durable artifacts;
+                    // the run root is scratch that the gate filled with a
+                    // `cargo test` build tree, so it is deleted as soon as
+                    // both are written.
+                    let root = run_root(task.id.as_str());
+                    let body = recorded
+                        .iter()
+                        .map(|e| serde_json::to_string(e).unwrap())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        + "\n";
+                    write_artifact(
+                        &records_dir
+                            .join(format!("{}-{file_model}{file_arm}-{run}.jsonl", task.id)),
+                        &body,
+                        &root,
+                    );
                     if let Some(session) = session {
-                        std::fs::write(
-                            sessions_dir.join(format!(
+                        write_artifact(
+                            &sessions_dir.join(format!(
                                 "{}-{file_model}{file_arm}-{run}.session.json",
                                 task.id
                             )),
-                            serde_json::to_string(&session).unwrap(),
-                        )
-                        .unwrap();
+                            &serde_json::to_string(&session).unwrap(),
+                            &root,
+                        );
                     }
+                    prune_run_root(&root);
                     by_task
                         .lock()
                         .unwrap()
@@ -3229,4 +3306,37 @@ fn replay_capabilities_derive_from_the_recording() {
         provider.capabilities("some-other-model").is_none(),
         "capabilities are per-model"
     );
+}
+
+#[test]
+fn run_roots_are_pruned_by_default_and_kept_on_request() {
+    assert!(!run_roots_kept(None));
+    assert!(!run_roots_kept(Some("")));
+    assert!(!run_roots_kept(Some("  ")));
+    assert!(!run_roots_kept(Some("0")));
+    assert!(!run_roots_kept(Some("false")));
+    assert!(!run_roots_kept(Some("OFF")));
+    assert!(run_roots_kept(Some("1")));
+    assert!(run_roots_kept(Some("true")));
+
+    let base = std::env::temp_dir().join(format!("loom-eval-prune-{}", std::process::id()));
+    let kept = base.join("kept");
+    let pruned = base.join("pruned");
+    std::fs::create_dir_all(&kept).unwrap();
+    std::fs::create_dir_all(&pruned).unwrap();
+    std::fs::write(kept.join("target-artifact"), "build tree").unwrap();
+    std::fs::write(pruned.join("target-artifact"), "build tree").unwrap();
+
+    prune_run_root_when(&kept, true);
+    prune_run_root_when(&pruned, false);
+    // A root from a finished or crashed run that is already gone is fine.
+    prune_run_root_when(&base.join("missing"), false);
+
+    assert!(
+        kept.join("target-artifact").exists(),
+        "a kept run root survives"
+    );
+    assert!(!pruned.exists(), "the default is to delete the run root");
+
+    std::fs::remove_dir_all(&base).unwrap();
 }
