@@ -9,10 +9,11 @@
 
 use loom_kernel::model::{ModelCapabilities, ModelProvider};
 use loom_providers::{
-    ANTHROPIC_PROVIDER_NAME, AnthropicConfig, AnthropicProvider, DEEPSEEK_PROVIDER_NAME,
-    DeepSeekConfig, DeepSeekProvider, GLM_PROVIDER_NAME, GROQ_PROVIDER_NAME, GlmConfig,
-    GlmProvider, GroqConfig, GroqProvider, NVIDIA_PROVIDER_NAME, NvidiaConfig, NvidiaProvider,
-    OPENROUTER_PROVIDER_NAME, OpenRouterConfig, OpenRouterProvider, ProviderCatalog,
+    ANTHROPIC_PROVIDER_NAME, AnthropicConfig, AnthropicProvider, CUSTOM_PROVIDER_NAME,
+    CustomConfig, CustomProvider, DEEPSEEK_PROVIDER_NAME, DeepSeekConfig, DeepSeekProvider,
+    GLM_PROVIDER_NAME, GROQ_PROVIDER_NAME, GlmConfig, GlmProvider, GroqConfig, GroqProvider,
+    NVIDIA_PROVIDER_NAME, NvidiaConfig, NvidiaProvider, OPENROUTER_PROVIDER_NAME, OpenRouterConfig,
+    OpenRouterProvider, ProviderCatalog,
 };
 
 use crate::engine::{EngineConfig, EngineError};
@@ -44,6 +45,9 @@ fn resolve_capabilities(
         Some(ProviderCatalog::OpenRouter(catalog)) => catalog
             .capabilities(&config.model)
             .or_else(|| provider.capabilities(&config.model)),
+        Some(ProviderCatalog::Custom(catalog)) => catalog
+            .capabilities(&config.model)
+            .or_else(|| provider.capabilities(&config.model)),
         None => provider.capabilities(&config.model),
     }
 }
@@ -57,10 +61,11 @@ pub(crate) fn resolution_source(
     config: &EngineConfig,
     provider: &dyn ModelProvider,
 ) -> (&'static str, String) {
-    let catalog_hit = matches!(
-        config.catalog.as_ref(),
-        Some(ProviderCatalog::OpenRouter(catalog)) if catalog.capabilities(&config.model).is_some()
-    );
+    let catalog_hit = match config.catalog.as_ref() {
+        Some(ProviderCatalog::OpenRouter(catalog)) => catalog.capabilities(&config.model).is_some(),
+        Some(ProviderCatalog::Custom(catalog)) => catalog.capabilities(&config.model).is_some(),
+        None => false,
+    };
     let source = if catalog_hit {
         "catalog"
     } else {
@@ -100,6 +105,7 @@ pub(crate) fn build(config: &EngineConfig, api_key: &str) -> Result<ProviderHand
         GLM_PROVIDER_NAME => build_glm(config, api_key),
         NVIDIA_PROVIDER_NAME => build_nvidia(config, api_key),
         GROQ_PROVIDER_NAME => build_groq(config, api_key),
+        CUSTOM_PROVIDER_NAME => build_custom(config, api_key),
         other => Err(EngineError::UnknownProvider(other.to_owned())),
     }
 }
@@ -268,6 +274,42 @@ fn build_openrouter(config: &EngineConfig, api_key: &str) -> Result<ProviderHand
     })
 }
 
+/// Builds the custom adapter from the frontend-supplied catalog.
+///
+/// Everything the adapter needs came from the user: `base_url` names
+/// the chat endpoint (mandatory — there is no default to fall back
+/// to), the catalog lists the models. Capabilities come from the
+/// catalog entry; an id it does not list fails loudly rather than
+/// guessing, while fields the entry omits use the adapter's safe
+/// defaults. No reasoning requirement: the plain OpenAI wire sends no
+/// reasoning fields either way.
+fn build_custom(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, EngineError> {
+    let catalog = match &config.catalog {
+        Some(ProviderCatalog::Custom(catalog)) => catalog.clone(),
+        _ => {
+            return Err(EngineError::CatalogMissing {
+                provider: config.provider.clone(),
+            });
+        }
+    };
+    let Some(base_url) = config.base_url.clone() else {
+        return Err(EngineError::MissingBaseUrl {
+            provider: config.provider.clone(),
+        });
+    };
+    let provider_config = CustomConfig::new(base_url, api_key);
+    let provider = CustomProvider::new(provider_config, catalog)
+        .map_err(|error| EngineError::Provider(Box::new(error)))?;
+    let capabilities = provider
+        .capabilities(&config.model)
+        .ok_or_else(|| unknown_model(config))?;
+    check_window(config, &capabilities)?;
+    Ok(ProviderHandle {
+        provider: Box::new(provider),
+        capabilities,
+    })
+}
+
 /// The model is not resolvable by the selected adapter.
 fn unknown_model(config: &EngineConfig) -> EngineError {
     EngineError::UnknownModel {
@@ -391,6 +433,81 @@ mod tests {
             )
             .expect("fixture"),
         ));
+        let error = build(&config, "key").expect_err("must reject");
+        assert!(matches!(
+            error,
+            EngineError::ModelWindowTooSmall { tokens: 8192, .. }
+        ));
+    }
+
+    fn custom_catalog_config(model: &str, body: &str) -> crate::engine::EngineConfig {
+        let mut config = crate::engine::test_config();
+        config.provider = "custom".to_owned();
+        config.model = model.to_owned();
+        config.base_url = Some("http://gateway.test/v1".to_owned());
+        config.catalog = Some(ProviderCatalog::Custom(
+            loom_providers::parse_custom_catalog(body, "http://gateway.test/v1/models", 1)
+                .expect("fixture"),
+        ));
+        config
+    }
+
+    #[test]
+    fn custom_resolves_capabilities_with_defaults_for_silent_fields() {
+        let config = custom_catalog_config("bare", r#"[{"id": "bare"}]"#);
+        let handle = build(&config, "key").expect("builds");
+        assert_eq!(
+            handle.capabilities.max_context_tokens,
+            loom_providers::DEFAULT_CONTEXT_TOKENS
+        );
+        assert_eq!(handle.capabilities.max_output_tokens, None);
+        assert!(handle.capabilities.tool_calls);
+        assert!(!handle.capabilities.parallel_tool_calls);
+        assert!(!handle.capabilities.reasoning);
+    }
+
+    #[test]
+    fn custom_resolves_advertised_fields() {
+        let config = custom_catalog_config(
+            "full",
+            r#"[{"id": "full", "context_window": 200000,
+                 "max_output_tokens": 8192,
+                 "supported_parameters": ["tools", "parallel_tool_calls", "reasoning"]}]"#,
+        );
+        let handle = build(&config, "key").expect("builds");
+        assert_eq!(handle.capabilities.max_context_tokens, 200_000);
+        assert_eq!(handle.capabilities.max_output_tokens, Some(8192));
+        assert!(handle.capabilities.tool_calls);
+        assert!(handle.capabilities.parallel_tool_calls);
+        assert!(handle.capabilities.reasoning);
+    }
+
+    #[test]
+    fn custom_without_base_url_fails_loudly() {
+        let mut config = custom_catalog_config("bare", r#"[{"id": "bare"}]"#);
+        config.base_url = None;
+        let error = build(&config, "key").expect_err("must reject");
+        assert!(matches!(error, EngineError::MissingBaseUrl { .. }));
+    }
+
+    #[test]
+    fn custom_without_catalog_fails_loudly() {
+        let mut config = custom_catalog_config("bare", r#"[{"id": "bare"}]"#);
+        config.catalog = None;
+        let error = build(&config, "key").expect_err("must reject");
+        assert!(matches!(error, EngineError::CatalogMissing { .. }));
+    }
+
+    #[test]
+    fn custom_model_outside_catalog_is_unknown() {
+        let config = custom_catalog_config("typo", r#"[{"id": "real"}]"#);
+        let error = build(&config, "key").expect_err("must reject");
+        assert!(matches!(error, EngineError::UnknownModel { .. }));
+    }
+
+    #[test]
+    fn custom_advertised_window_below_the_floor_is_rejected() {
+        let config = custom_catalog_config("tiny", r#"[{"id": "tiny", "context_length": 8192}]"#);
         let error = build(&config, "key").expect_err("must reject");
         assert!(matches!(
             error,

@@ -25,7 +25,7 @@ kernel never links a filesystem store or a CLI, the engine never prints.
 | `loom-core` | Facade re-exporting the public surface for embedders, plus the shared data-dir policy (`paths`) | engine, kernel, providers, store, tools |
 | `loom-kernel` | The agent itself: loop, context compilation, session/transcript model, tool abstraction, tool cache, artifacts, events, budgets | no workspace crates — it defines the side-effect traits (`ModelProvider`, `SessionStore`, `ArtifactStore`, `Tool`, …) itself |
 | `loom-engine` | Composition root: builds a configured `Agent` from paths, auth, a provider factory, tool registry, and stores; repository facts scanner; owns the OpenRouter catalog policy (`engine::catalog`), the trace export format (`engine::trace`), and its aggregation (`engine::trace_stats`) | kernel, store, providers, tools |
-| `loom-providers` | Model provider adapters (DeepSeek, OpenRouter, GLM, NVIDIA, Groq over one shared OpenAI-compatible wire; Anthropic on its own messages-API driver) | kernel model types |
+| `loom-providers` | Model provider adapters (DeepSeek, OpenRouter, GLM, NVIDIA, Groq over one shared OpenAI-compatible wire; Custom for any user-supplied OpenAI-compatible endpoint; Anthropic on its own messages-API driver) | kernel model types |
 | `loom-store` | SQLite persistence: sessions, turns, tasks, artifacts, auth accounts | kernel store traits |
 | `loom-tools` | The shipped tool suite (read/search/edit/write/list/run/verify + artifact read) | kernel tool traits |
 | `loom-eval` | The eval harness: task corpus (`tests/eval-tasks`), record/replay providers, outcome and bugfix gates, suite reports, live benchmarks — every arm opens the engine through `EngineOverrides`, never a hand-wired `Agent` | `loom-core` only |
@@ -796,6 +796,33 @@ Five adapters ship:
   ignores. Free plan: 30 rpm, 1,000 requests/day, 8,000 tokens/min,
   200,000 tokens/day — tokens, not requests, are the binding ceiling,
   and the free tier is unbilled.
+- **Custom** — any OpenAI-compatible endpoint the user points at:
+  `--provider custom --base-url <chat API> [--models-url <catalog API>]`
+  plus a key. There is no default base URL; missing one fails the open
+  with a pointed error. The catalog reader is schema-tolerant across
+  the shapes seen in the wild — `{data: [...]}` (OpenAI, OpenRouter,
+  most gateways), `{models: [...]}`, or a bare array — and sniffs
+  field spellings: context windows (`context_length`, `context_window`,
+  `max_context_tokens`, `max_context_length`, `context_len`,
+  `max_model_len`, `max_input_tokens` — numbers or numeric strings)
+  and output caps (`max_completion_tokens`, `max_output_tokens`,
+  `top_provider.max_completion_tokens`, `max_tokens`). Tool support:
+`supported_parameters` listing `tools`/`tool_calls`, or
+`supports_tools`-style booleans; parallel needs `parallel_tool_calls`;
+reasoning needs `reasoning` or `reasoning_effort`. Omitted fields
+default to the safe side: 131,072-token context (above the 64K pruning
+floor), tools on, parallel and reasoning off, no output cap. An id the
+catalog does not list fails loudly (typo protection), and an advertised
+window below the floor is rejected at open. `--models-url` overrides
+the catalog location (default `{--base-url}/models`); the cached
+snapshot is keyed to that URL, so switching endpoints never serves
+another gateway's model list, and a fetch failure falls back to a
+stale cache for the same URL only. Chat requests speak the plain
+OpenAI shape — no dialect fields — and OpenRouter-format conventions
+that cost nothing to honor are honored: `usage.cost` surfaces as
+provider-reported cost, and a `finish_reason` of `error` maps to a
+retryable server failure. `CUSTOM_API_KEY` or `loom auth login custom`
+supplies the key.
 - **Anthropic** — the messages API, not the OpenAI wire: system as a
   top-level param, `tool_use`/`tool_result` content blocks,
   `thinking_delta` reasoning capture, and Anthropic's error taxonomy.

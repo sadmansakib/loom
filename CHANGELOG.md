@@ -3,6 +3,47 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-20 — Custom provider: any OpenAI-compatible endpoint
+
+`--provider custom` connects Loom to any endpoint that speaks the OpenAI
+chat wire. The user supplies three things: `--base-url` (the chat API base
+URL, mandatory), `--models-url` (the model-catalog URL, default
+`{--base-url}/models`), and an API key (`loom auth login custom` or
+`CUSTOM_API_KEY`).
+
+- The adapter rides the shared `WireEndpoint` driver and sends the plain
+  OpenAI request shape — no dialect fields — so nothing vendor-specific
+  can trip a gateway that only implements the documented protocol.
+- The catalog reader is schema-tolerant: `{data: [...]}`,
+  `{models: [...]}`, or a bare array, with field sniffing for context
+  windows (`context_length`, `context_window`, `max_model_len`,
+  `max_input_tokens`, ...), output caps (`max_completion_tokens`,
+  `max_output_tokens`, `top_provider.max_completion_tokens`,
+  `max_tokens`), tool/parallel/reasoning support
+  (`supported_parameters` entries or `supports_*` booleans), and
+  number-or-string pricing. An id the catalog does not list fails loudly
+  (typo protection); omitted metadata resolves to safe defaults —
+  131,072-token context (clears the 64K pruning floor), tools on,
+  parallel and reasoning off, no output cap.
+- The catalog caches beside `loom.db` (`custom-models.json`) keyed to
+  the models URL: fresh for 24h, stale-cache fallback only when the URL
+  matches, so switching gateways never serves another endpoint's model
+  list. A fetch failure with no usable cache is fatal — there is no
+  built-in table to fall back to.
+- Conventions that cost nothing to honor are honored: `usage.cost` in
+  gateway-style reports surfaces as provider-reported cost, a
+  `finish_reason` of `error` (OpenRouter-format proxies) maps to a
+  retryable server failure, and status classification follows the
+  shared OpenAI-family error model including context-overflow bodies.
+- Missing `--base-url` fails the open with a pointed error
+  (`EngineError::MissingBaseUrl`); models advertised below the 64K
+  pruning floor are rejected at open as usual.
+- Wiremock-verified in `tests/custom_wiremock.rs` (6 tests: catalog
+  fetch with bearer auth, rejection mapping, happy-path SSE round trip
+  with cost, plain-shape request body, 429 classification, capability
+  defaults and typo protection) plus unit tests in `custom.rs`,
+  `provider.rs`, `catalog.rs`, and `args.rs`.
+
 ## 2026-10-18 — Groq adapter: hosted inference over the shared wire
 
 `--provider groq` runs Groq's three agentic deployments against the same shared

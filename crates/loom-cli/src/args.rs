@@ -51,7 +51,10 @@ pub struct RunArgs {
     pub json: bool,
 
     /// Provider adapter to use (`deepseek`, `anthropic`, `openrouter`,
-    /// `glm`, `nvidia`, `groq`). Required — Loom picks no provider for you.
+    /// `glm`, `nvidia`, `groq`, `custom`). Required — Loom picks no
+    /// provider for you. `custom` connects to any OpenAI-compatible
+    /// endpoint and additionally requires `--base-url` (plus an API key
+    /// via `loom auth login custom` or `CUSTOM_API_KEY`).
     #[arg(long)]
     pub provider: String,
 
@@ -60,9 +63,17 @@ pub struct RunArgs {
     #[arg(long)]
     pub model: String,
 
-    /// Override the provider base URL (proxies and gateways).
+    /// Override the provider base URL (proxies and gateways). For
+    /// `--provider custom` this is the chat API base URL and is
+    /// required.
     #[arg(long)]
     pub base_url: Option<String>,
+
+    /// Model-catalog URL for `--provider custom`: the endpoint whose
+    /// `GET` lists the gateway's models. Defaults to
+    /// `{--base-url}/models`. Ignored by other providers.
+    #[arg(long, value_name = "URL")]
+    pub models_url: Option<String>,
 
     /// Reasoning effort, sent explicitly on every request by providers
     /// that accept one (DeepSeek); ignored elsewhere.
@@ -150,7 +161,7 @@ pub enum AuthCommand {
 #[derive(Debug, Args)]
 pub struct LoginArgs {
     /// Provider to authenticate (`deepseek`, `anthropic`, `openrouter`,
-    /// `glm`, `nvidia`, `groq`). Required.
+    /// `glm`, `nvidia`, `groq`, `custom`). Required.
     pub provider: String,
 
     /// How the secret is supplied: `key` (prompt, stored in the keychain)
@@ -235,6 +246,34 @@ mod tests {
         assert!(!args.json);
         assert!(!args.no_save);
         assert!(!args.no_global_instructions);
+    }
+
+    #[test]
+    fn run_accepts_custom_provider_urls() {
+        let cli = parse(&[
+            "loom",
+            "run",
+            "--provider",
+            "custom",
+            "--model",
+            "gateway-model",
+            "--base-url",
+            "http://localhost:4000/v1",
+            "--models-url",
+            "http://localhost:4000/v1/models",
+            "do",
+            "the",
+            "thing",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected `run`");
+        };
+        assert_eq!(args.provider, "custom");
+        assert_eq!(args.base_url.as_deref(), Some("http://localhost:4000/v1"));
+        assert_eq!(
+            args.models_url.as_deref(),
+            Some("http://localhost:4000/v1/models")
+        );
     }
 
     #[test]

@@ -201,6 +201,10 @@ impl OpenRouterCatalog {
 pub enum ProviderCatalog {
     /// A `GET /models` snapshot (see [`fetch_catalog`]).
     OpenRouter(OpenRouterCatalog),
+    /// A snapshot from a user-supplied models URL (see
+    /// [`crate::custom::fetch_custom_catalog`]); `source` keys its
+    /// cache to the endpoint it came from.
+    Custom(crate::custom::CustomCatalog),
 }
 
 /// Errors from [`fetch_catalog`].
@@ -428,7 +432,10 @@ impl OpenRouterProvider {
 }
 
 /// Whether an error body describes a context-window overflow.
-fn names_context_overflow(body: &str) -> bool {
+///
+/// Shared by every OpenAI-family adapter that classifies 4xx bodies;
+/// custom gateways reuse the same message conventions.
+pub(crate) fn names_context_overflow(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     lower.contains("context length")
         || lower.contains("context_length")

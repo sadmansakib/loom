@@ -134,6 +134,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         provider: args.provider,
         model: args.model,
         base_url: args.base_url,
+        models_url: args.models_url,
         reasoning_effort: args.reasoning_effort,
         account: args.account,
         workspace: args.workspace,

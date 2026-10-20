@@ -14,12 +14,15 @@
 //! Anthropic (its own Messages API driver — see [`anthropic`] for
 //! why it does not share the OpenAI wire machine), GLM (Z.ai's
 //! metered API on the OpenAI-compatible wire — see [`glm`] for why the
-//! Coding Plan endpoint is off-limits), and NVIDIA (NIM hosted
+//! Coding Plan endpoint is off-limits), NVIDIA (NIM hosted
 //! inference — see [`nvidia`] for why the free tier matters to the
-//! eval backlog).
+//! eval backlog), Groq (hosted inference on the shared wire), and
+//! Custom (any user-supplied OpenAI-compatible endpoint — see
+//! [`custom`] for how two URLs and a key describe a provider).
 
 mod anthropic;
 mod anthropic_wire;
+mod custom;
 mod deepseek;
 mod glm;
 mod groq;
@@ -36,6 +39,11 @@ pub use anthropic::{
     PROVIDER_NAME as ANTHROPIC_PROVIDER_NAME,
 };
 pub use anthropic_wire::ANTHROPIC_VERSION as ANTHROPIC_API_VERSION;
+pub use custom::PROVIDER_NAME as CUSTOM_PROVIDER_NAME;
+pub use custom::{
+    CustomCatalog, CustomConfig, CustomModel, CustomProvider, DEFAULT_CONTEXT_TOKENS,
+    fetch_custom_catalog, fetch_custom_catalog_with, parse_custom_catalog,
+};
 pub use deepseek::PROVIDER_NAME as DEEPSEEK_PROVIDER_NAME;
 pub use deepseek::{
     DeepSeekConfig, DeepSeekProvider, ParseReasoningEffortError, ReasoningEffort, ThinkingMode,

@@ -19,7 +19,9 @@ use loom_kernel::model::ModelProvider;
 use loom_kernel::session::Session;
 use loom_kernel::store::{SharedEventStore, StoreError};
 use loom_kernel::tool::ToolRegistry;
-use loom_providers::{OPENROUTER_PROVIDER_NAME, ProviderCatalog, ReasoningEffort};
+use loom_providers::{
+    CUSTOM_PROVIDER_NAME, OPENROUTER_PROVIDER_NAME, ProviderCatalog, ReasoningEffort,
+};
 use loom_store::SqliteStore;
 use loom_tools::policy::CommandPolicy;
 use loom_tools::{
@@ -44,6 +46,12 @@ pub struct EngineConfig {
     pub model: String,
     /// Optional provider base-URL override (proxies and gateways).
     pub base_url: Option<String>,
+    /// Optional model-catalog URL for the `custom` provider.
+    ///
+    /// Defaults to `{base_url}/models` when absent. Other providers
+    /// ignore it: only `custom` is described entirely by user-supplied
+    /// URLs.
+    pub models_url: Option<String>,
     /// Reasoning effort, sent explicitly on every request.
     pub reasoning_effort: ReasoningEffort,
     /// Optional saved account (label or id) instead of the active account.
@@ -86,6 +94,7 @@ pub(crate) fn test_config() -> EngineConfig {
         provider: "deepseek".to_owned(),
         model: "deepseek-flash".to_owned(),
         base_url: None,
+        models_url: None,
         reasoning_effort: ReasoningEffort::default(),
         account: None,
         workspace: base.join("workspace"),
@@ -440,6 +449,36 @@ impl Engine {
         config: EngineConfig,
         overrides: EngineOverrides,
     ) -> Result<Self, EngineError> {
+        // `custom` is described entirely by user-supplied URLs: the
+        // chat base URL is mandatory and the catalog comes from the
+        // models URL (explicit or defaulted from the base). Its cache
+        // is keyed to the URL, and a fetch failure is fatal — the
+        // adapter has no built-in table to fall back to.
+        let config = if config.catalog.is_none() && config.provider == CUSTOM_PROVIDER_NAME {
+            let Some(base_url) = config.base_url.clone() else {
+                return Err(EngineError::MissingBaseUrl {
+                    provider: config.provider.clone(),
+                });
+            };
+            let models_url = config
+                .models_url
+                .clone()
+                .unwrap_or_else(|| format!("{}/models", base_url.trim_end_matches('/')));
+            let auth = crate::auth::Auth::open(&config.db_path)?;
+            let catalog = crate::catalog::load_custom(
+                &auth,
+                config.account.as_deref(),
+                &models_url,
+                &config.db_path,
+            )
+            .await?;
+            EngineConfig {
+                catalog: Some(ProviderCatalog::Custom(catalog)),
+                ..config
+            }
+        } else {
+            config
+        };
         // The catalog is fetched for every provider, not just the
         // catalog-driven one: capability resolution is catalog-first for
         // the table adapters too, so a model the adapter's static table
@@ -449,7 +488,8 @@ impl Engine {
         // account or base URL steer the catalog request — and when the
         // fetch fails, only `openrouter` runs propagate the error (their
         // adapter cannot resolve models without a catalog); table-driven
-        // adapters fall back to their built-in rows.
+        // adapters fall back to their built-in rows. `custom` already
+        // carried its own catalog past this branch.
         let config = if config.catalog.is_none() {
             let is_openrouter = config.provider == OPENROUTER_PROVIDER_NAME;
             let auth = crate::auth::Auth::open(&config.db_path)?;
@@ -815,6 +855,13 @@ pub enum EngineError {
     #[error("provider `{provider}` needs a model catalog, but none was loaded")]
     CatalogMissing {
         /// The provider that requires the catalog.
+        provider: String,
+    },
+    /// A provider described entirely by user-supplied URLs was
+    /// selected without its mandatory base URL.
+    #[error("provider `{provider}` needs --base-url (the chat API base URL)")]
+    MissingBaseUrl {
+        /// The provider that requires the base URL.
         provider: String,
     },
     /// The workspace does not exist or cannot be resolved.

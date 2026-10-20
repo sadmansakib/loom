@@ -29,8 +29,8 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use loom_providers::{
-    ANTHROPIC_PROVIDER_NAME, DEEPSEEK_PROVIDER_NAME, GLM_PROVIDER_NAME, GROQ_PROVIDER_NAME,
-    NVIDIA_PROVIDER_NAME, OPENROUTER_PROVIDER_NAME, SecretString,
+    ANTHROPIC_PROVIDER_NAME, CUSTOM_PROVIDER_NAME, DEEPSEEK_PROVIDER_NAME, GLM_PROVIDER_NAME,
+    GROQ_PROVIDER_NAME, NVIDIA_PROVIDER_NAME, OPENROUTER_PROVIDER_NAME, SecretString,
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -53,6 +53,7 @@ pub fn provider_env_names(provider: &str) -> &'static [&'static str] {
         GLM_PROVIDER_NAME => &["ZAI_API_KEY", "Z_AI_API_KEY"],
         NVIDIA_PROVIDER_NAME => &["NVIDIA_API_KEY", "NIM_API_KEY"],
         GROQ_PROVIDER_NAME => &["GROQ_API_KEY"],
+        CUSTOM_PROVIDER_NAME => &["CUSTOM_API_KEY"],
         _ => &[],
     }
 }
@@ -1227,6 +1228,7 @@ mod tests {
             &["NVIDIA_API_KEY", "NIM_API_KEY"]
         );
         assert_eq!(provider_env_names("groq"), &["GROQ_API_KEY"]);
+        assert_eq!(provider_env_names("custom"), &["CUSTOM_API_KEY"]);
         assert!(provider_env_names("nope").is_empty());
     }
 

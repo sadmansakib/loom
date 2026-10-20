@@ -40,6 +40,7 @@ fn main() -> anyhow::Result<()> {
         provider,
         model,
         base_url: None,
+        models_url: None,
         reasoning_effort: Default::default(),
         account: None,
         workspace: std::env::current_dir()?,

@@ -1,18 +1,24 @@
-//! The OpenRouter model-catalog cache.
+//! Model-catalog caches.
 //!
-//! The engine resolves model capabilities from the catalog, so obtaining
+//! The engine resolves model capabilities from a catalog, so obtaining
 //! one is part of opening an engine, not a frontend chore: [`load`]
-//! reuses a fresh cache, refreshes a stale one through the credential
-//! the provider itself would use, and falls back to a stale cache when
-//! the network is unreachable — a transient outage cannot block a run
-//! that already has a usable catalog. [`Engine::open_async`] drives this
-//! before the synchronous open; a frontend that already holds a snapshot
-//! can pass it in [`EngineConfig::catalog`] and use [`Engine::open`].
+//! and [`load_custom`] reuse a fresh cache, refresh a stale one through
+//! the credential the provider itself would use, and fall back to a
+//! stale cache when the network is unreachable — a transient outage
+//! cannot block a run that already has a usable catalog.
+//! [`Engine::open_async`] drives this before the synchronous open; a
+//! frontend that already holds a snapshot can pass it in
+//! [`EngineConfig::catalog`] and use [`Engine::open`].
+//!
+//! [`load`] serves the OpenRouter adapter; [`load_custom`] serves the
+//! `custom` adapter, whose cache is keyed to the models URL it was
+//! fetched from (see [`is_custom_fresh`]) so switching endpoints never
+//! serves another gateway's model list.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use loom_providers::{self, OpenRouterCatalog};
+use loom_providers::{self, CustomCatalog, OpenRouterCatalog};
 
 use crate::auth::Auth;
 use crate::engine::EngineError;
@@ -26,6 +32,11 @@ const CATALOG_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// user can inspect or delete.
 pub fn catalog_path(db_path: &Path) -> PathBuf {
     db_path.with_file_name("openrouter-models.json")
+}
+
+/// The `custom` adapter's cache file beside the database.
+pub fn custom_catalog_path(db_path: &Path) -> PathBuf {
+    db_path.with_file_name("custom-models.json")
 }
 
 /// Returns the credential-resolved, fresh-if-possible catalog.
@@ -81,6 +92,87 @@ pub async fn load(
 /// Whether `catalog` was fetched within [`CATALOG_TTL`].
 fn is_fresh(catalog: &OpenRouterCatalog, now: u64) -> bool {
     now.saturating_sub(catalog.fetched_at) < CATALOG_TTL.as_secs()
+}
+
+/// Returns the credential-resolved, fresh-if-possible catalog for the
+/// `custom` adapter.
+///
+/// Same discipline as [`load`], with one addition: the cache is only
+/// usable when it was fetched from *this* `models_url`. A custom cache
+/// is shared state across every endpoint the user points at, and
+/// serving gateway A's model list to gateway B would turn a
+/// configuration change into a wrong-capabilities run. Both the fresh
+/// short-circuit and the stale fallback require the URL to match.
+pub async fn load_custom(
+    auth: &Auth,
+    account: Option<&str>,
+    models_url: &str,
+    db_path: &Path,
+) -> Result<CustomCatalog, EngineError> {
+    let path = custom_catalog_path(db_path);
+    let cached = read_custom_cache(&path);
+
+    if let Some(cached) = &cached
+        && is_custom_fresh(cached, models_url, loom_providers::now_epoch_secs())
+    {
+        return Ok(cached.clone());
+    }
+
+    let credential = auth.resolve(loom_providers::CUSTOM_PROVIDER_NAME, account)?;
+
+    match loom_providers::fetch_custom_catalog(
+        models_url,
+        credential.secret.expose(),
+        loom_providers::TimeoutConfig::default(),
+    )
+    .await
+    {
+        Ok(catalog) => {
+            if let Err(error) = write_custom_cache(&path, &catalog) {
+                // A cache we cannot write is not a failed run: the
+                // snapshot in hand is enough.
+                tracing::warn!(%error, path = %path.display(), "could not cache the custom catalog");
+            }
+            Ok(catalog)
+        }
+        Err(error) => match cached {
+            Some(cached) if cached.source == models_url => {
+                tracing::warn!(%error, "using the stale custom catalog");
+                Ok(cached)
+            }
+            _ => Err(EngineError::Provider(Box::new(error))),
+        },
+    }
+}
+
+/// Whether `catalog` was fetched from `models_url` within
+/// [`CATALOG_TTL`]: fresh means both recent and for this endpoint.
+fn is_custom_fresh(catalog: &CustomCatalog, models_url: &str, now: u64) -> bool {
+    catalog.source == models_url && now.saturating_sub(catalog.fetched_at) < CATALOG_TTL.as_secs()
+}
+
+/// Reads the cached custom catalog; an unreadable or unparseable cache
+/// is treated as absent (it will be replaced on the next successful
+/// fetch).
+fn read_custom_cache(path: &Path) -> Option<CustomCatalog> {
+    let body = std::fs::read_to_string(path).ok()?;
+    match serde_json::from_str(&body) {
+        Ok(catalog) => Some(catalog),
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "ignoring an unreadable custom catalog cache");
+            None
+        }
+    }
+}
+
+/// Writes the custom catalog cache, creating the parent directory as
+/// needed.
+fn write_custom_cache(path: &Path, catalog: &CustomCatalog) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_vec(catalog).map_err(std::io::Error::other)?;
+    std::fs::write(path, body)
 }
 
 /// Reads the cached catalog; an unreadable or unparseable cache is
@@ -153,5 +245,53 @@ mod tests {
     fn cache_lives_beside_the_database() {
         let path = catalog_path(Path::new("/var/data/loom.db"));
         assert_eq!(path, Path::new("/var/data/openrouter-models.json"));
+        assert_eq!(
+            custom_catalog_path(Path::new("/var/data/loom.db")),
+            Path::new("/var/data/custom-models.json")
+        );
+    }
+
+    fn custom_catalog(source: &str, fetched_at: u64) -> CustomCatalog {
+        CustomCatalog {
+            source: source.to_owned(),
+            fetched_at,
+            models: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn custom_cache_round_trips_through_the_file() {
+        let dir = std::env::temp_dir().join("loom-engine-custom-catalog-test");
+        let path = custom_catalog_path(&dir.join("loom.db"));
+        let original = custom_catalog("http://gateway.test/models", 1_700_000_000);
+        write_custom_cache(&path, &original).expect("writes");
+        assert_eq!(read_custom_cache(&path), Some(original));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn custom_freshness_requires_both_ttl_and_matching_source() {
+        let url = "http://gateway.test/models";
+        let now = 1_700_000_000;
+        assert!(is_custom_fresh(&custom_catalog(url, now), url, now));
+        assert!(is_custom_fresh(
+            &custom_catalog(url, now - CATALOG_TTL.as_secs() + 1),
+            url,
+            now
+        ));
+        // Stale.
+        assert!(!is_custom_fresh(
+            &custom_catalog(url, now - CATALOG_TTL.as_secs()),
+            url,
+            now
+        ));
+        // Fresh but fetched from a different endpoint.
+        assert!(!is_custom_fresh(
+            &custom_catalog("http://other.test/models", now),
+            url,
+            now
+        ));
+        // Clock skew reads as fresh rather than forcing a refetch.
+        assert!(is_custom_fresh(&custom_catalog(url, now + 100), url, now));
     }
 }

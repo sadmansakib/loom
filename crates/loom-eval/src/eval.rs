@@ -1094,6 +1094,7 @@ pub(crate) fn eval_config(
         provider: provider.to_owned(),
         model: model.to_owned(),
         base_url: None,
+        models_url: None,
         reasoning_effort: ReasoningEffort::default(),
         account: None,
         workspace: root,
