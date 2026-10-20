@@ -162,7 +162,7 @@ Planned GLM support differs from the original plan: Loom targets the
 **metered Z.ai API**, never the GLM Coding Plan subscription endpoint
 (a non-API product; custom-harness use risks an account ban — see the
 warnings in the loom-eval harness). Shipped adapters are
-DeepSeek, OpenRouter, Anthropic, GLM, and NVIDIA. The GLM adapter
+DeepSeek, OpenRouter, Anthropic, GLM, NVIDIA, and Groq. The GLM adapter
 remains wiremock-verified against the Z.ai spec with no direct Z.ai
 key configured; GLM-5.3 is nonetheless reachable and live today
 through OpenRouter on a metered paid key (2026-10-18), which is the
@@ -307,7 +307,7 @@ orchestration — downstream of a strong core.
 Current iteration:     2 (core efficiency), with iteration 4 tools shipped early
 Language:              Rust (stable), 8 crates, unsafe forbidden
 Shipped providers:     DeepSeek, OpenRouter (free + paid), Anthropic, GLM,
-                      NVIDIA (NIM hosted inference)
+                      NVIDIA (NIM hosted inference), Groq (hosted inference)
 GLM status:            reachable via OpenRouter (z-ai/glm-5.3, metered, live-
                       verified 2026-10-18); the direct Z.ai API is still
                       wiremock-only (no Z.ai key on this machine)
@@ -315,6 +315,10 @@ NVIDIA status:         NIM adapter shipped and wiremock-verified, but the
                       z-ai/glm-5.3 completion endpoint stopped answering
                       (HTTP 000 at 45s and 120s, 2026-10-18) while the
                       catalog still lists 81 models; DeepSeek V4 NIM rows EOL'd
+Groq status:           adapter shipped, wiremock-verified, and live-probed
+                      2026-10-18 on a free-plan key (openai/gpt-oss-120b,
+                      openai/gpt-oss-20b, qwen/qwen3.8-27b); unbilled, and the
+                      binding free-plan ceiling is 8K tokens/min
 Eval models in use:    OpenRouter metered paid tier (z-ai/glm-5.3, live 200);
                       DeepSeek key drained; NVIDIA NIM unusable today
 Primary target:        successful work per model invocation

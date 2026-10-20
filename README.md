@@ -28,7 +28,7 @@ Capabilities move from model to software over time, never the reverse.
 | Crate | Purpose |
 |---|---|
 | `loom-kernel` | Domain model and traits (session, turns, tools, providers). No workspace dependencies. |
-| `loom-providers` | Provider adapters: DeepSeek, OpenRouter, GLM, NVIDIA (OpenAI-compatible wire format) and Anthropic (messages API). |
+| `loom-providers` | Provider adapters: DeepSeek, OpenRouter, GLM, NVIDIA, Groq (OpenAI-compatible wire format) and Anthropic (messages API). |
 | `loom-store` | SQLite persistence for sessions and events. |
 | `loom-tools` | Built-in deterministic tools: file read/write/edit, search, listing, sandboxed command execution. |
 | `loom-engine` | The deterministic turn loop: context compilation, token estimation, pruning, repo intelligence, completion gate. |
@@ -45,7 +45,7 @@ and `loom-cli` sit on top.
 Iteration 2 — the loop runs end to end with real providers:
 
 ```
-Task → Session → engine turn loop → provider (DeepSeek / OpenRouter / Anthropic / GLM / NVIDIA)
+Task → Session → engine turn loop → provider (DeepSeek / OpenRouter / Anthropic / GLM / NVIDIA / Groq)
      → tool calls → deterministic execution (incl. sandboxed shell)
      → tool results → pruning/estimation → completion gate → done
 ```

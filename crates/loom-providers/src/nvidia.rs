@@ -229,7 +229,13 @@ impl WireEndpoint for NvidiaProvider {
             "reasoning_effort".to_owned(),
             serde_json::json!(effort_for(&request.model, self.config.reasoning_effort)),
         );
-        build_request_body(request, &WireOptions { extra_body })
+        build_request_body(
+            request,
+            &WireOptions {
+                extra_body,
+                reasoning_field: None,
+            },
+        )
     }
 
     fn extra_headers(&self) -> Vec<(reqwest::header::HeaderName, String)> {

@@ -238,7 +238,13 @@ impl WireEndpoint for GlmProvider {
         if let Some(effort) = effort {
             extra_body.insert("reasoning_effort".to_owned(), serde_json::json!(effort));
         }
-        build_request_body(request, &WireOptions { extra_body })
+        build_request_body(
+            request,
+            &WireOptions {
+                extra_body,
+                reasoning_field: None,
+            },
+        )
     }
 
     fn extra_headers(&self) -> Vec<(reqwest::header::HeaderName, String)> {

@@ -23,6 +23,19 @@ use serde_json::{Value, json};
 /// The SSE terminator every OpenAI-compatible chat API sends.
 pub(crate) const DONE_MARKER: &str = "[DONE]";
 
+/// Reasoning ("thinking") field name on the DeepSeek/GLM/NIM dialect:
+/// streamed as `delta.reasoning_content`, replayed on the assistant
+/// message under the same key. This is the default because those three
+/// adapters are the majority of the shipped surface.
+pub(crate) const REASONING_FIELD: &str = "reasoning_content";
+
+/// Reasoning field name on Groq's dialect: the trace streams as
+/// `delta.reasoning` and must be replayed as `reasoning` too — Groq
+/// *rejects* `reasoning_content` on an assistant message with HTTP 400
+/// (`property 'reasoning_content' is unsupported`, live-verified
+/// 2026-10-18), so replay cannot merely omit the field.
+pub(crate) const REASONING_FIELD_PLAIN: &str = "reasoning";
+
 /// Provider-injected request knobs that differ between OpenAI-compatible
 /// providers.
 ///
@@ -37,6 +50,11 @@ pub(crate) struct WireOptions {
     /// A core field already present wins, so an adapter cannot
     /// accidentally override the request shape.
     pub extra_body: serde_json::Map<String, Value>,
+    /// Field name the replayed reasoning trace is written under on an
+    /// assistant message. `None` keeps the [`REASONING_FIELD`] default;
+    /// Groq passes [`REASONING_FIELD_PLAIN`] because its dialect names
+    /// the trace `reasoning` and rejects the default key outright.
+    pub reasoning_field: Option<&'static str>,
 }
 
 /// Builds the chat-completions request body for one [`ModelRequest`].
@@ -48,12 +66,15 @@ pub(crate) struct WireOptions {
 /// fields ([`WireOptions::extra_body`]) are merged in verbatim — without
 /// overwriting a core field.
 ///
-/// Reasoning replay: an assistant message carries `reasoning_content`
-/// whenever the context compiler replayed its trace — with `tools` in
-/// the request, omitting any prior `reasoning_content` is an HTTP 400 on
+/// Reasoning replay: an assistant message carries its prior trace
+/// whenever the context compiler replayed it — with `tools` in
+/// the request, omitting the prior reasoning is an HTTP 400 on
 /// DeepSeek, so replay here must stay aligned with compiler policy
-/// (ADR-006). `provider_data` is never sent: DeepSeek replays text only.
+/// (ADR-006). The key it is written under is dialect-specific
+/// ([`WireOptions::reasoning_field`]). `provider_data` is never sent:
+/// DeepSeek replays text only.
 pub(crate) fn build_request_body(request: &ModelRequest, options: &WireOptions) -> Value {
+    let reasoning_field = options.reasoning_field.unwrap_or(REASONING_FIELD);
     let messages: Vec<Value> = request
         .messages
         .iter()
@@ -63,7 +84,7 @@ pub(crate) fn build_request_body(request: &ModelRequest, options: &WireOptions) 
             Message::Assistant(assistant) => {
                 let mut value = json!({"role": "assistant", "content": assistant.content});
                 if let Some(reasoning) = &assistant.reasoning {
-                    value["reasoning_content"] = json!(reasoning.text);
+                    value[reasoning_field] = json!(reasoning.text);
                 }
                 if !assistant.tool_calls.is_empty() {
                     value["tool_calls"] = Value::Array(
@@ -174,6 +195,25 @@ pub(crate) struct ChatChunk {
     /// generic early-close transport error.
     #[serde(default)]
     pub error: Option<WireError>,
+    /// Groq reports a mid-stream failure inside its own per-chunk
+    /// `x_groq` envelope rather than the OpenAI-standard top-level
+    /// `error` key, then ends the stream. Live-verified shape:
+    /// `{"x_groq": {"id": ..., "error": {"message", "type", "code"}}}`.
+    /// Read into the same [`WireError`] slot so a Groq capacity failure
+    /// classifies as itself instead of a generic early close.
+    #[serde(default)]
+    pub x_groq: Option<GroqChunkEnvelope>,
+}
+
+/// Groq's per-chunk `x_groq` envelope (see
+/// [`ChatChunk::x_groq`]). Only the failure is read — the envelope also
+/// carries a request `id`, `seed`, timing, and `usage_breakdown` keys
+/// that nothing in the kernel consumes.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct GroqChunkEnvelope {
+    /// The failure, when the chunk carries one.
+    #[serde(default)]
+    pub error: Option<WireError>,
 }
 
 /// A mid-stream error object.
@@ -227,9 +267,13 @@ pub(crate) struct ChunkDelta {
     /// Visible text fragment.
     #[serde(default)]
     pub content: Option<String>,
-    /// Reasoning ("thinking") fragment.
+    /// Reasoning ("thinking") fragment, DeepSeek/GLM/NIM dialect.
     #[serde(default)]
     pub reasoning_content: Option<String>,
+    /// Reasoning fragment, Groq dialect (`delta.reasoning`); read only
+    /// when [`ChunkAccumulator::reasoning_field`] names it.
+    #[serde(default)]
+    pub reasoning: Option<String>,
     /// Tool-call fragments; the first for an `index` carries `id` and
     /// `function.name`, later ones only append `function.arguments`.
     #[serde(default, deserialize_with = "default_on_null")]
@@ -348,9 +392,21 @@ pub(crate) struct ChunkAccumulator {
     /// call; finalize turns this into a Protocol error instead of
     /// silently merging unrelated fragments.
     correlation_failed: bool,
+    /// Wire field this dialect streams reasoning fragments under (see
+    /// [`WireOptions::reasoning_field`]). `None` = the
+    /// [`REASONING_FIELD`] default.
+    reasoning_field: Option<&'static str>,
 }
 
 impl ChunkAccumulator {
+    /// Selects the dialect's reasoning field. Read-side counterpart to
+    /// [`WireOptions::reasoning_field`]: the write side decides which key
+    /// a replayed trace goes under, this decides which delta key the same
+    /// trace streams back on, so both must name the same dialect.
+    pub(crate) fn with_reasoning_field(mut self, field: Option<&'static str>) -> Self {
+        self.reasoning_field = field;
+        self
+    }
     /// Resolves the accumulation slot for a fragment whose `index` the
     /// server left out. A non-empty `id` matches the call it belongs to
     /// (or opens a new slot); an id-less continuation fragment is only
@@ -388,12 +444,13 @@ impl ChunkAccumulator {
         if let Some(usage) = chunk.usage {
             self.usage = Some(usage);
         }
-        if let Some(error) = chunk.error
+        let x_groq_error = chunk.x_groq.and_then(|envelope| envelope.error);
+        if let Some(error) = chunk.error.or(x_groq_error)
             && self.wire_error.is_none()
         {
             self.wire_error = Some(error);
         }
-        let Some(choice) = chunk.choices.into_iter().next() else {
+        let Some(mut choice) = chunk.choices.into_iter().next() else {
             return deltas; // usage-only chunk
         };
         if let Some(reason) = choice.finish_reason {
@@ -405,7 +462,18 @@ impl ChunkAccumulator {
             self.text.push_str(&fragment);
             deltas.push(ModelEvent::TextDelta(fragment));
         }
-        if let Some(fragment) = choice.delta.reasoning_content
+        let reasoning_fragment = match self.reasoning_field {
+            // Groq dialect: `delta.reasoning`. `reasoning_content` is
+            // still accepted as a fallback so an upstream that starts
+            // emitting the standard key does not silently drop traces.
+            Some(REASONING_FIELD_PLAIN) => choice
+                .delta
+                .reasoning
+                .take()
+                .or_else(|| choice.delta.reasoning_content.take()),
+            _ => choice.delta.reasoning_content.take(),
+        };
+        if let Some(fragment) = reasoning_fragment
             && !fragment.is_empty()
         {
             self.reasoning.push_str(&fragment);
@@ -779,7 +847,10 @@ mod tests {
         let mut extra_body = serde_json::Map::new();
         extra_body.insert("thinking".into(), json!({"type": "enabled"}));
         extra_body.insert("reasoning_effort".into(), json!("high"));
-        WireOptions { extra_body }
+        WireOptions {
+            extra_body,
+            reasoning_field: None,
+        }
     }
 
     #[test]
@@ -882,6 +953,7 @@ mod tests {
             }],
             usage: None,
             error: None,
+            x_groq: None,
         }
     }
     fn text_and_call_fragments() -> ChunkAccumulator {
@@ -975,6 +1047,7 @@ mod tests {
                 extra: Default::default(),
             }),
             error: None,
+            x_groq: None,
         });
         acc
     }
@@ -1009,6 +1082,7 @@ mod tests {
             }],
             usage: None,
             error: None,
+            x_groq: None,
         });
         let response = bare.finalize(true, &policy("test")).unwrap();
         assert_eq!(response.message.stop_reason, StopReason::ToolCalls);
@@ -1044,6 +1118,7 @@ mod tests {
             }],
             usage: None,
             error: None,
+            x_groq: None,
         });
         let error = acc.finalize(true, &policy("test")).unwrap_err();
         assert_eq!(error.kind, ModelErrorKind::Protocol);
@@ -1114,6 +1189,7 @@ mod tests {
             }],
             usage: None,
             error: None,
+            x_groq: None,
         });
         fn classify(reason: &str) -> Option<ModelErrorKind> {
             match reason {
@@ -1148,6 +1224,7 @@ mod tests {
                 message: Some("upstream provider is overloaded".into()),
                 code: Some(json!(503)),
             }),
+            x_groq: None,
         });
         let error = acc.finalize(true, &policy("test")).unwrap_err();
         assert_eq!(error.kind, ModelErrorKind::Overloaded);
@@ -1164,6 +1241,7 @@ mod tests {
                 message: Some("the selected model is unavailable".into()),
                 code: None,
             }),
+            x_groq: None,
         });
         let error = acc.finalize(true, &policy("test")).unwrap_err();
         assert_eq!(error.kind, ModelErrorKind::Server);
@@ -1187,6 +1265,7 @@ mod tests {
                 extra: Default::default(),
             }),
             error: None,
+            x_groq: None,
         });
         // OpenRouter's `cost` key is a dialect field: the policy's
         // dialect hook supplies it, the generic wire only carries it.
@@ -1397,10 +1476,87 @@ mod tests {
                 extra: Default::default(),
             }),
             error: None,
+            x_groq: None,
         });
         assert!(deltas.is_empty());
         let response = acc.finalize(true, &policy("test")).unwrap();
         assert_eq!(response.usage.cached_input_tokens, None);
+    }
+
+    #[test]
+    fn groq_dialect_streams_reasoning_from_the_plain_field() {
+        // Groq names the trace `delta.reasoning` (live-verified
+        // 2026-10-18) and rejects `reasoning_content` on replay, so a
+        // Groq-configured accumulator must read the other key.
+        let mut acc = ChunkAccumulator::default().with_reasoning_field(Some(REASONING_FIELD_PLAIN));
+        let deltas = acc.ingest(ChatChunk {
+            choices: vec![ChunkChoice {
+                delta: ChunkDelta {
+                    reasoning: Some("weighing options".into()),
+                    ..Default::default()
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+            error: None,
+            x_groq: None,
+        });
+        assert!(
+            matches!(deltas.as_slice(), [ModelEvent::ReasoningDelta(text)] if text == "weighing options")
+        );
+        acc.ingest(ChatChunk {
+            choices: vec![ChunkChoice {
+                delta: ChunkDelta {
+                    reasoning: Some(" and the tradeoffs".into()),
+                    ..Default::default()
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: None,
+            error: None,
+            x_groq: None,
+        });
+        let response = acc.finalize(true, &policy("test")).unwrap();
+        assert_eq!(
+            response.message.reasoning.as_ref().map(|r| r.text.as_str()),
+            Some("weighing options and the tradeoffs")
+        );
+    }
+
+    #[test]
+    fn the_default_dialect_ignores_the_groq_field() {
+        // Same bytes, default accumulator: `reasoning` is an unknown
+        // field on the DeepSeek/GLM/NIM dialect and must not leak in.
+        let mut acc = ChunkAccumulator::default();
+        acc.ingest(chunk_with(ChunkDelta {
+            reasoning: Some("not our dialect".into()),
+            ..Default::default()
+        }));
+        let response = acc.finalize(true, &policy("test")).unwrap();
+        assert!(response.message.reasoning.is_none());
+    }
+
+    #[test]
+    fn groq_envelope_error_classifies_like_a_standard_one() {
+        // Groq reports a mid-stream failure as
+        // `{"x_groq": {"error": {...}}}`, then ends the stream.
+        let mut acc = ChunkAccumulator::default();
+        acc.ingest(ChatChunk {
+            choices: vec![],
+            usage: None,
+            error: None,
+            x_groq: Some(GroqChunkEnvelope {
+                error: Some(WireError {
+                    message: Some("The selected model is overloaded".into()),
+                    code: Some(json!("rate_limit_exceeded")),
+                }),
+            }),
+        });
+        let error = acc.finalize(true, &policy("test")).unwrap_err();
+        assert!(
+            error.message.contains("overloaded"),
+            "the envelope message must classify: {error:?}"
+        );
     }
 
     #[test]
@@ -1420,6 +1576,7 @@ mod tests {
                 extra: Default::default(),
             }),
             error: None,
+            x_groq: None,
         });
         let response = acc.finalize(true, &policy("test")).unwrap();
         assert_eq!(response.usage.thinking_tokens, Some(12));
@@ -1445,6 +1602,7 @@ mod tests {
                 extra: Default::default(),
             }),
             error: None,
+            x_groq: None,
         });
         let response = acc.finalize(true, &policy("test")).unwrap();
         assert_eq!(response.usage.cached_input_tokens, Some(40));
@@ -1471,6 +1629,7 @@ mod tests {
                 },
             }),
             error: None,
+            x_groq: None,
         });
         let response = acc.finalize(true, &deepseek_policy("test")).unwrap();
         assert_eq!(response.usage.cached_input_tokens, Some(7));
@@ -1490,6 +1649,7 @@ mod tests {
                 extra: Default::default(),
             }),
             error: None,
+            x_groq: None,
         });
         let response = acc.finalize(true, &deepseek_policy("test")).unwrap();
         assert_eq!(response.usage.cached_input_tokens, Some(40));
@@ -1531,6 +1691,7 @@ mod tests {
             }],
             usage: None,
             error: None,
+            x_groq: None,
         });
         let response = acc.finalize(true, &policy("test")).unwrap();
         assert_eq!(response.message.stop_reason, StopReason::ContentFilter);
@@ -1546,6 +1707,7 @@ mod tests {
             }],
             usage: None,
             error: None,
+            x_groq: None,
         });
         let error = acc.finalize(true, &policy("test")).unwrap_err();
         assert_eq!(error.kind, ModelErrorKind::Protocol);

@@ -65,6 +65,15 @@ pub(crate) trait WireEndpoint: Clone + Send + Sync + 'static {
         crate::openai_wire::classify_wire_error(status, message)
     }
 
+    /// Wire field this dialect streams reasoning fragments under, if it
+    /// deviates from the shared `reasoning_content` default. Groq streams
+    /// and replays the trace as `reasoning` and rejects the default key
+    /// on an assistant message, so both the stream reader and the request
+    /// builder are told which dialect they are speaking.
+    fn reasoning_field(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Reads this provider's dialect fields out of a usage block's
     /// non-standard keys (everything the OpenAI-standard shapes in
     /// [`WireUsage`](crate::openai_wire::WireUsage) do not claim).
@@ -388,13 +397,17 @@ async fn step<P: WireEndpoint>(
                 Ok(body_stream) => body_stream,
                 Err(error) => return Some((Err(error), State::Done)),
             };
+            // Read the dialect before `provider` moves into the state.
+            let reasoning_field = provider.reasoning_field();
             Some((
                 Ok(None),
                 State::Body {
                     provider,
                     body_stream,
                     decoder: SseDecoder::new(),
-                    accumulator: Box::new(ChunkAccumulator::default()),
+                    accumulator: Box::new(
+                        ChunkAccumulator::default().with_reasoning_field(reasoning_field),
+                    ),
                     pending: VecDeque::new(),
                     saw_done: false,
                     last_progress: tokio::time::Instant::now(),

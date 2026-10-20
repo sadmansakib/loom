@@ -51,7 +51,7 @@ pub struct RunArgs {
     pub json: bool,
 
     /// Provider adapter to use (`deepseek`, `anthropic`, `openrouter`,
-    /// `glm`, `nvidia`). Required — Loom picks no provider for you.
+    /// `glm`, `nvidia`, `groq`). Required — Loom picks no provider for you.
     #[arg(long)]
     pub provider: String,
 
@@ -150,7 +150,7 @@ pub enum AuthCommand {
 #[derive(Debug, Args)]
 pub struct LoginArgs {
     /// Provider to authenticate (`deepseek`, `anthropic`, `openrouter`,
-    /// `glm`, `nvidia`). Required.
+    /// `glm`, `nvidia`, `groq`). Required.
     pub provider: String,
 
     /// How the secret is supplied: `key` (prompt, stored in the keychain)

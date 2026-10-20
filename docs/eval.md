@@ -138,7 +138,22 @@ at $0 either way. The free tier is rate-limited (requests/day, not
 dollars) — check the dashboard before a full-suite run.
 `LOOM_EVAL_PROVIDER=nvidia` targets NVIDIA NIM's free-trial tier the
 same way (keychain account or `NVIDIA_API_KEY`; prices at $0 by
-construction), which is roadmap item 1's zero-cost candidate.
+construction). That tier stopped serving completions on 2026-10-18 —
+see the SUPERSEDED note in `architecture.md` — so it is no longer a
+usable zero-cost candidate.
+
+`LOOM_EVAL_PROVIDER=groq` targets Groq's hosted inference the same way
+(keychain account or `GROQ_API_KEY`). Groq's free plan is unbilled, so
+`cost_usd` reports $0 there by construction — that holds only while
+the key is on the free plan; a developer-plan key bills real money and
+the cost table has no Groq prices, so switch the provider before
+upgrading. The binding cap is tokens, not requests: 8,000 tokens/min
+and 200,000 tokens/day against 30 rpm and 1,000 requests/day. A full
+agentic turn (system prompt plus a growing tool transcript) can cross
+8K on its own, so `LOOM_EVAL_RPM` alone will not pace this provider —
+expect token-limit pressure on the long tasks (`B7`, `LONG1`) first.
+`qwen/qwen3.8-27b` is the only Groq model in the adapter that issues
+parallel tool calls; the `gpt-oss` rows serialize.
 
 Scheduling: sweeps are run-index-major (every task completes run N
 before any starts run N+1), so an interrupted run leaves a complete

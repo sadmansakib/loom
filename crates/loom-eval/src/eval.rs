@@ -834,6 +834,14 @@ pub(crate) fn cost_usd(
     if provider == "nvidia" {
         return Some(0.0);
     }
+    // Groq's free tier is unbilled (Groq publishes no spending limits on
+    // free plans). This holds only while the key is on the free plan:
+    // a developer-plan key bills real money, and this table has no
+    // Groq prices. Treat priced-at-zero as scoped to the free plan and
+    // re-derive cost from the provider report if the plan changes.
+    if provider == "groq" {
+        return Some(0.0);
+    }
     let prices = match model {
         "deepseek-flash" => &FLASH,
         "deepseek-v4-pro" => &PRO,

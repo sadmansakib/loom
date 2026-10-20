@@ -25,7 +25,7 @@ kernel never links a filesystem store or a CLI, the engine never prints.
 | `loom-core` | Facade re-exporting the public surface for embedders, plus the shared data-dir policy (`paths`) | engine, kernel, providers, store, tools |
 | `loom-kernel` | The agent itself: loop, context compilation, session/transcript model, tool abstraction, tool cache, artifacts, events, budgets | no workspace crates — it defines the side-effect traits (`ModelProvider`, `SessionStore`, `ArtifactStore`, `Tool`, …) itself |
 | `loom-engine` | Composition root: builds a configured `Agent` from paths, auth, a provider factory, tool registry, and stores; repository facts scanner; owns the OpenRouter catalog policy (`engine::catalog`), the trace export format (`engine::trace`), and its aggregation (`engine::trace_stats`) | kernel, store, providers, tools |
-| `loom-providers` | Model provider adapters (DeepSeek, OpenRouter, GLM, NVIDIA over one shared OpenAI-compatible wire; Anthropic on its own messages-API driver) | kernel model types |
+| `loom-providers` | Model provider adapters (DeepSeek, OpenRouter, GLM, NVIDIA, Groq over one shared OpenAI-compatible wire; Anthropic on its own messages-API driver) | kernel model types |
 | `loom-store` | SQLite persistence: sessions, turns, tasks, artifacts, auth accounts | kernel store traits |
 | `loom-tools` | The shipped tool suite (read/search/edit/write/list/run/verify + artifact read) | kernel tool traits |
 | `loom-eval` | The eval harness: task corpus (`tests/eval-tasks`), record/replay providers, outcome and bugfix gates, suite reports, live benchmarks — every arm opens the engine through `EngineOverrides`, never a hand-wired `Agent` | `loom-core` only |
@@ -765,6 +765,37 @@ Five adapters ship:
   on-disk eval corpus (11 of 115 runs), so NIM is no longer the
   zero-cost candidate; the eval's OpenRouter account is the live
   path (roadmap item 1).
+- **Groq** — hosted inference (`api.groq.com/openai/v1`),
+  OpenAI-compatible. Model ids are `publisher/model`. The built-in
+  capability table covers the three agentic deployments live on the
+  account this was written against — `openai/gpt-oss-120b`,
+  `openai/gpt-oss-20b` (131,072 context, 65,536 max output, reasoning,
+  tool calls, but **no** parallel tool calls: both serialize to one
+  call per turn) and `qwen/qwen3.8-27b` (131,072 context, 16,384 max
+  output, reasoning, tool calls, parallel calls verified live).
+  Everything else resolves to "unknown", including the
+  `llama-3.1-8b-instant` / `llama-3.3-70b-versatile` rows Groq
+  decommissioned for free and developer tiers on 2026-08-16.
+  Two wire deviations, both live-verified 2026-10-18, both routed
+  through the shared dialect hooks rather than forked into a driver:
+  Groq rejects an assistant message carrying `reasoning_content`
+  (HTTP 400, `property 'reasoning_content' is unsupported`) and
+  streams the same fragment under the plain key `reasoning`, so the
+  endpoint declares a `reasoning_field` that both the request builder
+  and the chunk accumulator honor; and in-stream failures arrive on an
+  `x_groq` envelope rather than the standard `error` key, which the
+  accumulator folds into the same wire-error slot. Status mapping adds
+  Groq's two bespoke codes, 498 (flex tier at capacity, retryable
+  overload) and 499 (caller cancelled, terminal). Reasoning depth rides
+  the top-level `reasoning_effort` field; `gpt-oss` accepts only
+  `low`/`medium`/`high` and 400s on `none` and `max`, so the adapter
+  clamps the same way GLM clamps "none" — thinking is always on there.
+  Two measurement caveats worth knowing before comparing numbers:
+  Groq rewrites `temperature: 0` to `1e-8` (not true greedy), and
+  `gpt-oss` chunks carry a `delta.channel` key the accumulator
+  ignores. Free plan: 30 rpm, 1,000 requests/day, 8,000 tokens/min,
+  200,000 tokens/day — tokens, not requests, are the binding ceiling,
+  and the free tier is unbilled.
 - **Anthropic** — the messages API, not the OpenAI wire: system as a
   top-level param, `tool_use`/`tool_result` content blocks,
   `thinking_delta` reasoning capture, and Anthropic's error taxonomy.

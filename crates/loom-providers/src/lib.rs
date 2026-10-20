@@ -22,6 +22,7 @@ mod anthropic;
 mod anthropic_wire;
 mod deepseek;
 mod glm;
+mod groq;
 mod http;
 mod nvidia;
 mod openai_wire;
@@ -42,6 +43,8 @@ pub use deepseek::{
 };
 pub use glm::PROVIDER_NAME as GLM_PROVIDER_NAME;
 pub use glm::{GlmConfig, GlmProvider, model_capabilities as glm_model_capabilities};
+pub use groq::PROVIDER_NAME as GROQ_PROVIDER_NAME;
+pub use groq::{GroqConfig, GroqProvider, model_capabilities as groq_model_capabilities};
 pub use http::TimeoutConfig;
 pub use nvidia::PROVIDER_NAME as NVIDIA_PROVIDER_NAME;
 pub use nvidia::{NvidiaConfig, NvidiaProvider, model_capabilities as nvidia_model_capabilities};

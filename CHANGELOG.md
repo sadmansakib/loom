@@ -3,6 +3,52 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-18 — Groq adapter: hosted inference over the shared wire
+
+`--provider groq` runs Groq's three agentic deployments against the same shared
+OpenAI-compatible wire the other four adapters use. Added because the zero-cost
+eval paths kept closing (NVIDIA NIM stopped answering completions on
+2026-10-18) while the OpenRouter account has almost no balance left.
+
+- `groq_model_capabilities` pins `openai/gpt-oss-120b` and
+  `openai/gpt-oss-20b` (131,072 context, 65,536 max output, reasoning, tool
+  calls, **no** parallel tool calls — live-probed, both serialize to one call per
+  turn) and `qwen/qwen3.8-27b` (131,072 context, 16,384 max output, reasoning,
+  tool calls, parallel calls confirmed live). Everything else is unknown, which
+  includes the `llama-3.1-8b-instant` and `llama-3.3-70b-versatile` rows Groq
+  decommissioned for free and developer tiers on 2026-08-16.
+- **Two wire deviations, handled by dialect hooks rather than a forked driver.**
+  Groq rejects an assistant message carrying `reasoning_content` (HTTP 400,
+  `property 'reasoning_content' is unsupported`) and streams the same fragment
+  under the plain key `reasoning`, so `WireEndpoint::reasoning_field` names the
+  key once and both the request builder and the chunk accumulator honor it. And
+  in-stream failures arrive on an `x_groq` envelope instead of the standard
+  `error` key; the accumulator folds it into the same wire-error slot, so the
+  failure class is identical either way. Status mapping adds Groq's two bespoke
+  codes: 498 (flex tier at capacity, retryable overload) and 499 (caller
+  cancelled, terminal).
+- Reasoning depth rides the top-level `reasoning_effort` field. `gpt-oss`
+  accepts only `low`/`medium`/`high` and 400s on `none` and `max`, so the
+  adapter clamps — the same call GLM already makes for `none`.
+- `GROQ_API_KEY` joins the provider env names, and `cost_usd` reports $0 for
+  `groq` on the free plan, which is unbilled. That holds only while the key is
+  free: a developer-plan key bills real money and the cost table has no Groq
+  prices.
+- Two measurement caveats before comparing numbers across providers: Groq
+  rewrites `temperature: 0` to `1e-8` (not true greedy), and `gpt-oss` chunks
+  carry a `delta.channel` key the accumulator ignores. Free plan is 30 rpm,
+  1,000 requests/day, **8,000 tokens/min**, 200,000 tokens/day — tokens, not
+  requests, are the binding ceiling, so `LOOM_EVAL_RPM` alone will not pace it.
+- Wiremock-verified (10 tests in `tests/groq_wiremock.rs`) and live-probed
+  against `api.groq.com/openai/v1` on a free-plan key: tool-call streaming,
+  reasoning capture, effort clamping, the 400 on the shared reasoning key, the
+  `x_groq` error envelope, and the 498/499 codes all observed directly.
+- Three `#[ignore]`d live tests in `tests/groq_live.rs` keep that honest.
+  They read `GROQ_API_KEY` from the environment (never committed) and
+  `GROQ_LIVE_MODEL` (default `qwen/qwen3.8-27b`); the load-bearing one replays a
+  server-issued tool-call id to prove the dialect fix holds against the real
+  wire. All three passed on 2026-10-18.
+
 ## 2026-10-18 — The eval re-measures its own infrastructure losses
 
 Excluding infrastructure from `pass_rate` (the previous entry) keeps the rate
