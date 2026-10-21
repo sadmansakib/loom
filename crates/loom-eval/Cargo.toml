@@ -1,23 +1,23 @@
 [package]
 name = "loom-eval"
-description = "Loom eval harness: task fixtures, record/replay providers, gates, and suite reports, driven through the Engine"
+description = "Loom eval harness: SWE-bench Verified runs in container isolation, scored by the official swebench docker harness"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-loom-core = { workspace = true }
-futures = { workspace = true }
+# dataset fetch for the SWE-bench Verified sweep (swebench.rs); the
+# rustls feature set matches the workspace client.
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# runtime for the dataset fetch inside the swebench-run binary.
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
-tracing-subscriber = { workspace = true }
-tokio-util = { workspace = true }
 
 [lints]
 workspace = true
 
 [[bin]]
-name = "multiswe-import"
-path = "src/bin/multiswe_import.rs"
+name = "swebench-run"
+path = "src/bin/swebench_run.rs"

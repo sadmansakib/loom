@@ -1,9 +1,0 @@
-[package]
-name = "loom-eval-b7"
-version = "0.0.0"
-edition = "2021"
-
-[workspace]
-
-[dependencies]
-tokio = { version = "1", features = ["process", "rt", "macros", "time"] }

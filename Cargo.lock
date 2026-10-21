@@ -1485,13 +1485,10 @@ dependencies = [
 name = "loom-eval"
 version = "0.1.0"
 dependencies = [
- "futures",
- "loom-core",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
- "tokio-util",
- "tracing-subscriber",
 ]
 
 [[package]]

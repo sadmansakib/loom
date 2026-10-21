@@ -148,15 +148,17 @@ fn the_composition_root_does_not_reach_the_facade_above_it() {
 
 #[test]
 fn the_edge_cases_depend_on_the_facade_alone() {
-    // `loom-cli`'s own guard lives in `loom-cli/tests/facade.rs` (ADR-021).
-    // `loom-eval` is the same shape: the harness opens every arm through
-    // `EngineOverrides` on the engine rather than hand-wiring an `Agent`, and
-    // it reaches engine code through `loom-core` so the arms exercise the same
+    // `loom-cli`'s own guard lives in `loom-cli/tests/facade.rs` (ADR-021):
+    // it reaches engine code through `loom-core` so it exercises the same
     // public surface a real embedder would.
-    for crate_name in ["loom-cli", "loom-eval"] {
-        assert_no_workspace_deps(crate_name, &["loom-core"]);
-        assert_still_wired(crate_name, &["loom-core"]);
-    }
+    assert_no_workspace_deps("loom-cli", &["loom-core"]);
+    assert_still_wired("loom-cli", &["loom-core"]);
+    // `loom-eval` no longer embeds the engine at all: since the local suite
+    // was removed (2026-10-20) it orchestrates SWE-bench containers and
+    // shells out to `docker` and the `loom` CLI, so it must stay free of
+    // workspace dependencies entirely — the facade rule holds vacuously,
+    // and any future re-embedding has to arrive through `loom-core`.
+    assert_no_workspace_deps("loom-eval", &[]);
 }
 
 /// The kernel's `unsafe_code = "forbid"` is the other half of "cannot leak by

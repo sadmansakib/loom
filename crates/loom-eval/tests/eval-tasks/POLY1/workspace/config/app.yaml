@@ -1,6 +1,0 @@
-service:
-  name: storefront
-  replicas: 1
-  limits:
-    cpu: 500m
-    memory: 512Mi

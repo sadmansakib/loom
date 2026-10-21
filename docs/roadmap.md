@@ -376,7 +376,7 @@ also summarized here so this section is the single source of truth.
   transcript, with content-filtered turns dropped and tool-result
   side-channel state (effects, artifact refs) stripped. The same
   session compiles to byte-identical requests — the property the
-  prefix cache and the replay eval both lean on.
+  prefix cache and the wire-level replay tests both lean on.
 - **Token census.** Per-turn, per-source token estimates (system, facts,
   user, assistant, tool results, reasoning) with an authoritative
   total; surfaced to the loop, the pruning trigger, and eval reporting.
@@ -552,10 +552,13 @@ reproduces them.
      large-file, MULTI1 cross-file, LONG1 heavy long-horizon — the only
      in-house task that crosses the pruning floor) and every field task
      now carries an s/m/l/xl difficulty tier with a per-tier pass rate
-     in the suite headline; `multiswe-import` (loom-eval bin) bridges
+     in the suite headline; ~~`multiswe-import` (loom-eval bin) bridges
      Multi-SWE-bench JSONL into `EXT-*` tasks (clone at base commit,
      apply the test patch, gate on the instance's own F2P/P2P), so an
-     imported Lite-80-style slice is a command away. Shipped
+     imported Lite-80-style slice is a command away~~ — removed
+     2026-10-20 together with the local suite; measurement is now
+     SWE-bench Verified in container isolation (see “Measurement”).
+     Shipped
      2026-10-10, the second half: the **external slice is imported and
      validated** — 5 instances across 4 real repos (tokio-rs/bytes ×2,
      rayon-rs/rayon, clap-rs/clap at 803 P2P, tokio-rs/tracing),
@@ -596,8 +599,11 @@ reproduces them.
      gates~~ — shipped offline half: every run report (success or
      failure) embeds a `micro` block (per-tool fault taxonomy, edit
      acceptance, identical repeats, spills), recomputable from the
-     session snapshots `eval_live` persists under
-     `records/sessions/` and cross-checked by an offline test; the
+     session snapshots the local eval persisted under
+     `records/sessions/` and cross-checked by an offline test~~ — the
+     micro-eval machinery was removed with the local suite
+     (2026-10-20); the same signals can be re-derived from SWE-bench
+     run artifacts when they earn their keep; the
      30-task gate shipped 2026-10-10 (`LOOM_EVAL_TASKS=hard-gate`,
      derived — see item 1); the per-model comparison dimension remains;
    - `loom stats`: what each mechanism saved — pruning, tool-cache hits,
@@ -611,6 +617,19 @@ reproduces them.
      fast-path hits out of the event stream while stub hits, omission
      markers, and repairs still come from the transcript — same id set,
      so both sections describe the same sessions.
+   - **Paired same-task contrast reporting**: report arm comparisons
+     as per-task paired deltas — win/loss/tie on the gate plus
+     per-task turns/tokens/cost deltas on the same seed and workspace
+     snapshot — next to the suite medians, not instead of them. Arms
+     already run identical tasks, so this costs zero new runs; it
+     exists because the noise floor is the local enemy (B9: 6–40 turns
+     on identical config) and pairing cancels the task variance that
+     aggregate medians hide. Harness² (arXiv 2610.14224) probes
+     candidate harnesses on the same task for exactly this reason —
+     behavioral contrast between executions is its only selection
+     signal; here it strengthens claims at whatever N the budget
+     affords. Paired deltas become the default presentation of any A/B
+     once the funded model lands.
    - **Funded low-variance eval model** — the gating prerequisite.
      The free tier's variance (B9: 6–40 turns on identical config)
      sits above most levers, so items 4, 5, 6, 8, and 10 shipped on
@@ -661,11 +680,12 @@ reproduces them.
      `suite_headline` already reads `arm: "bare"`. The number this
      must produce is the G4/G5 headline in `docs/benchmarks/`: the
      claim that Loom raises a weaker model's success rate, which the
-     input model profiles (item 9) also need. Also shipped alongside:
+     input model profiles (item 9) also need. ~~Also shipped alongside:
      the deterministic **editor bench** (`editbench`, token-free, PR-Edit
      style) pinning `edit_file` competence across file sizes,
      ambiguity refusal, batch atomicity, and the oversize cap on every
-     commit.
+     commit~~ — removed 2026-10-20 with the local suite; edit
+     competence now has to show up in the SWE-bench numbers.
    - **Persist events** alongside transcripts (also item 20.1), so
      `loom stats` can attribute savings per mechanism. ~~Shipped
      2026-10-17.~~ Store schema v2 writes the observed event stream
@@ -1110,7 +1130,8 @@ reproduces them.
        persistence needed);
     2. every tunable — prune trigger and floors, read window, reasoning
        schedule, edit format — moved from constants into one config
-       struct, so the replay and live evals can sweep it (this subsumes
+       struct, so sweeps over the SWE-bench protocol can vary it (this
+       subsumes
        adaptive pruning thresholds);
     3. an outer loop in the Meta-Harness shape that reads *raw* traces,
        harness source, and scores and proposes changes (compressed
@@ -1123,6 +1144,27 @@ reproduces them.
        `memory_20260818` context edit; Claude Code's agent-written
        `MEMORY.md`) is the same pattern at the file level — plain files
        under model control, injected through a seam Loom already has.
+
+    **Harness² input (2026-10-20, arXiv 2610.14224).** Google's
+    recursive-harnessing framework is the same thesis with the editing
+    inverted — the model edits its own harness per task, offline here
+    instead. Three things transfer. Phases 2–3 get their search shape
+    from its Propose–Probe–Compose: propose invariant (task-agnostic)
+    and domain (task-class) edits separately, probe candidates on the
+    same task, then **compose** — combine independently-winning edits
+    and re-probe the combination, because edits interact (prune
+    trigger × read window × tool menu); per-lever winners are not a
+    shippable config. Its evidence rule becomes phase 4's adoption
+    gate: a lesson enters the facts seam only with before/after
+    contrast evidence from paired runs, carries an expiry, and is
+    re-validated or evicted — staleness answered structurally, not by
+    hope. And its split gives the landing zone: invariant lessons
+    become defaults in the config struct, domain lessons become
+    task-class profiles. The online half (model-edited harness at
+    task time, k× the token cost) is deliberately not taken: it breaks
+    the deterministic-controller principle and the never-worse
+    contract. Recursion stays offline in the eval harness, where the
+    maintenance bar rules.
 21. **Parallel orchestration.** Worktree-per-agent isolation with a
     merge path, above the engine. Only after item 19 shows delegation
     pays.
@@ -1155,6 +1197,18 @@ reproduces them.
     delegation semantics); blocked on item 1's funded model like
     everything that multiplies spend. Seam: the engine composing N
     child `Agent`s above `Agent::run_task`, same as item 19.
+
+    **Harness² input (2026-10-20, arXiv 2610.14224).** Two additions
+    from its contrastive selection. All-rollouts-fail fallback: pick
+    the rollout whose trace carries the fewest failure-mode markers —
+    identical repeats, edit rejections, idle turns, already counted by
+    the `micro` taxonomy — a deterministic selector for the case the
+    gate cannot decide, dodging the weak-selector regression above.
+    And vary the harness, not just approach hints: facts verbosity,
+    todo granularity, reasoning-effort schedule are Harness²-style
+    domain edits that diversify rollouts without changing the model;
+    the N traces are then free contrast evidence for item 20's lesson
+    mining.
 25. **Queued user steering** (G1, G2). **Shipped 2026-10-16** — the
     `TaskControl::steer` seam queues user messages on the control (shared via
     `Arc` across clones); the turn loop drains them at each turn boundary and

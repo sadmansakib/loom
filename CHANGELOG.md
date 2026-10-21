@@ -3,6 +3,79 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-21 — Evaluation: SWE-bench Verified in container isolation; local eval removed
+
+Loom now measures against **SWE-bench Verified** (the 500-instance
+human-validated split) and nothing else. The in-house evaluation suite —
+the 34-task corpus with its bugfix/outcome gates, replay machinery,
+`eval_live`, the edit bench, the live provider benches, and
+`multiswe-import` — is deleted: every number it produced was comparable
+only to Loom itself, and its host-side runs mutated the machine they ran
+on. The measurement contract is now: real repositories, official
+testbed containers, official grading.
+
+- The agent runs **inside the official per-instance testbed image**
+  (`sweb.eval.x86_64.<instance_id>`, built locally on arm64 via
+  `swebench images build SWE-bench/swe-bench-tasks --dataset verified -i <id>`). The host
+  only orchestrates: it mounts the Linux `loom` binary, the prompt,
+  and an output directory, and forwards the provider API key as an
+  environment variable. Nothing else on the host is touched.
+- Each container runs `loom run --json --no-save` against `/testbed`
+  (the repository at `base_commit`, test patch unapplied), then
+  extracts `patch.diff` with `git add -A && git diff --cached` — the
+  patch is captured even when the run fails or times out.
+- Grading belongs to the official harness:
+  `swebench eval verified -p predictions.jsonl --run-id <id>
+  -j 4`. Resolved rate from that command is the
+  headline; the sweep JSON and run reports are diagnostics.
+- `swebench-run` (the new loom-eval binary) selects instances
+  (explicit ids must resolve; repo filter; `--max` cap), fetches and
+  500-row-cross-checks the dataset once into a cache, runs
+  N runs per instance, and writes per-run predictions JSONL — one row
+  per instance, never duplicates — plus `swebench-sweep-<model>.json`
+  with per-run exits, patch sizes, and run reports.
+- `--build-loom` cross-builds the Linux binary inside docker
+  static musl build inside docker (`rust:1`, `x86_64-unknown-linux-musl`
+  — testbeds' older glibc rejects gnu-linked binaries); no host
+  toolchain changes.
+- First measurement (2026-10-21, 5 astropy instances, Laguna S 2.1
+  via the nano gateway): **3/5 resolved, 0 infra failures**. The two
+  misses drove prompt v2 + a turn-budget bump (`--max-turns` default
+  60 → 100): the task prompt now tells the agent to start editing once
+  it has a hypothesis (one run spent all 60 turns exploring, no edit),
+  to run the repo's existing tests over the files it touched (one run
+  broke an exact-string assertion a base test already covered), and to
+  delete scratch/repro scripts before finishing; the closing line now
+  says to finish rather than wait for input. Prompt changes start a new
+  baseline — v1 history stays in the sweep reports.
+- Removed with the suite: `crates/loom-eval/src/{eval.rs, benchmark.rs,
+  editbench.rs, bin/multiswe_import.rs}`, `scripts/bench-report.py`,
+  and the 3.5 GB `tests/eval-tasks` corpus. Historical baselines stay
+  in this log as history; they are not comparable to SWE-bench
+  numbers.
+
+## 2026-10-20 — Roadmap: Harness² input (arXiv 2610.14224)
+
+Compared google-research/harness2 (recursive agent harnessing:
+Propose–Probe–Compose over 8 editable harness components, model-edited
+per task) with Loom's approach and folded the transferable parts into
+`docs/roadmap.md`:
+
+- Item 1 gains **paired same-task contrast reporting** — per-task
+  win/loss/tie and turns/tokens/cost deltas between arms on the same
+  seed and snapshot, next to suite medians; zero new runs, kills the
+  task-variance noise floor (B9: 6–40 turns).
+- Item 20 gains the compose-then-reprobe search shape (combine
+  independently-winning config edits and re-probe — edits interact),
+  the invariant/domain lesson split with landing zones (defaults vs
+  task-class profiles), and the evidence+expiry adoption gate for
+  lessons. Online model-edited harnesses deliberately rejected —
+  breaks the deterministic-controller principle.
+- Item 24 gains the all-rollouts-fail fallback (deterministic pick by
+  fewest trace failure-mode markers from the `micro` taxonomy) and
+  harness-knob variation (facts verbosity, todo granularity) as the
+  rollout diversifier.
+
 ## 2026-10-20 — Custom provider: any OpenAI-compatible endpoint
 
 `--provider custom` connects Loom to any endpoint that speaks the OpenAI

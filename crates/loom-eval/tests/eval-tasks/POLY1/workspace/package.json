@@ -1,9 +1,0 @@
-{
-  "name": "poly1-service",
-  "version": "0.0.1",
-  "private": true,
-  "scripts": {
-    "build": "./scripts/build.sh",
-    "test": "./scripts/test.sh"
-  }
-}

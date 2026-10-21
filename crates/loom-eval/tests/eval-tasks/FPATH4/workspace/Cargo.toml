@@ -1,9 +1,0 @@
-[workspace]
-
-[package]
-name = "fp_deps_fixture"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-bitflags = "1.0.0"

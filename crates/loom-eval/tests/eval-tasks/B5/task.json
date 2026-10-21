@@ -1,8 +1,0 @@
-{
-  "id": "B5",
-  "prompt": "There are 8 markdown files in corpus/, named doc-01.md through doc-08.md. Process them in ascending filename order. For each file: read it with read_file, then append a line to it with edit_file by setting old_string to the file's current last line and new_string to that same last line followed by a newline and the text 'Reviewed.'. Issue exactly one tool call per turn and stop after that single call so the next turn continues with the next file. Do not search or read partial ranges, do not skip any file, and do not stop before all 8 files are processed: stopping early fails the task. After the last file is edited, reply with a single line DONE.",
-  "tools": "read-edit",
-  "heavy": true,
-  "system_prompt_file": "system-prompt.txt",
-  "workspace": "corpus"
-}

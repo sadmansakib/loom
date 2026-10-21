@@ -1,37 +1,24 @@
-//! The Loom eval harness: task fixtures, record/replay providers, outcome
-//! and bugfix gates, and suite reports — driven through [`loom_core`]'s
-//! `Engine` (via `EngineOverrides`), never a hand-wired `Agent`.
+//! The Loom eval harness: SWE-bench Verified runs in container
+//! isolation, scored by the official `swebench` docker harness.
 //!
-//! Everything here is test-only by design: the harness and its assertions
-//! compile under `#[cfg(test)]`, so the crate has no public surface and
-//! costs nothing in a normal `cargo build`. Live runs are `#[ignore]`
-//! tests behind `LOOM_EVAL_*` knobs (see `eval.rs`); the offline suite
-//! (replay equivalence, gate checks, report math) runs everywhere.
+//! The in-house task corpus, gates, and replay machinery were removed
+//! once the real benchmark arrived: measurement now happens against
+//! the Verified split (500 human-validated instances) with the agent
+//! running inside the official per-instance testbed image — repo at
+//! `base_commit`, correct interpreter and dependencies, no access to
+//! the host working tree. Grading belongs to the official harness
+//! (`swebench eval verified`), which applies its own `test_patch` and
+//! decides `resolved`.
 //!
-//! The harness owns, in `eval.rs`:
+//! [`swebench`] holds the plumbing (dataset fetch/cache, selection,
+//! prompts, container-run assembly, predictions emission); the
+//! `swebench-run` binary orchestrates the sweep end to end: it builds
+//! (or accepts) a linux loom binary, prepares per-instance prompts,
+//! starts one container per (instance, run), collects `patch.diff`
+//! plus the in-container `loom run --json` report, and writes one
+//! predictions JSONL per run — the file the official scorer consumes.
 //!
-//! * the task corpus in `tests/eval-tasks/<ID>/` (`task.json` per task);
-//! * the record/replay seam — `RecordingProvider` wraps a real provider
-//!   built by the engine, `ReplayProvider` serves a recorded script with
-//!   drift detection, so offline tests exercise the exact engine path;
-//! * gates — SWE-bench-shaped bugfix grading (`cargo test` fixtures with
-//!   fail-to-pass / pass-to-pass sets and protected files) and outcome
-//!   specs (exact files, contains, tests-green);
-//! * reports — per-run JSON with token economics, per-task and suite
-//!   rollups with pass rates and cost-per-solved, written under
-//!   `LOOM_EVAL_DIR` (default `<repo>/target/eval`); baselines get
-//!   copied into `docs/benchmarks/` by hand when recorded.
-//!
-//! `benchmark.rs` carries the long-running live benchmarks (read-only
-//! repository inspection and friends) behind `LOOM_BENCH_*` knobs.
-//!
-//! The N ≥ 5 protocol (roadmap, item 1): every field number comes from
-//! at least five runs of a recorded configuration, replayed or live,
-//! with per-run variance reported — never a single observation.
+//! Everything in the library is offline-testable except the two
+//! network edges (dataset fetch, docker), which the binary owns.
 
-#[cfg(test)]
-mod benchmark;
-#[cfg(test)]
-mod editbench;
-#[cfg(test)]
-mod eval;
+pub mod swebench;

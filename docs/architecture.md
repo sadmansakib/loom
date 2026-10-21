@@ -28,7 +28,7 @@ kernel never links a filesystem store or a CLI, the engine never prints.
 | `loom-providers` | Model provider adapters (DeepSeek, OpenRouter, GLM, NVIDIA, Groq over one shared OpenAI-compatible wire; Custom for any user-supplied OpenAI-compatible endpoint; Anthropic on its own messages-API driver) | kernel model types |
 | `loom-store` | SQLite persistence: sessions, turns, tasks, artifacts, auth accounts | kernel store traits |
 | `loom-tools` | The shipped tool suite (read/search/edit/write/list/run/verify + artifact read) | kernel tool traits |
-| `loom-eval` | The eval harness: task corpus (`tests/eval-tasks`), record/replay providers, outcome and bugfix gates, suite reports, live benchmarks — every arm opens the engine through `EngineOverrides`, never a hand-wired `Agent` | `loom-core` only |
+| `loom-eval` | The measurement harness: SWE-bench Verified runs in container isolation (`swebench` module + `swebench-run` orchestrator) — the agent binary executes inside official per-instance testbed images, grading belongs to the official `swebench` harness | no workspace crates — it shells out to docker and the `loom` CLI |
 | `loom-cli` | Binary: argument parsing, output rendering, run/auth/stats commands | `loom-core` only (ADR-021) |
 
 The kernel defines traits for everything with side effects
@@ -140,8 +140,8 @@ phase, and the idle session after `AwaitingInput` — the progress
 surface a GUI or TUI polls while a task runs; clones share one
 snapshot, so the driving API and the poller hold the same state.
 `StrictSink` wraps a
-sink and cancels the task on first drop; the eval harness requires zero
- dropped events.
+sink and cancels the task on first drop — event delivery is lossless
+or the run dies.
 
 ---
 
@@ -175,9 +175,8 @@ call may be retried: an exact repeat (same tool name, same canonical
 arguments) is refused with a `RepeatedCall` failure until any tool call
 succeeds. This turns "try the same thing again" into a compile error for
 the model and forces a change of approach. Canonical arguments rely on
-serde_json's sorted-key serialization (BTreeMap ordering — no crate in the
-workspace enables `preserve_order`; the eval harness's byte-identical
-request check would catch it first if one ever did).
+serde_json's sorted-key serialization (BTreeMap ordering — no crate in
+the workspace enables `preserve_order`).
 
 **Terminal states**: `EndTurn` returns the reply — after the
 **completion gate** (roadmap item 8): if files changed since the last
@@ -214,8 +213,7 @@ Content-filtered assistant turns are dropped from the projection. `max_tokens`
 is the lesser of the model's output cap and the reserved output budget.
 
 Determinism is the point: the same session compiles to byte-identical
-requests, which is what makes provider prefix caching effective and what
-the eval harness asserts.
+requests, which is what makes provider prefix caching effective.
 
 ### 5.2 Repository facts
 
@@ -248,7 +246,7 @@ Anthropic. The kernel itself keeps only the conservative
 bytes÷3 `HeuristicEstimator` as the default, so the kernel stays
 tokenizer-free. Attribution is careful to avoid double counting
 (reasoning is counted once, facts are subtracted from system). The census
-is how the loop, the pruning trigger, and the eval reporting all see the
+is how the loop and the pruning trigger see the
 same numbers.
 
 ### 5.4 Pruning (`PruningContextCompiler`)
@@ -603,11 +601,12 @@ the plain forms pass an empty one): every field is optional and `None`
 keeps the production choice — a prebuilt `provider` (replaying a
 recording, no credential involved), a `provider_hook` wrapping
 whichever provider results (recording, shadowing), a `registry`, a
-`compiler`. The eval harness (`loom-eval`) is the canonical embedder:
-its live arm opens `open_async_with` plus a recording hook, its replay
-arm overrides the provider outright, and both run through the exact
-engine wiring the CLI gets — the harness no longer hand-assembles an
-`Agent`, so it cannot drift from production composition.
+`compiler`. The overrides exist for embedders: until 2026-10-20 the
+eval harness was the canonical one, opening `open_async_with` with a
+recording hook and running through the exact wiring the CLI gets.
+Since the SWE-bench migration the harness drives the CLI binary
+inside testbed containers instead (§11), so `loom-core` embedders are
+the remaining consumers.
 
 The driving API is resume-first: besides `run_task` on a live session
 handle, `Engine::continue_session(id, input, …)` loads a persisted
@@ -618,9 +617,8 @@ or paused task still advances the session, so only load errors are
 task's terminal event the engine emits `AwaitingInput` naming the idle
 session: a stream-only frontend keys its resume loop on that marker
 without polling. Kernel-level drivers emit no such marker — it is an
-engine concept, so a hand-rolled kernel loop sees no new events (the
-engine-driven eval harness does see the marker; its per-run event tally
-counts it).
+engine concept, so a hand-rolled kernel loop sees no new events
+(an engine-driven frontend sees the marker).
 
 Stopping is two-granularity: `TaskControl` (the `run_task`/
 `continue_session` parameter) offers `cancel` — the hard stop that
@@ -663,8 +661,7 @@ identical numbers; `--trace DIR` switches the source to
 exported traces, where the manifests carry the provider's own billed
 counts and the event streams carry `context_pruned` reports — per-task
 and per-trigger prune attribution without server-side persistence; the
-walk/fold/aggregation is `engine::trace_stats`, the CLI only renders), and
-the eval entry points. The data-dir resolution the frontends share
+walk/fold/aggregation is `engine::trace_stats`, the CLI only renders). The data-dir resolution the frontends share
 (`LOOM_DATA_DIR` → XDG → `~/.local/share`) is `loom_core::paths`, a
 suggested default the engine itself never consults (ADR-008). Exit
 codes: 0 success, non-zero failure, 130
@@ -762,9 +759,9 @@ Five adapters ship:
   response — HTTP 000, no payload, at both 45s and 120s client
   timeouts. A healthy catalog with hanging completions is an
   outage, not a config error. It caused every `model_error` in the
-  on-disk eval corpus (11 of 115 runs), so NIM is no longer the
-  zero-cost candidate; the eval's OpenRouter account is the live
-  path (roadmap item 1).
+  on-disk eval corpus (11 of 115 runs), so NIM was no longer the
+  zero-cost candidate; the eval's OpenRouter account was the live
+  path until the local suite was removed (2026-10-20; §11).
 - **Groq** — hosted inference (`api.groq.com/openai/v1`),
   OpenAI-compatible. Model ids are `publisher/model`. The built-in
   capability table covers the three agentic deployments live on the
@@ -822,7 +819,11 @@ OpenAI shape — no dialect fields — and OpenRouter-format conventions
 that cost nothing to honor are honored: `usage.cost` surfaces as
 provider-reported cost, and a `finish_reason` of `error` maps to a
 retryable server failure. `CUSTOM_API_KEY` or `loom auth login custom`
-supplies the key.
+supplies the key. The pi agent's nano-llm gateway is the reference
+case — no dedicated adapter: point `--base-url` at its `/v1` root
+(the value pi keeps in `NANO_LLM_BASE_URL`), leave `--models-url` on
+the `{--base-url}/models` default, and store the key once with
+`loom auth login custom`.
 - **Anthropic** — the messages API, not the OpenAI wire: system as a
   top-level param, `tool_use`/`tool_result` content blocks,
   `thinking_delta` reasoning capture, and Anthropic's error taxonomy.
@@ -887,26 +888,35 @@ accounting in the loop.
 
 ## 11. Evaluation harness
 
-The eval suite (`docs/eval.md` is the protocol guide) has two halves.
+The eval suite (`docs/eval.md` is the protocol guide) measures Loom
+against **SWE-bench Verified** in container isolation. The in-house
+corpus, gates, replay proofs, editor bench, and live benchmarks were
+removed on 2026-10-20: they measured Loom against its own fix history
+rather than against the field, and nothing outside the repo consumed
+their numbers.
 
-- **Offline proofs**, run on every commit: recorded provider exchanges
-  replay through the real compiler and loop, asserting the replayed
-  transcript matches the recording verbatim, requests are byte-identical
-  across replays (the determinism contract), and zero events were
-  dropped. Corpus invariants are proven too: every seed fails exactly its
-  fail-to-pass set and passes exactly its pass-to-pass set, and the gate
-  rejects an untouched workspace.
-- **Live measurement**: N runs per task (default 5) against a real
-  provider. Field tasks (B2–B4, B6–B17, mined from Loom's own fix
-  history) are graded by outcome — SWE-bench-shaped gates of
-  `fail_to_pass`, `pass_to_pass`, and `protected` paths; lab tasks (B1,
-  B5) pin a system prompt as narrow regression instruments. Reports carry
-  per-run turns, census, est/billed tokens, cached input tokens, cost,
-  wall time, and tool-cache hit/miss, with aggregates per task and a
-  suite headline (gated pass rate). Strict mode asserts every gate green;
-  tolerant mode survives failures for baselines.
+- **Isolation**: the `swebench-run` orchestrator (`loom-eval`) runs
+  each instance in its official testbed docker image —
+  `sweb.eval.x86_64.<instance_id>`, the repository already checked out
+  at the issue's `base_commit` with the correct interpreter and
+  dependencies. A linux build of the `loom` CLI, the frozen prompt, and
+  an output dir are the only mounts; the host never touches a
+  checkout, the agent never touches the host.
+- **The run**: inside the container `loom run --json --no-save` works
+  the `/testbed` tree with full tool access under the usual sandbox;
+  the patch is extracted in-container (`git add -A` +
+  `git diff --cached`) even when the run fails, so partial work is
+  scored honestly.
+- **Grading**: Loom emits the official predictions JSONL and hands it
+  to `swebench eval verified` — the `resolved` verdict comes only from
+  the official harness, so no local gate can be tuned to flatter the
+  number. The sweep headline is the resolved rate; per-run reports
+  (turns, tokens, cost, exit codes, patch sizes) land in
+  `target/eval/swebench/` for context.
 
-Compare suites by medians over N ≥ 5; the observed noise floor is ±10%.
+The dataset (500 instances) is fetched once from HuggingFace and
+cached with a row-count integrity check; explicit instance ids must
+resolve or the sweep aborts — selection never shrinks silently.
 
 ---
 
@@ -943,6 +953,6 @@ Compare suites by medians over N ≥ 5; the observed noise floor is ±10%.
 **Testing** — the workspace carries 694 tests (13 live-API tests
 ignored by default): unit tests per module,
 protocol and invariant tests against in-memory seams, security regression
-tests for confinement, canary tests for secrets, integration tests that
-run real `git`/`cargo`, the replay eval, and corpus-invariant proofs. CI bar: all tests green,
+tests for confinement, canary tests for secrets, and integration tests
+that run real `git`/`cargo`. CI bar: all tests green,
 clippy clean, `cargo fmt --check` clean.

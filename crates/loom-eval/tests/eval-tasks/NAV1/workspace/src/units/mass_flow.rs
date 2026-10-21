@@ -1,9 +1,0 @@
-//! mass_flow: conversions to base units.
-
-/// How many base units one grams_per_second_per_kilogram_per_second holds.
-pub const GRAMS_PER_SECOND_PER_KILOGRAM_PER_SECOND: f64 = 1000.0;
-
-/// Converts a value measured in the prefixed unit to base units.
-pub fn to_base(value: f64) -> f64 {
-    value * GRAMS_PER_SECOND_PER_KILOGRAM_PER_SECOND
-}
