@@ -60,6 +60,7 @@ pub(crate) const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
 pub(crate) fn build_client(timeouts: &TimeoutConfig) -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .connect_timeout(timeouts.connect)
+        .user_agent(concat!("loom/", env!("CARGO_PKG_VERSION")))
         .build()
 }
 
