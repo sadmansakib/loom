@@ -35,6 +35,19 @@ changes close the gaps found:
   to 128K on their id-only model listing), sends the thinking-mode
   contract fields, and classifies 402/429 precisely.
 
+- **Second measurement (2026-10-22, 25 instances — 5 each from astropy,
+  django, sympy, scikit-learn, sphinx — deepseek-flash via
+  `--provider deepseek`, prompt v2, max-turns 100, jobs 2): 23/25
+  resolved (92%), 0 infrastructure failures, 0 empty patches, 0
+  timeouts.** Misses: sphinx-10614 (under-sized patch) and
+  sympy-11618. The cache accounting over the same sweep: 929 model
+  requests, 31.8M prompt tokens, 30.8M served from cache (96.9% hit
+  rate), 419K output — total API cost under $1, ~2.5h wall clock.
+  Artifacts: `swebench-sweep-deepseek-flash.json` (per-run usage) and
+  the scorer's `deepseek-flash.loom-deepseek-flash-1.json` report.
+  Not comparable to the 3/5 nano-gateway number: different model,
+  different provider budget (1M window, no rate-limit retries burned).
+
 ## 2026-10-21 — Evaluation: SWE-bench Verified in container isolation; local eval removed
 
 Loom now measures against **SWE-bench Verified** (the 500-instance
