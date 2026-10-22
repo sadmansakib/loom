@@ -252,8 +252,11 @@ fn ensure_image(
         return true;
     }
     println!("pulling {remote} (prebuilt testbed)…");
+    // The prebuilts are x86_64-only; without an explicit platform a
+    // docker pull on arm64 hosts (Apple Silicon) requests arm64 and
+    // fails with "no matching manifest".
     let status = Command::new("docker")
-        .args(["pull", &remote])
+        .args(["pull", "--platform", "linux/amd64", &remote])
         .status()
         .unwrap_or_else(|error| panic!("spawning docker pull for {remote}: {error}"));
     if !status.success() {
