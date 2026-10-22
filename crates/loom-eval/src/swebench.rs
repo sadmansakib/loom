@@ -243,19 +243,33 @@ pub fn select_instances<'a>(
 /// invalidates every baseline recorded against it. (v2, 2026-10-21:
 /// added the iterate-early, run-existing-tests, and scratch-cleanup
 /// directives after the first 5-instance sweep; v1 baseline = 3/5
-/// resolved on astropy.)
+/// resolved on astropy. v3, 2026-10-22: added the reproduce-and-verify
+/// and scope-minimality directives after the 25-instance deepseek-flash
+/// sweep diagnosed two process misses; v2 baseline = 23/25. Both v3
+/// rules mirror the field-standard prompts — SWE-agent's
+/// always-replicate-first tip and the standard harness's
+/// minimal-changes-to-non-tests step.)
 pub fn build_prompt(instance: &SweInstance) -> String {
     let mut prompt = format!(
         "You are an autonomous software engineer fixing a real issue in a GitHub repository.\n\n\
          Repository: {repo}\n\
          The repository is checked out at the issue's base commit in your working \
-         directory. You have file tools and a shell: explore the code, reproduce the \
-         issue if that helps, and edit the source to fix it.\n\n\
+         directory. You have file tools and a shell: explore the code and edit the \
+         source to fix it.\n\n\
          Rules:\n\
          - Fix the root cause in the source; do not paper over the symptom.\n\
+         - Fix exactly the reported defect: no new restrictions, errors on \
+         previously working inputs, API changes, or renames unless the issue \
+         explicitly asks for them. Behavior the issue does not mention must \
+         keep working.\n\
          - Once you have a workable hypothesis, start editing and iterate from \
          there; do not keep exploring toward certainty — you cannot verify the \
          fix by reading alone.\n\
+         - Reproduce the reported behavior with a minimal script — the issue's \
+         own example when it has one — that fails (nonzero exit) while the bug \
+         is present; after the fix, run it again and confirm it passes and that \
+         the behavior matches what the issue says is correct, including any \
+         exact expected values it states.\n\
          - Before finishing, run the repository's existing tests that cover the \
          files you changed, and make sure they still pass.\n\
          - Delete any scratch or reproduction scripts you created along the way; \
@@ -719,6 +733,10 @@ fn prompt_carries_the_problem_and_the_tree_contract() {
     assert!(prompt.contains("existing tests that cover the"));
     assert!(prompt.contains("Delete any scratch or reproduction scripts"));
     assert!(prompt.contains("and finish — do not wait for further input"));
+    // v3 directives: scope minimality, reproduce-and-verify.
+    assert!(prompt.contains("no new restrictions"));
+    assert!(prompt.contains("that fails (nonzero exit) while the bug"));
+    assert!(prompt.contains("including any exact expected values it states"));
     // No hints in the fixture → no hints block.
     assert!(!prompt.contains("<hints>"));
 

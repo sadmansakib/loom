@@ -27,7 +27,12 @@ the container and reads the results back. Nothing touches the host's
 checkouts, python, or git state — a run cannot impact the machine it
 runs on, and every run starts from the image's pristine `/testbed`.
 
-The prompt is the frozen SWE-bench template: repository name,
+The prompt is the frozen SWE-bench template (v3): repository name,
+root-cause and scope-minimality rules (fix exactly the reported
+defect; no new restrictions the issue didn't ask for), a
+reproduce-and-verify rule (minimal repro script — the issue's own
+example when it has one — failing nonzero before the fix, rerun and
+checked against the issue's stated expected values after), the
 working-tree contract (no commits, no touching `.git`), the verbatim
 `problem_statement`, optional `hints_text`, and a request for a change
 summary. The gold patch is never shown to the agent.

@@ -47,6 +47,36 @@ changes close the gaps found:
   the scorer's `deepseek-flash.loom-deepseek-flash-1.json` report.
   Not comparable to the 3/5 nano-gateway number: different model,
   different provider budget (1M window, no rate-limit retries burned).
+- Prompt v3 after diagnosing both v2 misses as process failures: a
+  **reproduce-and-verify rule** (minimal repro script — the issue's own
+  example when it has one — that fails with a nonzero exit while the
+  bug is present, rerun after the fix and checked against the issue's
+  stated expected values) and a **scope-minimality rule** (no new
+  restrictions, errors on previously working inputs, API changes, or
+  renames unless the issue asks; unmentioned behavior must keep
+  working). Root causes: sympy-11618 had the agent forbid what the
+  issue asked to fix (its own `ValueError` failing a test whose
+  `sqrt(5)` expectation was in the prompt verbatim), and sphinx-10614
+  had it reinvent the fix as path normalization, leaving the
+  intersphinx external-reference path unexercised. Both rules mirror
+  the field-standard prompts (SWE-agent's always-replicate-first tip,
+  the standard harness's minimal-changes-to-non-tests step) and
+  MarsCode's measured reproduce-loop gap (38.1% vs 32.4% static,
+  arXiv 2409.00899). Prompt change ⇒ new baseline; the 23/25 v2
+  number is not comparable.
+- **Third measurement (2026-10-22, 50 instances — 10 each from astropy,
+  django, sympy, scikit-learn, sphinx — deepseek-flash, prompt v3,
+  max-turns 100, jobs 2): 47/50 resolved (94%), 0 infrastructure
+  failures, 0 empty patches.** The old-25 subset went 24/25: the
+  reproduce-and-verify rule flipped sympy-11618 (resolved), with zero
+  regressions among v2's 23; sphinx-10614 misses again — its
+  intersphinx hidden-scenario gap is the case a general rule cannot
+  force. New-25 subset: 23/25, missing astropy-13977 (hit the 100-turn
+  cap mid-exploration) and sphinx-11510. Cache accounting: 2,034 model
+  requests, 74.6M prompt tokens, 72.1M served from cache (96.7% hit
+  rate), 936K output — total API cost ~$1.2. Artifacts under
+  `target/eval-dsflash-v3/swebench/` (predictions, sweep JSON with
+  per-run usage, scorer report, harness logs).
 
 ## 2026-10-21 — Evaluation: SWE-bench Verified in container isolation; local eval removed
 
@@ -88,7 +118,10 @@ testbed containers, official grading.
   names) and retagged to the local tags — pulled images are
   scoring-ready with no separate alias step, pulls serialize across
   `--jobs` workers, and a failed pull skips its instance with the
-  manual build command instead of aborting the sweep. Local
+  manual build command instead of aborting the sweep. Pulls pin
+  `--platform linux/amd64` — the Hub prebuilts are x86_64-only, so a
+  bare pull on an arm64 host requests the wrong manifest and fails
+  (found on Apple Silicon mid-sweep). Local
   `swebench images build` becomes the offline fallback (`--no-pull`);
   building images up front was the OOM-prone step this removes.
 - First measurement (2026-10-21, 5 astropy instances, Laguna S 2.1
