@@ -123,26 +123,14 @@ fn project_messages(
         facts_tokens = estimate_serialized(estimator, &message);
         messages.push(message);
     }
-    // Tail projection rule (roadmap item 8 phase B): the todo list travels
-    // as kernel-appended user blocks at the transcript tail. Only the
-    // newest block is model-visible — earlier blocks are durable state
-    // (the pruning compiler's user elision may reclaim them) but the model
-    // always sees exactly one authoritative plan, per the loop's contract.
-    let last_todo = session
-        .transcript
-        .iter()
-        .rposition(|item| {
-            matches!(item, Item::User { text } if text.starts_with(crate::session::TODO_BLOCK_HEADER))
-        });
-    for (index, item) in session.transcript.iter().enumerate() {
+    // Todo blocks (roadmap item 8 phase B) project like any other user
+    // item: every block, in append order. Eliding superseded blocks
+    // would rewrite the prefix mid-task and forfeit provider cache hits
+    // on everything past the elision point (§8.1.1) — far more
+    // expensive than the few hundred mostly-cached tokens a stale
+    // block costs. The newest block stays authoritative by recency.
+    for item in &session.transcript {
         let message = match item {
-            Item::User { text } if text.starts_with(crate::session::TODO_BLOCK_HEADER) => {
-                if Some(index) == last_todo {
-                    Some(Message::User { text: text.clone() })
-                } else {
-                    None
-                }
-            }
             Item::User { text } => Some(Message::User { text: text.clone() }),
             Item::Assistant(assistant) => {
                 if assistant.stop_reason == crate::model::StopReason::ContentFilter {
@@ -827,6 +815,51 @@ mod tests {
             .expect("within budget");
         assert_eq!(first.request.messages[0], second.request.messages[0]);
         assert_eq!(first.request.messages[1], second.request.messages[1]);
+    }
+
+    #[test]
+    fn todo_blocks_project_append_only() {
+        // §8.1.1: eliding a superseded todo block would rewrite the
+        // prefix mid-task and forfeit provider cache hits on the whole
+        // tail. Every block projects, so an update only ever appends.
+        let mut s = session();
+        s.push_item(Item::User { text: TASK.into() }).unwrap();
+        s.push_item(Item::User {
+            text: format!("{}\n- [ ] one", crate::session::TODO_BLOCK_HEADER),
+        })
+        .unwrap();
+        s.append_turn(assistant("working", StopReason::ToolCalls), vec![])
+            .unwrap();
+        let before = compile(&s, &registry(), budget()).expect("within budget");
+        let todo_count = |compiled: &CompiledContext| {
+            compiled
+                .request
+                .messages
+                .iter()
+                .filter(|message| {
+                    matches!(message,
+                        Message::User { text }
+                            if text.starts_with(crate::session::TODO_BLOCK_HEADER))
+                })
+                .count()
+        };
+        assert_eq!(todo_count(&before), 1);
+
+        // A second, updated block lands later in the transcript; both
+        // project, and the earlier projection is a strict prefix.
+        s.push_item(Item::User {
+            text: format!(
+                "{}\n- [x] one\n- [ ] two",
+                crate::session::TODO_BLOCK_HEADER
+            ),
+        })
+        .unwrap();
+        let after = compile(&s, &registry(), budget()).expect("within budget");
+        assert_eq!(todo_count(&after), 2);
+        assert_eq!(
+            &after.request.messages[..before.request.messages.len()],
+            &before.request.messages[..]
+        );
     }
 
     #[test]

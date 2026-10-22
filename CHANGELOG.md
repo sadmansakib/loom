@@ -3,6 +3,38 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-22 — Provider cache hits: append-only todo projection, cache-usage reporting
+
+Audited the request path against DeepSeek's disk context cache (the
+cost lever on long agentic sweeps: their own agent rides full-prefix
+hits of request N on request N+1). The kernel's §8.1.1 prefix
+invariants were already cache-ideal — static system prompt, append-only
+history, deterministic tool order, no silent compaction — and DeepSeek
+caching needs zero client work (no `cache_control` equivalents). Three
+changes close the gaps found:
+
+- **Todo blocks now project append-only.** Projection previously kept
+  only the newest `## todo (kernel)` block, eliding superseded ones
+  mid-history — every todo update rewrote the prefix at the elision
+  point and forfeited provider cache hits from there to the tail.
+  Superseded blocks now project like any other user item; the newest
+  stays authoritative by recency. Every earlier request is a
+  byte-identical prefix of every later one, unconditionally.
+- **`--provider custom` parses `prompt_cache_hit_tokens`.** DeepSeek-
+  family gateways report cache splits as a flat usage key; the adapter
+  now lifts it into `cached_input_tokens` (OpenAI's nested
+  `prompt_tokens_details.cached_tokens` stays the wire fallback), so
+  hit rates are visible for any dialect that reports them.
+- **Sweeps report cache economics.** `run_usage()` sums
+  `model_completed` usage from each run's event stream into a
+  `RunUsage` (input/cached/output tokens, request count, hit rate);
+  sweep report rows carry it as `usage` and the sweep prints a closing
+  cache summary line. Provider choice note: prefer
+  `--provider deepseek` over `--provider custom` for DeepSeek proper —
+  the dedicated adapter knows the 1M-token window (custom falls back
+  to 128K on their id-only model listing), sends the thinking-mode
+  contract fields, and classifies 402/429 precisely.
+
 ## 2026-10-21 — Evaluation: SWE-bench Verified in container isolation; local eval removed
 
 Loom now measures against **SWE-bench Verified** (the 500-instance
@@ -38,6 +70,14 @@ testbed containers, official grading.
   static musl build inside docker (`rust:1`, `x86_64-unknown-linux-musl`
   — testbeds' older glibc rejects gnu-linked binaries); no host
   toolchain changes.
+- Missing testbed images are pulled automatically from the swebench
+  Docker Hub prebuilts (the scorer's own dunder-rewritten lookup
+  names) and retagged to the local tags — pulled images are
+  scoring-ready with no separate alias step, pulls serialize across
+  `--jobs` workers, and a failed pull skips its instance with the
+  manual build command instead of aborting the sweep. Local
+  `swebench images build` becomes the offline fallback (`--no-pull`);
+  building images up front was the OOM-prone step this removes.
 - First measurement (2026-10-21, 5 astropy instances, Laguna S 2.1
   via the nano gateway): **3/5 resolved, 0 infra failures**. The two
   misses drove prompt v2 + a turn-budget bump (`--max-turns` default

@@ -2370,12 +2370,13 @@ async fn record_fast_path_books_a_zero_request_completion() {
 /// loop — the tail projection rule.
 ///
 /// The current list is re-appended as a user item at the transcript tail
-/// only when a turn's tool batch changed it, so:
+/// only when a turn's tool batch changed it, and projection keeps every
+/// appended block in place (append-only), so:
 ///
 /// * the request compiled right after a change ends with the fresh block;
 /// * every earlier request is a byte-identical *prefix* of every later
-///   one (the append-only transcript keeps the provider prefix cache
-///   valid);
+///   one (eliding superseded blocks would rewrite that prefix mid-task
+///   and forfeit provider cache hits past the elision point);
 /// * a quiet turn — a batch that did not touch the list — appends
 ///   nothing and still extends the projection by pure prefix growth.
 #[tokio::test]
@@ -2483,63 +2484,43 @@ async fn todo_list_re_appends_at_the_tail_only_when_changed() {
         Some(Message::User { text }) if text.starts_with("## todo (kernel)")
     ));
 
-    // Turn 3's compile, after the mark: the new block at the tail, and
-    // the entire previous request is a byte-identical prefix.
+    // Turn 3's compile, after the mark: the fresh block at the tail with
+    // the superseded block still in place, and the entire previous
+    // request a byte-identical prefix.
     let second_block = todo_blocks(&requests[2]);
     assert_eq!(
         second_block,
-        vec!["## todo (kernel)\n- [x] 1: step one\n- [ ] 2: step two".to_owned()]
+        vec![
+            "## todo (kernel)\n- [ ] 1: step one\n- [ ] 2: step two".to_owned(),
+            "## todo (kernel)\n- [x] 1: step one\n- [ ] 2: step two".to_owned(),
+        ],
+        "every appended block projects; the newest lands at the tail"
     );
-    let is_todo_block = |message: &Message| matches!(message, Message::User { text } if text.starts_with("## todo (kernel)"));
-    let projected: Vec<_> = requests[1]
-        .messages
-        .iter()
-        .filter(|message| !is_todo_block(message))
-        .collect();
-    let extension: Vec<_> = requests[2]
-        .messages
-        .iter()
-        .filter(|message| !is_todo_block(message))
-        .collect();
-    assert_eq!(projected, extension[..projected.len()]);
     assert_eq!(
-        extension.len() - projected.len(),
-        2,
-        "a changed list adds its assistant turn and its tool result"
+        requests[1].messages,
+        requests[2].messages[..requests[1].messages.len()],
+        "append-only projection keeps the earlier request a byte-identical prefix"
     );
-    assert!(
-        requests[2].messages.iter().all(|message| {
-            !matches!(message, Message::User { text } if text.starts_with("## todo (kernel)"))
-                || *message == *requests[2].messages.last().unwrap()
-        }),
-        "only the newest todo block is projected (tail projection rule)"
+    assert_eq!(
+        requests[2].messages.len() - requests[1].messages.len(),
+        3,
+        "a changed list adds its assistant turn, its tool result, and the fresh block"
     );
 
     // Turn 4's compile, after the quiet echo turn: no new block, and the
-    // previous request is again a pure prefix extension (modulo the
-    // tail-projected todo block, which may shift as history elides).
+    // previous request is again a pure prefix extension.
     assert_eq!(
         todo_blocks(&requests[3]),
         second_block,
         "an unchanged list is not re-appended"
     );
-    let projected_3: Vec<_> = requests[2]
-        .messages
-        .iter()
-        .filter(|message| !is_todo_block(message))
-        .collect();
-    let extension_3: Vec<_> = requests[3]
-        .messages
-        .iter()
-        .filter(|message| !is_todo_block(message))
-        .collect();
     assert_eq!(
-        projected_3,
-        extension_3[..projected_3.len()],
+        requests[2].messages,
+        requests[3].messages[..requests[2].messages.len()],
         "a quiet turn grows the projection by prefix only"
     );
     assert_eq!(
-        extension_3.len() - projected_3.len(),
+        requests[3].messages.len() - requests[2].messages.len(),
         2,
         "the quiet turn adds its assistant turn and its tool result"
     );

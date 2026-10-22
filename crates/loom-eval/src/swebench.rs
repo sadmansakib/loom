@@ -466,6 +466,79 @@ pub fn run_outcome(run_json: &Path) -> (usize, Option<String>) {
     (events, failure)
 }
 
+/// Token totals reduced from a run's JSONL event stream: summed over
+/// every `model_completed` event's usage block. `cached_input_tokens`
+/// stays `None` until some event reports a cache split, so a provider
+/// that never reports one is visibly unmeasured rather than reading as
+/// a misleading 0% hit rate.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RunUsage {
+    /// Summed prompt tokens across model requests.
+    pub input_tokens: u64,
+    /// Summed cache-hit share of the prompt, once any request
+    /// reported it.
+    pub cached_input_tokens: Option<u64>,
+    /// Summed completion tokens.
+    pub output_tokens: u64,
+    /// Number of model requests that carried a usage block.
+    pub model_requests: u64,
+}
+
+impl RunUsage {
+    /// Folds one `model_completed` usage object into the totals.
+    fn observe(&mut self, usage: &serde_json::Value) {
+        self.model_requests += 1;
+        self.input_tokens += usage["input_tokens"].as_u64().unwrap_or(0);
+        self.output_tokens += usage["output_tokens"].as_u64().unwrap_or(0);
+        let cached = usage["cached_input_tokens"].as_u64();
+        self.cached_input_tokens = match (self.cached_input_tokens, cached) {
+            (Some(accumulated), Some(cached)) => Some(accumulated + cached),
+            (None, Some(cached)) => Some(cached),
+            (accumulated, None) => accumulated,
+        };
+    }
+
+    /// Merge another run's totals into these (sweep-level roll-up).
+    pub fn merge(&mut self, other: RunUsage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.model_requests += other.model_requests;
+        self.cached_input_tokens = match (self.cached_input_tokens, other.cached_input_tokens) {
+            (Some(accumulated), Some(cached)) => Some(accumulated + cached),
+            (None, cached) => cached,
+            (accumulated, None) => accumulated,
+        };
+    }
+
+    /// Cache-hit share of input tokens, when this run reported any
+    /// split at all.
+    #[must_use]
+    pub fn hit_rate(&self) -> Option<f64> {
+        self.cached_input_tokens
+            .filter(|_| self.input_tokens > 0)
+            .map(|cached| cached as f64 / self.input_tokens as f64)
+    }
+}
+
+/// Reads a run's JSONL event stream and sums every model response's
+/// usage into [`RunUsage`] (the per-request split providers report on
+/// the authoritative `model_completed` event).
+pub fn run_usage(run_json: &Path) -> RunUsage {
+    let mut totals = RunUsage::default();
+    let Ok(body) = std::fs::read_to_string(run_json) else {
+        return totals;
+    };
+    for line in body.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value["kind"]["type"] == "model_completed" {
+            totals.observe(&value["kind"]["response"]["usage"]);
+        }
+    }
+    totals
+}
+
 /// A predictions row in the official harness's JSONL shape.
 #[derive(Serialize)]
 pub struct Prediction<'a> {
@@ -794,6 +867,54 @@ fn run_outcome_reads_the_event_stream() {
     // Malformed trailing junk must not sink the scan.
     std::fs::write(&path, "not json\n").unwrap();
     assert_eq!(run_outcome(&path), (0, None));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_usage_sums_model_completed_events() {
+    let dir = std::env::temp_dir().join(format!("loom-swe-usage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("run.json");
+
+    // Missing file: nothing observed.
+    assert_eq!(run_usage(&path), RunUsage::default());
+
+    // Two completed requests, one reporting a cache split, plus noise
+    // events that must not contribute.
+    std::fs::write(
+        &path,
+        "{\"schema_version\":10,\"sequence\":0,\"kind\":{\"type\":\"task_started\"}}\n\
+         {\"schema_version\":10,\"sequence\":1,\"kind\":{\"type\":\"model_completed\",\"response\":{\"usage\":{\"input_tokens\":1000,\"output_tokens\":50,\"cached_input_tokens\":900}}}}\n\
+         {\"schema_version\":10,\"sequence\":2,\"kind\":{\"type\":\"tool_completed\"}}\n\
+         {\"schema_version\":10,\"sequence\":3,\"kind\":{\"type\":\"model_completed\",\"response\":{\"usage\":{\"input_tokens\":2000,\"output_tokens\":80}}}}\n",
+    )
+    .unwrap();
+    let totals = run_usage(&path);
+    assert_eq!(totals.model_requests, 2);
+    assert_eq!(totals.input_tokens, 3000);
+    assert_eq!(totals.output_tokens, 130);
+    assert_eq!(totals.cached_input_tokens, Some(900));
+    let rate = totals.hit_rate().expect("hit rate measured");
+    assert!((rate - 0.3).abs() < 1e-9, "{rate}");
+
+    // A provider that never reports a split stays None, not 0%.
+    std::fs::write(
+        &path,
+        "{\"schema_version\":10,\"sequence\":1,\"kind\":{\"type\":\"model_completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}}\n",
+    )
+    .unwrap();
+    let silent = run_usage(&path);
+    assert_eq!(silent.cached_input_tokens, None);
+    assert_eq!(silent.hit_rate(), None);
+
+    // Roll-up: merging keeps the split once any side measured one.
+    let mut sweep = RunUsage::default();
+    sweep.merge(totals);
+    sweep.merge(silent);
+    assert_eq!(sweep.input_tokens, 3010);
+    assert_eq!(sweep.cached_input_tokens, Some(900));
+    assert_eq!(sweep.model_requests, 3);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

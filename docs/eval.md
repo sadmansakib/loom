@@ -57,10 +57,12 @@ swebench eval verified -p target/eval/swebench/predictions-deepseek-flash-1.json
   --run-id loom-deepseek-flash-1 -j 4
 ```
 
-On arm64, build the per-instance testbed images up front with
-`swebench images build`; the harness finds the locally built tags and
-skips the x86_64 DockerHub prebuilts. A missing testbed image
-skips its instance with the exact build command printed:
+On any host, missing testbed images are **pulled automatically** from
+the swebench Docker Hub prebuilts (x86_64) under the scorer's own
+lookup names and retagged to the local tags — pulled images are
+scoring-ready with no extra step. Local builds are only the fallback
+(offline hosts, or `--no-pull`); building every image up front is the
+OOM-prone step this replaces:
 
 ```bash
 swebench images build SWE-bench/swe-bench-tasks --dataset verified -i Django__Django-16379
@@ -68,9 +70,9 @@ swebench images build SWE-bench/swe-bench-tasks --dataset verified -i Django__Dj
 
 The scorer looks images up under a rewritten name — Docker Hub forbids
 dunders, so `astropy__astropy-12907` becomes
-`swebench/sweb.eval.x86_64.astropy_1776_astropy-12907`. Alias the local
-tags once before scoring (the sweep prints the exact commands), or the
-harness pulls from Docker Hub and fails:
+`swebench/sweb.eval.x86_64.astropy_1776_astropy-12907`. Images built
+locally need a one-time alias before scoring (the sweep prints the
+exact commands); pulled images already carry the scorer's name:
 
 ```bash
 docker tag sweb.eval.x86_64.astropy__astropy-12907:latest \
@@ -94,6 +96,7 @@ swebench eval verified --gold -i sympy__sympy-20590 --run-id validate-gold
 | `--per-repo N` | — | instead of `--max`: first N instances of each `--repos` repo (stratified sampling) |
 | `--runs N` | 1 | independent runs per instance (fresh container each) |
 | `--jobs N` | 1 | instances in parallel (per-instance dirs and container names cannot collide) |
+| `--no-pull` | — | never pull missing testbed images; skip the instance with the local build command printed |
 | `--provider P` | `$LOOM_EVAL_PROVIDER` or `deepseek` | provider, resolved by the in-container CLI |
 | `--model M` | `$LOOM_EVAL_MODEL` or `deepseek-flash` | model id |
 | `--base-url URL` | `$LOOM_EVAL_BASE_URL` | chat API base URL for OpenAI-compatible gateways (`custom` provider, e.g. nano-llm); unset for vendors with default endpoints |
@@ -130,7 +133,15 @@ Every sweep writes under `<eval-dir>/swebench/`:
   format; the scorer keys by `instance_id`, so repeated runs write
   per-run files and never duplicate rows;
 - `swebench-sweep-<model>.json` — per-instance runs, exit codes, patch
-  sizes, and the predictions-file inventory.
+  sizes, token usage, and the predictions-file inventory. Each row's
+  `usage` carries `input_tokens`, `cached_input_tokens`,
+  `output_tokens`, `model_requests`, and `hit_rate` summed from the
+  run's `model_completed` events (the deepseek adapter parses
+  `prompt_cache_hit_tokens`; gateways that report no cache split leave
+  `cached_input_tokens`/`hit_rate` null). The sweep also prints a
+  one-line cache summary (`cache: N/M prompt tokens served from cache
+  (X%)`) — provider prefix caching is the cost lever on long agentic
+  sweeps, so the projection keeps history append-only to preserve it.
 
 An empty patch row is legitimate output (the agent changed nothing);
 the official scorer counts it unresolved. The `resolved` verdict comes

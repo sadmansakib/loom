@@ -476,21 +476,28 @@ impl WireEndpoint for CustomProvider {
     }
 
     /// Many gateways (LiteLLM and OpenRouter-format proxies alike)
-    /// echo the actual USD charge back in `usage.cost`; read it when
-    /// present so cost reporting survives the hop through a gateway.
+    /// echo the actual USD charge back in `usage.cost`, and upstream
+    /// DeepSeek-family models report cache hits as flat
+    /// `prompt_cache_hit_tokens` instead of the OpenAI-standard
+    /// nested `prompt_tokens_details.cached_tokens`. Read both so
+    /// cache-hit visibility and cost reporting survive the hop
+    /// through whatever gateway the user pointed at.
     fn dialect_usage(
         extra: &serde_json::Map<String, serde_json::Value>,
     ) -> crate::openai_wire::DialectUsage {
-        #[derive(serde::Deserialize)]
+        #[derive(serde::Deserialize, Default)]
         struct ReportedUsage {
             #[serde(default)]
             cost: Option<f64>,
+            #[serde(default)]
+            prompt_cache_hit_tokens: Option<u64>,
         }
         let parsed =
-            serde_json::from_value::<ReportedUsage>(serde_json::Value::Object(extra.clone())).ok();
+            serde_json::from_value::<ReportedUsage>(serde_json::Value::Object(extra.clone()))
+                .unwrap_or_default();
         crate::openai_wire::DialectUsage {
-            cached_input_tokens: None,
-            cost_usd: parsed.and_then(|usage| usage.cost),
+            cached_input_tokens: parsed.prompt_cache_hit_tokens,
+            cost_usd: parsed.cost,
         }
     }
 }
@@ -679,17 +686,24 @@ mod tests {
     }
 
     #[test]
-    fn dialect_reads_reported_cost() {
+    fn dialect_reads_reported_cost_and_cache_hits() {
         use crate::openai_wire::DialectUsage;
         let mut extra = serde_json::Map::new();
         extra.insert("cost".to_string(), serde_json::Value::from(0.000123));
+        extra.insert(
+            "prompt_cache_hit_tokens".to_string(),
+            serde_json::Value::from(4096u64),
+        );
         assert_eq!(
             <CustomProvider as WireEndpoint>::dialect_usage(&extra),
             DialectUsage {
-                cached_input_tokens: None,
+                cached_input_tokens: Some(4096),
                 cost_usd: Some(0.000123),
             }
         );
+        // Gateways that echo neither key stay at the defaults; the
+        // OpenAI-standard nested shape is read by the shared wire
+        // fallback in `finalize`, not here.
         assert_eq!(
             <CustomProvider as WireEndpoint>::dialect_usage(&Default::default()),
             DialectUsage::default()

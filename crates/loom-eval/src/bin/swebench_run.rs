@@ -4,10 +4,13 @@
 //! image; the patch is extracted inside the container (never on the
 //! host); the official scorer consumes the emitted predictions files.
 //!
-//! Host prerequisites: docker, and the per-instance testbed images
-//! (built on arm64 via `swebench images build SWE-bench/swe-bench-tasks --dataset verified`).
-//! `--build-loom` cross-builds the linux binary inside a docker rust
-//! image, so the host toolchain stays untouched.
+//! Host prerequisites: docker. Missing testbed images are pulled
+//! automatically from the swebench Docker Hub prebuilts — the same
+//! registry names the scorer itself looks up — and retagged to the
+//! local tag. Local builds (`swebench images build`) are only the
+//! offline fallback (`--no-pull`). `--build-loom` cross-builds the
+//! linux binary inside a docker rust image, so the host toolchain
+//! stays untouched.
 
 // A harness binary: panicking on a setup failure is the intended
 // behavior.
@@ -17,9 +20,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use loom_eval::swebench::{
-    self, ContainerSpec, EXPECTED_ROWS, Prediction, SweInstance, api_key_envs, build_prompt,
-    dataset_cache_path, docker_run_argv, fetch_dataset_verified, load_dataset_cached, run_outcome,
-    select_instances, testbed_image,
+    self, ContainerSpec, EXPECTED_ROWS, Prediction, RunUsage, SweInstance, api_key_envs,
+    build_prompt, dataset_cache_path, docker_run_argv, fetch_dataset_verified, load_dataset_cached,
+    run_outcome, run_usage, select_instances, testbed_image,
 };
 
 struct Args {
@@ -34,6 +37,7 @@ struct Args {
     base_url: Option<String>,
     loom_bin: Option<PathBuf>,
     build_loom: bool,
+    pull_images: bool,
     timeout_secs: u64,
     max_turns: usize,
     eval_dir: PathBuf,
@@ -66,6 +70,8 @@ fn usage() -> ! {
   --jobs <n>           instances to run in parallel (default 1; container
                        names and artifact dirs are per-instance, so parallel
                        runs cannot collide)
+  --no-pull            never pull missing testbed images; skip the instance
+                       with the local build command printed instead
   --provider <name>    provider for the in-container loom (default $LOOM_EVAL_PROVIDER or deepseek)
   --model <name>       model for the in-container loom (default $LOOM_EVAL_MODEL or deepseek-flash)
   --base-url <url>     chat API base URL for OpenAI-compatible gateways (custom provider);
@@ -98,6 +104,7 @@ fn parse_args() -> Args {
         base_url: std::env::var("LOOM_EVAL_BASE_URL").ok(),
         loom_bin: None,
         build_loom: false,
+        pull_images: true,
         timeout_secs: 3600,
         // v2 (2026-10-21): 60 starved one astropy run into a pure
         // exploration loop with no edit; 100 gives iterating room while
@@ -122,6 +129,7 @@ fn parse_args() -> Args {
             "--base-url" => args.base_url = Some(value()),
             "--loom-bin" => args.loom_bin = Some(PathBuf::from(value())),
             "--build-loom" => args.build_loom = true,
+            "--no-pull" => args.pull_images = false,
             "--timeout-secs" => args.timeout_secs = value().parse().unwrap_or_else(|_| usage()),
             "--max-turns" => args.max_turns = value().parse().unwrap_or_else(|_| usage()),
             "--eval-dir" => args.eval_dir = PathBuf::from(value()),
@@ -214,6 +222,54 @@ fn image_exists(image: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Makes sure the local testbed tag exists. Missing images are pulled
+/// from the swebench Docker Hub prebuilts under the scorer's own
+/// lookup name (`swebench/sweb.eval.x86_64.<id, __→_1776_>`) and
+/// retagged to the local name — pulled images are scoring-ready as a
+/// side effect, no separate alias step. Pulls serialize on the lock so
+/// parallel jobs share bandwidth instead of hammering the registry;
+/// a failed pull skips the instance (with the manual build command)
+/// rather than aborting the sweep.
+fn ensure_image(
+    instance_id: &str,
+    image: &str,
+    pull: bool,
+    pull_lock: &std::sync::Mutex<()>,
+) -> bool {
+    if image_exists(image) {
+        return true;
+    }
+    if !pull {
+        eprintln!(
+            "SKIP {instance_id} — image missing; build it with: swebench images build SWE-bench/swe-bench-tasks --dataset verified -i {instance_id}"
+        );
+        return false;
+    }
+    let remote = swebench::scored_image(instance_id);
+    let _guard = pull_lock.lock().unwrap();
+    // A parallel worker may have pulled it while we waited.
+    if image_exists(image) {
+        return true;
+    }
+    println!("pulling {remote} (prebuilt testbed)…");
+    let status = Command::new("docker")
+        .args(["pull", &remote])
+        .status()
+        .unwrap_or_else(|error| panic!("spawning docker pull for {remote}: {error}"));
+    if !status.success() {
+        eprintln!(
+            "SKIP {instance_id} — pull {remote} failed; build locally with: swebench images build SWE-bench/swe-bench-tasks --dataset verified -i {instance_id}"
+        );
+        return false;
+    }
+    let status = Command::new("docker")
+        .args(["tag", &remote, image])
+        .status()
+        .unwrap_or_else(|error| panic!("spawning docker tag for {remote}: {error}"));
+    assert!(status.success(), "tagging {remote} as {image} failed");
+    true
+}
+
 fn main() {
     let args = parse_args();
     let base = args.eval_dir.join("swebench");
@@ -299,20 +355,23 @@ fn main() {
     let mut report: Vec<serde_json::Value> = Vec::new();
     let mut prediction_paths: Vec<PathBuf> = Vec::new();
 
-    // One instance's contribution: the report row plus per-run owned
-    // prediction rows (instance_id, model, patch).
-    type InstanceOutcome = Option<(serde_json::Value, Vec<Vec<(String, String, String)>>)>;
+    // One instance's contribution: the report row, per-run owned
+    // prediction rows (instance_id, model, patch), and the instance's
+    // rolled-up token usage for the sweep-level cache summary.
+    type InstanceOutcome = Option<(
+        serde_json::Value,
+        Vec<Vec<(String, String, String)>>,
+        RunUsage,
+    )>;
+    // Pulls serialize across workers; runs stay as parallel as --jobs.
+    let pull_lock = std::sync::Mutex::new(());
     let run_instance = |instance: &SweInstance| -> InstanceOutcome {
         let slug = swebench::slug(&instance.instance_id);
         let image = testbed_image(&instance.instance_id);
         let instance_dir = base.join("instances").join(&slug);
         std::fs::create_dir_all(&instance_dir).unwrap();
 
-        if !image_exists(&image) {
-            eprintln!(
-                "SKIP {} — image missing; build it with: swebench images build SWE-bench/swe-bench-tasks --dataset verified -i {}",
-                instance.instance_id, instance.instance_id
-            );
+        if !ensure_image(&instance.instance_id, &image, args.pull_images, &pull_lock) {
             return None;
         }
 
@@ -324,6 +383,7 @@ fn main() {
 
         let mut runs = Vec::new();
         let mut per_run: Vec<Vec<(String, String, String)>> = vec![Vec::new(); args.runs];
+        let mut usage_total = RunUsage::default();
         for run in 1..=args.runs {
             let out_dir = instance_dir.join(format!("run-{run}"));
             std::fs::create_dir_all(&out_dir).unwrap();
@@ -382,6 +442,8 @@ fn main() {
                 std::thread::sleep(std::time::Duration::from_secs(RATE_LIMIT_COOLDOWN_SECS));
             }
             let (events, task_failed) = outcome;
+            let usage = run_usage(&out_dir.join("run.json"));
+            usage_total.merge(usage);
             let row = serde_json::json!({
                 "run": run,
                 "container": container_name,
@@ -390,6 +452,13 @@ fn main() {
                 "patch_empty": patch.trim().is_empty(),
                 "events": events,
                 "task_failed": task_failed,
+                "usage": {
+                    "input_tokens": usage.input_tokens,
+                    "cached_input_tokens": usage.cached_input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "model_requests": usage.model_requests,
+                    "hit_rate": usage.hit_rate(),
+                },
             });
             println!(
                 "run {slug} #{run}: exit {exit_code}, patch {} bytes",
@@ -408,6 +477,7 @@ fn main() {
                 "runs": runs,
             }),
             per_run,
+            usage_total,
         ))
     };
 
@@ -433,8 +503,10 @@ fn main() {
         }
     });
     let outcomes = results.into_inner().unwrap();
-    for (row, per_run) in outcomes.into_iter().flatten() {
+    let mut sweep_usage = RunUsage::default();
+    for (row, per_run, instance_usage) in outcomes.into_iter().flatten() {
         report.push(row);
+        sweep_usage.merge(instance_usage);
         for (run_index, rows) in per_run.into_iter().enumerate() {
             predictions[run_index].extend(rows);
         }
@@ -473,13 +545,32 @@ fn main() {
     std::fs::write(&sweep_path, serde_json::to_string_pretty(&sweep).unwrap()).unwrap();
     println!("sweep report: {}", sweep_path.display());
 
+    // Cache observability: the whole point of the frozen prompt and
+    // append-only projection is provider prefix-cache hits; report the
+    // measured rate so regressions are visible per sweep.
+    if sweep_usage.model_requests > 0 {
+        match sweep_usage.hit_rate() {
+            Some(rate) => eprintln!(
+                "cache: {}/{} prompt tokens served from cache ({:.1}%) across {} model requests",
+                sweep_usage.cached_input_tokens.unwrap_or_default(),
+                sweep_usage.input_tokens,
+                rate * 100.0,
+                sweep_usage.model_requests
+            ),
+            None => eprintln!(
+                "cache: provider reported no cache split ({} prompt tokens across {} model requests)",
+                sweep_usage.input_tokens, sweep_usage.model_requests
+            ),
+        }
+    }
+
     if prediction_paths.is_empty() {
         eprintln!("no runs completed — nothing to score");
         std::process::exit(1);
     }
     eprintln!("\nnext: score each predictions file with the official harness —");
-    eprintln!("one-time: alias local testbed images to the scorer's names (it");
-    eprintln!("pulls from Docker Hub otherwise):");
+    eprintln!("if any images were built locally (not pulled), alias them to");
+    eprintln!("the scorer's names first (idempotent for pulled images):");
     for instance in &selected {
         eprintln!(
             "  docker tag {} {}",
