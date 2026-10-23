@@ -268,7 +268,15 @@ lessons (item 20.4) reuse the same seam.
 ### Iteration 6 — MCP & LSP integration
 
 MCP servers attach through the existing `Tool` trait; nothing MCP-specific
-leaks into the loop. LSP supplies definition, references, symbols,
+leaks into the loop. The MCP design is researched and pinned in
+[`docs/mcp-design.md`](mcp-design.md): stdio-only transport, manifest
+allowlist with hash-pinned tool definitions (rug-pull defense), ingestion
+hygiene for untrusted descriptions, and every MCP tool deferred behind a
+search/load meta-tool pair with idle offboarding (the ~30-tool threshold
+noted under "Measured out" is crossed by construction the moment a real
+server attaches — one GitHub server is 35 tools). Phased D1 protocol +
+hygiene → D2 deferred surface → D3 measurement. LSP supplies definition,
+references, symbols,
 diagnostics, rename, type information — justified only by fewer
 exploratory model turns. Tree-sitter symbol tools (item 18) came first
 and shipped 2026-10-23 — opt-in via `--symbols`.

@@ -3,6 +3,25 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-23 — MCP deep research + design pinned (slice D)
+
+- Deep research pass over token-efficiency and security literature for
+  the MCP slice; findings and full citations in `docs/mcp-design.md`.
+- Token side: five-server setups measured at ~55K tokens of tool
+  definitions before work starts (134K observed by Anthropic); deferred
+  search-loading (Anthropic Tool Search Tool, RAG-MCP arXiv 2505.03275)
+  cuts tool tokens ~85% and *raises* selection accuracy.
+- Security side: MCPLIB's 31 attacks, MCPSecBench's 17 (protocol-side
+  100% ASR), tool poisoning / rug pulls / shadowing (Invariant Labs;
+  5.5% of sampled servers poisoned), parasitic toolchain root cause =
+  missing context-tool isolation + least privilege.
+- Design pinned: stdio-only, manifest allowlist + lockfile hash pinning,
+  ingestion hygiene on untrusted descriptions, all-deferred tool surface
+  via `mcp_search_tools`/`mcp_load_tools` with idle offboarding, per-
+  server budgets, no sampling/elicitation. Roadmap iteration 6 links it.
+- No behavior change yet; implementation phased D1→D2→D3 with a $0
+  measurement probe before "done".
+
 ## 2026-10-23 — Release hygiene + first daily-driver probe (3/3, $0)
 
 - README flipped from "not usable yet" to an honest early-release state:
