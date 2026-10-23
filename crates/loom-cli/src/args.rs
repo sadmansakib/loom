@@ -143,6 +143,13 @@ pub struct RunArgs {
     /// registry. Off by default.
     #[arg(long)]
     pub skills: bool,
+
+    /// Enable MCP servers (iteration 6): servers declared in
+    /// `.loom/mcp.toml` attach over stdio with ingestion hygiene and
+    /// definition pinning into `.loom/mcp.lock` (docs/mcp-design.md).
+    /// Off by default.
+    #[arg(long)]
+    pub mcp: bool,
 }
 
 /// Arguments for `loom auth`.

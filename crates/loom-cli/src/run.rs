@@ -182,6 +182,15 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         }
         false
     };
+    // Slice D (iteration 6): MCP servers. Same gate, same bare-arm rule.
+    let mcp = if args.mcp && !bare_arm {
+        true
+    } else {
+        if args.mcp {
+            eprintln!("note: --mcp is ignored in the bare-loop arm");
+        }
+        false
+    };
     // Structured git tools (iteration 4): same gate, same bare-arm rule.
     let git = if args.git && !bare_arm {
         true
@@ -233,6 +242,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             symbols,
             git,
             skills,
+            mcp,
             budgets,
             prune: Some(prune),
         },

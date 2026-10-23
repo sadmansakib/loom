@@ -111,6 +111,14 @@ pub struct EngineConfig {
     /// `load_skill` serves bodies on demand. The bare-loop baseline
     /// never carries it.
     pub skills: bool,
+    /// MCP servers (iteration 6, slice D): when false (the default) no
+    /// manifest is read, no server spawns, and the registry is
+    /// byte-identical. When set, servers declared in
+    /// `.loom/mcp.toml` attach over stdio (spawn, handshake,
+    /// `tools/list`) with ingestion hygiene and SHA-256 pinning into
+    /// `.loom/mcp.lock` (docs/mcp-design.md). The bare-loop baseline
+    /// never carries them.
+    pub mcp: bool,
     /// Per-tool output budgets (roadmap item 20.2): the one struct a
     /// sweep varies instead of editing constants and rebuilding.
     /// [`ToolBudgets::default`] reproduces today's byte-exact behavior —
@@ -146,6 +154,7 @@ pub(crate) fn test_config() -> EngineConfig {
         symbols: false,
         git: false,
         skills: false,
+        mcp: false,
         budgets: ToolBudgets::default(),
         prune: None,
     }
@@ -300,6 +309,17 @@ impl Engine {
         config: EngineConfig,
         overrides: EngineOverrides,
     ) -> Result<Self, EngineError> {
+        Self::open_with_extra_tools(config, overrides, Vec::new())
+    }
+
+    /// [`Engine::open_with`] plus externally attached tools (MCP, D1).
+    /// Registered after every built-in opt-in surface; same failure
+    /// semantics as any other registration.
+    fn open_with_extra_tools(
+        config: EngineConfig,
+        overrides: EngineOverrides,
+        extra_tools: Vec<Box<dyn loom_kernel::tool::Tool>>,
+    ) -> Result<Self, EngineError> {
         let workspace =
             std::fs::canonicalize(&config.workspace).map_err(|source| EngineError::Workspace {
                 path: config.workspace.clone(),
@@ -448,6 +468,23 @@ impl Engine {
                 ))
                 .map_err(|error| EngineError::RegisterTool {
                     tool: "load_skill",
+                    message: error.to_string(),
+                })?;
+        }
+        // Slice D (iteration 6): MCP servers over stdio. Opt-in via
+        // `EngineConfig::mcp`; the bare-loop arm never carries them.
+        // Attach is eager in D1 and happens in the async open path
+        // (`open_async_with`): spawning a server and handshaking is
+        // async I/O, so this sync constructor receives the already-
+        // attached, hygiene-checked, hash-pinned tool set. Attach never
+        // fails the engine open — a bad manifest, lockfile, or server
+        // degrades that server to zero tools (fail closed), and the
+        // frozen default registry is untouched while the flag is off.
+        for tool in extra_tools {
+            registry
+                .register(tool)
+                .map_err(|error| EngineError::RegisterTool {
+                    tool: "mcp",
                     message: error.to_string(),
                 })?;
         }
@@ -652,7 +689,19 @@ impl Engine {
         } else {
             config
         };
-        Engine::open_with(config, overrides)
+        // Slice D (iteration 6): eager MCP attach. Spawning stdio servers
+        // and handshaking is async I/O, so it lives here — the sync
+        // constructor receives the resulting tools. A missing manifest
+        // attaches nothing; a bad server degrades to zero tools for that
+        // server (fail closed), never a failed open.
+        let extra_tools = if config.mcp && !overrides.bare_loop {
+            let workspace = std::fs::canonicalize(&config.workspace)
+                .unwrap_or_else(|_| config.workspace.clone());
+            loom_tools::mcp::attach_mcp_tools(&workspace, config.budgets).await
+        } else {
+            Vec::new()
+        };
+        Engine::open_with_extra_tools(config, overrides, extra_tools)
     }
 
     /// Creates a fresh session handle for one run.
@@ -915,6 +964,7 @@ fn compose_scout(
         symbols: false,
         git: false,
         skills: false,
+        mcp: false,
         budgets: parent.budgets,
         prune: None,
     };

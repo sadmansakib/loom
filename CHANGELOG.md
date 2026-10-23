@@ -3,6 +3,48 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-23 — MCP slice D1: stdio client, manifest allowlist, hygiene, pinning
+
+First implementation slice of `docs/mcp-design.md`: attach real MCP servers
+over stdio, eagerly, behind the `--mcp` opt-in flag. Defaults are
+byte-identical without the flag — no manifest, no tools, no change.
+
+- `crates/loom-tools/src/mcp.rs` (new): JSON-RPC stdio client
+  (initialize handshake, paginated tools/list, tools/call; reader task
+  with id→oneshot dispatch, non-JSON lines tolerated, per-request
+  timeouts, kill-on-drop, `tools/list_changed` observed), spawned
+  through the existing OS sandbox with `env_clear` + explicit manifest
+  env, network off by default.
+- Manifest allowlist `.loom/mcp.toml` (`[servers.<name>]`:
+  command/env/network/always_load + `[servers.<name>.policy]`
+  unknown=allow|ask|deny + deny globs). Missing/invalid manifest
+  attaches nothing; a bad server degrades to zero tools while others
+  proceed (fail closed, never a panic).
+- Ingestion hygiene at tools/list: control/bidi/zero-width characters
+  stripped, whitespace collapsed, descriptions capped at 512 chars,
+  schemas over 4 KiB skipped (truncating would misdescribe the tool),
+  per-server cap of 64 applied AFTER policy/hygiene filters (denied
+  tools must not consume allowed tools' slots), cross-server name
+  references rejected (shadowing class), imperative phrasing handled by
+  verdict (allow → loaded with a visible `[loom: …]` prefix; ask/deny →
+  skipped).
+- Definition pinning: SHA-256 over name+description+schema into
+  `.loom/mcp.lock`; a changed definition is quarantined until the user
+  deletes its pin (rug-pull defense). Pins are written on first sight.
+- Tool results carry `[mcp:<server>]` provenance, head-capped, isError
+  payloads surface as `ToolError::Execution`.
+- Engine: `EngineConfig.mcp` (default false) attaches tools eagerly in
+  `open_async_with` after the catalog fetch (async side; sync
+  `open_with` now threads `extra_tools` through a private
+  `open_with_extra_tools`). CLI: `--mcp` on `loom run`, ignored in the
+  bare arm.
+- Tests (`tests/mcp_stdio.rs`, 13): the mock server is the test binary
+  re-exec'd under the real sandbox — clean attach/call/pin roundtrip,
+  hygiene gauntlet, cross-server rejection (two-server manifest),
+  generation-shift quarantine, per-server cap, deny globs, unknown=deny,
+  bad command, missing manifest, plus hygiene units. Divergences from
+  the design doc's wording are all stricter and covered there.
+
 ## 2026-10-23 — MCP deep research + design pinned (slice D)
 
 - Deep research pass over token-efficiency and security literature for
