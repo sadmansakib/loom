@@ -133,7 +133,13 @@ Every sweep writes under `<eval-dir>/swebench/`:
 - `instances/<slug>/prompt.txt` — the frozen prompt, once per instance;
 - `instances/<slug>/run-<n>/run.json`, `run.err`, `patch.diff`,
   `patch.err` — per-run container output (the patch is extracted even
-  when the agent fails, so partial work is scored honestly);
+  when the agent fails, so partial work is scored honestly). Since
+  event schema 11 the JSONL events also carry forensics: `tool_started`
+  includes a 2,000-byte `arguments` head, `tool_completed` includes
+  `status` plus a 1,000-byte `content_head` (covering the `$ cmd` and
+  `exit status:` lines), and every loop-owned nudge (zero-progress,
+  late-budget, both completion refusals) is a `loop_nudge` event —
+  transcript greps no longer miss what the model actually ran;
 - `predictions-<model>-<n>.jsonl` — one row per instance, the official
   format; the scorer keys by `instance_id`, so repeated runs write
   per-run files and never duplicate rows;

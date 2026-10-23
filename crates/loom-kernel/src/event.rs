@@ -30,7 +30,7 @@ use crate::id::{SessionId, TaskId};
 use crate::model::{ModelErrorKind, ModelResponse};
 use crate::session::TodoItem;
 use crate::store::SharedEventStore;
-use crate::transcript::ToolCallId;
+use crate::transcript::{ToolCallId, ToolStatus};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -76,7 +76,30 @@ use tokio_util::sync::CancellationToken;
 /// reconstructs the list, and each event marks one tail re-append).
 /// v10 adds `SteeringApplied` (item 25: queued user messages joined
 /// the transcript at a turn boundary).
-pub const EVENT_SCHEMA_VERSION: u16 = 10;
+pub const EVENT_SCHEMA_VERSION: u16 = 11;
+
+/// Byte budget for a `ToolStarted` event's serialized arguments (schema
+/// 11): enough for the typical command or edit summary, never a whole
+/// file body.
+pub const ARGUMENTS_EVENT_HEAD: usize = 2_000;
+
+/// Byte budget for a `ToolCompleted` event's content head (schema 11):
+/// enough for the echoed command line and its exit status.
+pub const CONTENT_EVENT_HEAD: usize = 1_000;
+
+/// Head-bounds a string to `budget` bytes on a char boundary, marking
+/// the cut. Used by the tool events so the stream stays forensic
+/// without reproducing whole file bodies or tool outputs.
+pub fn text_head(text: &str, budget: usize) -> String {
+    if text.len() <= budget {
+        return text.to_owned();
+    }
+    let mut end = budget;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}[truncated]", &text[..end])
+}
 
 /// One observed occurrence during a task, wrapped for the wire.
 ///
@@ -253,6 +276,11 @@ pub enum EventKind {
         name: String,
         /// Correlation id of the call being executed.
         call_id: ToolCallId,
+        /// Serialized call arguments, head-bounded by
+        /// [`ARGUMENTS_EVENT_HEAD`] bytes — eval forensics reads what the
+        /// model asked for without the event stream reproducing whole
+        /// file bodies (schema 11).
+        arguments: String,
     },
     /// The engine finished one tool call (success or failure — the
     /// structured outcome lands in the transcript's `ToolResult`; the
@@ -262,6 +290,13 @@ pub enum EventKind {
         name: String,
         /// Correlation id of the finished call.
         call_id: ToolCallId,
+        /// The structured outcome (schema 11): `success`, an `error`
+        /// payload, or `cancelled`.
+        status: ToolStatus,
+        /// First [`CONTENT_EVENT_HEAD`] bytes of the result content —
+        /// enough to see the command line and its exit status without
+        /// reproducing whole tool outputs (schema 11).
+        content_head: String,
     },
     /// The kernel-owned todo list changed during the turn's tool batch
     /// (roadmap item 8 phase B): a `todo` create/add/mark bumped its
@@ -289,6 +324,16 @@ pub enum EventKind {
         turn: u32,
         /// How many queued messages were applied.
         messages: u32,
+    },
+    /// The loop injected a shaping message into the transcript (schema
+    /// 11): one of the one-shot completion refusals, the zero-progress
+    /// nudge, or the late-budget nudge. The item also persists in the
+    /// session, but the event stream carried no trace of it before —
+    /// eval forensics over run.json was blind to which runs had been
+    /// nudged, or with what text.
+    LoopNudge {
+        /// The full injected text.
+        text: String,
     },
     /// The task reached terminal success.
     TaskCompleted,
@@ -635,7 +680,11 @@ impl EventSink for StatusRecorder {
             EventKind::TurnStarted { turn } => state.turn = Some(turn),
             EventKind::ModelRequestStarted { attempt } => state.attempt = Some(attempt),
             EventKind::ModelCompleted { .. } => state.attempt = None,
-            EventKind::ToolStarted { name, call_id } => {
+            EventKind::ToolStarted {
+                name,
+                call_id,
+                arguments: _,
+            } => {
                 state.in_flight.push((call_id, name));
             }
             EventKind::ToolCompleted { call_id, .. } => {
@@ -1400,6 +1449,7 @@ mod tests {
             EventKind::ToolStarted {
                 name: "read_file".into(),
                 call_id: call.clone(),
+                arguments: "{}".into(),
             },
         );
         assert_eq!(
@@ -1412,6 +1462,8 @@ mod tests {
             EventKind::ToolCompleted {
                 name: "read_file".into(),
                 call_id: call,
+                status: ToolStatus::Success,
+                content_head: "ok".into(),
             },
         );
         assert_eq!(recorder.snapshot().in_flight_tools, Vec::<String>::new());
@@ -1468,6 +1520,7 @@ mod tests {
             EventKind::ToolStarted {
                 name: "shell".into(),
                 call_id: a.clone(),
+                arguments: "{}".into(),
             },
         );
         recorder.emit(
@@ -1475,6 +1528,7 @@ mod tests {
             EventKind::ToolStarted {
                 name: "shell".into(),
                 call_id: b.clone(),
+                arguments: "{}".into(),
             },
         );
         assert_eq!(
@@ -1487,6 +1541,8 @@ mod tests {
             EventKind::ToolCompleted {
                 name: "shell".into(),
                 call_id: a,
+                status: ToolStatus::Success,
+                content_head: "ok".into(),
             },
         );
         assert_eq!(
@@ -1499,6 +1555,8 @@ mod tests {
             EventKind::ToolCompleted {
                 name: "shell".into(),
                 call_id: b,
+                status: ToolStatus::Success,
+                content_head: "ok".into(),
             },
         );
         assert_eq!(recorder.snapshot().in_flight_tools, Vec::<String>::new());
@@ -1592,6 +1650,66 @@ mod tests {
             emitted.len(),
             2,
             "one event per change, none per quiet turn"
+        );
+    }
+
+    #[test]
+    fn text_head_passes_short_text_through_verbatim() {
+        assert_eq!(text_head("hello", 2_000), "hello");
+        assert_eq!(text_head("", 1_000), "");
+    }
+
+    #[test]
+    fn text_head_truncates_on_a_char_boundary_with_a_marker() {
+        let long = "ab".repeat(3_000);
+        let head = text_head(&long, 1_000);
+        assert!(head.len() <= 1_000 + "[truncated]".len());
+        assert!(head.ends_with("[truncated]"));
+        assert!(head.starts_with("abab"));
+    }
+
+    #[test]
+    fn text_head_never_splits_a_multibyte_char() {
+        // Each 'あ' is three UTF-8 bytes; a byte budget that lands
+        // mid-character must back off to the boundary.
+        let wide = "あ".repeat(600);
+        let head = text_head(&wide, 1_000);
+        assert!(head.ends_with("[truncated]"));
+        let kept = head.trim_end_matches("[truncated]");
+        assert_eq!(kept.len() % 3, 0, "no partial character survives");
+        assert!(std::str::from_utf8(kept.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn enriched_tool_events_and_loop_nudge_round_trip() {
+        // Schema 11: tool events carry argument heads and result heads,
+        // and loop-owned nudges serialize — the eval forensics the old
+        // shape was blind to (2026-10-23 misdiagnosis).
+        let call = ToolCallId::try_from("call_1".to_owned()).unwrap();
+        let started = EventKind::ToolStarted {
+            name: "run_command".into(),
+            call_id: call.clone(),
+            arguments: "{\"command\":[\"pytest\",\"-q\"]}".into(),
+        };
+        let completed = EventKind::ToolCompleted {
+            name: "run_command".into(),
+            call_id: call,
+            status: ToolStatus::Success,
+            content_head: "$ pytest -q\nexit status: 0".into(),
+        };
+        let nudge = EventKind::LoopNudge {
+            text: "Hold on — these files changed".into(),
+        };
+        for kind in [started, completed, nudge] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let back: EventKind = serde_json::from_str(&json).unwrap();
+            let round = serde_json::to_string(&back).unwrap();
+            assert_eq!(json, round, "event {json} must round-trip");
+        }
+        let nudge_json = serde_json::to_string(&EventKind::LoopNudge { text: "x".into() }).unwrap();
+        assert!(
+            nudge_json.contains("\"loop_nudge\""),
+            "kind tag is snake_case: {nudge_json}"
         );
     }
 }

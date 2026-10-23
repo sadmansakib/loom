@@ -1101,6 +1101,11 @@ impl Agent {
                          with write_file or edit_file, then verify it with cargo."
                     ),
                 };
+                let nudge_text = match &notice {
+                    Item::User { text } => text.clone(),
+                    _ => String::new(),
+                };
+                sink.emit(task_id, EventKind::LoopNudge { text: nudge_text });
                 if let Some(store) = &self.store {
                     store
                         .append_item(&session.id, session.next_index(), &notice)
@@ -1125,6 +1130,11 @@ impl Agent {
                         self.max_turns
                     ),
                 };
+                let nudge_text = match &notice {
+                    Item::User { text } => text.clone(),
+                    _ => String::new(),
+                };
+                sink.emit(task_id, EventKind::LoopNudge { text: nudge_text });
                 if let Some(store) = &self.store {
                     store
                         .append_item(&session.id, session.next_index(), &notice)
@@ -1221,6 +1231,7 @@ impl Agent {
                         &mut completion,
                         accounting,
                         &assistant,
+                        sink,
                     )? {
                         continue;
                     }
@@ -1435,6 +1446,7 @@ impl Agent {
     /// turn, quoting the changed paths and the original task — and let
     /// the loop take one more turn. Returns `true` when the refusal
     /// fired; the caller then continues instead of finishing.
+    #[allow(clippy::too_many_arguments)]
     fn refuse_completion_once(
         &self,
         session: &mut Session,
@@ -1443,6 +1455,7 @@ impl Agent {
         completion: &mut CompletionGate,
         accounting: &mut Accounting,
         assistant: &AssistantMessage,
+        sink: &dyn EventSink,
     ) -> Result<bool, TaskError> {
         // Pending verification takes precedence: the green-check gap is
         // the sharper failure. The test-consultation nudge (2026-10-23)
@@ -1459,6 +1472,7 @@ impl Agent {
             completion.test_refused = true;
             test_consultation_refusal(session)
         };
+        sink.emit(task_id, EventKind::LoopNudge { text: text.clone() });
         self.commit(session, assistant.clone(), Vec::new())?;
         let reminder = Item::User { text };
         if let Some(store) = &self.store {
@@ -1705,6 +1719,10 @@ impl Agent {
                 EventKind::ToolStarted {
                     name: call.name.clone(),
                     call_id: call.id.clone(),
+                    arguments: crate::event::text_head(
+                        &serde_json::to_string(&call.arguments).unwrap_or_default(),
+                        crate::event::ARGUMENTS_EVENT_HEAD,
+                    ),
                 },
             );
         }
@@ -1781,11 +1799,16 @@ impl Agent {
             // Pair each start with a completion: refused calls emitted no
             // start, so they emit no completion either.
             if is_runnable[index] {
+                let status = result.status;
+                let content_head =
+                    crate::event::text_head(&result.content, crate::event::CONTENT_EVENT_HEAD);
                 sink.emit(
                     task_id,
                     EventKind::ToolCompleted {
                         name: call.name.clone(),
                         call_id: call.id.clone(),
+                        status,
+                        content_head,
                     },
                 );
                 // Harness observations ride the result into the trace:

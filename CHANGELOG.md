@@ -3,6 +3,29 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-23 — run.json event enrichment (schema 11): forensics the old shape was blind to
+
+- Root-causing the 100-sweep misses exposed a blind spot: `tool_started`/
+  `tool_completed` events carried only `{call_id, name}`, and loop-owned
+  nudges were not events at all — so transcript greps could not see what
+  commands a run actually executed or how the loop shaped it. That blind
+  grep produced the "runs never consulted tests" misdiagnosis behind the
+  test-consultation nudge.
+- Event schema 10 → 11, additive only (readers keyed on `model_completed`/
+  `turn_started`/`task_*` are unaffected): `tool_started.arguments` (JSON
+  head, 2,000-byte budget), `tool_completed.status` +
+  `content_head` (1,000 bytes, covering the `$ cmd` and `exit status:`
+  lines), and a new `loop_nudge` event carrying the full injected text
+  from all four shaping sites — zero-progress, late-budget, and both
+  completion-refusal branches.
+- `text_head` truncates on char boundaries with a `[truncated]` marker;
+  heads are taken after failure-hint assembly so error paths are visible.
+- Tests: `text_head` units (passthrough, boundary, multibyte), event
+  round-trip for the enriched variants + `loop_nudge` snake_case tag, and
+  the completion-gate integration test now asserts both refusals emit
+  `LoopNudge`. Workspace 37 suites green, clippy 0.
+- docs/eval.md artifact section updated to describe the forensic fields.
+
 ## 2026-10-23 — First bare-vs-full contrast (G4/G5 probe, $0)
 
 - Paired same-task A/B executed on the user's nano gateway (custom

@@ -566,7 +566,7 @@ async fn an_unverified_finish_is_refused_once_then_accepted() {
     );
     let requests = provider.requests_handle();
     let mut session = Session::new(SessionId::new());
-    let (sink, _receiver) = ChannelEventSink::new();
+    let (sink, mut receiver) = ChannelEventSink::new();
     let control = TaskControl::new();
     let agent = agent(provider, registry, 10);
 
@@ -578,6 +578,17 @@ async fn an_unverified_finish_is_refused_once_then_accepted() {
     // Four model requests: write, verification refusal, test-consultation
     // refusal, accepted finish.
     assert_eq!(summary.model_requests, 4);
+    // Schema 11: every loop-owned nudge is also an event, not just a
+    // transcript item — both refusals surface here.
+    let mut nudges = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        if let EventKind::LoopNudge { text } = event.kind {
+            nudges.push(text);
+        }
+    }
+    assert_eq!(nudges.len(), 2, "both one-shot refusals emit LoopNudge");
+    assert!(nudges[0].contains("since the last green check"));
+    assert!(nudges[1].contains("no existing test suite"));
     let requests = requests.lock().unwrap();
     let green_refusal = requests[2].messages.iter().any(
         |m| matches!(m, Message::User { text } if text.contains("since the last green check")),
