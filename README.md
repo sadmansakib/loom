@@ -1,10 +1,14 @@
 # Loom
 
-[![Status: Work in Progress](https://img.shields.io/badge/status-work%20in%20progress-orange)]()
+[![Status: Early release](https://img.shields.io/badge/status-early%20release-blue)]()
+[![Tests: 977](https://img.shields.io/badge/tests-977-brightgreen)]()
+[![SWE-bench Verified: 90/100](https://img.shields.io/badge/SWE--bench%20Verified-90%2F100-blue)]()
 
-> **⚠️ Work in progress.** Loom is under active early development. Anything
-> here can change or break without notice. Not usable yet — no releases,
-> no stability guarantees.
+> **Early release.** The headless agent core is usable today: the `loom`
+> binary runs tasks end to end against real providers, and `loom-core`
+> exposes the embedding facade. There is no interactive TUI yet, `ask`
+> policy verdicts fail closed without a frontend, and APIs version by
+> iteration, not semver.
 
 Loom is a headless, provider-agnostic **coding-agent core** written in Rust.
 The deterministic loop is the controller; the model is only the reasoning
@@ -12,6 +16,9 @@ component.
 
 Design goal: **maximum successful work per model invocation with minimum
 context and turns.**
+
+Measured: **90/100 resolved** on a frozen 100-instance SWE-bench Verified
+sweep (official testbeds + official scorer, `deepseek-flash`, prompt v3).
 
 ## Principles
 
@@ -23,6 +30,62 @@ context and turns.**
 
 Capabilities move from model to software over time, never the reverse.
 
+## Install
+
+Requires Rust 1.89+ (edition 2024).
+
+```sh
+cargo install --git https://github.com/sadmansakib/loom loom-cli
+```
+
+From a checkout: `cargo install --path crates/loom-cli`.
+
+macOS uses Seatbelt and Linux uses bubblewrap for sandboxed command
+execution; on Linux install `bubblewrap` with your package manager first.
+
+## Quickstart
+
+```sh
+# store a provider key once (OS keychain; never a config file)
+loom auth login deepseek
+
+# run a task in the current directory (one-shot, headless)
+loom run --provider deepseek "fix the failing test and make cargo test pass"
+
+# any OpenAI-compatible gateway
+export CUSTOM_API_KEY=...
+loom run --provider custom --base-url https://gateway.example/v1 \
+    --model provider/model-name "your task"
+
+# structured events for tooling (NDJSON, event schema 11)
+loom run --provider deepseek --json "your task" | jq 'select(.kind.type=="tool_completed")'
+
+# past sessions live in SQLite; list and inspect them
+loom sessions
+loom stats
+```
+
+Sandboxed commands run with network off by default; escalation (network,
+extra writable paths, higher limits) is declared per program in
+`.loom/commands.toml`, and unrecognized programs can be allowed, asked
+about, or denied via the `[policy]` verdict layer.
+
+## What works
+
+| Area | State |
+|---|---|
+| Turn loop | completion gate, one-shot refusals, zero-progress + late-budget nudges, malformed tool-call recovery |
+| Tools | read/write/edit/list/search, sandboxed `run_command`, `verify`, `git_status`/`git_diff`/`git_log` (opt-in `--git`), symbol tools (`--symbols`), skills (`--skills`), read-only scout (`--scout`) |
+| Safety | Seatbelt/bubblewrap, network off default, manifest escalation, allow/ask/deny verdicts, credential scrubbing, process-group kill |
+| Context | repo facts, AGENTS.md instructions, pruning + turn-age masking, per-tool output budgets (env-sweepable) |
+| Providers | DeepSeek, OpenRouter, GLM, NVIDIA, Groq, Anthropic + any OpenAI-compatible custom gateway |
+| Persistence | SQLite sessions/events, resume, steering, `loom sessions`/`loom stats` |
+| Embedding | `loom-core` facade (ADR-021), full drive loop in `crates/loom-core/examples/frontend.rs` |
+
+Not built yet: interactive TUI/CLI surface (resume/steering/ask-mode need a
+frontend; the engine seams exist), MCP and LSP integration (roadmap
+iterations 6), parallel worktree orchestration (gated on measurement).
+
 ## Crates
 
 | Crate | Purpose |
@@ -30,38 +93,18 @@ Capabilities move from model to software over time, never the reverse.
 | `loom-kernel` | Domain model and traits (session, turns, tools, providers). No workspace dependencies. |
 | `loom-providers` | Provider adapters: DeepSeek, OpenRouter, GLM, NVIDIA, Groq (OpenAI-compatible wire format) and Anthropic (messages API). |
 | `loom-store` | SQLite persistence for sessions and events. |
-| `loom-tools` | Built-in deterministic tools: file read/write/edit, search, listing, sandboxed command execution. |
-| `loom-engine` | The deterministic turn loop: context compilation, token estimation, pruning, repo intelligence, completion gate. |
+| `loom-tools` | Built-in deterministic tools: file read/write/edit, search, listing, sandboxed command execution, git porcelain, symbols, skills. |
+| `loom-engine` | The deterministic turn loop: context compilation, token estimation, pruning, repo intelligence, completion gate, scout. |
 | `loom-core` | Facade re-exporting the public API for embedders. |
-| `loom-cli` | `loom` binary: config, tracing, signals, output, `loom stats`. |
+| `loom-eval` | SWE-bench Verified sweep orchestration + official-scorer reporting. |
+| `loom-cli` | `loom` binary: auth, run, sessions, stats, tracing, signals. |
 
 Dependency direction is enforced: `loom-kernel` depends on no workspace
 crate, so provider- or tool-specific behavior cannot leak into the domain.
 `loom-engine` builds on kernel, store, providers, and tools; `loom-core`
 and `loom-cli` sit on top.
 
-## Status
-
-Iteration 2 — the loop runs end to end with real providers:
-
-```
-Task → Session → engine turn loop → provider (DeepSeek / OpenRouter / Anthropic / GLM / NVIDIA / Groq)
-     → tool calls → deterministic execution (incl. sandboxed shell)
-     → tool results → pruning/estimation → completion gate → done
-```
-
-Shipped so far: time-ordered session/task IDs, transcript types, session
-aggregate with atomic turn commits, streaming adapters for five providers,
-per-provider token estimators (o200k-based; Anthropic-scaled), context
-pruning with turn-age masking and one-line stubs, bootstrap repo facts
-(tree, toolchains, AGENTS.md), sandboxed command execution (Seatbelt on
-macOS, bubblewrap on Linux), `edit_file` batch edits with region echo and
-whitespace-trim repair, a completion gate that refuses premature end turns,
-and `loom stats`. 694 tests.
-
 ## Development
-
-Requires Rust 1.85+ (edition 2024).
 
 ```sh
 cargo build
@@ -74,7 +117,8 @@ Workspace lints: `unsafe_code` forbidden; `missing_docs`, `unwrap_used`,
 `expect_used` warned.
 
 Documentation: [`docs/architecture.md`](docs/architecture.md) (design),
-[`docs/eval.md`](docs/eval.md) (eval suite protocol),
+[`docs/eval.md`](docs/eval.md) (eval suite protocol + honesty rules),
+[`docs/daily-driver.md`](docs/daily-driver.md) (generalization probes),
 [`docs/roadmap.md`](docs/roadmap.md) (vision, iterations, evidence
 backlog).
 

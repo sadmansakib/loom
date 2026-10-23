@@ -3,6 +3,24 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-23 — Release hygiene + first daily-driver probe (3/3, $0)
+
+- README flipped from "not usable yet" to an honest early-release state:
+  install path (`cargo install --git … loom-cli`), quickstart (`loom auth`,
+  `loom run`, custom gateway, `--json`), capability table incl. what is
+  deliberately NOT built (interactive surface, MCP/LSP), measured anchor
+  (90/100 frozen v3-100 sweep), test count badge (977).
+- `docs/daily-driver.md`: repeatable generalization probe — task-set spec
+  (seeded fix/implement/refactor in throwaway crates), vehicles ($0 nano
+  gateway default, off-peak deepseek option), metrics, honesty rules; the
+  fixture generator ships as `docs/benchmarks/daily-driver-fixture.py`.
+- First probe run ($0, weak free model): **3/3 success** — 8/11/13 turns,
+  zero nudges, zero gate refusals, all `end_reason: completed`; graded by
+  `cargo test` + human diff, never by the agent's own claims. One
+  spec-fidelity note recorded (byte-based rotation vs "code points" doc).
+- Schema-11 forensics (tool argument/result heads) saw their first live
+  daily-driver use reading these artifacts.
+
 ## 2026-10-23 — Verdict layer: allow/ask/deny over the command policy (iteration 4)
 
 - The manifest was purely an escalation layer: every bare program ran
