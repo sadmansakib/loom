@@ -28,6 +28,12 @@ keyring-core = { workspace = true }
 uuid = { workspace = true }
 # CancellationToken crosses the driving API (§6.6).
 tokio-util = { workspace = true }
+# The scout tool's call is async with a wall-clock deadline and a
+# parent-cancellation race (roadmap item 19): `time` for the timeout,
+# `macros` for `tokio::select!`, `futures` for the `BoxFuture` the
+# tool trait returns.
+tokio = { workspace = true, features = ["time", "macros"] }
+futures = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { workspace = true }

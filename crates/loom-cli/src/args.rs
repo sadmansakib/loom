@@ -114,6 +114,18 @@ pub struct RunArgs {
     /// transcript and the loop runs to its next stopping point.
     #[arg(long, value_name = "ID")]
     pub session: Option<String>,
+
+    /// Enable the read-only scout tool (roadmap item 19): a child agent
+    /// on this cheap provider answers focused workspace questions with
+    /// a bounded (~1 KB) capsule, saving parent context. Off by default.
+    #[arg(long, value_name = "PROVIDER")]
+    pub scout: Option<String>,
+
+    /// Model for `--scout`; required together with it. The parent's
+    /// `--provider`/`--model` stay fixed (mid-task selection is the
+    /// child's only).
+    #[arg(long, value_name = "MODEL")]
+    pub scout_model: Option<String>,
 }
 
 /// Arguments for `loom auth`.

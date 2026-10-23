@@ -49,6 +49,7 @@ fn main() -> anyhow::Result<()> {
         db_path: loom_core::paths::db_path(),
         persist: false,
         catalog: None,
+        scout: None,
     }))?;
 
     // Observation: one unbounded channel, one printing consumer. A TUI or

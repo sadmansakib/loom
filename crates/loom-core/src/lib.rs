@@ -55,7 +55,9 @@ pub use loom_tools as tools;
 // `loom_core::Engine`. Driving-API types are imported from the root, not
 // through the `engine` alias; module-scoped APIs stay behind the aliases
 // (`loom_core::kernel::…`, `loom_core::engine::auth::…`).
-pub use loom_engine::{Engine, EngineConfig, EngineError, EngineOverrides, ReasoningEffort};
+pub use loom_engine::{
+    Engine, EngineConfig, EngineError, EngineOverrides, ReasoningEffort, ScoutConfig,
+};
 
 // The stable frontend surface: the control and observation types every
 // frontend needs to drive a task. Same stability promise as the driving

@@ -3,6 +3,35 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-23 — Iteration 3 begins: read-only scout (roadmap item 19)
+
+- The item-19 seam shipped: `EngineConfig.scout` (opt-in `ScoutConfig
+  composes a child `Agent` on the scout's own provider/model, a read-only
+  registry (read/list/search/artifact; no writes, no shell, no recursion —
+  the child has no scout tool), `loop_shaping` off, and a plain append-only
+  compiler. Registered as a `scout` tool in the parent registry only when
+  configured and never in the bare arm.
+- `ScoutTool` runs one level deep: capsule prompt (question + optional
+  focus, output contract), fresh session, own `TaskControl`, raced against
+  the wall-clock timeout and the parent's cancellation token; the final
+  child answer is truncated to 1 KB on a char boundary with a marker. All
+  failure paths (timeout, cancel, child error, empty question) return a
+  tool result, never a panic.
+- CLI: `loom run --scout PROVIDER --scout-model MODEL` (pair required,
+  ignored under `LOOM_BARE`); `ScoutConfig` re-exported from `loom_core`.
+- Kernel: `ToolBatch::execute`'s wave futures now build via a named
+  `run_wave_item` fn instead of a closure-returned async block —
+  behavior-identical code motion required because a tool nesting
+  `Agent::run_task` (the scout) sends the `Send` witness through the
+  old shape and trips rustc #102211 ("implementation of FnOnce is not
+  general enough"). Kernel suites unchanged (green).
+- Tests: six scout suites (capsule content, truncation bounds, child
+  round-trip, timeout, parent cancellation, empty-question rejection)
+  over a recording fake provider; workspace 37 suites / 919 passed,
+  clippy clean. Delegation economics stay parked with item 1's
+  funded-measurement debt; items 21/24 not started (21 waits for 19 to
+  pay).
+
 ## 2026-10-23 — Iteration 2 closes: bare-arm seam + paired contrast reporting
 
 Roadmap item 1's two zero-cost obligations, shipped and validated; the

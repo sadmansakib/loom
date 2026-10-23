@@ -30,6 +30,7 @@ use loom_tools::{
 };
 
 use crate::auth::{self, KeychainBackend, SqliteAuthStore};
+use crate::scout::{ScoutConfig, ScoutTool};
 /// Everything a frontend must decide before [`Engine::open`].
 ///
 /// `workspace` is canonicalized by the engine; the rest maps one-to-one to the
@@ -83,6 +84,13 @@ pub struct EngineConfig {
     /// built-in table ignore it; adapters that need one reject the run
     /// when it is absent.
     pub catalog: Option<ProviderCatalog>,
+    /// Read-only scout delegation (roadmap item 19): `None` keeps the
+    /// tool out of the registry — the default, so every existing
+    /// frontend (and the frozen SWE-bench protocol) is unchanged until
+    /// a frontend deliberately opts in. When set, the engine composes a
+    /// child [`Agent`] on the cheap model and registers `scout` in the
+    /// parent registry.
+    pub scout: Option<ScoutConfig>,
 }
 
 /// A minimal [`EngineConfig`] for tests that need one without a real
@@ -103,6 +111,7 @@ pub(crate) fn test_config() -> EngineConfig {
         db_path: base.join("loom.db"),
         persist: false,
         catalog: None,
+        scout: None,
     }
 }
 
@@ -165,6 +174,10 @@ pub struct EngineOverrides {
     /// A tool registry built by the embedder, replacing the
     /// manifest-driven built-in set.
     pub registry: Option<ToolRegistry>,
+    /// A scout child agent handed in as an injected seam, replacing the
+    /// [`ScoutConfig`]-driven composition (offline tests use this; the
+    /// engine never resolves credentials for it).
+    pub scout: Option<Arc<Agent>>,
     /// A context compiler built by the embedder, replacing the default
     /// pruning chain.
     pub compiler: Option<Box<dyn ContextCompiler>>,
@@ -317,6 +330,33 @@ impl Engine {
                 }
             }
         };
+        // Roadmap item 19: the read-only scout. Opt-in via
+        // `EngineConfig::scout` (or injected through `overrides.scout`
+        // for offline tests); the bare-loop baseline never carries it,
+        // and a scout is never composed for a bare arm.
+        let scout_agent: Option<Arc<Agent>> = match overrides.scout {
+            Some(agent) => Some(agent),
+            None => match config.scout {
+                Some(ref cfg) if !overrides.bare_loop => {
+                    Some(Arc::new(compose_scout(cfg, &config, &workspace, &policy)?))
+                }
+                _ => None,
+            },
+        };
+        let mut registry = registry;
+        if let Some(agent) = scout_agent {
+            let timeout = config
+                .scout
+                .as_ref()
+                .map(|cfg| cfg.timeout_secs)
+                .unwrap_or(120);
+            registry
+                .register(Box::new(ScoutTool::new(agent, timeout)))
+                .map_err(|error| EngineError::RegisterTool {
+                    tool: "scout",
+                    message: error.to_string(),
+                })?;
+        }
         let system_prompt = config.system_prompt.unwrap_or_else(default_system_prompt);
         // Stage-1 repository facts (2E, ADR-015): the composition root owns the
         // I/O; the loop scans once per task through this source. The
@@ -748,6 +788,72 @@ pub struct Continuation {
 /// mutates kernel session state, not files, and joining here — rather
 /// than being re-registered by embedders — keeps one wiring for every
 /// frontend. The bare-loop arm filters it back out ([`bare_registry`]).
+/// Composes the scout child agent (roadmap item 19) from the parent
+/// config: a second provider build on the cheap model, the read-only
+/// subset of the built-in registry (recursion is structurally
+/// impossible — `scout` is not in the child's registry), the plain
+/// append-only compiler, and loop shaping off (a never-mutating scout
+/// must not be nudged for zero progress or untested finishes).
+fn compose_scout(
+    cfg: &ScoutConfig,
+    parent: &EngineConfig,
+    workspace: &std::path::Path,
+    policy: &CommandPolicy,
+) -> Result<Agent, EngineError> {
+    let child = EngineConfig {
+        provider: cfg.provider.clone(),
+        model: cfg.model.clone(),
+        base_url: parent.base_url.clone(),
+        models_url: None,
+        reasoning_effort: parent.reasoning_effort,
+        account: parent.account.clone(),
+        workspace: workspace.to_path_buf(),
+        system_prompt: None,
+        max_turns: cfg.max_turns,
+        db_path: parent.db_path.clone(),
+        persist: false,
+        catalog: parent.catalog.clone(),
+        scout: None,
+    };
+    // Credential resolution mirrors the parent's (§18.3) — the scout
+    // may live on a different provider with its own secret.
+    let store = SqliteAuthStore::open(&child.db_path).map_err(EngineError::Store)?;
+    let secrets = KeychainBackend::default();
+    let credential = auth::resolve(
+        &store,
+        &secrets,
+        &child.provider,
+        child.account.as_deref(),
+        |name| std::env::var(name).ok(),
+    )?;
+    let provider = crate::provider::build(&child, credential.secret.expose())?.provider;
+    let registry = ToolRegistry::from_tools(
+        build_registry(policy)?
+            .into_tools()
+            .filter(|tool| tool.is_read_only()),
+    );
+    let estimator: Arc<dyn loom_kernel::context::TokenEstimator> =
+        crate::estimate::estimator_for(&child.provider);
+    let compiler: Box<dyn ContextCompiler> =
+        Box::new(DefaultContextCompiler::with_estimator(estimator));
+    let agent_config = AgentConfig::new(
+        workspace.to_path_buf(),
+        "You are loom's read-only scout: answer one focused question about \
+         the workspace using read/list/search only, concisely, with \
+         file:line pointers for every claim."
+            .to_owned(),
+    );
+    Ok(Agent::new(
+        provider,
+        compiler,
+        registry,
+        agent_config,
+        cfg.model.clone(),
+    )
+    .with_max_turns(cfg.max_turns)
+    .with_loop_shaping(false))
+}
+
 fn build_registry(policy: &CommandPolicy) -> Result<ToolRegistry, EngineError> {
     let mut registry = ToolRegistry::new();
     let mut register = |name: &'static str, tool: Box<dyn loom_kernel::tool::Tool>| {

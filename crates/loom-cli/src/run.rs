@@ -14,7 +14,7 @@ use loom_core::engine::TaskControl;
 use loom_core::kernel::agent::{TaskError, TaskSummary};
 use loom_core::kernel::event::{ChannelEventSink, FanoutSink};
 use loom_core::kernel::session::Session;
-use loom_core::{Engine, EngineConfig, EngineOverrides};
+use loom_core::{Engine, EngineConfig, EngineOverrides, ScoutConfig};
 
 use crate::args::RunArgs;
 use crate::output::{self, Renderer};
@@ -148,6 +148,21 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     } else {
         EngineOverrides::default()
     };
+    // The scout arm (roadmap item 19): off unless both flags are given;
+    // the bare arm never carries it (it measures the plain loop).
+    let scout = match (args.scout.as_deref(), args.scout_model.as_deref()) {
+        (Some(provider), Some(model)) => {
+            if bare_arm {
+                eprintln!("note: --scout is ignored in the bare-loop arm");
+                None
+            } else {
+                Some(ScoutConfig::new(provider.to_owned(), model.to_owned()))
+            }
+        }
+        (Some(_), None) => anyhow::bail!("--scout requires --scout-model"),
+        (None, Some(_)) => anyhow::bail!("--scout-model requires --scout"),
+        (None, None) => None,
+    };
     let engine = runtime.block_on(Engine::open_async_with(
         EngineConfig {
             provider: args.provider,
@@ -162,6 +177,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             db_path,
             persist: !args.no_save,
             catalog: None,
+            scout,
         },
         overrides,
     ))?;

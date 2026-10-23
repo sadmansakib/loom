@@ -504,31 +504,24 @@ impl<'a> ToolBatch<'a> {
             .collect();
 
         'waves: for wave in &waves {
-            let mut stream = stream::iter(wave.iter().map(|&index| {
-                let call = &calls[index];
-                let slot = &slots[index];
-                let started = &started_flags[index];
-                async move {
-                    let result =
-                        execute_call(self.registry, self.exposure, call, ctx, started).await;
-                    // Record file effects before the next call in a
-                    // sequential batch starts, so a `verify` later in this
-                    // same batch links to a write earlier in it
-                    // (same-batch linkage, 2F). Conflict-free waves record
-                    // no conflicting effects.
-                    ctx.note_effects(&result.effects);
-                    // Drop cached reads that this call invalidated: a file
-                    // mutation clears entries whose paths overlap it, and a
-                    // `run_command` clears the whole cache (ADR-018, V14).
-                    if let Some(cache) = ctx.cache.as_ref()
-                        && let Ok(mut cache) = cache.lock()
-                    {
-                        cache.invalidate_effects(&result.effects);
-                    }
-                    lock_slot(slot).replace(result);
-                }
-            }))
-            .buffered(self.max_concurrency);
+            // Wave futures are pushed through a named `async fn`, not a
+            // closure returning an async block: the closure shape is
+            // unprovable for rustc (#102211) the moment an execute
+            // future must be `Send` — which any tool that nests a child
+            // `Agent::run_task` (the scout) requires. The loop shape
+            // borrows with `execute`'s own lifetimes and type-checks.
+            let mut wave_futures = Vec::with_capacity(wave.len());
+            for &index in wave.iter() {
+                wave_futures.push(run_wave_item(
+                    self.registry,
+                    self.exposure,
+                    &calls[index],
+                    ctx,
+                    &started_flags[index],
+                    &slots[index],
+                ));
+            }
+            let mut stream = stream::iter(wave_futures).buffered(self.max_concurrency);
 
             let mut remaining = wave.len();
             while remaining > 0 {
@@ -555,6 +548,38 @@ impl<'a> ToolBatch<'a> {
             )
             .collect()
     }
+}
+
+/// One scheduled wave item: run the call, record its effects, and
+/// publish the result into its slot. Extracted from
+/// [`ToolBatch::execute`] so the wave futures are named-fn futures
+/// (see the wave-loop comment for the rustc #102211 details).
+async fn run_wave_item(
+    registry: &ToolRegistry,
+    exposure: &ToolExposure,
+    call: &ToolCall,
+    ctx: &ToolContext,
+    started: &AtomicBool,
+    slot: &Mutex<Option<ToolResult>>,
+) {
+    let result = execute_call(registry, exposure, call, ctx, started).await;
+    // Record file effects before the next call in a sequential batch
+    // starts, so a `verify` later in this same batch links to a write
+    // earlier in it (same-batch linkage, 2F). Conflict-free waves
+    // record no conflicting effects.
+    ctx.note_effects(&result.effects);
+    // Drop cached reads that this call invalidated: a file mutation
+    // clears entries whose paths overlap it, and a `run_command`
+    // clears the whole cache (ADR-018, V14).
+    if let Some(cache) = ctx.cache.as_ref()
+        && let Ok(mut cache) = cache.lock()
+    {
+        cache.invalidate_effects(&result.effects);
+    }
+    // Same wedged-lock policy as `lock_slot`: poison-tolerant.
+    slot.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .replace(result);
 }
 
 /// The workspace paths a call reads, when the call is safely cacheable

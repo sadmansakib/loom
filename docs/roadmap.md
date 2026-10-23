@@ -1144,6 +1144,17 @@ reproduces them.
     child only; the parent's model stays fixed per task. Seam: the
     engine composes a child `Agent`; leases and cancellation already
     exist.
+    **Shipped 2026-10-23 (iteration 3, first step).** The seam and hard
+    bounds are in: `ScoutConfig` on `EngineConfig` (opt-in, `None` by
+    default so the frozen SWE-bench protocol is untouched) composes a
+    child `Agent` on its own provider/model with a read-only registry
+    (read/list/search/artifact only — no writes, no shell, no recursion:
+    the child has no scout tool), `loop_shaping` off, an 8-turn ceiling,
+    a wall-clock timeout (default 120 s), and a 1 KB truncated answer.
+    Cancellation rides the parent's tool context. CLI: `loom run
+    --scout PROVIDER --scout-model MODEL`. The delegation-economics
+    trigger stays parked with item 1's funded-measurement debt — the
+    runtime ships the seam, the eval measures when credit allows.
 20. **Self-optimization** (G10). In order:
     1. trace export: one directory per task with transcript, events,
        census, harness version, and outcome — **phase 1 shipped**

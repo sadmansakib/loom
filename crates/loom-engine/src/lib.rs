@@ -40,6 +40,7 @@ pub mod engine;
 mod estimate;
 mod provider;
 pub mod repo;
+pub mod scout;
 pub mod trace;
 pub mod trace_stats;
 
@@ -51,6 +52,7 @@ pub use estimate::{
     ANTHROPIC_TOKEN_SCALE_PER_MILLE, AnthropicEstimator, O200kEstimator, estimator_for,
 };
 pub use loom_kernel::agent::TaskControl;
+pub use scout::{ANSWER_BUDGET_BYTES, ScoutConfig, ScoutTool};
 // The provider/effort types a frontend must name to build an `EngineConfig`;
 // re-exported so a frontend never depends on the provider crate directly.
 pub use loom_providers::{ProviderCatalog, ReasoningEffort};
