@@ -3,7 +3,29 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-23 — MCP slice D3: deferral probe, 12.4× upfront token cut ($0)
+
+- `docs/benchmarks/mcp-probe-ghmock.rs`: standalone std-only mock GitHub
+  MCP server for measurement — 35 tools, ~3 KB schemas each (22.8K est.
+  tokens eager, mirroring the real server's ~26K), functional
+  `get_issue`, byte-exact definition dump via `LOOM_GHMOCK_DUMP`.
+- Probe (both arms $0 nano gateway, daily-driver `fix` fixture, same
+  task): deferred surface vs `always_load`-all-35 eager.
+  - Both arms completed, 2/2 tests, issue consulted through
+    `mcp_gh_get_issue` exactly once in each.
+  - Upfront tool tokens (deterministic, advertised bytes/4):
+    eager 22,776/request vs deferred 1,832 total → **12.4×**, clearing
+    the design bar of ≥10×.
+  - Deferred flow: one `mcp_search_tools`, one `mcp_load_tools`
+    (exactly `get_issue`), no deadlocks; 14 turns vs eager's 15 —
+    deferral added no turns in this run.
+  - Whole-run input tokens: 85.1K vs 414.7K (4.9×); per-request average
+    6.1K vs 27.6K.
+- Protocol + run log recorded in `docs/daily-driver.md` under the same
+  honesty rules as eval (fresh fixtures, no rerolls).
+
 ## 2026-10-23 — MCP slice D2: deferred tool surface (search + load + idle eviction)
+
 
 Second slice of `docs/mcp-design.md`: kill the eager-schema token tax.
 With `--mcp`, advertised tools are no longer all registered; the model
