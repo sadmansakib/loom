@@ -48,7 +48,7 @@ fn render_menu(servers: &[Arc<LspServer>]) -> String {
     format!(
         "LSP servers attached: {listing}. Semantic tools: lsp_definition, \
          lsp_references, lsp_symbols, lsp_workspace_symbols, lsp_hover, \
-         lsp_diagnostics, lsp_rename, lsp_format. Pass a file path plus a \
+         lsp_diagnostics, lsp_call_hierarchy, lsp_rename, lsp_format. Pass a file path plus a \
          symbol name (substring) or 1-based line:column; results are \
          path:line:col."
     )

@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock};
 
 use async_lsp::lsp_types;
 use async_lsp::lsp_types::request::{
+    CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
     DocumentDiagnosticRequest, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest,
     References, Rename, WorkspaceSymbolRequest,
 };
@@ -635,6 +636,152 @@ impl Tool for LspDiagnosticsTool {
     }
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub(crate) struct CallHierarchyInput {
+    /// File path of the symbol (workspace-relative or absolute).
+    pub path: String,
+    /// 1-based line number. Optional when `symbol` is given.
+    pub line: Option<u32>,
+    /// 1-based column in characters. Defaults to 1 when `line` is given.
+    pub column: Option<u32>,
+    /// Symbol substring; the tool locates its first occurrence instead
+    /// of requiring exact line/column.
+    pub symbol: Option<String>,
+    /// "incoming" (who calls this symbol; the default) or "outgoing"
+    /// (what this symbol calls).
+    pub direction: Option<String>,
+}
+
+lsp_read_tool!(
+    LspCallHierarchyTool,
+    "lsp_call_hierarchy",
+    "Show a symbol's callers (direction \"incoming\", the default) or callees (\"outgoing\"). Input: path plus `symbol` (substring) or 1-based line/column. Returns path:line:col entries with call-site counts.",
+    CallHierarchyInput
+);
+
+impl Tool for LspCallHierarchyTool {
+    fn spec(&self) -> &ToolSpec {
+        Self::spec_ref()
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
+    fn call(
+        &self,
+        input: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
+        let inner = self.inner.clone();
+        let ctx = ctx.clone();
+        Box::pin(async move {
+            let input: CallHierarchyInput = serde_json::from_value(input)
+                .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+            let outgoing = match input.direction.as_deref() {
+                None | Some("incoming") => false,
+                Some("outgoing") => true,
+                Some(other) => {
+                    return Err(ToolError::InvalidInput(format!(
+                        "direction must be \"incoming\" or \"outgoing\", got {other:?}"
+                    )));
+                }
+            };
+            let server = inner.pick_server(&input.path)?;
+            if server.capabilities.call_hierarchy_provider.is_none() {
+                return Err(ToolError::Execution(
+                    "server does not support call hierarchy".to_string(),
+                ));
+            }
+            let position = inner
+                .resolve_position(
+                    &ctx,
+                    &server,
+                    &PositionalInput {
+                        path: input.path.clone(),
+                        line: input.line,
+                        column: input.column,
+                        symbol: input.symbol.clone(),
+                    },
+                )
+                .await?;
+            let params = lsp_types::CallHierarchyPrepareParams {
+                text_document_position_params: lsp_types::TextDocumentPositionParams {
+                    text_document: lsp_types::TextDocumentIdentifier {
+                        uri: document_uri(&server, &input.path)?,
+                    },
+                    position,
+                },
+                work_done_progress_params: Default::default(),
+            };
+            let items = server
+                .request::<CallHierarchyPrepare>(params)
+                .await
+                .map_err(ToolError::Execution)?;
+            let Some(item) = items.unwrap_or_default().into_iter().next() else {
+                return finish(&server, String::new());
+            };
+            // Header names the symbol via its own definition location.
+            let mut body = loc_line(
+                &format!(
+                    "{} of {} at",
+                    if outgoing { "callees" } else { "callers" },
+                    item.name
+                ),
+                &lsp_types::Location {
+                    uri: item.uri.clone(),
+                    range: item.selection_range,
+                },
+            );
+            body.push('\n');
+            if outgoing {
+                let calls = server
+                    .request::<CallHierarchyOutgoingCalls>(
+                        lsp_types::CallHierarchyOutgoingCallsParams {
+                            item,
+                            work_done_progress_params: Default::default(),
+                            partial_result_params: Default::default(),
+                        },
+                    )
+                    .await
+                    .map_err(ToolError::Execution)?;
+                for call in calls.unwrap_or_default() {
+                    body.push_str(&loc_line(
+                        &format!("callee {}", call.to.name),
+                        &lsp_types::Location {
+                            uri: call.to.uri.clone(),
+                            range: call.to.selection_range,
+                        },
+                    ));
+                    body.push_str(&format!(" ({} call site(s))\n", call.from_ranges.len()));
+                }
+            } else {
+                let calls = server
+                    .request::<CallHierarchyIncomingCalls>(
+                        lsp_types::CallHierarchyIncomingCallsParams {
+                            item,
+                            work_done_progress_params: Default::default(),
+                            partial_result_params: Default::default(),
+                        },
+                    )
+                    .await
+                    .map_err(ToolError::Execution)?;
+                for call in calls.unwrap_or_default() {
+                    body.push_str(&loc_line(
+                        &format!("caller {}", call.from.name),
+                        &lsp_types::Location {
+                            uri: call.from.uri.clone(),
+                            range: call.from.selection_range,
+                        },
+                    ));
+                    body.push_str(&format!(" ({} call site(s))\n", call.from_ranges.len()));
+                }
+            }
+            finish(&server, body)
+        })
+    }
+}
+
 // ------------------------------------------------------------ E2: write
 
 #[derive(Deserialize, JsonSchema)]
@@ -879,6 +1026,7 @@ pub(crate) fn lsp_tools(inner: Arc<LspInner>) -> Vec<Box<dyn Tool>> {
         Box::new(LspWorkspaceSymbolsTool::new(inner.clone())),
         Box::new(LspHoverTool::new(inner.clone())),
         Box::new(LspDiagnosticsTool::new(inner.clone())),
+        Box::new(LspCallHierarchyTool::new(inner.clone())),
         Box::new(LspRenameTool::new(inner.clone())),
         Box::new(LspFormatTool::new(inner)),
     ]

@@ -3,9 +3,10 @@
 
 Usage: python3 daily-driver-fixture.py TARGET_DIR
 
-Writes three fresh single-crate repos under TARGET_DIR — fix/, impl/,
-refactor/ — each seeded red (a failing test, a stub, or a compile error).
-The probe recreates them before every run and throws them away after.
+Writes four fresh single-crate repos under TARGET_DIR — fix/, impl/,
+refactor/, rename/ — each seeded red (a failing test, a stub, a compile
+error, or callers pinned to a new name). The probe recreates them before
+every run and throws them away after.
 """
 
 import os
@@ -104,7 +105,97 @@ fn tag_uses_dash() {
 ''',
 }
 
-VARIANTS = {"fix": FIX, "impl": IMPL, "refactor": REFACTOR}
+RENAME = {
+    "src/lib.rs": '''//! Name helpers under rename.
+
+pub mod alpha;
+pub mod beta;
+pub mod gamma;
+pub mod delta;
+pub mod epsilon;
+
+/// Lowercases `raw` and collapses runs of whitespace to single spaces.
+/// Callers across the modules expect the trimmed form.
+pub fn normalize_name(raw: &str) -> String {
+    raw.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+''',
+    "src/alpha.rs": '''use crate::normalize_name;
+
+/// Greets a normalized name.
+pub fn greet(name: &str) -> String {
+    format!("hello {}", normalize_name(name))
+}
+''',
+    "src/beta.rs": '''use crate::normalize_name;
+
+/// Builds a sorted, normalized roster line.
+pub fn roster(names: &[&str]) -> String {
+    let mut cleaned: Vec<String> = names.iter().map(|n| normalize_name(n)).collect();
+    cleaned.sort();
+    cleaned.join(", ")
+}
+
+/// Counts names that normalize to the same form.
+pub fn collisions(names: &[&str]) -> usize {
+    let mut cleaned: Vec<String> = names.iter().map(|n| normalize_name(n)).collect();
+    cleaned.sort();
+    cleaned.windows(2).filter(|w| w[0] == w[1]).count()
+}
+''',
+    "src/gamma.rs": '''use crate::normalize_name;
+
+/// Wraps a normalized name in brackets.
+pub fn badge(name: &str) -> String {
+    format!("[{}]", normalize_name(name))
+}
+''',
+    "src/delta.rs": '''use crate::normalize_name;
+
+/// True when the normalized form is non-empty.
+pub fn is_usable(name: &str) -> bool {
+    !normalize_name(name).is_empty()
+}
+''',
+    "src/epsilon.rs": '''use crate::normalize_name;
+
+/// Normalizes then truncates to `max` characters.
+pub fn clip(name: &str, max: usize) -> String {
+    let normalized = normalize_name(name);
+    normalized.chars().take(max).collect()
+}
+
+/// Initials of the normalized form.
+pub fn initials(name: &str) -> String {
+    normalize_name(name)
+        .split_whitespace()
+        .filter_map(|w| w.chars().next())
+        .collect()
+}
+''',
+    "tests/names.rs": '''use proberepo::{alpha, beta, canonicalize, delta, epsilon, gamma};
+
+#[test]
+fn canonicalize_trims_and_lowercases() {
+    assert_eq!(canonicalize("  Ada   Lovelace  "), "ada lovelace");
+}
+
+#[test]
+fn callers_still_work() {
+    assert_eq!(alpha::greet("  GRACE  "), "hello grace");
+    assert_eq!(beta::roster(&["B", "  b "]), "b, b");
+    assert_eq!(gamma::badge(" Ada "), "[ada]");
+    assert!(delta::is_usable(" x "));
+    assert_eq!(epsilon::clip("four score", 4), "four");
+    assert_eq!(epsilon::initials("grace hopper"), "gh");
+}
+''',
+}
+
+VARIANTS = {"fix": FIX, "impl": IMPL, "refactor": REFACTOR, "rename": RENAME}
 
 
 def main() -> None:

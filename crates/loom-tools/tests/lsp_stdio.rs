@@ -126,6 +126,7 @@ fn nested<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json:
 fn mock_server_loop() -> ! {
     let no_pull = std::env::var("LOOM_LSP_NO_PULL").is_ok();
     let no_rename = std::env::var("LOOM_LSP_NO_RENAME").is_ok();
+    let no_call_hierarchy = std::env::var("LOOM_LSP_NO_CALLHIERARCHY").is_ok();
     let settings_probe = std::env::var("LOOM_LSP_SETTINGS_PROBE").is_ok();
     let mut out = std::io::stdout();
     // libtest writes its progress line without a newline; start on a
@@ -161,6 +162,9 @@ fn mock_server_loop() -> ! {
                 }
                 if !no_rename {
                     caps["renameProvider"] = serde_json::json!(true);
+                }
+                if !no_call_hierarchy {
+                    caps["callHierarchyProvider"] = serde_json::json!(true);
                 }
                 let result = serde_json::json!({
                     "capabilities": caps,
@@ -322,6 +326,75 @@ fn mock_server_loop() -> ! {
                         "message": "mock error: unused variable"
                     }]
                 });
+                if let Some(id) = id {
+                    send_response(&mut out, id, result);
+                }
+            }
+            "textDocument/prepareCallHierarchy" => {
+                let lib = file_uri(&format!("{}/src/lib.rs", ws_root()));
+                let result = serde_json::json!([{
+                    "name": "median",
+                    "kind": 12,
+                    "uri": lib,
+                    "range": {
+                        "start": {"line": 2, "character": 0},
+                        "end": {"line": 2, "character": 20}
+                    },
+                    "selectionRange": {
+                        "start": {"line": 2, "character": 7},
+                        "end": {"line": 2, "character": 13}
+                    }
+                }]);
+                if let Some(id) = id {
+                    send_response(&mut out, id, result);
+                }
+            }
+            "callHierarchy/incomingCalls" => {
+                let other = file_uri(&format!("{}/src/other.rs", ws_root()));
+                let result = serde_json::json!([{
+                    "from": {
+                        "name": "caller",
+                        "kind": 12,
+                        "uri": other,
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 20}
+                        },
+                        "selectionRange": {
+                            "start": {"line": 0, "character": 3},
+                            "end": {"line": 0, "character": 9}
+                        }
+                    },
+                    "fromRanges": [{
+                        "start": {"line": 0, "character": 10},
+                        "end": {"line": 0, "character": 16}
+                    }]
+                }]);
+                if let Some(id) = id {
+                    send_response(&mut out, id, result);
+                }
+            }
+            "callHierarchy/outgoingCalls" => {
+                let other = file_uri(&format!("{}/src/other.rs", ws_root()));
+                let result = serde_json::json!([{
+                    "to": {
+                        "name": "sort",
+                        "kind": 12,
+                        "uri": other,
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 20}
+                        },
+                        "selectionRange": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 4}
+                        }
+                    },
+                    "fromRanges": [{
+                        "start": {"line": 1, "character": 11},
+                        "end": {"line": 1, "character": 15}
+                    }]
+                }]);
                 if let Some(id) = id {
                     send_response(&mut out, id, result);
                 }
@@ -501,7 +574,7 @@ fn missing_binary_skips_server() {
 }
 
 #[test]
-fn attach_yields_eight_tools_and_menu() {
+fn attach_yields_nine_tools_and_menu() {
     let dir = workspace("attach");
     manifest(&dir, &[]);
     let attachment = attach(&dir);
@@ -519,6 +592,7 @@ fn attach_yields_eight_tools_and_menu() {
             "lsp_workspace_symbols",
             "lsp_hover",
             "lsp_diagnostics",
+            "lsp_call_hierarchy",
             "lsp_rename",
             "lsp_format",
         ]
@@ -527,6 +601,7 @@ fn attach_yields_eight_tools_and_menu() {
     assert!(menu.contains("rust_analyzer (Rust)"), "menu: {menu}");
     assert!(menu.contains("lsp_definition"));
     assert!(menu.contains("lsp_rename"));
+    assert!(menu.contains("lsp_call_hierarchy"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -823,6 +898,77 @@ fn settings_reach_workspace_configuration() {
         out.content.contains("settings seen: probe-77"),
         "{}",
         out.content
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn call_hierarchy_incoming_renders_callers() {
+    let dir = workspace("callh-in");
+    manifest(&dir, &[]);
+    let rt = build_runtime();
+    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let tool = find_tool(&attachment.tools, "lsp_call_hierarchy");
+    let ctx = context(&dir);
+    let out = rt
+        .block_on(tool.call(
+            serde_json::json!({"path": "src/lib.rs", "symbol": "median"}),
+            &ctx,
+        ))
+        .expect("call hierarchy call");
+    assert!(
+        out.content.contains("callers of median at"),
+        "{}",
+        out.content
+    );
+    assert!(out.content.contains("caller caller"), "{}", out.content);
+    assert!(out.content.contains("other.rs:1:4"), "{}", out.content);
+    assert!(out.content.contains("(1 call site(s))"), "{}", out.content);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn call_hierarchy_outgoing_renders_callees() {
+    let dir = workspace("callh-out");
+    manifest(&dir, &[]);
+    let rt = build_runtime();
+    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let tool = find_tool(&attachment.tools, "lsp_call_hierarchy");
+    let ctx = context(&dir);
+    let out = rt
+        .block_on(tool.call(
+            serde_json::json!({"path": "src/lib.rs", "symbol": "median", "direction": "outgoing"}),
+            &ctx,
+        ))
+        .expect("call hierarchy call");
+    assert!(
+        out.content.contains("callees of median at"),
+        "{}",
+        out.content
+    );
+    assert!(out.content.contains("callee"), "{}", out.content);
+    assert!(out.content.contains("sort"), "{}", out.content);
+    assert!(out.content.contains("other.rs:1:1"), "{}", out.content);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn call_hierarchy_without_capability_errors() {
+    let dir = workspace("callh-unsupported");
+    manifest(&dir, &[("LOOM_LSP_NO_CALLHIERARCHY", "1")]);
+    let rt = build_runtime();
+    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let tool = find_tool(&attachment.tools, "lsp_call_hierarchy");
+    let ctx = context(&dir);
+    let err = rt
+        .block_on(tool.call(
+            serde_json::json!({"path": "src/lib.rs", "symbol": "median"}),
+            &ctx,
+        ))
+        .expect_err("call hierarchy must fail without the capability");
+    assert!(
+        matches!(err, loom_kernel::tool::ToolError::Execution(ref m) if m.contains("call hierarchy")),
+        "{err:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

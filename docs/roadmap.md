@@ -303,8 +303,14 @@ diagnostics — opt-in via `--lsp`; tree-sitter `--symbols` stays as the
 zero-dependency floor. **Shipped 2026-10-23 (E2)**: rename + format
 with WorkspaceEdit application through loom's write path (bottom-up
 edits, overlap rejection, version stale-guard, ResourceOps honored),
-per-server `settings` serving, `applyEdit` still declined. Open: E3
-callHierarchy + the $0 turn-economy probe.
+per-server `settings` serving, `applyEdit` still declined. **Shipped
+2026-10-24 (E3)**: `lsp_call_hierarchy` (prepare + incoming/outgoing,
+capability-gated) plus the $0 turn-economy probe — rename-heavy fixture,
+real rust-analyzer, three labeled runs; all arms success at equal
+exploratory turns, with the honest caveat that the nano-tier model
+elects semantic tools stochastically (one run never called them; the
+rerun's single `lsp_rename` renamed six documents in one call, 3 fixup
+edits vs 20). Iteration 6 complete: un-gated engineering exhausted.
 
 ### Iteration 7 — Plugin system (future scope)
 

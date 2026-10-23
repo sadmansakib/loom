@@ -3,6 +3,29 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-24 — LSP call hierarchy + $0 turn-economy probe (slice E3)
+
+- `lsp_call_hierarchy` (capability-gated): prepare + incoming/outgoing
+  calls in one tool — `direction` selects callers (default) or callees;
+  results render symbol names at `path:line:col` with call-site counts.
+  Nine LSP tools total behind `--lsp`.
+- $0 turn-economy probe (docs/daily-driver.md): rename-heavy fixture
+  (`rename` variant in `daily-driver-fixture.py` — 7 call sites across
+  5 modules, tests pre-import the new name), real rust-analyzer, three
+  labeled runs. All arms success (2/2 tests, zero stale refs) at equal
+  exploratory turns (3) — bar met. Attribution split: one `--lsp` run
+  never called an lsp tool (16 turns); the labeled rerun elected
+  `lsp_rename` once — six documents renamed in a single call, 3 fixup
+  edits vs baseline's 20, 14 turns, −48% input tokens, 47.7s. Honest
+  conclusion: `--lsp` is no-harm opt-in breadth; the mechanical-rename
+  collapse is real when the model elects semantic tools, and the free
+  nano-tier model elects them stochastically. Capable-model validation
+  remains future funded work.
+- Tests: mock-server call-hierarchy arms (prepare/incoming/outgoing)
+  and the missing-capability error — 21 LSP integration tests,
+  stable across repeated runs. Workspace: 1049 passed, 0 failed;
+  clippy and fmt clean.
+
 ## 2026-10-23 — LSP rename + format with WorkspaceEdit application (slice E2)
 
 - `lsp_rename` and `lsp_format` (capability-gated; servers without the
