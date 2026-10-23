@@ -119,6 +119,14 @@ pub struct EngineConfig {
     /// `.loom/mcp.lock` (docs/mcp-design.md). The bare-loop baseline
     /// never carries them.
     pub mcp: bool,
+    /// LSP servers (iteration 6, slice E): when false (the default)
+    /// nothing spawns and the registry is byte-identical. When set,
+    /// language servers from the built-in table (binary on PATH +
+    /// language markers present) and `.loom/lsp.toml` overrides attach
+    /// sandboxed over stdio, and the `lsp_*` read tools enter the
+    /// registry (docs/lsp-design.md). The bare-loop baseline never
+    /// carries them.
+    pub lsp: bool,
     /// Per-tool output budgets (roadmap item 20.2): the one struct a
     /// sweep varies instead of editing constants and rebuilding.
     /// [`ToolBudgets::default`] reproduces today's byte-exact behavior —
@@ -155,6 +163,7 @@ pub(crate) fn test_config() -> EngineConfig {
         git: false,
         skills: false,
         mcp: false,
+        lsp: false,
         budgets: ToolBudgets::default(),
         prune: None,
     }
@@ -309,17 +318,24 @@ impl Engine {
         config: EngineConfig,
         overrides: EngineOverrides,
     ) -> Result<Self, EngineError> {
-        Self::open_with_extra_tools(config, overrides, loom_tools::mcp::McpAttachment::default())
+        Self::open_with_extra_tools(
+            config,
+            overrides,
+            loom_tools::mcp::McpAttachment::default(),
+            loom_tools::lsp::LspAttachment::default(),
+        )
     }
 
-    /// [`Engine::open_with`] plus an MCP attachment (slice D): eager
-    /// meta-tools and `always_load` pins register after every built-in
-    /// opt-in surface; the deferred surface and facts menu ride along.
-    /// Same failure semantics as any other registration.
+    /// [`Engine::open_with`] plus an MCP attachment (slice D) and an LSP
+    /// attachment (slice E): eager meta-tools and `always_load` pins
+    /// register after every built-in opt-in surface; the deferred
+    /// surface and facts menus ride along. Same failure semantics as
+    /// any other registration.
     fn open_with_extra_tools(
         config: EngineConfig,
         overrides: EngineOverrides,
         mcp: loom_tools::mcp::McpAttachment,
+        lsp: loom_tools::lsp::LspAttachment,
     ) -> Result<Self, EngineError> {
         let workspace =
             std::fs::canonicalize(&config.workspace).map_err(|source| EngineError::Workspace {
@@ -489,6 +505,21 @@ impl Engine {
                     message: error.to_string(),
                 })?;
         }
+        // Slice E (iteration 6): LSP servers over stdio. Opt-in via
+        // `EngineConfig::lsp`; the bare-loop arm never carries them.
+        // Like MCP, spawning and handshaking is async I/O, so the async
+        // open path computes the attachment and hands it in. Attach
+        // never fails the engine open — a missing binary or a failed
+        // spawn degrades that server to nothing (warn + skip), and an
+        // invalid `.loom/lsp.toml` degrades all of LSP (fail closed).
+        for tool in lsp.tools {
+            registry
+                .register(tool)
+                .map_err(|error| EngineError::RegisterTool {
+                    tool: "lsp",
+                    message: error.to_string(),
+                })?;
+        }
         let system_prompt = config.system_prompt.unwrap_or_else(default_system_prompt);
         // Stage-1 repository facts (2E, ADR-015): the composition root owns the
         // I/O; the loop scans once per task through this source. The
@@ -498,6 +529,7 @@ impl Engine {
             crate::repo::FsFactsSource::new(workspace.clone())
                 .with_skills(config.skills && !overrides.bare_loop)
                 .with_mcp_menu(mcp.menu.clone())
+                .with_lsp_menu(lsp.menu.clone())
         });
         let compiler: Box<dyn ContextCompiler> = match overrides.compiler {
             Some(compiler) => compiler,
@@ -707,7 +739,18 @@ impl Engine {
         } else {
             loom_tools::mcp::McpAttachment::default()
         };
-        Engine::open_with_extra_tools(config, overrides, mcp)
+        // Slice E1: LSP attach. Same async-open reasoning as MCP; a
+        // missing binary skips that server, an invalid manifest fails
+        // all of LSP closed, and the frozen default registry is
+        // untouched while the flag is off.
+        let lsp = if config.lsp && !overrides.bare_loop {
+            let workspace = std::fs::canonicalize(&config.workspace)
+                .unwrap_or_else(|_| config.workspace.clone());
+            loom_tools::lsp::attach_lsp(&workspace, config.budgets).await
+        } else {
+            loom_tools::lsp::LspAttachment::default()
+        };
+        Engine::open_with_extra_tools(config, overrides, mcp, lsp)
     }
 
     /// Creates a fresh session handle for one run.
@@ -971,6 +1014,7 @@ fn compose_scout(
         git: false,
         skills: false,
         mcp: false,
+        lsp: false,
         budgets: parent.budgets,
         prune: None,
     };

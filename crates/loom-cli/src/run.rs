@@ -191,6 +191,15 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         }
         false
     };
+    // Slice E (iteration 6): LSP servers. Same gate, same bare-arm rule.
+    let lsp = if args.lsp && !bare_arm {
+        true
+    } else {
+        if args.lsp {
+            eprintln!("note: --lsp is ignored in the bare-loop arm");
+        }
+        false
+    };
     // Structured git tools (iteration 4): same gate, same bare-arm rule.
     let git = if args.git && !bare_arm {
         true
@@ -243,6 +252,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             git,
             skills,
             mcp,
+            lsp,
             budgets,
             prune: Some(prune),
         },

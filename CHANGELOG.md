@@ -3,6 +3,43 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-23 — LSP client + semantic read tools (slice E1)
+
+- Generic stdio LSP client (`async-lsp` + `lsp-types`, the stack Helix
+  uses): sandboxed spawn (Seatbelt/bwrap, net-off, no env inheritance,
+  kill-on-drop), typed requests with per-request timeouts, deterministic
+  server→client handling (workspace/configuration from the manifest,
+  registerCapability recorded, applyWorkspaceEdit **declined** — servers
+  advise, loom's write tools act; window/* chatter → tracing).
+- Breadth by data, not code: built-in `KNOWN_SERVERS` table (rust-analyzer,
+  gopls, clangd, pyright, typescript-language-server, zls,
+  lua-language-server, bash-language-server) auto-attaches when the binary
+  is on PATH and language markers exist (missing binary = warn+skip);
+  `.loom/lsp.toml` overrides/extends per project; invalid manifest fails
+  closed.
+- Six read tools, `--lsp` opt-in: `lsp_definition`, `lsp_references`,
+  `lsp_symbols`, `lsp_workspace_symbols`, `lsp_hover`, `lsp_diagnostics` —
+  `[lsp:<server>]` provenance, head caps, drift-tolerant input (file path +
+  symbol substring OR 1-based line:column), char↔utf-16 position conversion
+  (negotiates utf-8; surrogate-pair tests), lazy `didOpen` +
+  recent-changes-fed `didChange`/`didChangeWatchedFiles` sync (no watcher
+  threads), pull diagnostics preferred with bounded-wait push-cache
+  fallback (never stale-as-fresh).
+- `PreambleSkip` read adapter: tolerates non-LSP noise (banners, test
+  harness progress) before the first framed message — real servers that
+  print banners survive too.
+- Facts `lsp_menu` slot (mirror of `mcp_menu`); defaults byte-identical
+  without `--lsp`; the bare loop never attaches.
+- Tree-sitter `--symbols` stays as the zero-dependency floor; LSP is the
+  breadth+semantics path (cross-file references, compiler diagnostics).
+  Coexistence is deliberate until the E3 probe measures otherwise.
+- Tests: 14 integration tests over an in-repo mock LSP server (framed
+  Content-Length JSON-RPC, re-exec pattern) + position/manifest/client
+  units; real-server rust-analyzer smoke behind an env-gated ignored test.
+- Honest gaps: server settings served as `Value::Null` placeholder (per-
+  server `settings` manifest key lands with E2); rename (E2) and
+  callHierarchy + $0 probe (E3) remain.
+
 ## 2026-10-23 — LSP deep research + design pinned (slice E)
 
 - `docs/lsp-design.md`: evidence (Serena's LSP-for-agents lessons —

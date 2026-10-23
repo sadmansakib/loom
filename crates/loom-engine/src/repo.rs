@@ -128,6 +128,7 @@ pub struct FsFactsSource {
     root: PathBuf,
     skills: bool,
     mcp_menu: Option<String>,
+    lsp_menu: Option<String>,
 }
 
 impl FsFactsSource {
@@ -138,6 +139,7 @@ impl FsFactsSource {
             root: root.into(),
             skills: false,
             mcp_menu: None,
+            lsp_menu: None,
         }
     }
 
@@ -163,6 +165,15 @@ impl FsFactsSource {
         self.mcp_menu = menu;
         self
     }
+
+    /// Bakes the attached LSP servers menu into the facts block
+    /// (slice E1). Static per task, like the MCP menu: the server set
+    /// is fixed at attach time.
+    #[must_use]
+    pub fn with_lsp_menu(mut self, menu: Option<String>) -> Self {
+        self.lsp_menu = menu;
+        self
+    }
 }
 
 impl FactsSource for FsFactsSource {
@@ -172,6 +183,7 @@ impl FactsSource for FsFactsSource {
             facts.skills = scan_skills(&self.root);
         }
         facts.mcp_menu = self.mcp_menu.clone();
+        facts.lsp_menu = self.lsp_menu.clone();
         facts
     }
 }
@@ -265,6 +277,7 @@ pub fn scan(root: &Path) -> KnownFacts {
         read_instructions(root),
         Vec::new(),
         git_state(root),
+        None,
         None,
     )
 }

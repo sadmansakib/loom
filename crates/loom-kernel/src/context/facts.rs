@@ -168,6 +168,11 @@ pub struct KnownFacts {
     /// the block stays byte-stable across turns.
     #[serde(default)]
     pub mcp_menu: Option<String>,
+    /// Attached LSP servers menu (slice E1): names the servers and the
+    /// `lsp_*` read tools. Baked once at attach time — static per task,
+    /// so the block stays byte-stable across turns.
+    #[serde(default)]
+    pub lsp_menu: Option<String>,
     /// Git state at capture time.
     pub git: GitState,
 }
@@ -189,6 +194,7 @@ impl KnownFacts {
         skills: Vec<SkillIndexEntry>,
         git: GitState,
         mcp_menu: Option<String>,
+        lsp_menu: Option<String>,
     ) -> Self {
         Self {
             root,
@@ -203,6 +209,7 @@ impl KnownFacts {
             skills,
             git,
             mcp_menu,
+            lsp_menu,
         }
     }
 
@@ -222,6 +229,7 @@ impl KnownFacts {
             && self.instructions.is_none()
             && self.skills.is_empty()
             && self.mcp_menu.is_none()
+            && self.lsp_menu.is_none()
             && self.git.is_empty()
     }
 
@@ -272,6 +280,10 @@ impl KnownFacts {
         }
         render_git(&mut out, &self.git);
         if let Some(menu) = &self.mcp_menu {
+            out.push('\n');
+            out.push_str(menu);
+        }
+        if let Some(menu) = &self.lsp_menu {
             out.push('\n');
             out.push_str(menu);
         }
@@ -442,6 +454,7 @@ mod tests {
             )),
             skills: Vec::new(),
             mcp_menu: None,
+            lsp_menu: None,
             git: GitState {
                 branch: Some("main".into()),
                 changed_files: vec!["src/lib.rs".into()],

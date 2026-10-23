@@ -30,13 +30,19 @@ nix = { version = "0.29", features = ["signal"] }
 # spawn_blocking wraps the blocking std::fs work; `process` backs
 # run_command and `io-util` its capped stream reads; `time` enforces
 # per-command wall-time caps from the policy manifest (architecture.md §9/§12)
-tokio = { workspace = true, features = ["rt", "process", "io-util", "time"] }
+tokio = { workspace = true, features = ["rt", "process", "io-util", "time", "fs"] }
 # .loom/commands.toml manifest parsing (command execution policy)
 toml = "0.9"
 # SHA-256 tool-definition pinning for MCP servers (docs/mcp-design.md §3)
 sha2 = { workspace = true }
-# CancellationToken in the search walk (per-file cancellation check)
-tokio-util = { workspace = true }
+# LSP slice E: typed protocol + async tower client (docs/lsp-design.md)
+lsp-types = { workspace = true }
+async-lsp = { version = "0.2.4", default-features = false, features = ["tokio", "omni-trait", "client-monitor"] }
+tower = { workspace = true }
+# CancellationToken in the search walk (per-file cancellation check);
+# `compat` adapts the LSP server child's stdin/stdout to async-lsp's
+# futures-io framed transport
+tokio-util = { workspace = true, features = ["compat"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

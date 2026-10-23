@@ -17,6 +17,7 @@ pub mod fastpath;
 mod fusion;
 pub mod git;
 mod list_dir;
+pub mod lsp;
 pub mod mcp;
 pub mod policy;
 pub mod read_file;
@@ -39,6 +40,9 @@ pub use budget::ToolBudgets;
 pub use edit_file::EditFileTool;
 pub use git::{GitDiffTool, GitLogTool, GitStatusTool};
 pub use list_dir::ListDirTool;
+pub use lsp::{
+    KNOWN_SERVERS, LspAttachment, LspManifest, LspServer, LspServerDecl, MANIFEST_RELATIVE_PATH,
+};
 pub use mcp::{McpError, McpManifest, McpServerDecl, McpToolPolicy};
 pub use policy::{AskResolver, CommandPolicy, CommandRule, PolicyError, PolicyVerdict};
 pub use read_file::ReadFileTool;

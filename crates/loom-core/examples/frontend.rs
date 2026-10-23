@@ -54,6 +54,7 @@ fn main() -> anyhow::Result<()> {
         git: false,
         skills: false,
         mcp: false,
+        lsp: false,
         budgets: loom_tools::ToolBudgets::default(),
         prune: None,
     }))?;

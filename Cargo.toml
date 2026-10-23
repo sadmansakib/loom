@@ -78,6 +78,17 @@ futures = "0.3.34"
 # identifiers: UUID v7, time-ordered (architecture.md §2 `id` module)
 uuid = { version = "1.27.0", features = ["v7", "serde"] }
 
+# LSP slice E: typed protocol types + the async client framework used
+# by Helix. tokio runtime + omni-trait typed request methods +
+# client-monitor exit tracking; stdio framing is done by hand over the
+# sandboxed child's pipes (tokio-util compat), so async-lsp's own
+# transport features stay off.
+lsp-types = "0.95"
+async-lsp = { version = "0.2.4", default-features = false, features = ["tokio", "omni-trait", "client-monitor"] }
+# ServiceBuilder + Layer for stacking async-lsp's Concurrency/CatchUnwind
+# layers over the Router (the client pattern from Helix)
+tower = { version = "0.5", default-features = false }
+
 # content addressing (ADR-012 decision 3): artifact bodies are keyed by the
 # SHA-256 of their bytes, so identical bodies dedupe and a ref survives the
 # file it was read from changing.

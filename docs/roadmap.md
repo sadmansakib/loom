@@ -293,7 +293,16 @@ lazy document sync fed by engine edit effects, position conversion done
 explicitly, ~8 fixed tools with Serena-style result shortening, rename
 deferred to E2 behind WorkspaceEdit application, codeAction/executeCommand
 excluded on the MCP-puppet rationale. Tree-sitter symbol tools (item 18)
-came first and shipped 2026-10-23 — opt-in via `--symbols`.
+came first and shipped 2026-10-23 — opt-in via `--symbols`. **Shipped
+2026-10-23 (E1)**: the generic client (async-lsp, sandboxed stdio,
+applyEdit declined), the `KNOWN_SERVERS` table with `.loom/lsp.toml`
+overrides, document sync (lazy didOpen + edit-effect-fed didChange), and
+six semantic read tools (definition/references/symbols/workspace-symbols/
+hover/diagnostics) with utf-16-safe positions and pull-else-push
+diagnostics — opt-in via `--lsp`; tree-sitter `--symbols` stays as the
+zero-dependency floor. Open: E2 rename/format via WorkspaceEdit
+application, E3 callHierarchy + the $0 turn-economy probe, per-server
+settings serving.
 
 ### Iteration 7 — Plugin system (future scope)
 

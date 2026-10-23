@@ -150,6 +150,14 @@ pub struct RunArgs {
     /// Off by default.
     #[arg(long)]
     pub mcp: bool,
+
+    /// Enable LSP servers (iteration 6): language servers from the
+    /// built-in table (binary on PATH + language files present) and
+    /// `.loom/lsp.toml` overrides attach sandboxed over stdio, adding
+    /// the `lsp_*` semantic read tools (docs/lsp-design.md). Off by
+    /// default.
+    #[arg(long)]
+    pub lsp: bool,
 }
 
 /// Arguments for `loom auth`.

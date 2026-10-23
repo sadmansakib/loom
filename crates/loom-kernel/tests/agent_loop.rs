@@ -443,6 +443,7 @@ async fn repository_facts_are_projected_as_a_stable_system_block() {
         Vec::new(),
         GitState::new(Some("main".to_owned()), vec!["src/lib.rs".to_owned()]),
         None,
+        None,
     );
     let agent = Agent::new(
         Box::new(provider),
