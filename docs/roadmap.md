@@ -130,7 +130,7 @@ iterations may start early where a backlog item is cheap and measured.
 | 6 | MCP & LSP integration | Started 2026-10-23 (item 18 symbol tools shipped) | 18✓ |
 | 7 | Plugin system | Future scope | — |
 | 8 | Intelligent model routing | Not started; prerequisites in place | 9⏸, 14✓ |
-| 9 | Learning & self-optimization | Not started; data path partial | 1, 20 |
+| 9 | Learning & self-optimization | Not started; data path partial | 1, 20 (20.2 sweepable set shipped) |
 | — | Product surface (cross-cutting) | Partial | 15, 22, 25 |
 
 Legend: ✓ shipped · ✓ᴬ phase A shipped, remainder open · ✗ skipped on
@@ -245,9 +245,14 @@ Pulled forward because the shell lever was large and measured. *Shipped:*
 `edit_file`/`write_file`/`run_command`/`verify`, OS sandbox (Seatbelt /
 bubblewrap) with network off by default, the command manifest as the
 escalation layer, credential scrubbing, process-group kill, `CommandEffect`
-audit records. *Open:* resource-aware allow/ask/deny policy (needs an
-interactive frontend for "ask"), `git` as a structured tool, worktree
-isolation (item 21), containerized runners (item 23).
+audit records, structured `git` tools (`git_status`/`git_diff`/`git_log`
+— read-only porcelain with deterministic flags, opt-in via `--git`,
+2026-10-23), and the verdict layer on top of the manifest
+(`[[deny]]` program blocklist, `[policy] unknown = "allow"|"ask"|"deny"`
+for unruled programs; `ask` fails closed without an interactive
+frontend — the resolver seam ships, the frontend is item 22; defaults
+byte-identical, 2026-10-23). *Open:* worktree isolation (item 21),
+containerized runners (item 23).
 
 ### Iteration 5 — Skills & contextual knowledge
 
@@ -1207,7 +1212,13 @@ reproduces them.
        schedule, edit format — moved from constants into one config
        struct, so sweeps over the SWE-bench protocol can vary it (this
        subsumes
-       adaptive pruning thresholds);
+       adaptive pruning thresholds). **Sweepable set shipped
+       2026-10-23**: `ToolBudgets` (all per-tool output budgets,
+       including the edit-echo shape) travels in `EngineConfig`, and
+       the prune trigger/floor/reclaim/tail layer over the provider
+       base via pure env seams (`LOOM_*` vars) the frozen container
+       script never sets — defaults byte-identical. The
+       reasoning-schedule slot stays gated with item 9;
     3. an outer loop in the Meta-Harness shape that reads *raw* traces,
        harness source, and scores and proposes changes (compressed
        feedback measured worse);

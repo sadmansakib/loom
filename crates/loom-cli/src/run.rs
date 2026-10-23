@@ -182,6 +182,39 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         }
         false
     };
+    // Structured git tools (iteration 4): same gate, same bare-arm rule.
+    let git = if args.git && !bare_arm {
+        true
+    } else {
+        if args.git {
+            eprintln!("note: --git is ignored in the bare-loop arm");
+        }
+        false
+    };
+    // Item 20.2: per-tool budgets and pruning policy are sweepable via
+    // env (LOOM_*_BYTES/_LINES and LOOM_PRUNE_*), layered over the
+    // defaults. Presence echoes (honesty: the run log records what
+    // varied); invalid values warn and are ignored.
+    for name in loom_core::engine::BUDGET_ENV_VARS
+        .into_iter()
+        .chain(loom_core::engine::PRUNE_ENV_VARS)
+    {
+        if let Ok(value) = std::env::var(name) {
+            eprintln!("override: {name}={value}");
+        }
+    }
+    let (budgets, budget_warnings) =
+        loom_core::engine::budgets_with_env(loom_core::tools::ToolBudgets::default(), |name| {
+            std::env::var(name).ok()
+        });
+    for warning in &budget_warnings {
+        eprintln!("warning: {warning}");
+    }
+    let (prune, prune_warnings) =
+        loom_core::engine::prune_with_env(&args.provider, |name| std::env::var(name).ok());
+    for warning in &prune_warnings {
+        eprintln!("warning: {warning}");
+    }
     let engine = runtime.block_on(Engine::open_async_with(
         EngineConfig {
             provider: args.provider,
@@ -198,7 +231,10 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             catalog: None,
             scout,
             symbols,
+            git,
             skills,
+            budgets,
+            prune: Some(prune),
         },
         overrides,
     ))?;

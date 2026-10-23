@@ -16,11 +16,25 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+use crate::budget::ToolBudgets;
 use crate::window::{self, DEFAULT_LIMIT};
 
 /// Refetches a stored tool-output artifact as a numbered line window.
 #[derive(Debug, Default)]
-pub struct ArtifactReadTool;
+pub struct ArtifactReadTool {
+    /// Output budgets (item 20.2): artifact bodies render through the
+    /// same read window as files. `Default` keeps the constants.
+    budgets: ToolBudgets,
+}
+
+impl ArtifactReadTool {
+    /// Builds the tool under explicit output budgets (the engine's
+    /// entry point).
+    pub fn with_budgets(mut self, budgets: ToolBudgets) -> Self {
+        self.budgets = budgets;
+        self
+    }
+}
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -117,7 +131,8 @@ impl Tool for ArtifactReadTool {
             };
             let label = format!("artifact {} [{}]", input.id, artifact.kind);
             let window = window::Window::from_text(&text, offset, limit, complete);
-            let (content, truncated) = window::render_window(&label, &window, offset);
+            let (content, truncated) =
+                window::render_window(&label, &window, offset, self.budgets.read_file_head_bytes);
             let mut output = ToolOutput::new(content);
             if truncated {
                 output = output.with_truncated();
@@ -164,7 +179,7 @@ mod tests {
     #[tokio::test]
     async fn reads_a_stored_artifact_with_numbered_lines() {
         let (store, id) = store(b"alpha\nbeta\n");
-        let output = ArtifactReadTool
+        let output = ArtifactReadTool::default()
             .call(json!({"id": id.to_string()}), &ctx_with(store))
             .await
             .expect("ok");
@@ -182,7 +197,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let (store, id) = store(body.as_bytes());
-        let output = ArtifactReadTool
+        let output = ArtifactReadTool::default()
             .call(
                 json!({"id": id.to_string(), "offset": 4, "limit": 3}),
                 &ctx_with(store),
@@ -203,7 +218,7 @@ mod tests {
     async fn a_missing_artifact_is_informational() {
         let (store, _) = store(b"body");
         let missing = ArtifactId::new();
-        let output = ArtifactReadTool
+        let output = ArtifactReadTool::default()
             .call(json!({"id": missing.to_string()}), &ctx_with(store))
             .await
             .expect("ok");
@@ -214,7 +229,7 @@ mod tests {
     #[tokio::test]
     async fn no_store_is_an_execution_error() {
         let (_, id) = store(b"body");
-        let err = ArtifactReadTool
+        let err = ArtifactReadTool::default()
             .call(json!({"id": id.to_string()}), &ctx_without())
             .await
             .expect_err("no store");
@@ -224,7 +239,7 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_id_is_invalid_input() {
         let (store, _) = store(b"body");
-        let err = ArtifactReadTool
+        let err = ArtifactReadTool::default()
             .call(json!({"id": "not-an-id"}), &ctx_with(store))
             .await
             .expect_err("bad id");
@@ -234,7 +249,7 @@ mod tests {
     #[tokio::test]
     async fn a_zero_offset_is_invalid_input() {
         let (store, id) = store(b"body");
-        let err = ArtifactReadTool
+        let err = ArtifactReadTool::default()
             .call(json!({"id": id.to_string(), "offset": 0}), &ctx_with(store))
             .await
             .expect_err("zero");

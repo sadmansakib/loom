@@ -19,6 +19,27 @@
 //! env_scrub = ["AWS_SECRET_ACCESS_KEY"]
 //! ```
 //!
+//! The verdict layer (iteration 4) sits in front of the rules and is
+//! optional in every workspace — omit both sections and the behavior is
+//! byte-identical with the policy that preceded it:
+//!
+//! ```toml
+//! # Programs that never run, even inside the sandbox.
+//! [[deny]]
+//! program = "curl"
+//!
+//! [policy]
+//! # Verdict for bare programs with no rule and no deny entry:
+//! # "allow" (shipped default: sandboxed run), "ask" (operator
+//! # approval; fails closed without an interactive frontend),
+//! # or "deny" (strict: only ruled programs run).
+//! unknown = "deny"
+//! ```
+//!
+//! A program with a rule is always admitted (the rule *is* the
+//! operator's explicit consent); a deny entry for a ruled program is a
+//! manifest error, so neither silently shadows the other.
+//!
 //! Each rule carries the three per-command limits:
 //!
 //! * `timeout_secs` — a wall-time cap. On expiry the child's whole
@@ -44,7 +65,7 @@
 
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Environment variables removed from every spawned child, regardless
 /// of manifest: Loom's own credentials never leak into a workspace
@@ -94,6 +115,34 @@ pub enum PolicyError {
     },
 }
 
+/// What the workspace policy says about executing a program that has
+/// no escalation rule: run it inside the boxed sandbox default
+/// ([`PolicyVerdict::Allow`]), refuse it outright
+/// ([`PolicyVerdict::Deny`]), or pause for operator approval
+/// ([`PolicyVerdict::Ask`] — requires an interactive frontend; without
+/// one, execution fails closed).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyVerdict {
+    /// Run inside the sandboxed default (or escalate when a rule
+    /// exists). The shipped behavior for every bare program.
+    #[default]
+    Allow,
+    /// Refuse to execute. The model sees a refusal naming the program.
+    Deny,
+    /// Requires operator approval before execution. Without an
+    /// attached ask resolver (interactive frontend), this fails closed
+    /// as a denial that names the missing frontend.
+    Ask,
+}
+
+/// Operator-approval hook for [`PolicyVerdict::Ask`]: returns `true`
+/// when execution is approved. Interactive frontends supply one; the
+/// engine default is none, so `ask` fails closed.
+pub type AskResolver =
+    std::sync::Arc<dyn Fn(&str) -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
+
 /// One policy rule: escalation grants and limits for a program.
 ///
 /// Rules no longer gate *whether* a program runs — every bare name may
@@ -142,9 +191,17 @@ impl CommandRule {
 
 /// What `run_command` may execute: an ordered rule set, looked up by
 /// bare program name. Data, never a branch on caller identity.
+///
+/// The verdict layer (iteration 4) sits in front of the rules: a
+/// program named in the deny list never runs, and a program with no
+/// rule and no deny entry runs only when the unknown-verdict is
+/// `allow` (the shipped default — byte-identical with the policy that
+/// preceded the layer).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CommandPolicy {
     rules: Vec<CommandRule>,
+    unknown: PolicyVerdict,
+    denied: Vec<String>,
 }
 
 impl CommandPolicy {
@@ -153,6 +210,8 @@ impl CommandPolicy {
     pub fn cargo_only() -> Self {
         Self {
             rules: vec![CommandRule::bare("cargo")],
+            unknown: PolicyVerdict::Allow,
+            denied: Vec::new(),
         }
     }
 
@@ -166,7 +225,36 @@ impl CommandPolicy {
     {
         Self {
             rules: programs.into_iter().map(CommandRule::bare).collect(),
+            unknown: PolicyVerdict::Allow,
+            denied: Vec::new(),
         }
+    }
+
+    /// The verdict for `program`: a rule admits it, the deny list
+    /// refuses it, and everything else falls through to the
+    /// unknown-program verdict.
+    #[must_use]
+    pub fn verdict(&self, program: &str) -> PolicyVerdict {
+        if self.rules.iter().any(|rule| rule.program == program) {
+            PolicyVerdict::Allow
+        } else if self.denied.iter().any(|name| name == program) {
+            PolicyVerdict::Deny
+        } else {
+            self.unknown
+        }
+    }
+
+    /// The denied program names, in manifest order.
+    #[must_use]
+    pub fn denied_names(&self) -> Vec<&str> {
+        self.denied.iter().map(String::as_str).collect()
+    }
+
+    /// The verdict applying to programs with neither a rule nor a deny
+    /// entry.
+    #[must_use]
+    pub fn unknown_verdict(&self) -> PolicyVerdict {
+        self.unknown
     }
 
     /// The rule admitting `program`, if any.
@@ -195,7 +283,21 @@ impl CommandPolicy {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Manifest {
+            #[serde(default)]
             command: Vec<ManifestCommand>,
+            #[serde(default)]
+            deny: Vec<ManifestDeny>,
+            policy: Option<ManifestPolicy>,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ManifestDeny {
+            program: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ManifestPolicy {
+            unknown: PolicyVerdict,
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields, rename_all = "snake_case")]
@@ -222,6 +324,36 @@ impl CommandPolicy {
             true
         }
         let mut policy = Self::cargo_only();
+        if let Some(section) = manifest.policy {
+            policy.unknown = section.unknown;
+        }
+        for entry in manifest.deny {
+            if !bare_name(&entry.program) {
+                return Err(PolicyError::Invalid {
+                    path: path.clone(),
+                    message: format!(
+                        "denied program \"{}\" must be a bare executable name",
+                        entry.program
+                    ),
+                });
+            }
+            if policy.rule(&entry.program).is_some() {
+                return Err(PolicyError::Invalid {
+                    path: path.clone(),
+                    message: format!(
+                        "program \"{}\" is both denied and ruled; remove one",
+                        entry.program
+                    ),
+                });
+            }
+            if policy.denied.contains(&entry.program) {
+                return Err(PolicyError::Invalid {
+                    path: path.clone(),
+                    message: format!("program \"{}\" is denied twice", entry.program),
+                });
+            }
+            policy.denied.push(entry.program);
+        }
         for entry in manifest.command {
             let rule = CommandRule {
                 program: entry.program,
@@ -237,6 +369,15 @@ impl CommandPolicy {
                 return Err(PolicyError::Invalid {
                     path,
                     message: format!("program \"{}\" is declared twice", rule.program),
+                });
+            }
+            if policy.denied.contains(&rule.program) {
+                return Err(PolicyError::Invalid {
+                    path,
+                    message: format!(
+                        "program \"{}\" is both denied and ruled; remove one",
+                        rule.program
+                    ),
                 });
             }
             policy.rules.push(rule);
@@ -443,5 +584,76 @@ mod tests {
     fn the_scrub_floor_covers_provider_credentials() {
         assert!(SCRUB_FLOOR.contains(&"DEEPSEEK_API_KEY"));
         assert!(SCRUB_FLOOR.contains(&"OPENROUTER_API_KEY"));
+    }
+
+    #[test]
+    fn the_shipped_policy_stays_allow_unknown() {
+        let policy = CommandPolicy::cargo_only();
+        assert_eq!(policy.unknown_verdict(), PolicyVerdict::Allow);
+        assert!(policy.denied_names().is_empty());
+        assert_eq!(policy.verdict("rm"), PolicyVerdict::Allow);
+        assert_eq!(policy.verdict("cargo"), PolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn the_verdict_layer_parses_and_resolves() {
+        let policy = CommandPolicy::parse(
+            "[policy]\nunknown = \"deny\"\n[[deny]]\nprogram = \"curl\"\n\
+             [[command]]\nprogram = \"git\"\n",
+        )
+        .expect("policy");
+        assert_eq!(policy.verdict("git"), PolicyVerdict::Allow, "rules admit");
+        assert_eq!(policy.verdict("curl"), PolicyVerdict::Deny, "deny list");
+        assert_eq!(
+            policy.verdict("python"),
+            PolicyVerdict::Deny,
+            "strict unknown"
+        );
+        assert_eq!(policy.denied_names(), vec!["curl"]);
+    }
+
+    #[test]
+    fn unknown_ask_parses() {
+        let policy = CommandPolicy::parse("[policy]\nunknown = \"ask\"\n").expect("policy");
+        assert_eq!(policy.verdict("echo"), PolicyVerdict::Ask);
+        assert_eq!(
+            policy.verdict("cargo"),
+            PolicyVerdict::Allow,
+            "cargo stays ruled"
+        );
+    }
+
+    #[test]
+    fn deny_and_rule_conflicts_are_errors_in_both_orders() {
+        // Deny first, rule after.
+        let error =
+            CommandPolicy::parse("[[deny]]\nprogram = \"git\"\n[[command]]\nprogram = \"git\"\n")
+                .expect_err("conflict");
+        assert!(
+            error.to_string().contains("both denied and ruled"),
+            "{error}"
+        );
+        // Rule first (cargo), deny after — same refusal.
+        let error = CommandPolicy::parse("[[deny]]\nprogram = \"cargo\"\n")
+            .expect_err("cargo is always ruled");
+        assert!(
+            error.to_string().contains("both denied and ruled"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn duplicate_deny_entries_are_errors() {
+        let error =
+            CommandPolicy::parse("[[deny]]\nprogram = \"curl\"\n[[deny]]\nprogram = \"curl\"\n")
+                .expect_err("duplicate");
+        assert!(error.to_string().contains("denied twice"), "{error}");
+    }
+
+    #[test]
+    fn an_invalid_unknown_verdict_is_rejected() {
+        let error =
+            CommandPolicy::parse("[policy]\nunknown = \"maybe\"\n").expect_err("not a verdict");
+        assert!(error.to_string().contains("unknown"), "{error}");
     }
 }

@@ -39,15 +39,18 @@ const SPEC_BUDGETS: &[(&str, usize)] = &[("edit_file", 1_700)];
 fn serialized_specs_stay_within_budget() {
     let run = RunCommandTool::new();
     let verify = VerifyTool::new();
+    let read = ReadFileTool::default();
+    let artifact = ArtifactReadTool::default();
+    let edit = EditFileTool::default();
     let tools: Vec<&dyn Tool> = vec![
-        &ReadFileTool,
+        &read,
         &ListDirTool,
         &SearchTool,
         &WriteFileTool,
-        &EditFileTool,
+        &edit,
         &run,
         &verify,
-        &ArtifactReadTool,
+        &artifact,
     ];
     let mut total = 0;
     for tool in tools {

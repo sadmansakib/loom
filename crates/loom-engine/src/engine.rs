@@ -26,7 +26,7 @@ use loom_store::SqliteStore;
 use loom_tools::policy::CommandPolicy;
 use loom_tools::{
     ArtifactReadTool, EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool,
-    VerifyTool, WriteFileTool,
+    ToolBudgets, VerifyTool, WriteFileTool,
 };
 
 use crate::auth::{self, KeychainBackend, SqliteAuthStore};
@@ -97,6 +97,12 @@ pub struct EngineConfig {
     /// frontend are unchanged until a frontend opts in. The bare-loop
     /// baseline never carries them.
     pub symbols: bool,
+    /// Structured git tools (iteration 4): when false (the default)
+    /// `git_status`/`git_diff`/`git_log` stay out of the registry — the
+    /// frozen SWE-bench protocol and every existing frontend are
+    /// unchanged until a frontend opts in. Read-only porcelain over the
+    /// same bounded sandbox exec path `run_command` uses.
+    pub git: bool,
     /// On-demand skills index (iteration 5): when false (the default)
     /// the facts block carries no skills menu and `load_skill` stays out
     /// of the registry — the frozen SWE-bench protocol and every
@@ -105,6 +111,17 @@ pub struct EngineConfig {
     /// `load_skill` serves bodies on demand. The bare-loop baseline
     /// never carries it.
     pub skills: bool,
+    /// Per-tool output budgets (roadmap item 20.2): the one struct a
+    /// sweep varies instead of editing constants and rebuilding.
+    /// [`ToolBudgets::default`] reproduces today's byte-exact behavior —
+    /// the frozen SWE-bench protocol is unchanged until a frontend
+    /// deliberately overrides.
+    pub budgets: ToolBudgets,
+    /// Full frontend override for the context-pruning policy (roadmap
+    /// item 20.2). `None` keeps the per-provider default
+    /// ([`prune_config_for`]), including the GLM/Anthropic
+    /// elide-reasoning behavior.
+    pub prune: Option<PruneConfig>,
 }
 
 /// A minimal [`EngineConfig`] for tests that need one without a real
@@ -127,7 +144,10 @@ pub(crate) fn test_config() -> EngineConfig {
         catalog: None,
         scout: None,
         symbols: false,
+        git: false,
         skills: false,
+        budgets: ToolBudgets::default(),
+        prune: None,
     }
 }
 
@@ -333,7 +353,7 @@ impl Engine {
         let registry = match overrides.registry {
             Some(registry) => registry,
             None => {
-                let built = build_registry(&policy)?;
+                let built = build_registry(&policy, config.budgets)?;
                 // The bare-loop arm keeps the primitive tool set only
                 // (read/list/write/edit/shell); a search index, the
                 // artifact re-fetch, the fused verify, and the
@@ -377,24 +397,55 @@ impl Engine {
         // `EngineConfig::symbols`; the bare-loop arm never carries them.
         if config.symbols && !overrides.bare_loop {
             registry
-                .register(Box::new(loom_tools::SymbolsOverviewTool))
+                .register(Box::new(
+                    loom_tools::SymbolsOverviewTool::default().with_budgets(config.budgets),
+                ))
                 .map_err(|error| EngineError::RegisterTool {
                     tool: "symbols_overview",
                     message: error.to_string(),
                 })?;
             registry
-                .register(Box::new(loom_tools::ReplaceSymbolTool))
+                .register(Box::new(
+                    loom_tools::ReplaceSymbolTool::default().with_budgets(config.budgets),
+                ))
                 .map_err(|error| EngineError::RegisterTool {
                     tool: "replace_symbol",
                     message: error.to_string(),
                 })?;
+        }
+        // Iteration 4: structured git tools. Same opt-in shape as the
+        // symbol tools; the bare-loop arm never carries them.
+        if config.git && !overrides.bare_loop {
+            for (name, tool) in [
+                (
+                    "git_status",
+                    Box::new(loom_tools::GitStatusTool) as Box<dyn loom_kernel::tool::Tool>,
+                ),
+                (
+                    "git_diff",
+                    Box::new(loom_tools::GitDiffTool) as Box<dyn loom_kernel::tool::Tool>,
+                ),
+                (
+                    "git_log",
+                    Box::new(loom_tools::GitLogTool) as Box<dyn loom_kernel::tool::Tool>,
+                ),
+            ] {
+                registry
+                    .register(tool)
+                    .map_err(|error| EngineError::RegisterTool {
+                        tool: name,
+                        message: error.to_string(),
+                    })?;
+            }
         }
         // Iteration 5: on-demand skills. Same opt-in shape as the symbol
         // tools; the facts block gains the index menu only when the tool
         // that serves the bodies is also present.
         if config.skills && !overrides.bare_loop {
             registry
-                .register(Box::new(loom_tools::LoadSkillTool))
+                .register(Box::new(
+                    loom_tools::LoadSkillTool::default().with_budgets(config.budgets),
+                ))
                 .map_err(|error| EngineError::RegisterTool {
                     tool: "load_skill",
                     message: error.to_string(),
@@ -428,7 +479,9 @@ impl Engine {
                     Box::new(
                         PruningContextCompiler::new(
                             Box::new(DefaultContextCompiler::with_estimator(estimator.clone())),
-                            prune_config_for(&config.provider),
+                            config
+                                .prune
+                                .unwrap_or_else(|| prune_config_for(&config.provider)),
                         )
                         .with_estimator(estimator),
                     )
@@ -860,7 +913,10 @@ fn compose_scout(
         catalog: parent.catalog.clone(),
         scout: None,
         symbols: false,
+        git: false,
         skills: false,
+        budgets: parent.budgets,
+        prune: None,
     };
     // Credential resolution mirrors the parent's (§18.3) — the scout
     // may live on a different provider with its own secret.
@@ -875,7 +931,7 @@ fn compose_scout(
     )?;
     let provider = crate::provider::build(&child, credential.secret.expose())?.provider;
     let registry = ToolRegistry::from_tools(
-        build_registry(policy)?
+        build_registry(policy, child.budgets)?
             .into_tools()
             .filter(|tool| tool.is_read_only()),
     );
@@ -901,7 +957,10 @@ fn compose_scout(
     .with_loop_shaping(false))
 }
 
-fn build_registry(policy: &CommandPolicy) -> Result<ToolRegistry, EngineError> {
+fn build_registry(
+    policy: &CommandPolicy,
+    budgets: ToolBudgets,
+) -> Result<ToolRegistry, EngineError> {
     let mut registry = ToolRegistry::new();
     let mut register = |name: &'static str, tool: Box<dyn loom_kernel::tool::Tool>| {
         registry
@@ -911,17 +970,29 @@ fn build_registry(policy: &CommandPolicy) -> Result<ToolRegistry, EngineError> {
                 message: error.to_string(),
             })
     };
-    register("read_file", Box::new(ReadFileTool))?;
+    register(
+        "read_file",
+        Box::new(ReadFileTool::default().with_budgets(budgets)),
+    )?;
     register("list_dir", Box::new(ListDirTool))?;
     register("search", Box::new(SearchTool))?;
-    register("artifact_read", Box::new(ArtifactReadTool))?;
+    register(
+        "artifact_read",
+        Box::new(ArtifactReadTool::default().with_budgets(budgets)),
+    )?;
     register("write_file", Box::new(WriteFileTool))?;
-    register("edit_file", Box::new(EditFileTool))?;
+    register(
+        "edit_file",
+        Box::new(EditFileTool::default().with_budgets(budgets)),
+    )?;
     register(
         "run_command",
-        Box::new(RunCommandTool::with_policy(policy.clone())),
+        Box::new(RunCommandTool::with_policy(policy.clone()).with_budgets(budgets)),
     )?;
-    register("verify", Box::new(VerifyTool::with_policy(policy.clone())))?;
+    register(
+        "verify",
+        Box::new(VerifyTool::with_policy(policy.clone()).with_budgets(budgets)),
+    )?;
     register("todo", Box::new(loom_kernel::tool::TodoTool::new()))?;
     Ok(registry)
 }
@@ -991,6 +1062,84 @@ fn prune_config_for(provider: &str) -> PruneConfig {
         config.elide_reasoning = Some(8);
     }
     config
+}
+
+/// The `LOOM_*` budget knobs [`budgets_with_env`] reads, in struct
+/// order. Exported so a frontend can echo which overrides a run
+/// actually saw (sweep logs stay honest about what varied).
+pub const BUDGET_ENV_VARS: [&str; 8] = [
+    "LOOM_READ_HEAD_BYTES",
+    "LOOM_COMMAND_HEAD_BYTES",
+    "LOOM_COMMAND_TAIL_BYTES",
+    "LOOM_EDIT_ECHO_MAX_BYTES",
+    "LOOM_EDIT_ECHO_LINES",
+    "LOOM_SYMBOLS_OVERVIEW_MAX_BYTES",
+    "LOOM_SKILL_HEAD_BYTES",
+    "LOOM_REPLACE_SYMBOL_HEAD_BYTES",
+];
+
+/// The `LOOM_PRUNE_*` knobs [`prune_with_env`] reads, in struct order.
+pub const PRUNE_ENV_VARS: [&str; 4] = [
+    "LOOM_PRUNE_TRIGGER_PERCENT",
+    "LOOM_PRUNE_FLOOR_TOKENS",
+    "LOOM_PRUNE_MIN_RECLAIM_TOKENS",
+    "LOOM_PRUNE_TAIL_TOKENS",
+];
+
+/// Applies `LOOM_*` per-tool budget overrides (roadmap item 20.2) over
+/// `base`. Pure — the caller supplies the env reader — so the frozen
+/// SWE-bench container script (which sets none of these) is unaffected,
+/// and tests drive it without touching process env. Invalid or
+/// zero-valued entries are ignored and reported as warning lines for the
+/// frontend to print.
+pub fn budgets_with_env(
+    base: ToolBudgets,
+    get: impl Fn(&str) -> Option<String>,
+) -> (ToolBudgets, Vec<String>) {
+    let mut budgets = base;
+    let mut warnings = Vec::new();
+    let mut apply = |slot: &mut usize, name: &str| {
+        if let Some(raw) = get(name) {
+            match raw.trim().parse::<usize>() {
+                Ok(value) if value > 0 => *slot = value,
+                _ => warnings.push(format!("ignoring invalid {name}={raw:?}")),
+            }
+        }
+    };
+    apply(&mut budgets.read_file_head_bytes, BUDGET_ENV_VARS[0]);
+    apply(&mut budgets.command_head_bytes, BUDGET_ENV_VARS[1]);
+    apply(&mut budgets.command_tail_bytes, BUDGET_ENV_VARS[2]);
+    apply(&mut budgets.edit_echo_max_bytes, BUDGET_ENV_VARS[3]);
+    apply(&mut budgets.edit_echo_context_lines, BUDGET_ENV_VARS[4]);
+    apply(&mut budgets.symbols_overview_max_bytes, BUDGET_ENV_VARS[5]);
+    apply(&mut budgets.skill_body_head_bytes, BUDGET_ENV_VARS[6]);
+    apply(&mut budgets.replace_symbol_head_bytes, BUDGET_ENV_VARS[7]);
+    (budgets, warnings)
+}
+
+/// Applies `LOOM_PRUNE_*` overrides (roadmap item 20.2) over the
+/// per-provider base from [`prune_config_for`], preserving its
+/// provider-gated reasoning elision. Same purity and warning contract
+/// as [`budgets_with_env`].
+pub fn prune_with_env(
+    provider: &str,
+    get: impl Fn(&str) -> Option<String>,
+) -> (PruneConfig, Vec<String>) {
+    let mut config = prune_config_for(provider);
+    let mut warnings = Vec::new();
+    let mut apply = |slot: &mut u32, name: &str| {
+        if let Some(raw) = get(name) {
+            match raw.trim().parse::<u32>() {
+                Ok(value) if value > 0 => *slot = value,
+                _ => warnings.push(format!("ignoring invalid {name}={raw:?}")),
+            }
+        }
+    };
+    apply(&mut config.trigger_percent, PRUNE_ENV_VARS[0]);
+    apply(&mut config.floor_tokens, PRUNE_ENV_VARS[1]);
+    apply(&mut config.min_reclaim_tokens, PRUNE_ENV_VARS[2]);
+    apply(&mut config.protected_tail_tokens, PRUNE_ENV_VARS[3]);
+    (config, warnings)
 }
 
 /// Why opening an engine, running a task, or persisting a session failed.
@@ -1911,7 +2060,8 @@ mod tests {
     /// (bare = read/list/write/edit/shell).
     #[test]
     fn todo_tool_is_exposed_in_the_full_registry_and_excluded_from_bare() {
-        let built = build_registry(&CommandPolicy::default()).expect("built-in registry");
+        let built = build_registry(&CommandPolicy::default(), ToolBudgets::default())
+            .expect("built-in registry");
         let full: Vec<&str> = built.specs().map(|spec| spec.name.as_str()).collect();
         assert!(
             full.contains(&"todo"),
@@ -2186,6 +2336,232 @@ mod tests {
         assert!(
             skill_content(&kinds).is_none(),
             "the bare arm must never expose load_skill"
+        );
+    }
+
+    fn git_status_script() -> Vec<Result<ModelEvent, ModelError>> {
+        use loom_kernel::transcript::{ToolArguments, ToolCall, ToolCallId};
+        let call = ToolCall {
+            id: ToolCallId::try_from(format!("call-{}", std::process::id())).unwrap(),
+            name: "git_status".to_owned(),
+            arguments: ToolArguments::try_from(serde_json::json!({})).expect("arguments"),
+        };
+        vec![Ok(ModelEvent::Completed(ModelResponse {
+            message: AssistantMessage {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![call],
+                stop_reason: StopReason::ToolCalls,
+            },
+            usage: Usage::default(),
+        }))]
+    }
+
+    fn git_fixture(base: &std::path::Path) -> std::path::PathBuf {
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&workspace)
+                .output()
+                .expect("git spawns")
+        };
+        git(&["-c", "init.defaultBranch=main", "init", "--quiet"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(workspace.join("f.txt"), "one\n").expect("file");
+        git(&["add", "."]);
+        git(&["commit", "--quiet", "-m", "first"]);
+        std::fs::write(workspace.join("f.txt"), "one\ntwo\n").expect("edit");
+        workspace
+    }
+
+    async fn run_git_task(config: EngineConfig, overrides: EngineOverrides) -> Vec<EventKind> {
+        let engine = Engine::open_with(config, overrides).expect("engine");
+        let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
+        let mut session = engine.new_session();
+        let _ = engine
+            .run_task(
+                &mut session,
+                "Show the workspace status",
+                &sink,
+                &Default::default(),
+            )
+            .await;
+        drain(&mut receiver)
+    }
+
+    fn git_status_content(kinds: &[EventKind]) -> Option<&str> {
+        kinds.iter().find_map(|kind| match kind {
+            EventKind::ToolCompleted {
+                name,
+                status: loom_kernel::transcript::ToolStatus::Success,
+                content_head,
+                ..
+            } if name == "git_status" => Some(content_head.as_str()),
+            _ => None,
+        })
+    }
+
+    fn read_file_script(path: &str) -> Vec<Result<ModelEvent, ModelError>> {
+        use loom_kernel::transcript::{ToolArguments, ToolCall, ToolCallId};
+        let call = ToolCall {
+            id: ToolCallId::try_from(format!("call-{}", std::process::id())).unwrap(),
+            name: "read_file".to_owned(),
+            arguments: ToolArguments::try_from(serde_json::json!({ "path": path }))
+                .expect("arguments"),
+        };
+        vec![Ok(ModelEvent::Completed(ModelResponse {
+            message: AssistantMessage {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![call],
+                stop_reason: StopReason::ToolCalls,
+            },
+            usage: Usage::default(),
+        }))]
+    }
+
+    fn read_file_content(kinds: &[EventKind]) -> Option<&str> {
+        kinds.iter().find_map(|kind| match kind {
+            EventKind::ToolCompleted {
+                name,
+                status: loom_kernel::transcript::ToolStatus::Success,
+                content_head,
+                ..
+            } if name == "read_file" => Some(content_head.as_str()),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn engine_honors_custom_read_budget() {
+        // Item 20.2: a sweep shrinks the read window through
+        // EngineConfig.budgets; the omission marker proves the custom
+        // budget shaped the output, not the 56 KiB default.
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = base.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        std::fs::write(workspace.join("big.txt"), "x".repeat(10_000)).expect("file");
+        let mut config = test_config();
+        config.workspace = workspace;
+        config.db_path = base.path().join("loom.db");
+        config.max_turns = 2;
+        config.budgets = loom_tools::ToolBudgets {
+            read_file_head_bytes: 64,
+            ..loom_tools::ToolBudgets::default()
+        };
+        let provider = Box::new(FakeProvider::scripted(vec![
+            read_file_script("big.txt"),
+            FakeProvider::end_turn_script("done"),
+        ]));
+        let kinds = run_git_task(config, EngineOverrides::default().with_provider(provider)).await;
+        let content = read_file_content(&kinds).expect("read_file ran");
+        assert!(content.contains("bytes omitted"), "{content}");
+        assert!(content.len() < 200, "{content}");
+    }
+
+    #[test]
+    fn budgets_with_env_applies_valid_and_warns_on_invalid() {
+        let (budgets, warnings) = budgets_with_env(ToolBudgets::default(), |name| match name {
+            "LOOM_READ_HEAD_BYTES" => Some("128".to_owned()),
+            "LOOM_EDIT_ECHO_LINES" => Some(" 5 ".to_owned()),
+            "LOOM_SKILL_HEAD_BYTES" => Some("zero".to_owned()),
+            "LOOM_COMMAND_TAIL_BYTES" => Some("0".to_owned()),
+            _ => None,
+        });
+        assert_eq!(budgets.read_file_head_bytes, 128);
+        assert_eq!(budgets.edit_echo_context_lines, 5);
+        assert_eq!(
+            budgets.command_tail_bytes,
+            ToolBudgets::default().command_tail_bytes
+        );
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("LOOM_SKILL_HEAD_BYTES")));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("LOOM_COMMAND_TAIL_BYTES"))
+        );
+    }
+
+    #[test]
+    fn prune_with_env_layers_over_provider_base() {
+        // GLM keeps its elide-reasoning default; only the swept knobs move.
+        let (prune, warnings) =
+            prune_with_env(loom_providers::GLM_PROVIDER_NAME, |name| match name {
+                "LOOM_PRUNE_TRIGGER_PERCENT" => Some("50".to_owned()),
+                "LOOM_PRUNE_TAIL_TOKENS" => Some("bad".to_owned()),
+                _ => None,
+            });
+        assert_eq!(prune.trigger_percent, 50);
+        assert_eq!(prune.elide_reasoning, Some(8));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+    }
+
+    #[tokio::test]
+    async fn git_tools_are_opt_in_and_report_status() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config();
+        config.workspace = git_fixture(base.path());
+        config.db_path = base.path().join("loom.db");
+        config.max_turns = 2;
+        config.git = true;
+        let provider = Box::new(FakeProvider::scripted(vec![
+            git_status_script(),
+            FakeProvider::end_turn_script("done"),
+        ]));
+        let kinds = run_git_task(config, EngineOverrides::default().with_provider(provider)).await;
+        let content =
+            git_status_content(&kinds).expect("git_status ran successfully when opted in");
+        assert!(content.contains("branch: main"), "{content}");
+        assert!(
+            content.contains("M  f.txt") || content.contains(" M f.txt"),
+            "{content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_tools_stay_out_of_the_default_and_bare_registries() {
+        // Default: the call fails as an unknown tool.
+        let base = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config();
+        config.workspace = git_fixture(base.path());
+        config.db_path = base.path().join("loom.db");
+        config.max_turns = 2;
+        let provider = Box::new(FakeProvider::scripted(vec![
+            git_status_script(),
+            FakeProvider::end_turn_script("done"),
+        ]));
+        let kinds = run_git_task(config, EngineOverrides::default().with_provider(provider)).await;
+        assert!(
+            git_status_content(&kinds).is_none(),
+            "default registry must not expose git_status"
+        );
+
+        // Bare arm: even an explicit opt-in is ignored — the arm
+        // measures the plain loop.
+        let base = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config();
+        config.workspace = git_fixture(base.path());
+        config.db_path = base.path().join("loom.db");
+        config.max_turns = 2;
+        config.git = true;
+        let provider = Box::new(FakeProvider::scripted(vec![
+            git_status_script(),
+            FakeProvider::end_turn_script("done"),
+        ]));
+        let kinds = run_git_task(
+            config,
+            EngineOverrides::default()
+                .with_provider(provider)
+                .bare_loop(),
+        )
+        .await;
+        assert!(
+            git_status_content(&kinds).is_none(),
+            "the bare arm must never expose git_status"
         );
     }
 }

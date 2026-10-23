@@ -8,8 +8,8 @@
 //! optional per-edit `path` defaults to the top-level one). Batch edits
 //! apply against the evolving text, and nothing is written unless every
 //! edit matches exactly once. The result echoes each edited region
-//! (±[`ECHO_CONTEXT_LINES`] numbered lines, final file state), so the
-//! model never re-reads to confirm what it just wrote.
+//! (±[`ToolBudgets::edit_echo_context_lines`] numbered lines, final file
+//! state), so the model never re-reads to confirm what it just wrote.
 
 use futures::future::BoxFuture;
 use loom_kernel::tool::{
@@ -21,16 +21,13 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use crate::budget::{self, EDIT_ECHO_MAX_BYTES};
+use crate::budget::{self, ToolBudgets};
 use crate::confinement::{resolve_within, workspace_relative};
 
 /// Edits larger than this are refused: the whole file is read into memory and
 /// rewritten, so an unbounded read is a memory spike (a large generated file
 /// is the realistic case). 8 MiB covers source files with room to spare.
 const MAX_EDIT_FILE_BYTES: u64 = 8 * 1024 * 1024;
-
-/// Context lines shown above and below each edited region in the echo.
-const ECHO_CONTEXT_LINES: usize = 3;
 
 /// One edit in a batch. The optional `path` defaults to the top-level
 /// `path`, so a batch touching one file repeats only the strings.
@@ -49,8 +46,23 @@ struct EditSpec {
 
 /// Replaces unique exact-string matches in existing UTF-8 files,
 /// confined to the workspace root.
+/// Applies precise string replacements and echoes the edited regions.
 #[derive(Debug, Default)]
-pub struct EditFileTool;
+pub struct EditFileTool {
+    /// Output budgets (item 20.2): the echo shape (context lines and
+    /// byte cap) is this tool's "edit format" knob. `Default` keeps
+    /// the documented constants.
+    budgets: ToolBudgets,
+}
+
+impl EditFileTool {
+    /// Builds the tool under explicit output budgets (the engine's
+    /// entry point).
+    pub fn with_budgets(mut self, budgets: ToolBudgets) -> Self {
+        self.budgets = budgets;
+        self
+    }
+}
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -124,7 +136,7 @@ fn resolve_edits(
 /// Turns an applied batch into its effects and the pre-verify output
 /// body: the success line, the repair note when Loom salvaged calls,
 /// and the echoed regions.
-fn assemble_body(outcome: &EditOutcome) -> (ToolEffects, String, bool) {
+fn assemble_body(outcome: &EditOutcome, budgets: &ToolBudgets) -> (ToolEffects, String, bool) {
     let mut effects = ToolEffects::none();
     for (relative, _) in &outcome.files {
         effects = effects.with_file_written(relative.clone());
@@ -137,7 +149,7 @@ fn assemble_body(outcome: &EditOutcome) -> (ToolEffects, String, bool) {
     } else {
         format!("\n(repaired: {})", outcome.repairs.join("; "))
     };
-    let (echo, truncated_echo) = render_echo(outcome);
+    let (echo, truncated_echo) = render_echo(outcome, budgets);
     let mut content = format!("edited {}{}", outcome.detail, repair_note);
     if !echo.is_empty() {
         content.push_str("\n\n");
@@ -198,7 +210,7 @@ impl Tool for EditFileTool {
             let outcome = tokio::task::spawn_blocking(move || apply_edits(&root, &edits))
                 .await
                 .map_err(|err| ToolError::Execution(format!("edit task failed: {err}")))??;
-            let (mut effects, mut content, truncated_echo) = assemble_body(&outcome);
+            let (mut effects, mut content, truncated_echo) = assemble_body(&outcome, &self.budgets);
             let mut truncated = false;
             if let Some(scope) = scope {
                 let verify_target = outcome
@@ -500,9 +512,9 @@ fn apply_edits(root: &Path, edits: &[(PathBuf, String, String)]) -> Result<EditO
 }
 
 /// Renders the edited regions from the final file state: one numbered
-/// snippet per edit, ±[`ECHO_CONTEXT_LINES`] lines, capped by the echo
+/// snippet per edit, ±`edit_echo_context_lines` lines, capped by the echo
 /// byte budget. Returns the text and whether the budget cut anything.
-fn render_echo(outcome: &EditOutcome) -> (String, bool) {
+fn render_echo(outcome: &EditOutcome, budgets: &ToolBudgets) -> (String, bool) {
     let mut joined = String::new();
     for (file_idx, start, len) in &outcome.spans {
         let (relative, text) = &outcome.files[*file_idx];
@@ -515,8 +527,10 @@ fn render_echo(outcome: &EditOutcome) -> (String, bool) {
             last_line -= 1;
         }
         let last_line = last_line.max(first_line);
-        let ctx_first = first_line.saturating_sub(ECHO_CONTEXT_LINES).max(1);
-        let ctx_last = (last_line + ECHO_CONTEXT_LINES).min(total_lines);
+        let ctx_first = first_line
+            .saturating_sub(budgets.edit_echo_context_lines)
+            .max(1);
+        let ctx_last = (last_line + budgets.edit_echo_context_lines).min(total_lines);
         joined.push_str(&format!(
             "{relative}: lines {first_line}-{last_line} of {total_lines}\n"
         ));
@@ -527,7 +541,7 @@ fn render_echo(outcome: &EditOutcome) -> (String, bool) {
     if joined.is_empty() {
         return (String::new(), false);
     }
-    let half = EDIT_ECHO_MAX_BYTES / 2;
+    let half = budgets.edit_echo_max_bytes / 2;
     budget::head_tail(&joined, half, half)
 }
 
@@ -555,7 +569,7 @@ mod tests {
     }
 
     async fn edit(root: &Path, args: Value) -> Result<ToolOutput, ToolError> {
-        EditFileTool.call(args, &ctx(root)).await
+        EditFileTool::default().call(args, &ctx(root)).await
     }
 
     #[tokio::test]
@@ -1059,7 +1073,7 @@ mod tests {
             CancellationToken::new(),
             Duration::from_secs(120),
         );
-        let output = EditFileTool
+        let output = EditFileTool::default()
             .call(
                 json!({
                     "path": "src/lib.rs",

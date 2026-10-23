@@ -29,12 +29,12 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::budget;
+use crate::budget::{self, ToolBudgets};
 use crate::evidence::{
     Evidence, cargo_diagnostics, go_diagnostics, go_failures, libtest_failures, nextest_junit,
     pytest_failures, python_diagnostics,
 };
-use crate::policy::CommandPolicy;
+use crate::policy::{CommandPolicy, PolicyVerdict};
 
 /// The build system a verification runs for. Variant meanings live in
 /// the command table and the `ecosystem` field docs.
@@ -102,6 +102,8 @@ pub struct VerifyTool {
     /// Escalation rules for the build drivers (`cargo`, `go`, …) —
     /// drivers without a rule run inside the boxed default sandbox.
     policy: CommandPolicy,
+    /// Output budgets (item 20.2); `Default` keeps the constants.
+    budgets: ToolBudgets,
 }
 
 /// How much verification to run.
@@ -147,6 +149,7 @@ impl VerifyTool {
     pub fn new() -> Self {
         Self {
             policy: CommandPolicy::cargo_only(),
+            budgets: ToolBudgets::default(),
         }
     }
 
@@ -155,7 +158,17 @@ impl VerifyTool {
     /// like `run_command` programs.
     #[must_use]
     pub fn with_policy(policy: CommandPolicy) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            budgets: ToolBudgets::default(),
+        }
+    }
+
+    /// Sets explicit output budgets (item 20.2) on this instance.
+    #[must_use]
+    pub fn with_budgets(mut self, budgets: ToolBudgets) -> Self {
+        self.budgets = budgets;
+        self
     }
 }
 
@@ -196,6 +209,23 @@ impl Tool for VerifyTool {
                     ))
                 })?;
             let (program, args) = ecosystem.command(input.scope)?;
+            // The verdict layer gates drivers exactly like run_command
+            // (fail closed: `ask` without a frontend refuses too).
+            match self.policy.verdict(program) {
+                PolicyVerdict::Allow => {}
+                PolicyVerdict::Deny => {
+                    return Err(ToolError::InvalidInput(format!(
+                        "program \"{program}\" is denied by workspace policy \
+                         (.loom/commands.toml); cannot verify here"
+                    )));
+                }
+                PolicyVerdict::Ask => {
+                    return Err(ToolError::InvalidInput(format!(
+                        "program \"{program}\" needs operator approval (policy unknown = \
+                         \"ask\"); cannot verify without an interactive frontend"
+                    )));
+                }
+            }
             // Drivers escalate through the same policy rules as
             // `run_command`; a driver without a rule runs inside the
             // boxed default sandbox (network off).
@@ -214,8 +244,15 @@ impl Tool for VerifyTool {
                 output.status.code(),
             ));
             let recent_changes = ctx.recent_changes();
-            let mut rendered =
-                render(ecosystem, program, &args, &output, &recent_changes).with_effects(effects);
+            let mut rendered = render(
+                ecosystem,
+                program,
+                &args,
+                &output,
+                &recent_changes,
+                &self.budgets,
+            )
+            .with_effects(effects);
             // Same trace-side facts `run_command` surfaces: an unconfined
             // verification run, a stream an escaped holder truncated.
             if !sandbox.confined() {
@@ -242,6 +279,7 @@ pub(crate) fn render(
     args: &[String],
     output: &std::process::Output,
     recent_changes: &[String],
+    budgets: &ToolBudgets,
 ) -> ToolOutput {
     let raw = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -272,8 +310,8 @@ pub(crate) fn render(
 
     let (text, cut) = budget::head_tail(
         &text,
-        budget::COMMAND_HEAD_BYTES,
-        budget::COMMAND_TAIL_BYTES,
+        budgets.command_head_bytes,
+        budgets.command_tail_bytes,
     );
     let output = ToolOutput::new(text);
     if cut { output.with_truncated() } else { output }
@@ -405,6 +443,7 @@ mod tests {
             &["check".to_owned(), "--message-format=json".to_owned()],
             &output(101, stdout, ""),
             &["src/lib.rs".to_owned()],
+            &ToolBudgets::default(),
         );
         assert!(rendered.content.contains("exit status: 101"));
         assert!(
@@ -427,6 +466,7 @@ mod tests {
                 "",
             ),
             &["src/lib.rs".to_owned()],
+            &ToolBudgets::default(),
         );
         assert!(
             rendered.content.contains("exit status: 0"),
@@ -455,6 +495,7 @@ mod tests {
             &["check".to_owned()],
             &output(1, "Compiling\nsome non-json noise\n", ""),
             &[],
+            &ToolBudgets::default(),
         );
         assert!(rendered.content.contains("--- output ---"));
         assert!(rendered.content.contains("some non-json noise"));
@@ -475,6 +516,7 @@ FAIL\texample.com/m\t0.012s
             &["test".to_owned(), "./...".to_owned()],
             &output(1, stdout, stderr),
             &[],
+            &ToolBudgets::default(),
         );
         assert!(
             rendered.content.contains("exit status: 1"),
@@ -512,6 +554,7 @@ FAIL\texample.com/m\t0.012s
                 "",
             ),
             &[],
+            &ToolBudgets::default(),
         );
         assert!(
             rendered.content.contains("4 passed in 0.02s"),
@@ -549,6 +592,7 @@ FAILED tests/test_math.py::TestSum::test_sum - assert 4 == 5
             &["-m".to_owned(), "pytest".to_owned()],
             &output(1, stdout, ""),
             &[],
+            &ToolBudgets::default(),
         );
         assert!(
             rendered.content.contains("- test: TestSum.test_sum"),
@@ -575,6 +619,7 @@ FAILED tests/test_math.py::TestSum::test_sum - assert 4 == 5
             &["check".to_owned()],
             &output(2, "", "make: *** [check] Error 2\n"),
             &[],
+            &ToolBudgets::default(),
         );
         assert!(
             rendered.content.contains("--- stderr ---"),

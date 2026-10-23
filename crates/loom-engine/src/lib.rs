@@ -45,8 +45,8 @@ pub mod trace;
 pub mod trace_stats;
 
 pub use engine::{
-    Continuation, Engine, EngineConfig, EngineError, EngineOverrides, ProviderHook,
-    default_system_prompt,
+    BUDGET_ENV_VARS, Continuation, Engine, EngineConfig, EngineError, EngineOverrides,
+    PRUNE_ENV_VARS, ProviderHook, budgets_with_env, default_system_prompt, prune_with_env,
 };
 pub use estimate::{
     ANTHROPIC_TOKEN_SCALE_PER_MILLE, AnthropicEstimator, O200kEstimator, estimator_for,

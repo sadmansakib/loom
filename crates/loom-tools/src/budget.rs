@@ -41,6 +41,65 @@ pub(crate) const SYMBOLS_OVERVIEW_MAX_BYTES: usize = 8 * 1024;
 /// standard omission marker instead of flooding the context.
 pub(crate) const SKILL_BODY_HEAD_BYTES: usize = 16 * 1024;
 
+/// Bytes kept from the replaced definition a `replace_symbol` echoes —
+/// the previous text is context for the model's next decision, not
+/// payload; past this it is cut with the standard head marker.
+pub(crate) const REPLACED_HEAD_BYTES: usize = 400;
+
+/// Every per-tool output budget in one struct (roadmap item 20.2, the
+/// deterministic half): what was a scattered set of constants becomes
+/// data, so a frontend — or a sweep over the SWE-bench protocol — can
+/// vary any budget without code changes. The constants above remain the
+/// documented defaults; [`Default`] reproduces them exactly.
+///
+/// Budgets travel to the tools at construction (each tool's
+/// `with_budgets`), never as ambient state: two engines in one process
+/// can run different budgets, and tests stay parallel-safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolBudgets {
+    /// Bytes kept from the head of a `read_file` result
+    /// (default [`READ_FILE_HEAD_BYTES`]).
+    pub read_file_head_bytes: usize,
+    /// Bytes kept from the head of a `run_command`/`verify` result
+    /// (default [`COMMAND_HEAD_BYTES`]).
+    pub command_head_bytes: usize,
+    /// Bytes kept from the tail of a `run_command`/`verify` result —
+    /// errors live here (default [`COMMAND_TAIL_BYTES`]).
+    pub command_tail_bytes: usize,
+    /// Cap on an `edit_file` echo of the edited regions
+    /// (default [`EDIT_ECHO_MAX_BYTES`]).
+    pub edit_echo_max_bytes: usize,
+    /// Context lines echoed around each edited region — the "edit
+    /// format" knob: how much final state the model sees per edit
+    /// without re-reading (default 3).
+    pub edit_echo_context_lines: usize,
+    /// Bytes a `symbols_overview` rendering may occupy before falling
+    /// back to per-kind counts (default [`SYMBOLS_OVERVIEW_MAX_BYTES`]).
+    pub symbols_overview_max_bytes: usize,
+    /// Bytes kept from the head of a `load_skill` body
+    /// (default [`SKILL_BODY_HEAD_BYTES`]).
+    pub skill_body_head_bytes: usize,
+    /// Bytes kept from the head of the replaced definition in a
+    /// `replace_symbol` echo — the previous definition is context, not
+    /// payload (default [`REPLACED_HEAD_BYTES`]).
+    pub replace_symbol_head_bytes: usize,
+}
+
+impl Default for ToolBudgets {
+    fn default() -> Self {
+        Self {
+            read_file_head_bytes: READ_FILE_HEAD_BYTES,
+            command_head_bytes: COMMAND_HEAD_BYTES,
+            command_tail_bytes: COMMAND_TAIL_BYTES,
+            edit_echo_max_bytes: EDIT_ECHO_MAX_BYTES,
+            edit_echo_context_lines: 3,
+            symbols_overview_max_bytes: SYMBOLS_OVERVIEW_MAX_BYTES,
+            skill_body_head_bytes: SKILL_BODY_HEAD_BYTES,
+            replace_symbol_head_bytes: REPLACED_HEAD_BYTES,
+        }
+    }
+}
+
 /// The explicit-omission marker appended where output was dropped.
 pub(crate) fn omitted(count: u64) -> String {
     format!("... [{count} bytes omitted]")
@@ -142,5 +201,21 @@ mod tests {
         let (shaped, cut) = head_only(&text, 4);
         assert!(cut);
         assert_eq!(shaped, format!("✀\n{}", omitted(6)));
+    }
+
+    #[test]
+    fn default_matches_documented_constants() {
+        // Item 20.2: the defaults must stay byte-identical to the
+        // constants the frozen SWE-bench protocol ran on — a sweep that
+        // overrides nothing reproduces today's behavior exactly.
+        let d = ToolBudgets::default();
+        assert_eq!(d.read_file_head_bytes, READ_FILE_HEAD_BYTES);
+        assert_eq!(d.command_head_bytes, COMMAND_HEAD_BYTES);
+        assert_eq!(d.command_tail_bytes, COMMAND_TAIL_BYTES);
+        assert_eq!(d.edit_echo_max_bytes, EDIT_ECHO_MAX_BYTES);
+        assert_eq!(d.edit_echo_context_lines, 3);
+        assert_eq!(d.symbols_overview_max_bytes, SYMBOLS_OVERVIEW_MAX_BYTES);
+        assert_eq!(d.skill_body_head_bytes, SKILL_BODY_HEAD_BYTES);
+        assert_eq!(d.replace_symbol_head_bytes, REPLACED_HEAD_BYTES);
     }
 }

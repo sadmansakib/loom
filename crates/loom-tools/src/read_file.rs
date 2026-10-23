@@ -12,13 +12,27 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::sync::OnceLock;
 
+use crate::budget::ToolBudgets;
 use crate::confinement::resolve_within;
 use crate::window::{self, DEFAULT_LIMIT};
 
 /// Reads one file's UTF-8 text, confined to the workspace root, returning a
 /// numbered window of lines with a total-lines header.
 #[derive(Debug, Default)]
-pub struct ReadFileTool;
+pub struct ReadFileTool {
+    /// Output budgets (item 20.2): the head cap is this tool's read
+    /// window. `Default` reproduces the documented constants.
+    budgets: ToolBudgets,
+}
+
+impl ReadFileTool {
+    /// Builds the tool under explicit output budgets (the engine's
+    /// entry point; `Default` keeps the documented constants).
+    pub fn with_budgets(mut self, budgets: ToolBudgets) -> Self {
+        self.budgets = budgets;
+        self
+    }
+}
 
 /// Reads `offset` leniently: the model reaches for 0-based or negative
 /// values, and both mean "from the first line" — rejecting them costs a
@@ -107,7 +121,8 @@ impl Tool for ReadFileTool {
                     "file \"{display}\" does not exist"
                 )));
             };
-            let (content, truncated) = window::render_window(&display, &window, offset);
+            let (content, truncated) =
+                window::render_window(&display, &window, offset, self.budgets.read_file_head_bytes);
             let mut output = ToolOutput::new(content);
             if truncated {
                 output = output.with_truncated();
@@ -141,7 +156,7 @@ mod tests {
     }
 
     async fn read(root: &std::path::Path, args: Value) -> Result<ToolOutput, ToolError> {
-        ReadFileTool.call(args, &ctx(root)).await
+        ReadFileTool::default().call(args, &ctx(root)).await
     }
 
     #[tokio::test]

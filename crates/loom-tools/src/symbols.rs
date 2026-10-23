@@ -21,7 +21,7 @@
 //! Registration is gated (`EngineConfig::symbols`, default off) so the
 //! frozen SWE-bench prompt bytes are unchanged until a frontend opts in.
 
-use crate::budget::SYMBOLS_OVERVIEW_MAX_BYTES;
+use crate::budget::ToolBudgets;
 use crate::confinement::{resolve_within, workspace_relative};
 use futures::future::BoxFuture;
 use loom_kernel::tool::{
@@ -52,10 +52,6 @@ const SYMBOLS_MAX_FILE_BYTES: u64 = 1 << 20;
 /// Hard cap on collected symbols per call: a file that declares more is
 /// machine-generated, and the tool should say so rather than grind.
 const SYMBOLS_MAX_COUNT: usize = 10_000;
-
-/// How many replaced-body bytes the result echoes, so the model sees
-/// what it replaced without a re-read.
-const REPLACED_HEAD_BYTES: usize = 400;
 
 /// The languages the symbol tools understand, selected by extension.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -371,8 +367,8 @@ fn load_symbols(
 }
 
 /// Head-bounded excerpt of replaced text for the result echo.
-fn replaced_head(text: &str) -> String {
-    head_bytes(text, REPLACED_HEAD_BYTES)
+fn replaced_head(text: &str, head: usize) -> String {
+    head_bytes(text, head)
 }
 
 // ---------------------------------------------------------------------------
@@ -381,7 +377,23 @@ fn replaced_head(text: &str) -> String {
 
 /// Lists the symbols a file declares, with name-paths and line ranges —
 /// the one-call replacement for the search→read wander.
-pub struct SymbolsOverviewTool;
+/// Tree-sitter-powered symbol survey: a bounded, indexed outline of one
+/// file's definitions (roadmap item 18).
+#[derive(Debug, Default)]
+pub struct SymbolsOverviewTool {
+    /// Output budgets (item 20.2): the overview byte cap before the
+    /// kind-count fallback. `Default` keeps the constants.
+    budgets: ToolBudgets,
+}
+
+impl SymbolsOverviewTool {
+    /// Builds the tool under explicit output budgets (the engine's
+    /// entry point).
+    pub fn with_budgets(mut self, budgets: ToolBudgets) -> Self {
+        self.budgets = budgets;
+        self
+    }
+}
 
 #[derive(Deserialize, JsonSchema)]
 struct OverviewInput {
@@ -456,15 +468,16 @@ impl Tool for SymbolsOverviewTool {
                 .iter()
                 .filter(|symbol| symbol.depth <= depth as usize)
                 .collect();
-            let content = match render_overview(&relative, &visible, depth, symbols.len()) {
-                Some(rendered) => rendered,
-                None => {
-                    // Over budget: fall back to kind counts (Serena's
-                    // progressive shortening) instead of truncating the
-                    // listing mid-symbol.
-                    render_kind_counts(&relative, &symbols)
-                }
-            };
+            let content =
+                match render_overview(&relative, &visible, depth, symbols.len(), &self.budgets) {
+                    Some(rendered) => rendered,
+                    None => {
+                        // Over budget: fall back to kind counts (Serena's
+                        // progressive shortening) instead of truncating the
+                        // listing mid-symbol.
+                        render_kind_counts(&relative, &symbols)
+                    }
+                };
             let _ = source;
             Ok(ToolOutput::new(content))
         })
@@ -478,6 +491,7 @@ fn render_overview(
     visible: &[&FlatSymbol],
     depth: u32,
     total: usize,
+    budgets: &ToolBudgets,
 ) -> Option<String> {
     let mut out = format!("{relative} — {total} symbols (depth {depth})\n");
     for symbol in visible {
@@ -495,7 +509,7 @@ fn render_overview(
             },
             indent = "  ".repeat(symbol.depth + 1),
         );
-        if out.len() + line.len() > SYMBOLS_OVERVIEW_MAX_BYTES {
+        if out.len() + line.len() > budgets.symbols_overview_max_bytes {
             return None;
         }
         out.push_str(&line);
@@ -528,7 +542,20 @@ fn render_kind_counts(relative: &str, symbols: &[FlatSymbol]) -> String {
 /// Rewrites one symbol's definition by name-path — the one-call
 /// replacement for the read→edit chain when the change is "rewrite this
 /// function".
-pub struct ReplaceSymbolTool;
+#[derive(Debug, Default)]
+pub struct ReplaceSymbolTool {
+    /// Output budgets (item 20.2): the replaced-definition echo head.
+    pub(crate) budgets: ToolBudgets,
+}
+
+impl ReplaceSymbolTool {
+    /// Builds the tool under explicit output budgets (the engine's
+    /// registration path; item 20.2).
+    pub fn with_budgets(mut self, budgets: ToolBudgets) -> Self {
+        self.budgets = budgets;
+        self
+    }
+}
 
 #[derive(Deserialize, JsonSchema)]
 struct ReplaceInput {
@@ -608,7 +635,7 @@ impl Tool for ReplaceSymbolTool {
                  definition started with:\n{}",
                 matches.display(),
                 new_text.len(),
-                replaced_head(&replaced),
+                replaced_head(&replaced, self.budgets.replace_symbol_head_bytes),
             );
             Ok(ToolOutput::new(content)
                 .with_effects(ToolEffects::none().with_file_written(relative)))
@@ -743,7 +770,7 @@ mod tests {
     }
 
     async fn call_overview(root: &std::path::Path, input: serde_json::Value) -> String {
-        SymbolsOverviewTool
+        SymbolsOverviewTool::default()
             .call(input, &ctx_for(root))
             .await
             .expect("overview succeeds")
@@ -751,7 +778,7 @@ mod tests {
     }
 
     async fn call_replace(root: &std::path::Path, input: serde_json::Value) -> String {
-        ReplaceSymbolTool
+        ReplaceSymbolTool::default()
             .call(input, &ctx_for(root))
             .await
             .expect("replace succeeds")
@@ -759,7 +786,7 @@ mod tests {
     }
 
     fn err_of(root: &std::path::Path, input: serde_json::Value) -> String {
-        futures::executor::block_on(ReplaceSymbolTool.call(input, &ctx_for(root)))
+        futures::executor::block_on(ReplaceSymbolTool::default().call(input, &ctx_for(root)))
             .expect_err("replace must fail")
             .to_string()
     }
@@ -1138,7 +1165,7 @@ let plain = 3;
 
     #[tokio::test]
     async fn overview_reports_read_touch_replace_reports_write_touch() {
-        let read_touch = SymbolsOverviewTool
+        let read_touch = SymbolsOverviewTool::default()
             .touched_paths(&serde_json::json!({"path": "lib.rs"}))
             .expect("touches");
         assert_eq!(read_touch.len(), 1);
@@ -1146,7 +1173,7 @@ let plain = 3;
             read_touch[0].access,
             loom_kernel::tool::PathAccess::Read
         ));
-        let write_touch = ReplaceSymbolTool
+        let write_touch = ReplaceSymbolTool::default()
             .touched_paths(&serde_json::json!({"path": "lib.rs", "name_path": "a", "body": "b"}))
             .expect("touches");
         assert!(matches!(

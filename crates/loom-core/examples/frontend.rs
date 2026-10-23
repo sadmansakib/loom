@@ -51,7 +51,10 @@ fn main() -> anyhow::Result<()> {
         catalog: None,
         scout: None,
         symbols: false,
+        git: false,
         skills: false,
+        budgets: loom_tools::ToolBudgets::default(),
+        prune: None,
     }))?;
 
     // Observation: one unbounded channel, one printing consumer. A TUI or

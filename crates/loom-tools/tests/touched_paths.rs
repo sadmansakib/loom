@@ -24,7 +24,10 @@ fn write(path: &str) -> PathTouch {
 #[test]
 fn read_only_tools_declare_their_read_path() {
     assert_eq!(
-        touches(&loom_tools::ReadFileTool, json!({"path": "src/a.rs"})),
+        touches(
+            &loom_tools::ReadFileTool::default(),
+            json!({"path": "src/a.rs"})
+        ),
         Some(vec![read("src/a.rs")])
     );
     assert_eq!(
@@ -56,7 +59,7 @@ fn mutating_tools_declare_their_write_path() {
     );
     assert_eq!(
         touches(
-            &loom_tools::EditFileTool,
+            &loom_tools::EditFileTool::default(),
             json!({"path": "src/a.rs", "old_string": "a", "new_string": "b"})
         ),
         Some(vec![write("src/a.rs")])
@@ -66,7 +69,10 @@ fn mutating_tools_declare_their_write_path() {
 #[test]
 fn artifact_read_touches_no_workspace_path() {
     assert_eq!(
-        touches(&loom_tools::ArtifactReadTool, json!({"id": "abc"})),
+        touches(
+            &loom_tools::ArtifactReadTool::default(),
+            json!({"id": "abc"})
+        ),
         Some(Vec::new())
     );
 }
@@ -92,7 +98,7 @@ fn unparseable_arguments_declare_nothing() {
     // An invalid call fails without touching anything, so it must not create a
     // false dependency.
     assert_eq!(
-        touches(&loom_tools::ReadFileTool, json!({})),
+        touches(&loom_tools::ReadFileTool::default(), json!({})),
         Some(Vec::new())
     );
     assert_eq!(

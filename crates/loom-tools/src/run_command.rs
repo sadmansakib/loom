@@ -47,17 +47,30 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::budget;
+use crate::budget::{self, ToolBudgets};
 use crate::evidence::{Evidence, cargo_diagnostics, libtest_failures, nextest_junit};
-use crate::policy::CommandPolicy;
+use crate::policy::{AskResolver, CommandPolicy, PolicyVerdict};
 use crate::reduce;
 
 /// Runs a program in the workspace root inside an OS sandbox and
 /// returns its combined output and exit status.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RunCommandTool {
     policy: CommandPolicy,
     spec: ToolSpec,
+    budgets: ToolBudgets,
+    ask: Option<AskResolver>,
+}
+
+impl std::fmt::Debug for RunCommandTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunCommandTool")
+            .field("policy", &self.policy)
+            .field("spec", &self.spec)
+            .field("budgets", &self.budgets)
+            .field("ask", &self.ask.as_ref().map(|_| "<resolver>"))
+            .finish()
+    }
 }
 
 impl Default for RunCommandTool {
@@ -85,7 +98,8 @@ impl RunCommandTool {
              children stay sandboxed). Well-shaped command output (git, \
              ls, tree, grep, cargo test) is compacted; the full stream is \
              stored as an artifact (artifact_read). Escalated, \
-             grants beyond the sandbox default: {escalated}."
+             grants beyond the sandbox default: {escalated}.{admission}",
+            admission = admission_sentence(&policy),
         );
         Self {
             spec: ToolSpec {
@@ -94,6 +108,8 @@ impl RunCommandTool {
                 parameters: crate::schema::parameters::<RunInput>(),
             },
             policy,
+            budgets: ToolBudgets::default(),
+            ask: None,
         }
     }
 
@@ -103,10 +119,23 @@ impl RunCommandTool {
         Self::default()
     }
 
+    /// Sets explicit output budgets (item 20.2) on this instance.
+    pub fn with_budgets(mut self, budgets: ToolBudgets) -> Self {
+        self.budgets = budgets;
+        self
+    }
+
     /// A tool under an explicit policy (the engine's entry point after
     /// loading a workspace manifest).
     pub fn with_policy(policy: CommandPolicy) -> Self {
         Self::under(policy)
+    }
+
+    /// Attaches the operator-approval hook for `ask` verdicts
+    /// (interactive frontends; without one, `ask` fails closed).
+    pub fn with_ask_resolver(mut self, ask: AskResolver) -> Self {
+        self.ask = Some(ask);
+        self
     }
 
     /// A tool allowing a different program set with shipped-default
@@ -118,6 +147,33 @@ impl RunCommandTool {
     {
         Self::under(CommandPolicy::allowing(allowed))
     }
+}
+
+/// The verdict-layer sentence appended to the tool description. Empty
+/// for the shipped default policy (allow-unknown, nothing denied), so
+/// the model-visible spec — and the cached prompt prefix — stay
+/// byte-identical until an operator actually narrows the policy.
+fn admission_sentence(policy: &CommandPolicy) -> String {
+    let denied = policy.denied_names();
+    let unknown = policy.unknown_verdict();
+    if denied.is_empty() && unknown == PolicyVerdict::Allow {
+        return String::new();
+    }
+    let unknown = match unknown {
+        PolicyVerdict::Allow => "run sandboxed",
+        PolicyVerdict::Ask => "need operator approval (fails closed without a frontend)",
+        PolicyVerdict::Deny => "are refused",
+    };
+    let mut sentence = format!(" Unrecognized programs {unknown}.");
+    if !denied.is_empty() {
+        let names = denied
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        sentence.push_str(&format!(" Never run: {names}."));
+    }
+    sentence
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -304,6 +360,37 @@ impl Tool for RunCommandTool {
                     }
                 }
             }
+            // The verdict layer gates execution before anything runs:
+            // denied programs never execute, and `ask` verdicts need
+            // operator approval (failing closed without a frontend).
+            match self.policy.verdict(&input.program) {
+                PolicyVerdict::Allow => {}
+                PolicyVerdict::Deny => {
+                    return Err(ToolError::InvalidInput(format!(
+                        "program \"{}\" is denied by workspace policy (.loom/commands.toml); \
+                         pick another approach",
+                        input.program
+                    )));
+                }
+                PolicyVerdict::Ask => {
+                    let approved = match &self.ask {
+                        Some(resolver) => resolver(&input.program).await,
+                        None => false,
+                    };
+                    if !approved {
+                        return Err(ToolError::InvalidInput(format!(
+                            "program \"{}\" needs operator approval (policy unknown = \"ask\") \
+                             and was not approved{}; pick another approach",
+                            input.program,
+                            if self.ask.is_none() {
+                                " — no interactive frontend is attached"
+                            } else {
+                                ""
+                            }
+                        )));
+                    }
+                }
+            }
             // The sandbox wrapper reports a missing program as an opaque
             // non-zero exit; resolve bare names on PATH first so the
             // model gets the same "cannot run" either way.
@@ -352,6 +439,7 @@ impl Tool for RunCommandTool {
                 &outcome.output,
                 &recent_changes,
                 ctx,
+                &self.budgets,
             );
             if let Some(original) = normalized {
                 rendered = rendered.with_notice(loom_kernel::tool::ToolNotice::new(
@@ -413,6 +501,7 @@ fn render(
     output: &std::process::Output,
     recent_changes: &[String],
     ctx: &ToolContext,
+    budgets: &ToolBudgets,
 ) -> ToolOutput {
     let effects = ToolEffects::none().with_command(CommandEffect::new(
         program,
@@ -472,8 +561,8 @@ fn render(
     // tail; the explicit marker names what was dropped.
     let (text, cut) = budget::head_tail(
         &text,
-        budget::COMMAND_HEAD_BYTES,
-        budget::COMMAND_TAIL_BYTES,
+        budgets.command_head_bytes,
+        budgets.command_tail_bytes,
     );
     let mut rendered = if cut {
         ToolOutput::new(text).with_truncated()
@@ -890,7 +979,14 @@ mod tests {
             stdout,
             stderr: Vec::new(),
         };
-        let rendered = render("echo", &[], &output, &[], &plain_ctx());
+        let rendered = render(
+            "echo",
+            &[],
+            &output,
+            &[],
+            &plain_ctx(),
+            &ToolBudgets::default(),
+        );
         assert!(rendered.truncated);
         assert!(
             rendered.content.contains("bytes omitted"),
@@ -913,7 +1009,14 @@ mod tests {
             stdout: b"out".to_vec(),
             stderr: b"err".to_vec(),
         };
-        let rendered = render("cargo", &["test".to_owned()], &output, &[], &plain_ctx());
+        let rendered = render(
+            "cargo",
+            &["test".to_owned()],
+            &output,
+            &[],
+            &plain_ctx(),
+            &ToolBudgets::default(),
+        );
         assert_eq!(
             rendered.content,
             "$ cargo test\nexit status: 2\n--- stdout ---\nout\n--- stderr ---\nerr"
@@ -962,6 +1065,7 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured
             &output,
             &["src/lib.rs".to_owned()],
             &plain_ctx(),
+            &ToolBudgets::default(),
         );
         assert!(
             rendered.content.contains("failure evidence:"),
@@ -1005,7 +1109,14 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured
             stdout: libtest_failure_stdout(),
             stderr: Vec::new(),
         };
-        let rendered = render("cargo", &["test".to_owned()], &output, &[], &plain_ctx());
+        let rendered = render(
+            "cargo",
+            &["test".to_owned()],
+            &output,
+            &[],
+            &plain_ctx(),
+            &ToolBudgets::default(),
+        );
         assert!(
             rendered.content.contains("--- stdout ---"),
             "{}",
@@ -1036,7 +1147,14 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured
             stderr: Vec::new(),
         };
         let (ctx, store) = stored_ctx();
-        let rendered = render("git", &["log".to_owned()], &output, &[], &ctx);
+        let rendered = render(
+            "git",
+            &["log".to_owned()],
+            &output,
+            &[],
+            &ctx,
+            &ToolBudgets::default(),
+        );
         assert!(
             rendered.content.contains("subject 24"),
             "{}",
@@ -1081,7 +1199,14 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured
             stdout: stdout.into_bytes(),
             stderr: Vec::new(),
         };
-        let rendered = render("git", &["log".to_owned()], &output, &[], &plain_ctx());
+        let rendered = render(
+            "git",
+            &["log".to_owned()],
+            &output,
+            &[],
+            &plain_ctx(),
+            &ToolBudgets::default(),
+        );
         assert!(
             rendered.content.contains("subject 29"),
             "{}",
@@ -1099,7 +1224,14 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured
             stderr: Vec::new(),
         };
         let (ctx, store) = stored_ctx();
-        let rendered = render("cargo", &["test".to_owned()], &output, &[], &ctx);
+        let rendered = render(
+            "cargo",
+            &["test".to_owned()],
+            &output,
+            &[],
+            &ctx,
+            &ToolBudgets::default(),
+        );
         assert!(
             rendered.content.contains("failure evidence:"),
             "{}",
@@ -1123,7 +1255,14 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured
             stdout: libtest_failure_stdout(),
             stderr: Vec::new(),
         };
-        let rendered = render("cargo", &["test".to_owned()], &output, &[], &plain_ctx());
+        let rendered = render(
+            "cargo",
+            &["test".to_owned()],
+            &output,
+            &[],
+            &plain_ctx(),
+            &ToolBudgets::default(),
+        );
         assert!(
             rendered.content.contains("failure evidence:"),
             "{}",
@@ -1361,5 +1500,101 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured
             !is_executable_file(&root.join("absent")),
             "a missing candidate is not a program"
         );
+    }
+
+    #[tokio::test]
+    async fn denied_program_is_refused_before_execution() {
+        let (_guard, root) = temp_root();
+        // `echo` denied while unknown stays allow: the refusal names
+        // the policy, proving the verdict fired (not a PATH miss — the
+        // verdict check runs first, even for programs that do exist).
+        let policy = CommandPolicy::parse("[[deny]]\nprogram = \"echo\"\n").expect("policy");
+        let tool = RunCommandTool::with_policy(policy);
+        let error = run(&tool, &root, json!({"program": "echo", "args": ["hi"]}))
+            .await
+            .expect_err("denied");
+        assert!(
+            matches!(&error, ToolError::InvalidInput(m) if m.contains("denied by workspace policy")),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_unknown_denies_unruled_programs_but_rules_still_run() {
+        let (_guard, root) = temp_root();
+        let policy =
+            CommandPolicy::parse("[policy]\nunknown = \"deny\"\n[[command]]\nprogram = \"echo\"\n")
+                .expect("policy");
+        let tool = RunCommandTool::with_policy(policy);
+        let refused = run(&tool, &root, json!({"program": "sleep", "args": ["0"]}))
+            .await
+            .expect_err("unruled denied");
+        assert!(
+            matches!(&refused, ToolError::InvalidInput(m) if m.contains("denied by workspace policy")),
+            "{refused}"
+        );
+        let admitted = run(&tool, &root, json!({"program": "echo", "args": ["ok"]}))
+            .await
+            .expect("ruled programs are unaffected");
+        assert!(admitted.content.contains("ok"), "{}", admitted.content);
+    }
+
+    #[tokio::test]
+    async fn ask_fails_closed_without_a_frontend() {
+        let (_guard, root) = temp_root();
+        let policy = CommandPolicy::parse("[policy]\nunknown = \"ask\"\n").expect("policy");
+        let tool = RunCommandTool::with_policy(policy);
+        let error = run(&tool, &root, json!({"program": "echo", "args": ["hi"]}))
+            .await
+            .expect_err("no resolver");
+        assert!(
+            matches!(&error, ToolError::InvalidInput(m)
+                if m.contains("operator approval") && m.contains("no interactive frontend")),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_resolver_decides_execution() {
+        use std::sync::Arc;
+        let (_guard, root) = temp_root();
+        let policy = CommandPolicy::parse("[policy]\nunknown = \"ask\"\n").expect("policy");
+        // Approve only `echo`; everything else is declined by the
+        // operator, which the model sees as a refusal.
+        let tool = RunCommandTool::with_policy(policy).with_ask_resolver(Arc::new(|program| {
+            let program = program.to_owned();
+            Box::pin(async move { program == "echo" })
+        }));
+        let approved = run(&tool, &root, json!({"program": "echo", "args": ["yes"]}))
+            .await
+            .expect("approved runs");
+        assert!(approved.content.contains("yes"), "{}", approved.content);
+        let declined = run(&tool, &root, json!({"program": "sleep", "args": ["0"]}))
+            .await
+            .expect_err("declined");
+        assert!(
+            matches!(&declined, ToolError::InvalidInput(m) if m.contains("was not approved")),
+            "{declined}"
+        );
+    }
+
+    #[test]
+    fn spec_mentions_admission_only_when_the_policy_narrows() {
+        let shipped = RunCommandTool::new();
+        assert!(
+            !shipped.spec().description.contains("Unrecognized programs"),
+            "default spec stays byte-identical"
+        );
+        let strict = RunCommandTool::with_policy(
+            CommandPolicy::parse("[policy]\nunknown = \"deny\"\n[[deny]]\nprogram = \"curl\"\n")
+                .expect("policy"),
+        );
+        assert!(
+            strict
+                .spec()
+                .description
+                .contains("Unrecognized programs are refused.")
+        );
+        assert!(strict.spec().description.contains("Never run: `curl`."));
     }
 }

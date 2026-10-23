@@ -11,6 +11,7 @@
 
 use loom_kernel::tool::{CommandEffect, ToolContext, ToolError, ToolOutput};
 
+use crate::budget::ToolBudgets;
 use crate::verify::{Ecosystem, Scope};
 
 /// Runs the detected ecosystem's verification per `scope` and shapes the
@@ -53,6 +54,13 @@ pub(crate) async fn run_fused(
     let effect = CommandEffect::new(program, args.clone(), output.status.code());
     let mut recent = ctx.recent_changes();
     recent.push(changed.to_owned());
-    let rendered = crate::verify::render(ecosystem, program, &args, &output, &recent);
+    let rendered = crate::verify::render(
+        ecosystem,
+        program,
+        &args,
+        &output,
+        &recent,
+        &ToolBudgets::default(),
+    );
     Ok((rendered, Some(effect)))
 }

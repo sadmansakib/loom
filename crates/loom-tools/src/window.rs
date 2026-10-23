@@ -8,7 +8,7 @@
 use std::io::Read;
 use std::path::Path;
 
-use crate::budget::{self, READ_FILE_HEAD_BYTES};
+use crate::budget;
 
 /// Lines returned when the caller does not pass `limit`.
 ///
@@ -89,7 +89,12 @@ pub(crate) fn decode_body(body: Vec<u8>) -> Option<(String, bool)> {
 /// Renders a window: a header naming the total, the numbered lines, an explicit
 /// hint when more lines remain, then the byte budget. Returns whether anything
 /// was cut (echoing or exceeding the window both count).
-pub(crate) fn render_window(label: &str, window: &Window, offset: usize) -> (String, bool) {
+pub(crate) fn render_window(
+    label: &str,
+    window: &Window,
+    offset: usize,
+    head_bytes: usize,
+) -> (String, bool) {
     if window.total == 0 {
         return (format!("{label} is empty"), false);
     }
@@ -124,6 +129,6 @@ pub(crate) fn render_window(label: &str, window: &Window, offset: usize) -> (Str
         ));
         truncated = true;
     }
-    let (text, cut) = budget::head_only(&text, READ_FILE_HEAD_BYTES);
+    let (text, cut) = budget::head_only(&text, head_bytes);
     (text, truncated || cut)
 }

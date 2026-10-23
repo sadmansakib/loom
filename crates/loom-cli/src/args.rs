@@ -133,6 +133,11 @@ pub struct RunArgs {
     #[arg(long)]
     pub symbols: bool,
 
+    /// Enable the structured git tools (iteration 4): `git_status`,
+    /// `git_diff`, and `git_log` join the registry. Off by default.
+    #[arg(long)]
+    pub git: bool,
+
     /// Enable the skills seam (iteration 5): `.agents/skills/*.md`
     /// names appear in the facts block and `load_skill` joins the
     /// registry. Off by default.

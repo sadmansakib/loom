@@ -17,7 +17,7 @@
 //! Registration is gated (`EngineConfig::skills`, default off) so the
 //! frozen SWE-bench prompt bytes are unchanged until a frontend opts in.
 
-use crate::budget::{SKILL_BODY_HEAD_BYTES, head_only};
+use crate::budget::{ToolBudgets, head_only};
 use crate::confinement::resolve_within;
 use futures::future::BoxFuture;
 use loom_kernel::tool::{PathTouch, Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
@@ -27,8 +27,20 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// Loads one skill body by menu name (iteration 5).
-#[derive(Debug)]
-pub struct LoadSkillTool;
+#[derive(Debug, Default)]
+pub struct LoadSkillTool {
+    /// Output budgets (item 20.2): the skill-body head cap.
+    pub(crate) budgets: ToolBudgets,
+}
+
+impl LoadSkillTool {
+    /// Builds the tool under explicit output budgets (the engine's
+    /// registration path; item 20.2).
+    pub fn with_budgets(mut self, budgets: ToolBudgets) -> Self {
+        self.budgets = budgets;
+        self
+    }
+}
 
 /// Input shape: the skill name exactly as the facts-block menu shows it.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -99,8 +111,9 @@ impl Tool for LoadSkillTool {
             let name = input.name;
             let relative = format!(".agents/skills/{name}.md");
             let path = resolve_within(&root, &relative)?;
+            let head_bytes = self.budgets.skill_body_head_bytes;
             let (content, listed) =
-                tokio::task::spawn_blocking(move || read_skill(&root, &path, &name))
+                tokio::task::spawn_blocking(move || read_skill(&root, &path, &name, head_bytes))
                     .await
                     .map_err(|err| {
                         ToolError::Execution(format!("load_skill task failed: {err}"))
@@ -121,11 +134,16 @@ fn is_plain_name(name: &str) -> bool {
 /// Reads one skill body and shapes it. Unknown names list the menu so
 /// the model corrects in one turn; missing directory says so plainly
 /// (the facts block then simply showed no menu).
-fn read_skill(root: &Path, path: &PathBuf, name: &str) -> Result<(String, bool), ToolError> {
+fn read_skill(
+    root: &Path,
+    path: &PathBuf,
+    name: &str,
+    head_bytes: usize,
+) -> Result<(String, bool), ToolError> {
     match std::fs::read(path) {
         Ok(bytes) => {
             let text = String::from_utf8_lossy(&bytes).into_owned();
-            let (shaped, cut) = head_only(&text, SKILL_BODY_HEAD_BYTES);
+            let (shaped, cut) = head_only(&text, head_bytes);
             let header = if cut {
                 format!("# skill: {name} (body cut to budget)\n")
             } else {
@@ -201,7 +219,7 @@ mod tests {
     async fn serves_a_skill_body_under_a_header() {
         let (_dir, root) = temp_root("body");
         write_skill(&root, "release", "# Release checklist\n1. run cargo test\n");
-        let out = LoadSkillTool
+        let out = LoadSkillTool::default()
             .call(serde_json::json!({ "name": "release" }), &ctx_at(&root))
             .await
             .unwrap();
@@ -213,9 +231,9 @@ mod tests {
     #[tokio::test]
     async fn cuts_runaway_bodies_with_the_omission_marker() {
         let (_dir, root) = temp_root("cut");
-        let body = "x".repeat(SKILL_BODY_HEAD_BYTES + 10_000);
+        let body = "x".repeat(crate::budget::SKILL_BODY_HEAD_BYTES + 10_000);
         write_skill(&root, "big", &body);
-        let out = LoadSkillTool
+        let out = LoadSkillTool::default()
             .call(serde_json::json!({ "name": "big" }), &ctx_at(&root))
             .await
             .unwrap();
@@ -228,7 +246,7 @@ mod tests {
         let (_dir, root) = temp_root("unknown");
         write_skill(&root, "alpha", "a");
         write_skill(&root, "beta", "b");
-        let err = LoadSkillTool
+        let err = LoadSkillTool::default()
             .call(serde_json::json!({ "name": "gamma" }), &ctx_at(&root))
             .await
             .unwrap_err();
@@ -244,7 +262,7 @@ mod tests {
     #[tokio::test]
     async fn missing_directory_says_so() {
         let (_dir, root) = temp_root("missing");
-        let err = LoadSkillTool
+        let err = LoadSkillTool::default()
             .call(serde_json::json!({ "name": "any" }), &ctx_at(&root))
             .await
             .unwrap_err();
@@ -261,7 +279,7 @@ mod tests {
         let (_dir, root) = temp_root("traversal");
         write_skill(&root, "real", "body");
         for bad in ["../real", ".agents/skills/real", "a/b", "..", ""] {
-            let err = LoadSkillTool
+            let err = LoadSkillTool::default()
                 .call(serde_json::json!({ "name": bad }), &ctx_at(&root))
                 .await
                 .unwrap_err();
@@ -274,7 +292,7 @@ mod tests {
 
     #[test]
     fn touched_paths_reports_the_skill_file() {
-        let touches = LoadSkillTool
+        let touches = LoadSkillTool::default()
             .touched_paths(&serde_json::json!({ "name": "release" }))
             .unwrap();
         assert_eq!(touches.len(), 1);
@@ -282,6 +300,6 @@ mod tests {
 
     #[test]
     fn spec_name_is_load_skill() {
-        assert_eq!(LoadSkillTool.spec().name, "load_skill");
+        assert_eq!(LoadSkillTool::default().spec().name, "load_skill");
     }
 }

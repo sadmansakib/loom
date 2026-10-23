@@ -3,6 +3,86 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-23 — Verdict layer: allow/ask/deny over the command policy (iteration 4)
+
+- The manifest was purely an escalation layer: every bare program ran
+  inside the boxed sandbox, and an operator could not forbid anything.
+  The verdict layer sits in front of it: `[[deny]]` entries refuse
+  programs outright, and `[policy] unknown = "allow"|"ask"|"deny"`
+  decides unruled programs (`allow` = shipped sandboxed default,
+  `deny` = strict mode where only ruled programs run, `ask` = operator
+  approval). Deny/rule conflicts are manifest errors, so neither
+  silently shadows the other.
+- `ask` needs an interactive frontend, so it fails closed today: the
+  `AskResolver` seam ships on `run_command`
+  (`with_ask_resolver`; `Arc<dyn Fn(&str) -> BoxFuture<'static, bool>>`),
+  and item 22's frontend will attach one. Without it, an `ask` verdict
+  is a refusal naming the missing frontend.
+- The gate applies at all three execution surfaces: `run_command`
+  (refusal the model sees and can route around), `verify` drivers
+  (fail-closed refusals), and the fast path (silently declines — the
+  normal flow then surfaces the refusal). `cargo` stays ruled in every
+  manifest, so the shipped engine behavior is byte-identical: pinned by
+  test, and the tool description only grows an admission sentence when
+  a workspace actually narrows its policy (cached prompt prefixes stay
+  stable).
+- Tests: parse + conflict + duplicate + invalid-verdict errors, verdict
+  resolution table, refused-before-execution ordering, strict mode
+  sparing ruled programs, fail-closed ask, resolver approve/decline,
+  spec stability. 37 suites green, clippy 0.
+
+## 2026-10-23 — Item 20.2 sweepable tunables: `ToolBudgets` in `EngineConfig` + `LOOM_*` env seams
+
+- Sweeps over the SWE-bench protocol could not vary any output budget
+  or pruning knob without editing constants and rebuilding. Every
+  per-tool presentation budget now travels in one struct,
+  `loom_tools::ToolBudgets` (read head, command head/tail, edit echo
+  bytes + context lines, symbols overview, skill body, replaced-symbol
+  echo), set at engine registration; the prune policy gained a full
+  frontend override (`EngineConfig.prune`) over the per-provider base.
+- Two pure env seams layer sweeps over defaults without touching the
+  frozen container script: `budgets_with_env` / `prune_with_env`
+  (8 + 4 `LOOM_*` vars, names exported as `BUDGET_ENV_VARS` /
+  `PRUNE_ENV_VARS`). `loom run` echoes every override it sees and
+  warns on invalid values; zero-valued entries are rejected.
+- Honesty: `ToolBudgets::default()` is byte-identical to the constants
+  the v3-100 sweep ran on (pinned by test); with no env set, prompts
+  and behavior are unchanged. The reasoning-schedule slot remains gated
+  with item 9.
+- Tests: defaults-vs-constants pin, env seam units (valid applies,
+  invalid/zero warns, GLM elide-reasoning preserved), and an engine
+  integration test proving a shrunken read budget shapes real
+  `read_file` output. 37 suites green, clippy 0.
+
+## 2026-10-23 — Structured git tools (iteration 4): `git_status`, `git_diff`, `git_log`
+
+- First slice of the feature-complete program. `run_command` already ran
+  git (and reduced its output, item 3), but through the generic exec
+  path: the bytes depended on the user's `~/.gitconfig` (aliases,
+  colors, `core.quotepath`), and the call was classified as a mutating
+  sandbox command. The structured tools pin the invocation instead.
+- Fixed global flags (`--no-optional-locks`, `core.quotepath=false`,
+  colors and advice off) make output deterministic; the tools are
+  read-only porcelain (scout-registry eligible, no commit surface);
+  path arguments are workspace-confined; every invocation runs through
+  the same bounded sandbox exec path and lands in the transcript as a
+  `CommandEffect` audit record. On macOS the sandbox grants git's
+  `/dev/null` sink (diff plumbing opens it read-write; the blanket
+  Seatbelt write-deny blocked the character device).
+- `git_status` parses `--porcelain=v1 -z --branch` into branch plus
+  rendered entries (rename/copy records joined with `<- orig`);
+  `git_diff` scopes to an optional path, optional `staged`; `git_log`
+  takes an optional path and a clamped `limit` (default 20, max 200).
+  Non-zero exits (not a repository, bad revision) surface as content
+  with the exit status — the `run_command` self-correction contract.
+- Registration gated by `EngineConfig::git` / `--git` (default off, so
+  the frozen SWE-bench prompt bytes and every existing frontend are
+  unchanged); the bare-loop arm never carries them.
+- Tests: porcelain parsing (branch, rename, detached HEAD), a real
+  repository integration (status/diff/log), non-repo reporting,
+  workspace-escape rejection, limit clamping, engine opt-in/default/
+  bare registration. Workspace 37 suites green, clippy 0.
+
 ## 2026-10-23 — Skills index + `load_skill` (iteration 5, context-compiler seam)
 
 - `.agents/skills/*.md` is now a first-class knowledge surface, loaded

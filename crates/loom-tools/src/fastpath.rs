@@ -35,7 +35,7 @@ use loom_kernel::tool::ToolContext;
 use tokio_util::sync::CancellationToken;
 
 use crate::exec::{ExecLimits, run_bounded};
-use crate::policy::CommandPolicy;
+use crate::policy::{CommandPolicy, PolicyVerdict};
 use crate::sandbox::{Sandbox, SandboxGrants};
 
 /// What a successful fast path proved, for the transcript and events.
@@ -535,12 +535,18 @@ fn count_word(text: &str, needle: &str) -> usize {
 
 /// Runs `<program> <args…>` under the policy, sandbox, and bounds the
 /// `run_command` tool uses for that program; green exit means verified.
+/// The verdict layer applies here too: a non-allow verdict simply means
+/// "cannot verify this way" — the fast path declines and the normal
+/// turn flow surfaces the refusal where the model can see it.
 async fn program_ok(
     workspace: &Path,
     policy: &CommandPolicy,
     program: &str,
     args: &[&str],
 ) -> bool {
+    if policy.verdict(program) != PolicyVerdict::Allow {
+        return false;
+    }
     let owned: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
     let rule = policy.rule(program);
     let limits = ExecLimits {
@@ -569,12 +575,16 @@ async fn cargo_ok(workspace: &Path, policy: &CommandPolicy, args: &[&str]) -> bo
 }
 
 /// Runs `<program> <args…>` capturing stdout, when the run exits at all.
+/// Honors the verdict layer like [`program_ok`] (no output = no help).
 async fn program_output(
     workspace: &Path,
     policy: &CommandPolicy,
     program: &str,
     args: &[&str],
 ) -> Option<String> {
+    if policy.verdict(program) != PolicyVerdict::Allow {
+        return None;
+    }
     let owned: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
     let rule = policy.rule(program);
     let limits = ExecLimits {
