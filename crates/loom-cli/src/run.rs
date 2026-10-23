@@ -14,7 +14,7 @@ use loom_core::engine::TaskControl;
 use loom_core::kernel::agent::{TaskError, TaskSummary};
 use loom_core::kernel::event::{ChannelEventSink, FanoutSink};
 use loom_core::kernel::session::Session;
-use loom_core::{Engine, EngineConfig};
+use loom_core::{Engine, EngineConfig, EngineOverrides};
 
 use crate::args::RunArgs;
 use crate::output::{self, Renderer};
@@ -123,6 +123,19 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         ))
     };
 
+    // The bare-loop arm (roadmap item 1): the eval harness sets
+    // LOOM_BARE to measure the engine's levers against the plain
+    // five-tool loop. Read here, not in the engine (ADR-008): embedders
+    // assemble their own overrides, and a stray env var on a user
+    // machine must not silently strip their harness.
+    let bare_arm = std::env::var_os("LOOM_BARE").is_some();
+    if bare_arm {
+        eprintln!(
+            "bare-loop arm active (LOOM_BARE): facts, pruning, completion \
+             gate, failure ledger, and fast paths are off"
+        );
+    }
+
     // Captured before `EngineConfig` consumes the strings: the trace
     // manifest needs the run configuration after the task ended.
     let trace_provider = args.provider.clone();
@@ -130,20 +143,28 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
 
     // `open_async` owns the catalog sequencing: fetch, cache beside the
     // database, fall back to a stale cache — identical for every frontend.
-    let engine = runtime.block_on(Engine::open_async(EngineConfig {
-        provider: args.provider,
-        model: args.model,
-        base_url: args.base_url,
-        models_url: args.models_url,
-        reasoning_effort: args.reasoning_effort,
-        account: args.account,
-        workspace: args.workspace,
-        system_prompt,
-        max_turns: args.max_turns,
-        db_path,
-        persist: !args.no_save,
-        catalog: None,
-    }))?;
+    let overrides = if bare_arm {
+        EngineOverrides::default().bare_loop()
+    } else {
+        EngineOverrides::default()
+    };
+    let engine = runtime.block_on(Engine::open_async_with(
+        EngineConfig {
+            provider: args.provider,
+            model: args.model,
+            base_url: args.base_url,
+            models_url: args.models_url,
+            reasoning_effort: args.reasoning_effort,
+            account: args.account,
+            workspace: args.workspace,
+            system_prompt,
+            max_turns: args.max_turns,
+            db_path,
+            persist: !args.no_save,
+            catalog: None,
+        },
+        overrides,
+    ))?;
 
     let input = args.task.join(" ");
 

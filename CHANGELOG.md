@@ -3,6 +3,36 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-23 — Iteration 2 closes: bare-arm seam + paired contrast reporting
+
+Roadmap item 1's two zero-cost obligations, shipped and validated; the
+funded-measurement debt is recorded in the roadmap instead of run thin.
+
+- `swebench-run --arm full|bare` (env `LOOM_EVAL_ARM`): the bare arm
+  forwards `LOOM_BARE=1` through the frozen container script — byte
+  identical in both arms, asserted by test — and the CLI applies
+  `EngineOverrides::bare_loop()` (facts, pruning, completion gate,
+  failure ledger, fast paths all off). Per the ADR-008 split the engine
+  never reads the env var; embedders assemble their own overrides. Run
+  each arm in its own `--eval-dir`; the arm is recorded in the sweep
+  summary.
+- `swebench-contrast` (new loom-eval bin, roadmap item 1): paired
+  same-task contrast over artifacts that already exist — two official
+  scorer reports plus their eval dirs render per-instance outcome
+  glyphs, win/loss/tie, and Δturns / Δinput / Δoutput / Δrequests /
+  Δcost (run-1 metrics; optional per-M pricing flags). Validated on the
+  v3-100 vs post-fix overlap (6 shared instances): 3→5 resolved, 0
+  wins / 2 losses / 4 ties — matches the scorer verdicts exactly.
+- Supporting readers in `loom-eval::swebench`: `run_turns` (counts
+  `turn_started` events — `task_completed` carries no fields),
+  `run_metrics`, `scorer_outcomes` (wrapper-report shape, sticky
+  resolution, skips never-submitted keys).
+- Roadmap: iteration 2 marked done 2026-10-23; current-state block
+  refreshed (deepseek-flash funded adapter, v3-100 90/99, balance
+  $1.12); recorded debt — N ≥ 5 re-runs for items 4/5/6/8/10 ≈ $3+,
+  first bare-vs-full contrast (10 × 2 × N=2) ≈ $0.84, both beyond the
+  current balance and deliberately not run thin (2026-10-23 decision).
+
 ## 2026-10-23 — Malformed tool-call recovery + test-consultation nudge
 
 The 100-instance sweep surfaced a new failure class: the model

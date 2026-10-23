@@ -123,7 +123,7 @@ iterations may start early where a backlog item is cheap and measured.
 | # | Iteration | Status | Backlog items |
 |---|---|---|---|
 | 1 | Core service | **Done** | — (see Shipped) |
-| 2 | Core efficiency & repository intelligence | **In progress (current)** | 1, 3✓, 4✓, 5✓, 6✓, 7✗, 8✓, 10✓ᴬ, 11⏸, 12✓, 16✓, 17✓ |
+| 2 | Core efficiency & repository intelligence | **Done 2026-10-23** (funded-measurement debt in item 1) | 1, 3✓, 4✓, 5✓, 6✓, 7✗, 8✓, 10✓ᴬ, 11⏸, 12✓, 16✓, 17✓ |
 | 3 | Intelligent subagent scheduling | Not started | 19, 21, 24 |
 | 4 | Execution safety & richer tools | **Largely shipped early** | 2✓, 13⏸, 23 |
 | 5 | Skills & contextual knowledge | Partial (AGENTS.md facts) | 4✓ (instructions), 20.4 |
@@ -304,7 +304,9 @@ orchestration — downstream of a strong core.
 ## Current state
 
 ```text
-Current iteration:     2 (core efficiency), with iteration 4 tools shipped early
+Current iteration:     2 closed 2026-10-23 (efficiency engineering complete;
+                      funded-measurement debt recorded in item 1); iteration
+                      3 (subagent scheduling) not started
 Language:              Rust (stable), 8 crates, unsafe forbidden
 Shipped providers:     DeepSeek, OpenRouter (free + paid), Anthropic, GLM,
                       NVIDIA (NIM hosted inference), Groq (hosted inference)
@@ -319,12 +321,16 @@ Groq status:           adapter shipped, wiremock-verified, and live-probed
                       2026-10-18 on a free-plan key (openai/gpt-oss-120b,
                       openai/gpt-oss-20b, qwen/qwen3.8-27b); unbilled, and the
                       binding free-plan ceiling is 8K tokens/min
-Eval models in use:    OpenRouter metered paid tier (z-ai/glm-5.3, live 200);
-                      DeepSeek key drained; NVIDIA NIM unusable today
+Eval models in use:    DeepSeek `deepseek-flash` on a funded adapter (1M
+                      window, cache-aware usage parsing) — the v3-100 sweep
+                      completed 2026-10-23: 90 resolved / 99 completed,
+                      $2.1 total, 96.9% cache-read; account balance $1.12
 Primary target:        successful work per model invocation
-Biggest open risk:     N=1 measurements below the noise floor (see item 1),
-                      now compounded by eval budget: the OpenRouter account
-                      holds ~$0.04 of its $15 credit (see item 1)
+Biggest open risk:     funded measurement debt (item 1): the N ≥ 5 re-runs
+                      for items 4/5/6/8/10 cost ≈$3+, the first bare-vs-full
+                      contrast (10 tasks × 2 arms × N=2) ≈$0.84, and the
+                      balance is $1.12 — engineering seams are done and
+                      validated; only credit is missing
 ```
 
 ---
@@ -629,7 +635,13 @@ reproduces them.
      behavioral contrast between executions is its only selection
      signal; here it strengthens claims at whatever N the budget
      affords. Paired deltas become the default presentation of any A/B
-     once the funded model lands.
+     once the funded model lands. **Shipped 2026-10-23 for SWE-bench
+     artifacts**: `swebench-contrast` (loom-eval bin) reads two official
+     scorer reports plus their eval dirs and renders per-instance
+     outcome glyphs, win/loss/tie, and Δturns/Δtokens/Δrequests/Δcost
+     (run-1 artifacts; pricing flags optional). Validated on the
+     v3-100 vs post-fix overlap (6 shared instances): 3→5 resolved,
+     0 wins / 2 losses / 4 ties, matching the scorer verdicts exactly.
    - **Funded low-variance eval model** — the gating prerequisite.
      The free tier's variance (B9: 6–40 turns on identical config)
      sits above most levers, so items 4, 5, 6, 8, and 10 shipped on
@@ -652,6 +664,16 @@ reproduces them.
      `spend_usd: 0` at reset), so even funded the sweep paces itself
      across ~5 days unless the guardrail is raised — `LOOM_EVAL_RPM`
      meters requests, and the daily budget is the coarser ceiling.
+     **Status 2026-10-23: the funded model landed, on DeepSeek instead.**
+     The dedicated `deepseek-flash` adapter (1M window, cache-hit token
+     parsing) ran the full v3-100 SWE-bench Verified sweep: 90 resolved /
+     99 completed for $2.1 at 96.9% cache-read (~$0.021 per instance), and
+     the follow-up validation sweeps confirmed the malformed-salvage and
+     test-consultation-nudge fixes (f682374). What remains open is only
+     the re-baseline debt at today's balance of $1.12: the N ≥ 5 re-runs
+     for items 4/5/6/8/10 cost ≈$3+, and the first bare-vs-full contrast
+     (10 tasks × 2 arms × N=2) ≈$0.84 — skipped on budget and recorded
+     here rather than run thin (2026-10-23 decision).
      Candidate alternatives, re-checked 2026-10-18: the direct Z.ai
      API is still wiremock-only (no Z.ai key on this machine);
      DeepSeek is drained (`is_available: false`); **NVIDIA NIM is no
@@ -677,7 +699,13 @@ reproduces them.
      afterward (above), so the arms now wait on OpenRouter credit
      rather than on engineering — the arm is shipped, pinned by
      `bare_registry_excludes_the_kernel_todo_tool`, and
-     `suite_headline` already reads `arm: "bare"`. The number this
+     `suite_headline` already reads `arm: "bare"`. **2026-10-23: the seam is
+     wired end-to-end for SWE-bench** — `swebench-run --arm bare` (or
+     `LOOM_EVAL_ARM`) forwards `LOOM_BARE=1` through the frozen container
+     script into the CLI, which applies `EngineOverrides::bare_loop()`;
+     the script itself stays byte-identical (asserted by test), and
+     `swebench-contrast` renders the paired arms once both exist. The
+     G4/G5 number still waits on credit, not engineering. The number this
      must produce is the G4/G5 headline in `docs/benchmarks/`: the
      claim that Loom raises a weaker model's success rate, which the
      input model profiles (item 9) also need. ~~Also shipped alongside:

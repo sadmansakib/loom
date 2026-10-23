@@ -21,3 +21,7 @@ workspace = true
 [[bin]]
 name = "swebench-run"
 path = "src/bin/swebench_run.rs"
+
+[[bin]]
+name = "swebench-contrast"
+path = "src/bin/swebench_contrast.rs"

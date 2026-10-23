@@ -408,6 +408,12 @@ pub struct ContainerSpec<'a> {
     pub timeout_secs: u64,
     /// `--max-turns` budget for the in-container loom run.
     pub max_turns: usize,
+    /// Selects the bare-loop arm (roadmap item 1): forwards `LOOM_BARE=1`
+    /// so the in-container binary strips every harness lever (facts,
+    /// pruning, completion gate, failure ledger, fast paths). The
+    /// container script itself stays byte-identical — the env var is
+    /// consumed by the loom binary, like `LOOM_SKIP_SANDBOX_PREFLIGHT`.
+    pub bare: bool,
     /// Unique container name (`--name`), e.g. `loom-<slug>-run1`.
     pub container_name: &'a str,
 }
@@ -432,6 +438,9 @@ pub fn docker_run_argv(spec: &ContainerSpec<'_>) -> Vec<String> {
     ];
     if let Some(base_url) = spec.base_url {
         argv.extend(["-e".into(), format!("LOOM_BASE_URL={base_url}")]);
+    }
+    if spec.bare {
+        argv.extend(["-e".into(), "LOOM_BARE=1".into()]);
     }
     argv.extend([
         "-e".into(),
@@ -478,6 +487,84 @@ pub fn run_outcome(run_json: &Path) -> (usize, Option<String>) {
         }
     }
     (events, failure)
+}
+
+/// Model turns in a run's JSONL event stream: the count of
+/// `turn_started` events (the terminal `task_completed` event carries
+/// no fields, so this is the only turn signal the artifacts hold).
+pub fn run_turns(run_json: &Path) -> u64 {
+    let Ok(body) = std::fs::read_to_string(run_json) else {
+        return 0;
+    };
+    body.lines()
+        .filter(|line| line.contains("\"turn_started\""))
+        .count() as u64
+}
+
+/// The per-run numbers a paired contrast reports (roadmap item 1):
+/// turns plus the token totals from [`run_usage`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RunMetrics {
+    /// `turn_started` events.
+    pub turns: u64,
+    /// Token totals across model requests.
+    pub usage: RunUsage,
+}
+
+/// Reads a run's turns and token totals in one pass.
+pub fn run_metrics(run_json: &Path) -> RunMetrics {
+    RunMetrics {
+        turns: run_turns(run_json),
+        usage: run_usage(run_json),
+    }
+}
+
+/// Outcome map from an official scorer report: instance id → resolved.
+/// The scorer writes a wrapper object whose `*_ids` arrays partition the
+/// run — `resolved_ids` true; `unresolved_ids`, `incomplete_ids`,
+/// `error_ids`, `empty_patch_ids`, `infra_failure_ids`, and
+/// `ambiguous_failure_ids` false.
+pub fn scorer_outcomes(report_json: &Path) -> std::io::Result<Vec<(String, bool)>> {
+    /// The scorer's id partitions; every other `*_ids` key (e.g.
+    /// `unremoved_images`) is bookkeeping, not outcomes.
+    fn partition(key: &str) -> Option<bool> {
+        match key {
+            "resolved_ids" | "resolved_instances" => Some(true),
+            // `incomplete_*` ids were never submitted — they carry no
+            // outcome and stay out of the map entirely, so contrasts
+            // pair attempted work only.
+            "incomplete_ids" | "incomplete_instances" => None,
+            "unresolved_ids"
+            | "unresolved_instances"
+            | "error_ids"
+            | "error_instances"
+            | "empty_patch_ids"
+            | "empty_patch_instances"
+            | "infra_failure_ids"
+            | "infra_failure_instances"
+            | "ambiguous_failure_ids"
+            | "ambiguous_failure_instances" => Some(false),
+            _ => None,
+        }
+    }
+
+    let body = std::fs::read_to_string(report_json)?;
+    let value: serde_json::Value = serde_json::from_str(&body)?;
+    let mut outcomes = std::collections::BTreeMap::new();
+    for (key, entry) in value.as_object().into_iter().flatten() {
+        // An id appears in several partitions (`submitted_ids` overlaps
+        // `resolved_ids`); resolution is sticky and never downgraded.
+        let Some(listed_resolved) = partition(key) else {
+            continue;
+        };
+        for id in entry.as_array().into_iter().flatten() {
+            if let Some(id) = id.as_str() {
+                let resolved = outcomes.get(id).copied().unwrap_or(false) || listed_resolved;
+                outcomes.insert(id.to_owned(), resolved);
+            }
+        }
+    }
+    Ok(outcomes.into_iter().collect())
 }
 
 /// Token totals reduced from a run's JSONL event stream: summed over
@@ -794,6 +881,7 @@ fn docker_argv_mounts_and_env_without_a_shell() {
         api_key: "sk-test",
         timeout_secs: 3600,
         max_turns: 60,
+        bare: false,
         container_name: "loom-org-one-1-run1",
     };
     let argv = docker_run_argv(&spec);
@@ -802,6 +890,8 @@ fn docker_argv_mounts_and_env_without_a_shell() {
     assert!(joined.contains("--rm\n"));
     assert!(joined.contains("--name\nloom-org-one-1-run1\n"));
     assert!(joined.contains("-e\nLOOM_PROVIDER=deepseek\n-e\nLOOM_MODEL=deepseek-flash"));
+    // Full arm: no LOOM_BARE is forwarded.
+    assert!(!joined.contains("LOOM_BARE"));
     // The container is the isolation boundary; the in-container bwrap
     // probe would fail (no bubblewrap in testbed images).
     assert!(joined.contains("-e\nLOOM_SKIP_SANDBOX_PREFLIGHT=1"));
@@ -847,6 +937,18 @@ fn docker_argv_mounts_and_env_without_a_shell() {
     let joined = argv.join("\n");
     assert!(joined.contains("-e\nLOOM_BASE_URL=https://free.empexaura.com/v1"));
     assert!(joined.contains("-e\nCUSTOM_API_KEY=nano-test"));
+
+    // The bare-loop arm (roadmap item 1): one env var, and the frozen
+    // container script stays byte-identical — the binary consumes the
+    // knob, not the script.
+    let bare_arm = ContainerSpec {
+        bare: true,
+        ..gateway
+    };
+    let argv = docker_run_argv(&bare_arm);
+    let joined = argv.join("\n");
+    assert!(joined.contains("-e\nLOOM_BARE=1\n"));
+    assert!(!CONTAINER_SCRIPT.contains("LOOM_BARE"));
 }
 
 #[test]
@@ -885,6 +987,63 @@ fn run_outcome_reads_the_event_stream() {
     // Malformed trailing junk must not sink the scan.
     std::fs::write(&path, "not json\n").unwrap();
     assert_eq!(run_outcome(&path), (0, None));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_turns_counts_turn_started_events() {
+    let dir = std::env::temp_dir().join(format!("loom-swe-turns-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("run.json");
+
+    // Missing file: a run that never started.
+    assert_eq!(run_turns(&path), 0);
+
+    // Three turns among other events; task_completed carries nothing.
+    std::fs::write(
+        &path,
+        "{\"schema_version\":10,\"kind\":{\"type\":\"task_started\"}}\n\
+         {\"schema_version\":10,\"kind\":{\"type\":\"turn_started\"}}\n\
+         {\"schema_version\":10,\"kind\":{\"type\":\"model_completed\",\"response\":{}}}\n\
+         {\"schema_version\":10,\"kind\":{\"type\":\"turn_started\"}}\n\
+         {\"schema_version\":10,\"kind\":{\"type\":\"tool_completed\"}}\n\
+         {\"schema_version\":10,\"kind\":{\"type\":\"turn_started\"}}\n\
+         {\"schema_version\":10,\"kind\":{\"type\":\"task_completed\"}}\n",
+    )
+    .unwrap();
+    assert_eq!(run_turns(&path), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scorer_outcomes_reads_a_report_object() {
+    let dir = std::env::temp_dir().join(format!("loom-swe-report-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("report.json");
+
+    // Missing file is a caller error, not an empty map.
+    assert!(scorer_outcomes(&path).is_err());
+
+    std::fs::write(
+        &path,
+        "{\"total_instances\":500,\"resolved_ids\":[\"a__a-1\"],\
+          \"unresolved_ids\":[\"b__b-2\"],\"error_ids\":[\"c__c-3\"],\
+          \"incomplete_ids\":[\"d__d-4\"],\"unremoved_images\":[\"img-x\"]}",
+    )
+    .unwrap();
+    let outcomes = scorer_outcomes(&path).unwrap();
+    // d-4 was never submitted (incomplete) and img-x is bookkeeping:
+    // neither carries an outcome.
+    assert_eq!(
+        outcomes,
+        vec![
+            ("a__a-1".to_owned(), true),
+            ("b__b-2".to_owned(), false),
+            ("c__c-3".to_owned(), false),
+        ]
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

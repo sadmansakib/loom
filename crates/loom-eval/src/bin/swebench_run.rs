@@ -40,6 +40,8 @@ struct Args {
     pull_images: bool,
     timeout_secs: u64,
     max_turns: usize,
+    /// `full` (default) or `bare` — the roadmap-item-1 A/B arm.
+    arm: String,
     eval_dir: PathBuf,
 }
 
@@ -81,6 +83,12 @@ fn usage() -> ! {
   --build-loom         cross-build the linux binary inside a docker rust image
   --timeout-secs <n>   wall-clock budget per run (default 3600)
   --max-turns <n>      --max-turns for the in-container loom run (default 100)
+  --arm <full|bare>    harness arm (default $LOOM_EVAL_ARM or full): `bare`
+                       forwards LOOM_BARE=1 so the in-container loom strips
+                       every harness lever (facts, pruning, completion gate,
+                       failure ledger, fast paths) — the roadmap-item-1 A/B
+                       baseline. The container script is identical in both
+                       arms; run each arm in its own --eval-dir
   --eval-dir <path>    artifacts root (default $LOOM_EVAL_DIR or <cwd>/target/eval)
 
 Knobs mirror the environment forms: LOOM_EVAL_SWEBENCH_INSTANCES,
@@ -110,6 +118,7 @@ fn parse_args() -> Args {
         // exploration loop with no edit; 100 gives iterating room while
         // --timeout-secs still bounds wall clock.
         max_turns: 100,
+        arm: std::env::var("LOOM_EVAL_ARM").unwrap_or_else(|_| "full".into()),
         eval_dir: std::env::var("LOOM_EVAL_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("target/eval")),
@@ -132,6 +141,7 @@ fn parse_args() -> Args {
             "--no-pull" => args.pull_images = false,
             "--timeout-secs" => args.timeout_secs = value().parse().unwrap_or_else(|_| usage()),
             "--max-turns" => args.max_turns = value().parse().unwrap_or_else(|_| usage()),
+            "--arm" => args.arm = value(),
             "--eval-dir" => args.eval_dir = PathBuf::from(value()),
             "--help" | "-h" => usage(),
             _ => usage(),
@@ -147,6 +157,10 @@ fn parse_args() -> Args {
     }
     if args.per_repo == Some(0) {
         eprintln!("--per-repo must be positive");
+        std::process::exit(2);
+    }
+    if args.arm != "full" && args.arm != "bare" {
+        eprintln!("--arm must be `full` or `bare`");
         std::process::exit(2);
     }
     args
@@ -317,11 +331,12 @@ fn main() {
         args.per_repo,
     );
     println!(
-        "sweep: {} instance(s) x {} run(s), provider={}, model={}",
+        "sweep: {} instance(s) x {} run(s), provider={}, model={}, arm={}",
         selected.len(),
         args.runs,
         args.provider,
-        args.model
+        args.model,
+        args.arm
     );
     if selected.is_empty() {
         eprintln!("no instances selected (filters too tight?)");
@@ -415,6 +430,7 @@ fn main() {
                     api_key: &key_value,
                     timeout_secs: args.timeout_secs,
                     max_turns: args.max_turns,
+                    bare: args.arm == "bare",
                     container_name: &container_name,
                 };
                 println!("run {slug} #{run} (attempt {attempt}) in {image}…");
@@ -537,6 +553,7 @@ fn main() {
         "provider": args.provider,
         "model": args.model,
         "base_url": args.base_url,
+        "arm": args.arm,
         "dataset": swebench::DATASET_ID,
         "instances": report,
         "predictions_files": prediction_paths
