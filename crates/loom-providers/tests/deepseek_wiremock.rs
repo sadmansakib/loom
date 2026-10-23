@@ -345,7 +345,7 @@ async fn length_with_partial_args_discards_calls() {
 }
 
 #[tokio::test]
-async fn unparseable_args_is_protocol_error() {
+async fn unparseable_args_is_salvaged_not_fatal() {
     let server = MockServer::start().await;
     mount_sse(
         &server,
@@ -361,9 +361,15 @@ async fn unparseable_args_is_protocol_error() {
     let events =
         collect(provider_at(&server.uri(), TimeoutConfig::default()).stream(&plain_request()))
             .await;
-    let error = expect_error(events);
-    assert_eq!(error.kind, ModelErrorKind::Protocol);
-    assert!(!error.is_retryable());
+    // The malformed call is salvaged, not fatal: the stream completes
+    // with the call committed as a placeholder the engine refuses to
+    // dispatch, so the model can reissue it (2026-10-23 recovery loop).
+    let response = expect_completed(events);
+    assert_eq!(response.message.stop_reason, StopReason::ToolCalls);
+    let call = &response.message.tool_calls[0];
+    assert_eq!(call.id.as_str(), "call_a");
+    assert_eq!(call.name, "read_file");
+    assert!(call.arguments_are_malformed());
 }
 
 #[tokio::test]

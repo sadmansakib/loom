@@ -255,6 +255,9 @@ impl Tool for FailingTool {
 struct WritingTool {
     spec: ToolSpec,
     green: bool,
+    /// The command the fused check echoes; "cargo test" makes the
+    /// result count as a test run for the completion gate.
+    check: &'static str,
 }
 
 impl Tool for WritingTool {
@@ -278,7 +281,10 @@ impl Tool for WritingTool {
             Some(0),
         ));
         let content = if self.green {
-            String::from("edited src/lib.rs\n--- verify ---\n$ cargo check\nexit status: 0")
+            format!(
+                "edited src/lib.rs\n--- verify ---\n$ {}\nexit status: 0",
+                self.check
+            )
         } else {
             String::from("edited src/lib.rs")
         };
@@ -530,6 +536,7 @@ async fn an_unverified_finish_is_refused_once_then_accepted() {
         .register(Box::new(WritingTool {
             spec: spec("write"),
             green: false,
+            check: "cargo check",
         }))
         .unwrap();
     let provider = FakeProvider::new(
@@ -551,6 +558,10 @@ async fn an_unverified_finish_is_refused_once_then_accepted() {
                 assistant("really done", StopReason::EndTurn, Vec::new()),
                 usage(30, 7, None),
             ),
+            completed(
+                assistant("truly done", StopReason::EndTurn, Vec::new()),
+                usage(40, 9, None),
+            ),
         ],
     );
     let requests = provider.requests_handle();
@@ -564,24 +575,35 @@ async fn an_unverified_finish_is_refused_once_then_accepted() {
         .await
         .unwrap();
 
-    // Three model requests: write, refused finish, accepted finish.
-    assert_eq!(summary.model_requests, 3);
+    // Four model requests: write, verification refusal, test-consultation
+    // refusal, accepted finish.
+    assert_eq!(summary.model_requests, 4);
     let requests = requests.lock().unwrap();
-    let refusal_projected = requests[2]
+    let green_refusal = requests[2].messages.iter().any(
+        |m| matches!(m, Message::User { text } if text.contains("since the last green check")),
+    );
+    let test_refusal = requests[3]
         .messages
         .iter()
-        .any(|m| matches!(m, Message::User { text } if text.contains("Hold on") && text.contains("src/lib.rs") && text.contains("fix the bug")));
-    assert!(refusal_projected, "the refusal must reach the model");
+        .any(|m| matches!(m, Message::User { text } if text.contains("no existing test suite")));
+    assert!(
+        green_refusal,
+        "the verification refusal must reach the model"
+    );
+    assert!(
+        test_refusal,
+        "the test-consultation refusal must reach the model"
+    );
     drop(requests);
 
-    // The refusal persists in the transcript as a user item.
+    // Both refusals persist in the transcript as user items.
     assert!(
         session
             .transcript
             .iter()
             .any(|i| matches!(i, Item::User { text } if text.contains("Hold on")))
     );
-    assert_eq!(summary.turns, 3);
+    assert_eq!(summary.turns, 4);
 }
 
 #[tokio::test]
@@ -595,6 +617,7 @@ async fn the_bare_loop_never_refuses_an_unverified_finish() {
         .register(Box::new(WritingTool {
             spec: spec("write"),
             green: false,
+            check: "cargo check",
         }))
         .unwrap();
     let provider = FakeProvider::new(
@@ -639,14 +662,76 @@ async fn the_bare_loop_never_refuses_an_unverified_finish() {
 }
 
 #[tokio::test]
-async fn a_fused_green_check_finishes_without_refusal() {
-    // The same write carrying a fused `exit status: 0` check satisfies the
-    // gate: the first EndTurn completes the task.
+async fn a_fused_green_check_still_gets_one_test_consultation_refusal() {
+    // The fused `exit status: 0` check satisfies the verification gate,
+    // but `cargo check` is not a test run: the first EndTurn gets the
+    // once-only test-consultation nudge, the second completes.
     let mut registry = ToolRegistry::new();
     registry
         .register(Box::new(WritingTool {
             spec: spec("write"),
             green: true,
+            check: "cargo check",
+        }))
+        .unwrap();
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            completed(
+                assistant(
+                    "working",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_1", "write", json!({}))],
+                ),
+                usage(10, 3, None),
+            ),
+            completed(
+                assistant("done", StopReason::EndTurn, Vec::new()),
+                usage(20, 5, None),
+            ),
+            completed(
+                assistant("really done", StopReason::EndTurn, Vec::new()),
+                usage(30, 7, None),
+            ),
+        ],
+    );
+    let requests = provider.requests_handle();
+    let mut session = Session::new(SessionId::new());
+    let (sink, _receiver) = ChannelEventSink::new();
+    let control = TaskControl::new();
+    let agent = agent(provider, registry, 10);
+
+    let summary = agent
+        .run_task(&mut session, "fix the bug", &sink, &control)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.model_requests, 3, "one nudge turn, then done");
+    let requests = requests.lock().unwrap();
+    assert!(
+        requests[2].messages.iter().any(
+            |m| matches!(m, Message::User { text } if text.contains("no existing test suite"))
+        ),
+        "the test-consultation nudge must reach the model"
+    );
+    assert!(
+        !requests.iter().any(|r| r.messages.iter().any(
+            |m| matches!(m, Message::User { text } if text.contains("since the last green check"))
+        )),
+        "the verification refusal must not fire when the check is green"
+    );
+}
+
+#[tokio::test]
+async fn a_fused_green_test_run_finishes_without_any_refusal() {
+    // A fused green check whose command IS a test run satisfies both
+    // gates: the first EndTurn completes the task.
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(WritingTool {
+            spec: spec("write"),
+            green: true,
+            check: "cargo test",
         }))
         .unwrap();
     let provider = FakeProvider::new(
@@ -2545,6 +2630,104 @@ async fn todo_list_re_appends_at_the_tail_only_when_changed() {
         .filter(|kind| matches!(kind, EventKind::TodoUpdated { .. }))
         .count();
     assert_eq!(updates, 2, "events: {kinds:?}");
+}
+
+/// Salvage path (malformed-arguments recovery): a tool call whose
+/// arguments carry the malformed marker never executes; the model sees
+/// an error result instead, reissues a well-formed call, and the task
+/// still completes.
+#[tokio::test]
+async fn malformed_call_is_refused_and_recovered_from() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(loom_kernel::tool::TodoTool::new()))
+        .unwrap();
+
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            completed(
+                assistant(
+                    "planning",
+                    StopReason::ToolCalls,
+                    vec![tool_call(
+                        "call_1",
+                        "todo",
+                        json!({"_loom_malformed_arguments": "not json"}),
+                    )],
+                ),
+                usage(10, 3, None),
+            ),
+            completed(
+                assistant(
+                    "retrying",
+                    StopReason::ToolCalls,
+                    vec![tool_call(
+                        "call_2",
+                        "todo",
+                        json!({"op": "add", "text": "step one"}),
+                    )],
+                ),
+                usage(20, 4, None),
+            ),
+            completed(
+                assistant("done", StopReason::EndTurn, Vec::new()),
+                usage(30, 5, None),
+            ),
+        ],
+    );
+    let (sink, _receiver) = ChannelEventSink::new();
+    let agent = agent(provider, registry, 10);
+
+    let mut session = Session::new(SessionId::new());
+    let summary = agent
+        .run_task(&mut session, "do the thing", &sink, &TaskControl::default())
+        .await
+        .expect("task completes despite the malformed call");
+    assert_eq!(summary.turns, 3);
+
+    // The malformed call never executed; the reissued valid call did.
+    assert_eq!(session.todos.items.len(), 1);
+    assert_eq!(session.todos.items[0].text, "step one");
+}
+
+/// Three consecutive all-malformed turns trip the ceiling and fail the
+/// task instead of burning the turn budget.
+#[tokio::test]
+async fn three_consecutive_malformed_turns_fail_the_task() {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(loom_kernel::tool::TodoTool::new()))
+        .unwrap();
+
+    let malformed = || {
+        completed(
+            assistant(
+                "garbled",
+                StopReason::ToolCalls,
+                vec![tool_call(
+                    "call_1",
+                    "todo",
+                    json!({"_loom_malformed_arguments": "not json"}),
+                )],
+            ),
+            usage(10, 3, None),
+        )
+    };
+    let provider = FakeProvider::new(capabilities(), vec![malformed(), malformed(), malformed()]);
+    let (sink, _receiver) = ChannelEventSink::new();
+    let agent = agent(provider, registry, 10);
+
+    let mut session = Session::new(SessionId::new());
+    let error = agent
+        .run_task(&mut session, "do the thing", &sink, &TaskControl::default())
+        .await
+        .expect_err("the third consecutive malformed turn fails the task");
+    assert!(matches!(
+        error,
+        loom_kernel::agent::TaskError::Protocol(ref message)
+            if message == "model emitted malformed tool-call arguments in 3 consecutive turns"
+    ));
 }
 
 /// A tool that queues steering mid-batch and completes normally — the

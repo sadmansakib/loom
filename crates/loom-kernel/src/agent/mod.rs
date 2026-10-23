@@ -34,7 +34,9 @@ use crate::session::{PlannedTurn, Session, TaskRecord, TerminalTaskStatus};
 use crate::store::{ArtifactStore, SessionStore, StoreError};
 use crate::tool::{ToolContext, ToolRegistry};
 use crate::tool_cache::ToolCache;
-use crate::transcript::{AssistantMessage, Item, ToolCall, ToolFailure, ToolResult, ToolStatus};
+use crate::transcript::{
+    AssistantMessage, Item, MALFORMED_ARGUMENTS_KEY, ToolCall, ToolFailure, ToolResult, ToolStatus,
+};
 
 pub mod retry;
 pub mod tools;
@@ -57,6 +59,14 @@ pub const DEFAULT_MAX_TURNS: u32 = 50;
 /// since the workspace last changed cannot misfire that way, and the
 /// nudge itself only adds a message — it never refuses a call.
 pub const ZERO_PROGRESS_TURNS: u32 = 12;
+
+/// The malformed-arguments ceiling: consecutive turns in which *every*
+/// tool call was a salvaged (unparseable) call after which the task
+/// fails instead of looping. One malformed call is fed back to the
+/// model as an error result — the field-standard recovery loop — but a
+/// model that cannot produce a well-formed call at all is stuck, not
+/// recovering, and burning turns on it helps nobody.
+pub const MALFORMED_ARGUMENT_TURNS_LIMIT: u32 = 3;
 
 /// Whether the zero-progress nudge is due: enough turns have passed
 /// without a change, and this stall has not been nudged yet.
@@ -1026,6 +1036,10 @@ impl Agent {
         // of its turn budget it has spent.
         let mut late_nudged = false;
 
+        // Malformed-salvage bookkeeping: consecutive turns in which
+        // every tool call carried unparseable (salvaged) arguments.
+        let mut malformed_turns: u32 = 0;
+
         for turn in 1..=self.max_turns {
             // A pause requested before the task or during the previous
             // turn's tool batch stops here: the in-flight turn has fully
@@ -1264,6 +1278,27 @@ impl Agent {
                                         .get(&call.name)
                                         .is_some_and(|tool| !tool.is_read_only())
                             });
+                    // A batch that was entirely salvaged (unparseable)
+                    // calls counts toward the malformed ceiling; three
+                    // in a row fails the task before the commit, per
+                    // the failed-attempts-leave-no-trace rule (§6.3).
+                    let all_malformed = !assistant.tool_calls.is_empty()
+                        && assistant
+                            .tool_calls
+                            .iter()
+                            .all(|call| call.arguments_are_malformed());
+                    if all_malformed {
+                        malformed_turns += 1;
+                        if malformed_turns >= MALFORMED_ARGUMENT_TURNS_LIMIT {
+                            return Err(TaskError::Protocol(
+                                "model emitted malformed tool-call arguments in \
+                                 3 consecutive turns"
+                                    .into(),
+                            ));
+                        }
+                    } else {
+                        malformed_turns = 0;
+                    }
                     // A batch interrupted by cancellation still commits its
                     // completed results plus cancelled fillers (§6.1, §10).
                     self.commit(session, assistant, results)?;
@@ -1409,16 +1444,23 @@ impl Agent {
         accounting: &mut Accounting,
         assistant: &AssistantMessage,
     ) -> Result<bool, TaskError> {
-        if !self.loop_shaping
-            || !(completion.pending() && !completion.refused && turn < self.max_turns)
-        {
+        // Pending verification takes precedence: the green-check gap is
+        // the sharper failure. The test-consultation nudge (2026-10-23)
+        // fires on the next EndTurn if the task still never ran tests.
+        let pending_refusal = completion.pending() && !completion.refused;
+        let test_refusal = completion.untested() && !completion.test_refused;
+        if !self.loop_shaping || turn >= self.max_turns || !(pending_refusal || test_refusal) {
             return Ok(false);
         }
-        completion.refused = true;
-        self.commit(session, assistant.clone(), Vec::new())?;
-        let reminder = Item::User {
-            text: completion_refusal(session),
+        let text = if pending_refusal {
+            completion.refused = true;
+            completion_refusal(session)
+        } else {
+            completion.test_refused = true;
+            test_consultation_refusal(session)
         };
+        self.commit(session, assistant.clone(), Vec::new())?;
+        let reminder = Item::User { text };
         if let Some(store) = &self.store {
             store
                 .append_item(&session.id, session.next_index(), &reminder)
@@ -1639,15 +1681,19 @@ impl Agent {
     ) -> Vec<ToolResult> {
         let exposure = ToolExposure::from_names(request.tools.iter().map(|spec| spec.name.clone()));
 
-        // Partition into calls the loop refuses (an exact repeat of a
-        // failure with no success since) and calls that may run. A refused
-        // call never reaches the tool engine, so it starts nothing and emits
-        // no tool events; its `RepeatedCall` result is committed instead.
+        // Partition into calls the loop refuses and calls that may run.
+        // Refused: salvaged calls whose arguments carry the malformed
+        // marker (never dispatched — the wire committed the model's raw
+        // text as a placeholder), and, when loop shaping is on, an
+        // exact repeat of a failure with no success since. A refused
+        // call never reaches the tool engine, so it starts nothing and
+        // emits no tool events; its filler result is committed instead.
         let mut runnable: Vec<ToolCall> = Vec::new();
         let mut runnable_indices: Vec<usize> = Vec::new();
         let mut is_runnable = vec![false; calls.len()];
         for (index, call) in calls.iter().enumerate() {
-            if !(self.loop_shaping && failures.refuses(call)) {
+            let malformed = call.arguments_are_malformed();
+            if !malformed && !(self.loop_shaping && failures.refuses(call)) {
                 runnable_indices.push(index);
                 runnable.push(call.clone());
                 is_runnable[index] = true;
@@ -1692,16 +1738,22 @@ impl Agent {
         let mut emitted_notices: HashSet<(String, String)> = HashSet::new();
 
         // Refused calls were never handed to the engine; reconstruct every
-        // result in call order from the executed set plus refusal fillers.
+        // result in call order from the executed set plus refusal fillers
+        // (malformed-salvage refusals and ledger refusals each get their
+        // own filler).
         let mut executed: HashMap<usize, ToolResult> =
             runnable_indices.iter().copied().zip(ran).collect();
         let mut results: Vec<ToolResult> = calls
             .iter()
             .enumerate()
             .map(|(index, call)| {
-                executed
-                    .remove(&index)
-                    .unwrap_or_else(|| repeated_call_result(call))
+                executed.remove(&index).unwrap_or_else(|| {
+                    if call.arguments_are_malformed() {
+                        malformed_arguments_result(call)
+                    } else {
+                        repeated_call_result(call)
+                    }
+                })
             })
             .collect();
 
@@ -1876,6 +1928,10 @@ struct CompletionGate {
     verified_at: Option<u64>,
     /// Whether the one-shot refusal already fired.
     refused: bool,
+    /// Whether any committed result ran a test-like command this task.
+    tested: bool,
+    /// Whether the one-shot test-consultation refusal already fired.
+    test_refused: bool,
 }
 
 impl CompletionGate {
@@ -1887,11 +1943,20 @@ impl CompletionGate {
         if green_check(result) {
             self.verified_at = Some(self.mutations);
         }
+        if command_runs_tests(&result.content) {
+            self.tested = true;
+        }
     }
 
     /// Whether unverified mutations are outstanding.
     fn pending(&self) -> bool {
         self.mutations > 0 && self.verified_at != Some(self.mutations)
+    }
+
+    /// Whether files changed but no test-like command ran (2026-10-23
+    /// test-consultation nudge).
+    fn untested(&self) -> bool {
+        self.mutations > 0 && !self.tested
     }
 }
 
@@ -2046,6 +2111,20 @@ fn green_check(result: &ToolResult) -> bool {
     false
 }
 
+/// Whether a committed result's transcript shows a test-like command:
+/// any `$ …` line mentioning "test" (case-insensitive). Recall is
+/// favored over precision — `pytest`, `go test`, `cargo test`,
+/// `npm test`, `python tests/test_x.py`, jest `-Dtest`, and a stray
+/// "latest" all match — because the consumer is a once-only advisory
+/// nudge, and exit status is irrelevant: a failing suite still means
+/// the tests were consulted.
+fn command_runs_tests(content: &str) -> bool {
+    content
+        .lines()
+        .filter(|line| line.starts_with("$ "))
+        .any(|line| line[2..].to_ascii_lowercase().contains("test"))
+}
+
 /// The one-shot refusal text: changed paths plus the original task,
 /// head-bounded so an oversized instruction cannot balloon the turn.
 fn completion_refusal(session: &Session) -> String {
@@ -2064,6 +2143,35 @@ fn completion_refusal(session: &Session) -> String {
          Before finishing, run the relevant checks (verify, cargo test, \
          cargo check) and fix what fails. If the checks pass, the task is \
          complete. Original task: {}",
+        paths.join(", "),
+        instruction_head,
+    )
+}
+
+/// The one-shot test-consultation nudge (2026-10-23): the task changed
+/// files but no command-shaped result ever looked like a test run. Three
+/// of four undiagnosed 100-sweep misses were exactly this — the failing
+/// assertion lived in a pre-existing in-repo test file the run never
+/// consulted. Style-mates [`completion_refusal`]: changed paths plus the
+/// original task, head-bounded.
+fn test_consultation_refusal(session: &Session) -> String {
+    let paths = recent_changes(session);
+    let instruction = session
+        .transcript
+        .iter()
+        .find_map(|item| match item {
+            Item::User { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let instruction_head = instruction.chars().take(800).collect::<String>();
+    format!(
+        "Hold on — these files changed during this task, but no existing \
+         test suite was run: {}. Before finishing, run the affected \
+         module's existing tests (the project's usual test command over \
+         the touched paths) and address any failure your change caused. \
+         If a failure predates your change, note that and finish. If the \
+         project has no tests to run, finish. Original task: {}",
         paths.join(", "),
         instruction_head,
     )
@@ -2112,6 +2220,28 @@ fn repeated_call_result(call: &ToolCall) -> ToolResult {
              repeating it unchanged is not permitted. Reassess before calling again: read \
              the failure above, change the arguments, or use a different tool.",
             call.name
+        ),
+        false,
+    )
+}
+
+/// The loop's refusal result for a salvaged tool call: the wire adapter
+/// committed the model's malformed argument JSON as a placeholder object,
+/// the tool never ran, and the model is told what happened and asked to
+/// reissue a well-formed call — the field-standard recovery loop
+/// (OpenAI/Anthropic agent loops feed the error back as a tool result).
+fn malformed_arguments_result(call: &ToolCall) -> ToolResult {
+    let excerpt = call
+        .arguments
+        .get(MALFORMED_ARGUMENTS_KEY)
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    ToolResult::new(
+        call.id.clone(),
+        ToolStatus::Error(ToolFailure::InvalidInput),
+        format!(
+            "error: tool arguments were not a valid JSON object (raw: {excerpt}); \
+             the call was not executed. Reissue it with well-formed JSON arguments.",
         ),
         false,
     )

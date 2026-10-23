@@ -583,19 +583,17 @@ impl ChunkAccumulator {
             return Err(error);
         }
 
-        // Try to assemble every call; remember whether any failed so
-        // `length` can downgrade to MaxTokens-with-discard instead of
-        // Protocol (§5.1 rows 5 and 6).
+        // Assemble every call. Unparseable or non-object arguments are
+        // salvaged into a placeholder (see `assemble_call`) instead of
+        // failing the response: the engine reports them back to the
+        // model as tool errors, which it can correct, rather than
+        // killing the run with a non-retryable Protocol error.
         let mut calls = Vec::new();
-        let mut any_bad = false;
         for partial in self.tool_calls.values() {
-            match assemble_call(partial, policy.id_prefix) {
-                Ok(call) => calls.push(call),
-                Err(_) => any_bad = true,
-            }
+            calls.push(assemble_call(partial, policy.id_prefix));
         }
 
-        let stop_reason = normalized_stop(self.finish_reason.as_deref(), &mut calls, any_bad)?;
+        let stop_reason = normalized_stop(self.finish_reason.as_deref(), &mut calls)?;
 
         let message = AssistantMessage {
             content: self.text,
@@ -650,37 +648,20 @@ impl ChunkAccumulator {
 /// calls when the message was truncated or filtered (Invariant 22:
 /// calls from a truncated response are never executed — nor replayed;
 /// truncation can land after a short complete call, so they clear
-/// unconditionally, not only when assembly failed). `any_bad` marks
-/// that some call's arguments failed to assemble.
+/// unconditionally, not only when assembly failed). Unparseable
+/// arguments no longer fail here — the call is salvaged upstream and
+/// the engine reports it back to the model as a tool error.
 fn normalized_stop(
     raw_finish: Option<&str>,
     calls: &mut Vec<ToolCall>,
-    any_bad: bool,
 ) -> Result<StopReason, ModelError> {
     match raw_finish {
-        Some("stop") | None => {
-            if any_bad {
-                // Without `length` there is no truncation excuse:
-                // unparseable arguments are a protocol violation,
-                // never a silent EndTurn with the call dropped.
-                return Err(ModelError::new(
-                    ModelErrorKind::Protocol,
-                    "tool call with unparseable or non-object arguments",
-                ));
-            }
-            Ok(if calls.is_empty() {
-                StopReason::EndTurn
-            } else {
-                StopReason::ToolCalls
-            })
-        }
+        Some("stop") | None => Ok(if calls.is_empty() {
+            StopReason::EndTurn
+        } else {
+            StopReason::ToolCalls
+        }),
         Some("tool_calls") => {
-            if any_bad {
-                return Err(ModelError::new(
-                    ModelErrorKind::Protocol,
-                    "tool call with unparseable or non-object arguments",
-                ));
-            }
             if calls.is_empty() {
                 return Err(ModelError::new(
                     ModelErrorKind::Protocol,
@@ -756,8 +737,17 @@ pub(crate) fn classify_wire_error(status: Option<u16>, _message: &str) -> ModelE
 
 /// Assembles one accumulated call, synthesizing an id when the provider
 /// sent none (`ToolCallId` requires non-empty; synthesis is the
-/// adapter's documented duty).
-fn assemble_call(partial: &PartialToolCall, id_prefix: &str) -> Result<ToolCall, ModelErrorKind> {
+/// adapter's documented duty). Arguments that fail to parse, or parse
+/// to a non-object, are salvaged into a placeholder carrying the raw
+/// text under [`MALFORMED_ARGUMENTS_KEY`]; the engine refuses to
+/// dispatch those calls and reports the error back as the tool result,
+/// so the model can reissue them. Failing the whole response here
+/// would kill the run over a recoverable slip.
+// The `expect`s below are proven invariants, not fallible parsing: an
+// empty JSON object is always a valid `ToolArguments`, and the id is
+// either echoed non-empty by the model or synthesized above.
+#[allow(clippy::expect_used)]
+fn assemble_call(partial: &PartialToolCall, id_prefix: &str) -> ToolCall {
     let id = match &partial.id {
         Some(id) if !id.is_empty() => id.clone(),
         _ => {
@@ -771,11 +761,12 @@ fn assemble_call(partial: &PartialToolCall, id_prefix: &str) -> Result<ToolCall,
             format!("{id_prefix}-call-{nonce:x}-{seq}")
         }
     };
-    let name = partial.name.as_deref().ok_or(ModelErrorKind::Protocol)?;
+    let name = partial.name.clone().unwrap_or_else(|| "unknown".to_owned());
     // An absent `arguments` (empty accumulated string) means the model
     // requested no arguments: send `{}`, not a parse error.
-    let arguments_value = if partial.arguments.trim().is_empty() {
-        Value::Object(Default::default())
+    let arguments = if partial.arguments.trim().is_empty() {
+        ToolArguments::try_from(Value::Object(Default::default()))
+            .expect("the empty object is always valid ToolArguments")
     } else {
         match serde_json::from_str::<Value>(&partial.arguments) {
             // Some models double-encode the object as a JSON *string*
@@ -783,22 +774,24 @@ fn assemble_call(partial: &PartialToolCall, id_prefix: &str) -> Result<ToolCall,
             // what the model meant, and rejecting it would raise a
             // non-retryable `Protocol` error that costs the whole run.
             Ok(Value::String(inner)) => {
-                serde_json::from_str(&inner).unwrap_or(Value::String(inner))
+                let unwrapped = serde_json::from_str(&inner).unwrap_or(Value::String(inner));
+                ToolArguments::try_from(unwrapped)
+                    .unwrap_or_else(|_| ToolArguments::malformed(&partial.arguments))
             }
             // An explicit `null` means the same as an absent string.
-            Ok(Value::Null) => Value::Object(Default::default()),
-            Ok(value) => value,
-            Err(_) => return Err(ModelErrorKind::Protocol),
+            Ok(Value::Null) => ToolArguments::try_from(Value::Object(Default::default()))
+                .expect("the empty object is always valid ToolArguments"),
+            Ok(value) => ToolArguments::try_from(value)
+                .unwrap_or_else(|_| ToolArguments::malformed(&partial.arguments)),
+            Err(_) => ToolArguments::malformed(&partial.arguments),
         }
     };
-    let arguments =
-        ToolArguments::try_from(arguments_value).map_err(|_| ModelErrorKind::Protocol)?;
-    let id = ToolCallId::try_from(id).map_err(|_| ModelErrorKind::Protocol)?;
-    Ok(ToolCall {
+    let id = ToolCallId::try_from(id).expect("synthesized or echoed ids are non-empty");
+    ToolCall {
         id,
-        name: name.to_owned(),
+        name,
         arguments,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -806,6 +799,7 @@ mod tests {
     use super::*;
     use loom_kernel::model::ModelCapabilities;
     use loom_kernel::tool::ToolSpec;
+    use loom_kernel::transcript::MALFORMED_ARGUMENTS_KEY;
 
     fn no_in_stream(_: &str) -> Option<ModelErrorKind> {
         None
@@ -995,8 +989,7 @@ mod tests {
                 arguments: "\"{\\\"path\\\":\\\"src/lib.rs\\\"}\"".to_owned(),
             },
             "p",
-        )
-        .expect("double-encoded arguments assemble");
+        );
         assert_eq!(call.arguments["path"], "src/lib.rs");
     }
 
@@ -1010,25 +1003,47 @@ mod tests {
                 arguments: "null".to_owned(),
             },
             "p",
-        )
-        .expect("null arguments assemble");
+        );
         assert_eq!(*call.arguments, serde_json::json!({}));
     }
 
-    // Genuinely unparseable text is still a protocol violation: the
-    // coercion above is a recovery, not a loosening of the contract.
+    // Genuinely unparseable text is salvaged as a placeholder object so
+    // the turn can be committed and fed back to the model as an error
+    // result (the wire never raises a protocol error for it — the
+    // engine refuses dispatch and bounds the loop instead).
     #[test]
-    fn assemble_call_still_rejects_arguments_that_are_not_json() {
-        let error = assemble_call(
+    fn assemble_call_salvages_unparseable_arguments() {
+        let call = assemble_call(
             &PartialToolCall {
                 id: Some("call-3".to_owned()),
                 name: Some("read_file".to_owned()),
                 arguments: "not json".to_owned(),
             },
             "p",
-        )
-        .expect_err("unparseable arguments stay an error");
-        assert_eq!(error, ModelErrorKind::Protocol);
+        );
+        assert!(call.arguments_are_malformed());
+        assert_eq!(
+            *call.arguments,
+            serde_json::json!({ MALFORMED_ARGUMENTS_KEY: "not json" })
+        );
+        assert_eq!(call.name, "read_file");
+    }
+
+    // A missing name is salvaged the same way; the engine's error
+    // result still tells the model which call to reissue.
+    #[test]
+    fn assemble_call_falls_back_to_an_unknown_name() {
+        let call = assemble_call(
+            &PartialToolCall {
+                id: None,
+                name: None,
+                arguments: "not json".to_owned(),
+            },
+            "p",
+        );
+        assert_eq!(call.name, "unknown");
+        assert!(call.arguments_are_malformed());
+        assert!(call.id.as_str().starts_with("p-call-"));
     }
 
     fn finished(mut acc: ChunkAccumulator, reason: &str) -> ChunkAccumulator {
@@ -1161,12 +1176,12 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_args_is_protocol() {
+    fn unparseable_args_is_salvaged_not_fatal() {
         let mut acc = text_and_call_fragments();
         acc.ingest(chunk_with(ChunkDelta {
             tool_calls: vec![ToolCallDelta {
-                index: Some(0),
-                id: Some("call_1".into()),
+                index: Some(1),
+                id: Some("call_2".into()),
                 function: Some(ToolCallFunctionDelta {
                     name: Some("read_file".into()),
                     arguments: Some(r#"{"path": "#.into()), // truncated JSON
@@ -1175,8 +1190,19 @@ mod tests {
             ..Default::default()
         }));
         let acc = finished(acc, "stop");
-        let error = acc.finalize(true, &policy("test")).unwrap_err();
-        assert_eq!(error.kind, ModelErrorKind::Protocol);
+        let response = acc.finalize(true, &policy("test")).unwrap();
+        // The malformed call is committed as a placeholder; the engine
+        // refuses to dispatch it and feeds the error back as a tool
+        // result instead of killing the run.
+        assert_eq!(response.message.stop_reason, StopReason::ToolCalls);
+        let salvaged = response
+            .message
+            .tool_calls
+            .iter()
+            .find(|call| call.id.as_str() == "call_2")
+            .expect("salvaged call is committed");
+        assert!(salvaged.arguments_are_malformed());
+        assert_eq!(salvaged.name, "read_file");
     }
 
     #[test]

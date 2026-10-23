@@ -447,7 +447,8 @@ impl AnthropicAssembler {
 
     /// Builds the terminal response. Structural normalization mirrors
     /// the OpenAI wire's contract: `ToolCalls` without calls and calls
-    /// with malformed argument JSON are Protocol errors; a
+    /// with malformed argument JSON are salvaged (the engine refuses to
+    /// dispatch them and reports the parse failure back to the model); a
     /// `MaxTokens` response discards partially-assembled calls.
     pub(crate) fn finalize(mut self) -> Result<ModelResponse, ModelError> {
         self.close_current();
@@ -481,23 +482,28 @@ impl AnthropicAssembler {
         let mut tool_calls = Vec::new();
         for block in &self.blocks {
             if let Block::Tool { id, name, json } = block {
-                let arguments: Value = if json.trim().is_empty() {
-                    json!({})
+                // Salvage instead of failing: unparseable or non-object
+                // arguments become a placeholder object under the
+                // reserved key (the engine refuses to dispatch it and
+                // feeds the excerpt back so the model can reissue the
+                // call) — one malformed block no longer kills the turn.
+                // The expect is a proven invariant: an empty JSON
+                // object is always valid ToolArguments.
+                #[allow(clippy::expect_used)]
+                let arguments = if json.trim().is_empty() {
+                    loom_kernel::transcript::ToolArguments::try_from(json!({}))
+                        .expect("the empty object is always valid ToolArguments")
                 } else {
-                    serde_json::from_str(json).map_err(|error| {
-                        ModelError::new(
-                            ModelErrorKind::Protocol,
-                            format!("malformed tool_use arguments for {name:?}: {error}"),
-                        )
-                    })?
+                    let parsed = serde_json::from_str::<Value>(json)
+                        .map_err(|_| ())
+                        .and_then(|value| {
+                            loom_kernel::transcript::ToolArguments::try_from(value).map_err(|_| ())
+                        });
+                    match parsed {
+                        Ok(arguments) => arguments,
+                        Err(_) => loom_kernel::transcript::ToolArguments::malformed(json),
+                    }
                 };
-                let arguments = loom_kernel::transcript::ToolArguments::try_from(arguments)
-                    .map_err(|_| {
-                        ModelError::new(
-                            ModelErrorKind::Protocol,
-                            format!("tool_use arguments for {name:?} are not an object"),
-                        )
-                    })?;
                 let id =
                     loom_kernel::transcript::ToolCallId::try_from(id.clone()).map_err(|_| {
                         ModelError::new(
@@ -977,7 +983,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_argument_json_is_a_protocol_error() {
+    fn malformed_argument_json_is_salvaged_not_fatal() {
         let mut assembler = AnthropicAssembler::default();
         for data in [
             r#"{"type":"message_start","message":{"usage":{}}}"#,
@@ -989,10 +995,13 @@ mod tests {
         ] {
             assembler.ingest(data).unwrap();
         }
-        assert_eq!(
-            assembler.finalize().unwrap_err().kind,
-            ModelErrorKind::Protocol
-        );
+        let response = assembler.finalize().unwrap();
+        assert_eq!(response.message.stop_reason, StopReason::ToolCalls);
+        assert_eq!(response.message.tool_calls.len(), 1);
+        let call = &response.message.tool_calls[0];
+        assert_eq!(call.id.as_str(), "toolu_1");
+        assert_eq!(call.name, "read_file");
+        assert!(call.arguments_are_malformed());
     }
 
     #[test]

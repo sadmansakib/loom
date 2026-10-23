@@ -26,7 +26,7 @@ use crate::artifact::ArtifactRef;
 use crate::model::StopReason;
 use crate::tool::ToolEffects;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// Position of an [`Item`] inside the session transcript.
 ///
@@ -269,6 +269,34 @@ impl std::ops::Deref for ToolArguments {
     }
 }
 
+/// The reserved key an adapter uses to salvage a tool call whose raw
+/// arguments did not parse as a JSON object ([`ToolArguments::malformed`]).
+///
+/// A salvaged call is committed to the transcript verbatim (history stays
+/// append-only, provider prefix caches stay valid) but is never executed:
+/// the engine sees the key and answers the call with an `InvalidInput`
+/// error result telling the model to reissue it with well-formed JSON —
+/// the same recovery the OpenAI/Anthropic loops use — instead of failing
+/// the whole task on a protocol error.
+pub const MALFORMED_ARGUMENTS_KEY: &str = "_loom_malformed_arguments";
+
+/// Longest raw-arguments excerpt kept in a salvaged call's placeholder.
+const MALFORMED_ARGUMENTS_EXCERPT: usize = 400;
+
+impl ToolArguments {
+    /// Builds the placeholder object for arguments that did not parse:
+    /// `{ MALFORMED_ARGUMENTS_KEY: "<raw excerpt>" }`. The excerpt is
+    /// bounded so a runaway fragment cannot bloat the transcript.
+    pub fn malformed(raw: &str) -> Self {
+        let excerpt = if raw.len() > MALFORMED_ARGUMENTS_EXCERPT {
+            format!("{}[truncated]", &raw[..MALFORMED_ARGUMENTS_EXCERPT])
+        } else {
+            raw.to_owned()
+        };
+        Self(json!({ MALFORMED_ARGUMENTS_KEY: excerpt }))
+    }
+}
+
 /// Names a JSON value's kind for error messages ("null", "array", …).
 fn json_kind(value: &Value) -> &'static str {
     match value {
@@ -308,11 +336,27 @@ pub struct ToolCall {
     /// enforces this on every input path).
     ///
     /// The adapter assembles provider argument fragments and validates that
-    /// they parse before constructing the committed `ToolCall`: malformed
-    /// JSON is a protocol error and never becomes a `ToolCall`; max-token
+    /// they parse before constructing the committed `ToolCall`; max-token
     /// truncation discards incomplete calls outright. Value equality is the
     /// fidelity contract — raw byte formatting need not survive.
+    ///
+    /// One exception: arguments that parse to nothing usable are salvaged
+    /// as a placeholder object carrying the raw text under
+    /// [`MALFORMED_ARGUMENTS_KEY`] (see [`ToolArguments::malformed`]). The
+    /// turn commits — append-only history, valid prefix caches — but the
+    /// engine never dispatches the call ([`Self::arguments_are_malformed`]);
+    /// the model gets an error result and reissues.
     pub arguments: ToolArguments,
+}
+
+impl ToolCall {
+    /// Whether this call's arguments are the malformed-arguments
+    /// placeholder ([`MALFORMED_ARGUMENTS_KEY`]) rather than real,
+    /// model-intended arguments. Such calls are committed for history
+    /// fidelity but never executed.
+    pub fn arguments_are_malformed(&self) -> bool {
+        self.arguments.get(MALFORMED_ARGUMENTS_KEY).is_some()
+    }
 }
 
 /// The outcome of one tool call, persisted and shown to the model.

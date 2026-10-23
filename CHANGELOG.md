@@ -3,6 +3,75 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-23 — Malformed tool-call recovery + test-consultation nudge
+
+The 100-instance sweep surfaced a new failure class: the model
+occasionally emits a tool call whose `arguments` are not a valid JSON
+object (truncated mid-stream, glued fragments, bad escapes). The wire
+adapters treated that as a fatal protocol error — `[protocol] tool call
+with unparseable or non-object arguments` — killing the whole task even
+though every field-standard agent loop (OpenAI, Anthropic) feeds the
+parse error back as a tool result and lets the model reissue the call.
+Loom now does the same:
+
+- Adapters (OpenAI wire incl. DeepSeek/custom riders, Anthropic wire)
+  **salvage** an unparseable call into a real `ToolCall` whose arguments
+  are a placeholder object `{\"_loom_malformed_arguments\": \"<raw
+  excerpt, bounded>\"}` — no schema change, no event-version bump, and
+  the assistant turn still commits verbatim so the append-only prefix
+  (and with it the provider cache) stays intact.
+- The engine refuses to dispatch a salvaged call: it never runs, no
+  tool events fire, and the model receives an `InvalidInput` error
+  result naming the raw text and asking for a well-formed reissue. The
+  failure ledger still refuses an exact repeat.
+- Bounded: three consecutive turns consisting *entirely* of salvaged
+  calls fail the task (`model emitted malformed tool-call arguments in
+  3 consecutive turns`) before the third commit — a model that cannot
+  produce one well-formed call is stuck, not recovering.
+- Engine behavior, not the frozen SWE-bench prompt — same category as
+  the 429 retry, no baseline invalidation.
+- **Test-consultation nudge.** A hypothesized miss class — finishing
+  without ever running the project's tests — turned out to be empty on
+  this suite (corrected transcript analysis showed every miss run had
+  run suites; the actual gaps were hidden acceptance criteria). The
+  mechanism stays as a bounded general guardrail: the roadmap-item-8
+  completion gate also refuses the first EndTurn when files changed but
+  no test-like command ran all task (any `$ …` transcript line
+  mentioning "test"), with a once-only nudge to run the affected
+  module's existing tests ("if a failure predates your change, note
+  that and finish"). Both refusals are one-shot, worst case two nudge
+  turns. astropy-7336 (harness-owned test-file rename conflict) is not
+  addressable generically — editing tests is legitimate in general —
+  and stays benchmark tax.
+- **Validation (official scorer).** Malformed class (django-11211,
+  scikit-learn-14141, sympy-13974, rebuilt binary): **3/3 resolved** —
+  no salvage event recurred (the class is stochastic), so this is
+  do-no-harm plus fresh sampling, not a live recovery demo.
+  Test-consultation sweep (astropy-14369, django-11239, sphinx-7748 +
+  resolved controls astropy-12907, django-10097, sphinx-10323, binary
+  with both mechanisms): **controls 3/3 held; django-11239 and
+  sphinx-7748 resolved; astropy-14369 still fails** exactly the
+  `test_cds_grammar_fail[km/s.Mpc-1]` case the scorer's test patch
+  adds — hidden acceptance, information-gap. The nudge fired in zero
+  of the six runs (all ran tests early), i.e. inert in practice; the
+  two flips are fresh-sampling outcomes, not nudge effects. Corrected
+  miss map for the 100-sweep: 3 malformed (fixed), 5 information-gap
+  (13977, 10614, 11510, 14369, 11239), 1 competence-detail (7748),
+  1 benchmark tax (7336).
+- Fourth measurement (2026-10-22/23, prompt v3, deepseek-flash, second
+  50 = dataset rows 11–20 of the same five repos, `--jobs 2`):
+  **100-instance total 90 resolved / 99 completed** (batch 1 47/50,
+  batch 2 43/50). Old-50 misses all repeat (astropy-13977 turn-budget,
+  sphinx-10614 + sphinx-11510 information-gap). Batch 2 adds four
+  undiagnosed misses (astropy-14369, astropy-7336, django-11239,
+  sphinx-7748) and **three malformed-argument protocol deaths**
+  (django-11211, sympy-13974 ran on but died at the end;
+  scikit-learn-14141 died at 574 events with an empty patch — the
+  "incomplete" row). 3,889 model requests, 139.7M prompt tokens,
+  96.9% cache hit, 1.79M output, ~$2.1 combined. The protocol deaths
+  are exactly the failure class this recovery addresses; the three
+  affected instances are the validation set for it.
+
 ## 2026-10-22 — Provider cache hits: append-only todo projection, cache-usage reporting
 
 Audited the request path against DeepSeek's disk context cache (the
