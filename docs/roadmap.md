@@ -285,7 +285,14 @@ arms completed, **12.4× upfront tool-token cut** at ≥10× bar —
 `docs/daily-driver.md`), opt-in via `--mcp`. Open: remote servers via
 declared proxy commands. LSP supplies definition, references, symbols,
 diagnostics, rename, type information — justified only by fewer
-exploratory model turns. Tree-sitter symbol tools (item 18)
+exploratory model turns. The LSP design is researched and pinned in
+[`docs/lsp-design.md`](lsp-design.md): generic async-lsp client plus a
+built-in server table (the nvim-lspconfig/mason move — breadth as data,
+auto-discovery, no auto-install), manifest allowlist and sandbox reuse,
+lazy document sync fed by engine edit effects, position conversion done
+explicitly, ~8 fixed tools with Serena-style result shortening, rename
+deferred to E2 behind WorkspaceEdit application, codeAction/executeCommand
+excluded on the MCP-puppet rationale. Tree-sitter symbol tools (item 18)
 came first and shipped 2026-10-23 — opt-in via `--symbols`.
 
 ### Iteration 7 — Plugin system (future scope)

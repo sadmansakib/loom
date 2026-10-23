@@ -3,6 +3,23 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-23 — LSP deep research + design pinned (slice E)
+
+- `docs/lsp-design.md`: evidence (Serena's LSP-for-agents lessons —
+  symbol paths, multi-stage result shortening, server-quality ceiling;
+  async-lsp/tower stack proven by Helix; nvim-lspconfig ≈380 configs as
+  the breadth-by-data model) and the pinned design: generic stdio client
+  with a built-in server table + `.loom/lsp.toml` overrides (auto-discover
+  on PATH + language match, never auto-install), sandbox/manifest reuse
+  from MCP, lazy didOpen/didChange sync fed by engine edit effects,
+  explicit UTF-8/UTF-16 position conversion, ~8 fixed read tools with
+  budget-capped shortening, rename/format as E2 (WorkspaceEdit through
+  loom's write path), call hierarchy as E3, codeAction/executeCommand
+  excluded (server-chosen execution = the MCP puppet class), $0 probe bar
+  = equal-or-better success at fewer-or-equal exploratory turns,
+  sandbox-grandchild (flycheck) verification as an explicit gate.
+- Roadmap iteration 6 links the design doc.
+
 ## 2026-10-23 — Containerized/remote verify runners (slice F, item 23)
 
 - `.loom/verify.toml` `[runner] command` declares the verification
