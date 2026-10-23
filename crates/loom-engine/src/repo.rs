@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ignore::WalkBuilder;
-use loom_kernel::context::{FactsSource, GitState, InstructionFile, KnownFacts};
+use loom_kernel::context::{FactsSource, GitState, InstructionFile, KnownFacts, SkillIndexEntry};
 
 /// How deep into the tree the walk descends. Enough to reach
 /// `crates/<crate>/src` and `crates/<crate>/tests` in a monorepo, bounded so a
@@ -41,6 +41,18 @@ const INSTRUCTION_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
 
 /// Head of an instruction file kept in the facts block.
 const INSTRUCTIONS_MAX_BYTES: usize = 4096;
+
+/// Directory scanned for the on-demand skills index (iteration 5).
+const SKILLS_DIR: &[&str] = &[".agents", "skills"];
+
+/// Cap on indexed skill files; the render caps again at the list level.
+const SKILLS_MAX_FILES: usize = 64;
+
+/// Head of a skill file read when deriving its one-line description.
+const SKILL_DESCRIPTION_READ_BYTES: usize = 1024;
+
+/// Byte budget for a rendered skill description.
+const SKILL_DESCRIPTION_MAX_BYTES: usize = 120;
 
 /// Toolchain probes per detected build system, in deterministic order.
 /// Each entry is `(build system, program, args, human prefix)` — the
@@ -114,19 +126,37 @@ const LANGUAGES: &[(&str, &str)] = &[
 #[derive(Debug, Clone)]
 pub struct FsFactsSource {
     root: PathBuf,
+    skills: bool,
 }
 
 impl FsFactsSource {
     /// Creates a source that scans `root`.
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            skills: false,
+        }
+    }
+
+    /// Also indexes `.agents/skills/*.md` into the facts block (iteration 5).
+    ///
+    /// Off by default: the skills index and the `load_skill` tool are one
+    /// opt-in capability, so a default run's facts block is unchanged.
+    #[must_use]
+    pub fn with_skills(mut self, enabled: bool) -> Self {
+        self.skills = enabled;
+        self
     }
 }
 
 impl FactsSource for FsFactsSource {
     fn scan(&self) -> KnownFacts {
-        scan(&self.root)
+        let mut facts = scan(&self.root);
+        if self.skills {
+            facts.skills = scan_skills(&self.root);
+        }
+        facts
     }
 }
 
@@ -217,8 +247,65 @@ pub fn scan(root: &Path) -> KnownFacts {
         toolchain_versions(&build_systems),
         tree_lines,
         read_instructions(root),
+        Vec::new(),
         git_state(root),
     )
+}
+
+/// Indexes `.agents/skills/*.md` (iteration 5): name = file stem,
+/// description = first non-empty line stripped of heading syntax, bounded.
+///
+/// Infallible like the rest of the scan: a missing or unreadable directory
+/// degrades to an empty index, which renders nothing. Flat files only —
+/// subdirectories are ignored (a nested skill is a later concern, not a
+/// silent surprise).
+pub(crate) fn scan_skills(root: &Path) -> Vec<SkillIndexEntry> {
+    let dir = SKILLS_DIR
+        .iter()
+        .fold(root.to_path_buf(), |p, part| p.join(part));
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut skills: Vec<SkillIndexEntry> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                return None;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                return None;
+            }
+            let stem = path.file_stem()?.to_str()?.to_owned();
+            // A stem that cannot be typed as a `load_skill` argument adds
+            // noise, not capability.
+            if stem.is_empty() {
+                return None;
+            }
+            let description = skill_description(&path);
+            Some(SkillIndexEntry::new(stem, description))
+        })
+        .collect();
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills.truncate(SKILLS_MAX_FILES);
+    skills
+}
+
+/// Derives a bounded one-line description from a skill file's head: the
+/// first non-empty line, stripped of Markdown heading markers and
+/// surrounding whitespace.
+fn skill_description(path: &Path) -> String {
+    let Ok(bytes) = std::fs::read(path) else {
+        return String::new();
+    };
+    let head = truncate_utf8_head(&bytes, SKILL_DESCRIPTION_READ_BYTES);
+    let line = head
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    let stripped = line.trim_start_matches('#').trim();
+    truncate_utf8_head(stripped.as_bytes(), SKILL_DESCRIPTION_MAX_BYTES)
 }
 
 /// Orders detected languages by frequency, ties by name, for a stable fact.

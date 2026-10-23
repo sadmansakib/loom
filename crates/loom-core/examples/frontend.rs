@@ -50,6 +50,8 @@ fn main() -> anyhow::Result<()> {
         persist: false,
         catalog: None,
         scout: None,
+        symbols: false,
+        skills: false,
     }))?;
 
     // Observation: one unbounded channel, one printing consumer. A TUI or

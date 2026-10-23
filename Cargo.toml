@@ -26,7 +26,9 @@ rust-version = "1.89"
 # syntax guard (roadmap item 5 phase B): parse-before-write refusal for
 # edit_file/write_file; grammars are per-language, Rust first.
 tree-sitter = "0.25"
+tree-sitter-python = "0.23"
 tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
 # internal crates
 loom-kernel = { path = "crates/loom-kernel" }
 loom-store = { path = "crates/loom-store" }

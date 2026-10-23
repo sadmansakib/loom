@@ -29,6 +29,18 @@ pub(crate) const COMMAND_TAIL_BYTES: usize = 16 * 1024;
 /// long lines) is bounded by this cap instead of flooding the turn.
 pub(crate) const EDIT_ECHO_MAX_BYTES: usize = 8 * 1024;
 
+/// Bytes a `symbols_overview` rendering may occupy before falling back to
+/// per-kind counts. The overview exists to point at symbols, not to
+/// enumerate a whole crate: past this budget the model gets the shape of
+/// the file (`functions: 120`) and raises depth on a narrower path instead.
+pub(crate) const SYMBOLS_OVERVIEW_MAX_BYTES: usize = 8 * 1024;
+
+/// Bytes kept from the head of a `load_skill` body (iteration 5). Skills
+/// are hand-written playbooks, not data: 16 KiB covers a thorough one and
+/// matches the command head budget, while a runaway file is cut with the
+/// standard omission marker instead of flooding the context.
+pub(crate) const SKILL_BODY_HEAD_BYTES: usize = 16 * 1024;
+
 /// The explicit-omission marker appended where output was dropped.
 pub(crate) fn omitted(count: u64) -> String {
     format!("... [{count} bytes omitted]")

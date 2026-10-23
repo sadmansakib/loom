@@ -126,6 +126,18 @@ pub struct RunArgs {
     /// child's only).
     #[arg(long, value_name = "MODEL")]
     pub scout_model: Option<String>,
+
+    /// Enable the tree-sitter symbol tools (roadmap item 18):
+    /// `symbols_overview` and `replace_symbol` join the registry.
+    /// Off by default.
+    #[arg(long)]
+    pub symbols: bool,
+
+    /// Enable the skills seam (iteration 5): `.agents/skills/*.md`
+    /// names appear in the facts block and `load_skill` joins the
+    /// registry. Off by default.
+    #[arg(long)]
+    pub skills: bool,
 }
 
 /// Arguments for `loom auth`.

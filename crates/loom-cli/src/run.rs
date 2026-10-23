@@ -163,6 +163,25 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         (None, Some(_)) => anyhow::bail!("--scout-model requires --scout"),
         (None, None) => None,
     };
+    // The symbol tools (roadmap item 18): off unless asked; the bare
+    // arm measures the plain loop, so it never carries them.
+    let symbols = if args.symbols && !bare_arm {
+        true
+    } else {
+        if args.symbols {
+            eprintln!("note: --symbols is ignored in the bare-loop arm");
+        }
+        false
+    };
+    // The skills seam (iteration 5): same gate, same bare-arm rule.
+    let skills = if args.skills && !bare_arm {
+        true
+    } else {
+        if args.skills {
+            eprintln!("note: --skills is ignored in the bare-loop arm");
+        }
+        false
+    };
     let engine = runtime.block_on(Engine::open_async_with(
         EngineConfig {
             provider: args.provider,
@@ -178,6 +197,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             persist: !args.no_save,
             catalog: None,
             scout,
+            symbols,
+            skills,
         },
         overrides,
     ))?;

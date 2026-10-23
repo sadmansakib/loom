@@ -91,6 +91,20 @@ pub struct EngineConfig {
     /// child [`Agent`] on the cheap model and registers `scout` in the
     /// parent registry.
     pub scout: Option<ScoutConfig>,
+    /// Tree-sitter symbol tools (roadmap item 18): when false (the
+    /// default) `symbols_overview`/`replace_symbol` stay out of the
+    /// registry, so the frozen SWE-bench protocol and every existing
+    /// frontend are unchanged until a frontend opts in. The bare-loop
+    /// baseline never carries them.
+    pub symbols: bool,
+    /// On-demand skills index (iteration 5): when false (the default)
+    /// the facts block carries no skills menu and `load_skill` stays out
+    /// of the registry — the frozen SWE-bench protocol and every
+    /// existing frontend are unchanged until a frontend opts in. When
+    /// set, `.agents/skills/*.md` is indexed into the facts block and
+    /// `load_skill` serves bodies on demand. The bare-loop baseline
+    /// never carries it.
+    pub skills: bool,
 }
 
 /// A minimal [`EngineConfig`] for tests that need one without a real
@@ -112,6 +126,8 @@ pub(crate) fn test_config() -> EngineConfig {
         persist: false,
         catalog: None,
         scout: None,
+        symbols: false,
+        skills: false,
     }
 }
 
@@ -357,13 +373,42 @@ impl Engine {
                     message: error.to_string(),
                 })?;
         }
+        // Roadmap item 18: tree-sitter symbol tools. Opt-in via
+        // `EngineConfig::symbols`; the bare-loop arm never carries them.
+        if config.symbols && !overrides.bare_loop {
+            registry
+                .register(Box::new(loom_tools::SymbolsOverviewTool))
+                .map_err(|error| EngineError::RegisterTool {
+                    tool: "symbols_overview",
+                    message: error.to_string(),
+                })?;
+            registry
+                .register(Box::new(loom_tools::ReplaceSymbolTool))
+                .map_err(|error| EngineError::RegisterTool {
+                    tool: "replace_symbol",
+                    message: error.to_string(),
+                })?;
+        }
+        // Iteration 5: on-demand skills. Same opt-in shape as the symbol
+        // tools; the facts block gains the index menu only when the tool
+        // that serves the bodies is also present.
+        if config.skills && !overrides.bare_loop {
+            registry
+                .register(Box::new(loom_tools::LoadSkillTool))
+                .map_err(|error| EngineError::RegisterTool {
+                    tool: "load_skill",
+                    message: error.to_string(),
+                })?;
+        }
         let system_prompt = config.system_prompt.unwrap_or_else(default_system_prompt);
         // Stage-1 repository facts (2E, ADR-015): the composition root owns the
         // I/O; the loop scans once per task through this source. The
         // bare-loop arm attaches no source — the empty block is the
         // baseline's point.
-        let facts =
-            (!overrides.bare_loop).then(|| crate::repo::FsFactsSource::new(workspace.clone()));
+        let facts = (!overrides.bare_loop).then(|| {
+            crate::repo::FsFactsSource::new(workspace.clone())
+                .with_skills(config.skills && !overrides.bare_loop)
+        });
         let compiler: Box<dyn ContextCompiler> = match overrides.compiler {
             Some(compiler) => compiler,
             None => {
@@ -814,6 +859,8 @@ fn compose_scout(
         persist: false,
         catalog: parent.catalog.clone(),
         scout: None,
+        symbols: false,
+        skills: false,
     };
     // Credential resolution mirrors the parent's (§18.3) — the scout
     // may live on a different provider with its own secret.
@@ -1887,6 +1934,258 @@ mod tests {
                 "run_command"
             ],
             "the bare arm is exactly the five primitives, in order"
+        );
+    }
+
+    /// Roadmap item 18: the tree-sitter symbol tools are opt-in —
+    /// `symbols: true` exposes `symbols_overview` and `replace_symbol`;
+    /// the default (and the bare-loop baseline) keeps them out, so the
+    /// frozen SWE-bench protocol is unchanged until a frontend opts in.
+    fn symbols_overview_script() -> Vec<Result<ModelEvent, ModelError>> {
+        use loom_kernel::transcript::{ToolArguments, ToolCall, ToolCallId};
+        let call = ToolCall {
+            id: ToolCallId::try_from(format!("call-{}", std::process::id())).unwrap(),
+            name: "symbols_overview".to_owned(),
+            arguments: ToolArguments::try_from(serde_json::json!({
+                "path": "lib.rs",
+                "depth": 1,
+            }))
+            .expect("arguments"),
+        };
+        vec![Ok(ModelEvent::Completed(ModelResponse {
+            message: AssistantMessage {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![call],
+                stop_reason: StopReason::ToolCalls,
+            },
+            usage: Usage::default(),
+        }))]
+    }
+
+    fn symbols_fixture(base: &std::path::Path) -> std::path::PathBuf {
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        std::fs::write(
+            workspace.join("lib.rs"),
+            "const LIMIT: u32 = 3;\n\nstruct Config {\n    name: String,\n}\n\n\
+             impl Config {\n    fn new() -> Self {\n        Self { name: String::new() }\n    }\n}\n",
+        )
+        .expect("fixture");
+        workspace
+    }
+
+    async fn run_symbols_task(config: EngineConfig, overrides: EngineOverrides) -> Vec<EventKind> {
+        let engine = Engine::open_with(config, overrides).expect("engine");
+        let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
+        let mut session = engine.new_session();
+        let _ = engine
+            .run_task(&mut session, "List the symbols", &sink, &Default::default())
+            .await;
+        drain(&mut receiver)
+    }
+
+    fn overview_content(kinds: &[EventKind]) -> Option<&str> {
+        kinds.iter().find_map(|kind| match kind {
+            EventKind::ToolCompleted {
+                name,
+                status: loom_kernel::transcript::ToolStatus::Success,
+                content_head,
+                ..
+            } if name == "symbols_overview" => Some(content_head.as_str()),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn symbols_tools_are_opt_in_and_serve_overviews() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config();
+        config.workspace = symbols_fixture(base.path());
+        config.db_path = base.path().join("loom.db");
+        config.max_turns = 2;
+        config.symbols = true;
+        let provider = Box::new(FakeProvider::scripted(vec![
+            symbols_overview_script(),
+            FakeProvider::end_turn_script("done"),
+        ]));
+        let kinds =
+            run_symbols_task(config, EngineOverrides::default().with_provider(provider)).await;
+        let content =
+            overview_content(&kinds).expect("symbols_overview ran successfully when opted in");
+        assert!(content.contains("function Config/new"), "{content}");
+        assert!(content.contains("struct Config"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn symbols_tools_stay_out_of_the_default_and_bare_registries() {
+        // Default: the call fails as an unknown tool.
+        let base = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config();
+        config.workspace = symbols_fixture(base.path());
+        config.db_path = base.path().join("loom.db");
+        config.max_turns = 2;
+        let provider = Box::new(FakeProvider::scripted(vec![
+            symbols_overview_script(),
+            FakeProvider::end_turn_script("done"),
+        ]));
+        let kinds =
+            run_symbols_task(config, EngineOverrides::default().with_provider(provider)).await;
+        assert!(
+            overview_content(&kinds).is_none(),
+            "default registry must not expose symbols_overview"
+        );
+
+        // Bare arm: even an explicit opt-in is ignored — the arm
+        // measures the plain loop.
+        let base = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config();
+        config.workspace = symbols_fixture(base.path());
+        config.db_path = base.path().join("loom.db");
+        config.max_turns = 2;
+        config.symbols = true;
+        let provider = Box::new(FakeProvider::scripted(vec![
+            symbols_overview_script(),
+            FakeProvider::end_turn_script("done"),
+        ]));
+        let kinds = run_symbols_task(
+            config,
+            EngineOverrides::default()
+                .with_provider(provider)
+                .bare_loop(),
+        )
+        .await;
+        assert!(
+            overview_content(&kinds).is_none(),
+            "the bare arm must never expose symbols_overview"
+        );
+    }
+
+    /// Roadmap iteration 5: the skills seam is opt-in — `skills: true`
+    /// exposes `load_skill` (and the facts block grows the skill menu
+    /// pointing at it); the default (and the bare-loop baseline) keeps
+    /// it out, so the frozen SWE-bench protocol is unchanged until a
+    /// frontend opts in.
+    fn skill_load_script() -> Vec<Result<ModelEvent, ModelError>> {
+        use loom_kernel::transcript::{ToolArguments, ToolCall, ToolCallId};
+        let call = ToolCall {
+            id: ToolCallId::try_from(format!("call-{}", std::process::id())).unwrap(),
+            name: "load_skill".to_owned(),
+            arguments: ToolArguments::try_from(serde_json::json!({
+                "name": "alpha",
+            }))
+            .expect("arguments"),
+        };
+        vec![Ok(ModelEvent::Completed(ModelResponse {
+            message: AssistantMessage {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![call],
+                stop_reason: StopReason::ToolCalls,
+            },
+            usage: Usage::default(),
+        }))]
+    }
+
+    fn skills_fixture(base: &std::path::Path) -> std::path::PathBuf {
+        let workspace = base.join("workspace");
+        let dir = workspace.join(".agents").join("skills");
+        std::fs::create_dir_all(&dir).expect("skills dir");
+        std::fs::write(
+            dir.join("alpha.md"),
+            "# Alpha: release checklist\n\nRun cargo test before tagging.",
+        )
+        .expect("fixture");
+        workspace
+    }
+
+    async fn run_skills_task(config: EngineConfig, overrides: EngineOverrides) -> Vec<EventKind> {
+        let engine = Engine::open_with(config, overrides).expect("engine");
+        let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
+        let mut session = engine.new_session();
+        let _ = engine
+            .run_task(
+                &mut session,
+                "Load the alpha skill",
+                &sink,
+                &Default::default(),
+            )
+            .await;
+        drain(&mut receiver)
+    }
+
+    fn skill_content(kinds: &[EventKind]) -> Option<&str> {
+        kinds.iter().find_map(|kind| match kind {
+            EventKind::ToolCompleted {
+                name,
+                status: loom_kernel::transcript::ToolStatus::Success,
+                content_head,
+                ..
+            } if name == "load_skill" => Some(content_head.as_str()),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn skill_tool_is_opt_in_and_serves_bodies() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config();
+        config.workspace = skills_fixture(base.path());
+        config.db_path = base.path().join("loom.db");
+        config.max_turns = 2;
+        config.skills = true;
+        let provider = Box::new(FakeProvider::scripted(vec![
+            skill_load_script(),
+            FakeProvider::end_turn_script("done"),
+        ]));
+        let kinds =
+            run_skills_task(config, EngineOverrides::default().with_provider(provider)).await;
+        let content = skill_content(&kinds).expect("load_skill ran successfully when opted in");
+        assert!(content.contains("# skill: alpha"), "{content}");
+        assert!(content.contains("Run cargo test"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn skill_tool_stays_out_of_the_default_and_bare_registries() {
+        // Default: the call fails as an unknown tool.
+        let base = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config();
+        config.workspace = skills_fixture(base.path());
+        config.db_path = base.path().join("loom.db");
+        config.max_turns = 2;
+        let provider = Box::new(FakeProvider::scripted(vec![
+            skill_load_script(),
+            FakeProvider::end_turn_script("done"),
+        ]));
+        let kinds =
+            run_skills_task(config, EngineOverrides::default().with_provider(provider)).await;
+        assert!(
+            skill_content(&kinds).is_none(),
+            "default registry must not expose load_skill"
+        );
+
+        // Bare arm: even an explicit opt-in is ignored — the arm
+        // measures the plain loop.
+        let base = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config();
+        config.workspace = skills_fixture(base.path());
+        config.db_path = base.path().join("loom.db");
+        config.max_turns = 2;
+        config.skills = true;
+        let provider = Box::new(FakeProvider::scripted(vec![
+            skill_load_script(),
+            FakeProvider::end_turn_script("done"),
+        ]));
+        let kinds = run_skills_task(
+            config,
+            EngineOverrides::default()
+                .with_provider(provider)
+                .bare_loop(),
+        )
+        .await;
+        assert!(
+            skill_content(&kinds).is_none(),
+            "the bare arm must never expose load_skill"
         );
     }
 }

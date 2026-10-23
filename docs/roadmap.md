@@ -126,8 +126,8 @@ iterations may start early where a backlog item is cheap and measured.
 | 2 | Core efficiency & repository intelligence | **Done 2026-10-23** (funded-measurement debt in item 1) | 1, 3✓, 4✓, 5✓, 6✓, 7✗, 8✓, 10✓ᴬ, 11⏸, 12✓, 16✓, 17✓ |
 | 3 | Intelligent subagent scheduling | Not started | 19, 21, 24 |
 | 4 | Execution safety & richer tools | **Largely shipped early** | 2✓, 13⏸, 23 |
-| 5 | Skills & contextual knowledge | Partial (AGENTS.md facts) | 4✓ (instructions), 20.4 |
-| 6 | MCP & LSP integration | Not started | 18 |
+| 5 | Skills & contextual knowledge | **Largely shipped 2026-10-23** (skills index + `load_skill`) | 4✓ (instructions), skills✓, 20.4 |
+| 6 | MCP & LSP integration | Started 2026-10-23 (item 18 symbol tools shipped) | 18✓ |
 | 7 | Plugin system | Future scope | — |
 | 8 | Intelligent model routing | Not started; prerequisites in place | 9⏸, 14✓ |
 | 9 | Learning & self-optimization | Not started; data path partial | 1, 20 |
@@ -253,17 +253,20 @@ isolation (item 21), containerized runners (item 23).
 
 Knowledge loaded on demand, not injected globally. *Shipped:* always-on
 project instructions (`AGENTS.md` → `CLAUDE.md`, 4 KiB head) through the
-facts block. *Open:* an `.agents/skills/` index where the model sees skill
-names first and loads bodies on demand, attached through the context
-compiler seam — not a separate prompt mechanism. Learned lessons
-(item 20.4) reuse the same seam.
+facts block; the `.agents/skills/` index (2026-10-23) — the facts block
+lists skill names plus one-line descriptions (first heading of each
+`*.md`, flat scan, ≤64 entries), and the opt-in `load_skill` tool
+(`--skills`) serves bodies on demand at a 16 KiB head, through the same
+context-compiler seam, never a second prompt mechanism. *Open:* learned
+lessons (item 20.4) reuse the same seam.
 
 ### Iteration 6 — MCP & LSP integration
 
 MCP servers attach through the existing `Tool` trait; nothing MCP-specific
 leaks into the loop. LSP supplies definition, references, symbols,
 diagnostics, rename, type information — justified only by fewer
-exploratory model turns. Tree-sitter symbol tools (item 18) come first.
+exploratory model turns. Tree-sitter symbol tools (item 18) came first
+and shipped 2026-10-23 — opt-in via `--symbols`.
 
 ### Iteration 7 — Plugin system (future scope)
 
@@ -1150,6 +1153,24 @@ reproduces them.
     `replace_symbol` for Rust, TypeScript, and Python; LSP-backed
     references and rename after that (Serena). One call replaces a
     search→read→edit chain. Builds on the item 5 parser.
+    **Shipped 2026-10-23 (iteration 6, first step).** Both tools live
+    in `loom-tools::symbols`, opt-in via `EngineConfig::symbols` /
+    `loom run --symbols` (default off, so the frozen SWE-bench
+    protocol and every existing frontend are unchanged; the bare-loop
+    arm never carries them). `symbols_overview {path, depth}` renders
+    a bounded (8 KB, then per-kind counts) nesting-aware listing —
+    Rust fns/structs/enums/traits/impls/mods/consts/macros (impls
+    named by their type, so methods address as `Config/new`), Python
+    functions/classes with nested defs (replacement spans widened to
+    include decorators), TypeScript/Tsx functions/classes/interfaces/
+    enums/type aliases/arrow-function declarators. `replace_symbol
+    {path, name_path, body}` splices whole definition bodies with
+    `/`-separated suffix addressing (a leading `/` anchors at top
+    level), refuses ambiguous or missing matches with the candidates
+    listed, re-runs the item 5 parse guard before the single atomic
+    write, and records the write in its effects. Measurement —
+    whether the tools cut exploratory turns — is item 1's funded
+    debt, not a gate on the seam.
 19. **Delegation by measured economics** (G6). A read-only scout on a
     cheap model that returns a ≤1 KB answer (Codebuff file-picker, Amp
     Librarian), one level deep only. Delegate when estimated parent

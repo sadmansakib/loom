@@ -61,6 +61,35 @@ impl InstructionFile {
     }
 }
 
+/// One entry of the on-demand skills index (iteration 5).
+///
+/// The scanner lists the skill files it found (name plus a one-line
+/// description); bodies stay on disk until the model asks for them with
+/// the `load_skill` tool, so the facts block never grows with skill
+/// content — the index is a menu, not the meal.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SkillIndexEntry {
+    /// Skill name (the file stem under `.agents/skills/`), the handle
+    /// `load_skill` accepts.
+    pub name: String,
+    /// One-line description: the file's first non-empty line, stripped of
+    /// Markdown heading syntax, bounded. Empty when the file starts with
+    /// its body directly.
+    pub description: String,
+}
+
+impl SkillIndexEntry {
+    /// Builds an index entry.
+    #[must_use]
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+        }
+    }
+}
+
 /// Git state observed when the facts were captured.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -126,6 +155,13 @@ pub struct KnownFacts {
     /// Project instruction file (`AGENTS.md`, falling back to `CLAUDE.md`),
     /// bounded.
     pub instructions: Option<InstructionFile>,
+    /// On-demand skills index (iteration 5): name and one-line
+    /// description per skill file found under `.agents/skills/`. Bodies
+    /// load through the `load_skill` tool, never through the block.
+    /// Gated by the engine's skills flag; empty workspaces render
+    /// nothing.
+    #[serde(default)]
+    pub skills: Vec<SkillIndexEntry>,
     /// Git state at capture time.
     pub git: GitState,
 }
@@ -144,6 +180,7 @@ impl KnownFacts {
         toolchains: Vec<String>,
         tree: Vec<String>,
         instructions: Option<InstructionFile>,
+        skills: Vec<SkillIndexEntry>,
         git: GitState,
     ) -> Self {
         Self {
@@ -156,6 +193,7 @@ impl KnownFacts {
             toolchains,
             tree,
             instructions,
+            skills,
             git,
         }
     }
@@ -174,6 +212,7 @@ impl KnownFacts {
             && self.toolchains.is_empty()
             && self.tree.is_empty()
             && self.instructions.is_none()
+            && self.skills.is_empty()
             && self.git.is_empty()
     }
 
@@ -215,6 +254,7 @@ impl KnownFacts {
         if let Some(instructions) = &self.instructions {
             render_instructions(&mut out, instructions);
         }
+        render_skills(&mut out, &self.skills);
         if !self.tree.is_empty() {
             let _ = writeln!(out, "file tree:");
             for line in &self.tree {
@@ -252,6 +292,26 @@ fn render_instructions(out: &mut String, instructions: &InstructionFile) {
     }
     let _ = writeln!(out, "{}", instructions.text);
     let _ = writeln!(out, "(end of project instructions)");
+}
+
+/// Emits the skills index (iteration 5): one line per skill, capped,
+/// with the `load_skill` hint. Empty index renders nothing.
+fn render_skills(out: &mut String, skills: &[SkillIndexEntry]) {
+    if skills.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "skills (call load_skill <name> for the body):");
+    for entry in skills.iter().take(RENDER_LIST_CAP) {
+        if entry.description.is_empty() {
+            let _ = writeln!(out, "- {}", entry.name);
+        } else {
+            let _ = writeln!(out, "- {}: {}", entry.name, entry.description);
+        }
+    }
+    let extra = skills.len().saturating_sub(RENDER_LIST_CAP);
+    if extra > 0 {
+        let _ = writeln!(out, "- (+{extra} more)");
+    }
 }
 
 /// Emits the git footer: branch when observed, then the changed-file
@@ -367,6 +427,7 @@ mod tests {
                 21,
                 "Run cargo test first.".into(),
             )),
+            skills: Vec::new(),
             git: GitState {
                 branch: Some("main".into()),
                 changed_files: vec!["src/lib.rs".into()],
@@ -384,6 +445,54 @@ mod tests {
     fn render_is_deterministic() {
         let facts = facts();
         assert_eq!(facts.render(), facts.render());
+    }
+
+    #[test]
+    fn skills_index_renders_as_a_menu_with_load_hint() {
+        let mut facts = facts();
+        facts.skills = vec![
+            SkillIndexEntry::new("commit-review", "conventional commits for this repo"),
+            SkillIndexEntry::new("deploy", ""),
+        ];
+        let rendered = facts.render();
+        assert!(rendered.contains("skills (call load_skill <name> for the body):"));
+        assert!(rendered.contains("- commit-review: conventional commits for this repo"));
+        assert!(rendered.contains("- deploy\n"));
+        // Determinism holds with skills present.
+        assert_eq!(facts.render(), rendered);
+    }
+
+    #[test]
+    fn skills_index_is_capped_like_other_lists() {
+        let mut facts = facts();
+        facts.skills = (0..20)
+            .map(|i| SkillIndexEntry::new(format!("s{i}"), "d"))
+            .collect();
+        let rendered = facts.render();
+        assert!(rendered.contains("- s15: d"));
+        assert!(!rendered.contains("- s16: d"));
+        assert!(rendered.contains("- (+4 more)"));
+    }
+
+    #[test]
+    fn facts_without_skills_field_deserialize_from_old_json() {
+        // Schema evolution: events written before iteration 5 carry no
+        // `skills` key; `#[serde(default)]` must accept them.
+        let old = r#"{
+            "root": "/ws",
+            "languages": [],
+            "build_systems": [],
+            "source_dirs": [],
+            "test_dirs": [],
+            "config_files": [],
+            "toolchains": [],
+            "tree": [],
+            "instructions": null,
+            "git": {"branch": null, "changed_files": []}
+        }"#;
+        let facts: KnownFacts = serde_json::from_str(old).expect("old facts must deserialize");
+        assert!(facts.skills.is_empty());
+        assert!(facts.is_empty());
     }
 
     #[test]

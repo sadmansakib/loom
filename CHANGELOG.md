@@ -3,6 +3,55 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-23 — Skills index + `load_skill` (iteration 5, context-compiler seam)
+
+- `.agents/skills/*.md` is now a first-class knowledge surface, loaded
+  on demand instead of injected globally — the roadmap's iteration-5
+  shape, attached through the existing context-compiler seam (no second
+  prompt mechanism).
+- The facts block grows a skills menu: name plus a one-line description
+  (first heading of each file, flat scan, sorted, ≤64 entries) with a
+  `call load_skill <name>` hint — names first, bodies on demand.
+- Opt-in `load_skill {name}` tool (`--skills`, `EngineConfig::skills`;
+  never in the bare arm, so the frozen SWE-bench protocol is unchanged):
+  serves the body under a `# skill: <name>` header at a 16 KiB head,
+  rejects path traversal, and an unknown name lists the available menu.
+- `KnownFacts.skills` carries the index (`#[serde(default)]` — old
+  events deserialize unchanged); `FsFactsSource::with_skills` gates the
+  scan so bare/default engines pay nothing.
+- Tests: kernel menu render + 16-entry cap + old-JSON compat, tool body
+  + truncation + traversal + unknown-name menu (7), engine opt-in
+  serving via schema-11 `content_head` + default/bare refusal (2).
+  Workspace 37 suites green, clippy 0.
+- Learned lessons (item 20.4) will reuse the same seam.
+
+## 2026-10-23 — Tree-sitter symbol tools (roadmap item 18, iteration 6 begins)
+
+- `symbols_overview {path, depth?}` and `replace_symbol {path,
+  name_path, body}` join `loom-tools`, backed by tree-sitter grammars
+  for Rust, Python, and TypeScript/TSX — the roadmap's answer to the
+  search→read→edit wander the G4/G5 probe watched weak models perform.
+- Overview renders a nesting-aware, budget-bounded (8 KB, then
+  per-kind counts) symbol listing with `Outer/inner` name paths;
+  impl blocks are named by their type (methods address as
+  `Config/new`); Python replacement spans include decorators; plain
+  variable declarators stay out of the listing.
+- `replace_symbol` splices whole definition bodies addressed by
+  `/`-separated suffix (a leading `/` anchors top level), refuses
+  ambiguous/missing matches with candidates listed, re-checks the
+  item 5 parse guard before a single atomic write, and reports the
+  write through its effects.
+- Opt-in everywhere: `EngineConfig::symbols` / `loom run --symbols`,
+  default off — the frozen SWE-bench protocol, existing frontends,
+  and the bare-loop arm are unchanged until a frontend asks. Engine
+  tests pin the gate (opt-in serves overviews; default and bare arm
+  refuse the call).
+- 17 tool tests (fixtures per language, ambiguity/confinement/guard
+  refusal, kind-count fallback) + 2 engine gate tests; workspace 37
+  suites green, clippy 0.
+- Measurement (do the tools cut exploratory turns?) joins item 1's
+  funded-measurement debt; the seam is not gated on it.
+
 ## 2026-10-23 — run.json event enrichment (schema 11): forensics the old shape was blind to
 
 - Root-causing the 100-sweep misses exposed a blind spot: `tool_started`/
