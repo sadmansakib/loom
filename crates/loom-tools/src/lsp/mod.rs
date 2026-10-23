@@ -7,6 +7,7 @@
 //! semantic tools. Without the flag nothing here runs and the default
 //! tool surface is byte-identical.
 
+mod apply;
 mod client;
 mod manifest;
 mod position;
@@ -47,8 +48,9 @@ fn render_menu(servers: &[Arc<LspServer>]) -> String {
     format!(
         "LSP servers attached: {listing}. Semantic tools: lsp_definition, \
          lsp_references, lsp_symbols, lsp_workspace_symbols, lsp_hover, \
-         lsp_diagnostics. Pass a file path plus a symbol name (substring) \
-         or 1-based line:column; results are path:line:col."
+         lsp_diagnostics, lsp_rename, lsp_format. Pass a file path plus a \
+         symbol name (substring) or 1-based line:column; results are \
+         path:line:col."
     )
 }
 
@@ -85,7 +87,7 @@ pub async fn attach_lsp(workspace: &Path, budgets: ToolBudgets) -> LspAttachment
         let settings = manifest
             .servers
             .get(&candidate.name)
-            .map(|_| serde_json::Value::Null)
+            .and_then(|decl| decl.settings.clone())
             .unwrap_or(serde_json::Value::Null);
         match client::spawn_server(candidate, workspace, settings).await {
             Ok(server) => servers.push(server),
@@ -98,7 +100,7 @@ pub async fn attach_lsp(workspace: &Path, budgets: ToolBudgets) -> LspAttachment
     let menu = render_menu(&servers);
     let inner = Arc::new(LspInner { servers, budgets });
     LspAttachment {
-        tools: tools::read_tools(inner),
+        tools: tools::lsp_tools(inner),
         menu: Some(menu),
     }
 }

@@ -75,7 +75,7 @@ about, or denied via the `[policy]` verdict layer.
 | Area | State |
 |---|---|
 | Turn loop | completion gate, one-shot refusals, zero-progress + late-budget nudges, malformed tool-call recovery |
-| Tools | read/write/edit/list/search, sandboxed `run_command`, `verify` (local, or containerized/remote via `.loom/verify.toml`), `git_status`/`git_diff`/`git_log` (opt-in `--git`), symbol tools (`--symbols`), skills (`--skills`), read-only scout (`--scout`), MCP servers (opt-in `--mcp`: stdio, allowlisted, hash-pinned, deferred loading), LSP semantic tools (opt-in `--lsp`: definition/references/symbols/hover/diagnostics via known servers) |
+| Tools | read/write/edit/list/search, sandboxed `run_command`, `verify` (local, or containerized/remote via `.loom/verify.toml`), `git_status`/`git_diff`/`git_log` (opt-in `--git`), symbol tools (`--symbols`), skills (`--skills`), read-only scout (`--scout`), MCP servers (opt-in `--mcp`: stdio, allowlisted, hash-pinned, deferred loading), LSP semantic tools (opt-in `--lsp`: definition/references/symbols/hover/diagnostics/rename/format via known servers) |
 | Safety | Seatbelt/bubblewrap, network off default, manifest escalation, allow/ask/deny verdicts, credential scrubbing, process-group kill |
 | Context | repo facts, AGENTS.md instructions, pruning + turn-age masking, per-tool output budgets (env-sweepable) |
 | Providers | DeepSeek, OpenRouter, GLM, NVIDIA, Groq, Anthropic + any OpenAI-compatible custom gateway |
@@ -83,8 +83,8 @@ about, or denied via the `[policy]` verdict layer.
 | Embedding | `loom-core` facade (ADR-021), full drive loop in `crates/loom-core/examples/frontend.rs` |
 
 Not built yet: interactive TUI/CLI surface (resume/steering/ask-mode need a
-frontend; the engine seams exist), LSP rename/call-hierarchy (E2/E3;
-semantic read tools shipped via `--lsp`), parallel worktree orchestration
+frontend; the engine seams exist), LSP call-hierarchy (E3; rename/format
+shipped via `--lsp`), parallel worktree orchestration
 (gated on measurement).
 
 ## Crates

@@ -300,9 +300,11 @@ overrides, document sync (lazy didOpen + edit-effect-fed didChange), and
 six semantic read tools (definition/references/symbols/workspace-symbols/
 hover/diagnostics) with utf-16-safe positions and pull-else-push
 diagnostics — opt-in via `--lsp`; tree-sitter `--symbols` stays as the
-zero-dependency floor. Open: E2 rename/format via WorkspaceEdit
-application, E3 callHierarchy + the $0 turn-economy probe, per-server
-settings serving.
+zero-dependency floor. **Shipped 2026-10-23 (E2)**: rename + format
+with WorkspaceEdit application through loom's write path (bottom-up
+edits, overlap rejection, version stale-guard, ResourceOps honored),
+per-server `settings` serving, `applyEdit` still declined. Open: E3
+callHierarchy + the $0 turn-economy probe.
 
 ### Iteration 7 — Plugin system (future scope)
 

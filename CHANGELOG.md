@@ -3,6 +3,32 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-23 — LSP rename + format with WorkspaceEdit application (slice E2)
+
+- `lsp_rename` and `lsp_format` (capability-gated; servers without the
+  provider fail fast with a clear error). Both are write tools: effects
+  record every touched path like an ordinary edit — same review trail.
+- `apply_workspace_edit`: servers *advise*, loom's write path *acts* —
+  bottom-up per-document edits (later ops see earlier results), overlap
+  rejection (overlapping edits in one document error out; LSP spec
+  allows losing overlaps, loom refuses silently losing them), version
+  stale-guard (server-pinned version below the client's open version →
+  reject as stale), `documentChanges` incl. Create/Rename/Delete file
+  operations with `overwrite`/`ignoreIfNotExists` honored, legacy
+  `changes` map applied in URI order. Utf-16 edit ranges → byte offsets
+  → applied on disk text.
+- After each applied write, `note_local_write` bumps the open-document
+  version and pushes a full-text `didChange` — the server's view stays
+  in sync without a watcher thread. `workspace/applyEdit` remains
+  **declined** on the wire (E1 stance unchanged).
+- Per-server settings serving: `.loom/lsp.toml` `[servers.<name>]
+  settings = {...}` is served verbatim to `workspace/configuration`
+  (previously a `null` placeholder).
+- Tests: mock-server rename (edit + file-move in one change set),
+  format, missing-capability errors, settings round-trip — 18 LSP
+  integration tests total, stable across repeated runs.
+- Honest gaps: callHierarchy + the $0 turn-economy probe remain (E3).
+
 ## 2026-10-23 — LSP client + semantic read tools (slice E1)
 
 - Generic stdio LSP client (`async-lsp` + `lsp-types`, the stack Helix

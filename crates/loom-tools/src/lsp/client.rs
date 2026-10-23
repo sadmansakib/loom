@@ -106,6 +106,68 @@ impl LspServer {
     pub fn document_uri(&self, path: &str) -> Result<lsp_types::Url, String> {
         url_for(&resolve(&self.root, path))
     }
+
+    /// Canonical key for the open-files map: the resolved (absolute)
+    /// path string. Tool callers pass surface paths ("src/lib.rs"),
+    /// edit application passes URI-derived absolute paths — both must
+    /// land on the same key or version tracking misses (E2).
+    pub(crate) fn open_key(&self, path: &str) -> String {
+        resolve(&self.root, path).to_string_lossy().into_owned()
+    }
+
+    /// True when the server negotiated UTF-8 position encoding.
+    pub(crate) fn uses_utf8_positions(&self) -> bool {
+        self.utf8_positions
+    }
+
+    /// The currently open version for a path (None when not open) —
+    /// the stale-computation guard for server-computed edits (E2).
+    pub(crate) fn open_version(&self, path: &str) -> Option<u32> {
+        let key = self.open_key(path);
+        self.open_files
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&key).copied())
+    }
+
+    /// Informs the server that loom itself wrote `path` (E2): open
+    /// files get a full-text didChange with a bumped version so
+    /// subsequent server computations see loom's writes; files not
+    /// open are left alone (the next ensure_open reads disk truth).
+    pub(crate) async fn note_local_write(&self, path: &str, text: String) {
+        use lsp_types::notification::DidChangeTextDocument;
+        let key = self.open_key(path);
+        let next = match self.open_files.lock() {
+            Ok(mut open) => match open.get_mut(&key) {
+                Some(version) => {
+                    *version = version.saturating_add(1);
+                    *version
+                }
+                None => return, // not open: nothing to sync
+            },
+            Err(_) => return,
+        };
+        let full = resolve(&self.root, path);
+        let Ok(uri) = url_for(&full) else {
+            return;
+        };
+        if let Err(e) =
+            self.socket
+                .notify::<DidChangeTextDocument>(lsp_types::DidChangeTextDocumentParams {
+                    text_document: lsp_types::VersionedTextDocumentIdentifier {
+                        uri,
+                        version: i32::try_from(next).unwrap_or(1),
+                    },
+                    content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
+                        range: None,
+                        range_length: None,
+                        text,
+                    }],
+                })
+        {
+            tracing::warn!(server = %self.name, "didChange after local write failed: {e}");
+        }
+    }
 }
 
 /// Resolves a workspace path against the server root.
@@ -134,9 +196,10 @@ impl LspServer {
     /// Ensures `didOpen` has been sent for the file, reading current
     /// disk content (docs/lsp-design.md §5: lazy open, disk truth).
     pub(crate) async fn ensure_open(&self, path: &str) -> Result<(), String> {
+        let key = self.open_key(path);
         {
             let open = self.open_files.lock().map_err(|e| e.to_string())?;
-            if open.contains_key(path) {
+            if open.contains_key(&key) {
                 return Ok(());
             }
         }
@@ -161,7 +224,7 @@ impl LspServer {
         self.open_files
             .lock()
             .map_err(|e| e.to_string())?
-            .insert(path.to_string(), 1);
+            .insert(key, 1);
         Ok(())
     }
 
@@ -172,17 +235,18 @@ impl LspServer {
         use lsp_types::notification::{DidChangeTextDocument, DidChangeWatchedFiles};
         for path in changed_paths {
             let full = resolve(&self.root, path);
+            let key = self.open_key(path);
             let is_open = self
                 .open_files
                 .lock()
-                .map(|m| m.contains_key(path))
+                .map(|m| m.contains_key(&key))
                 .unwrap_or(false);
             let version = if is_open {
                 self.open_files
                     .lock()
                     .map(|mut m| {
-                        let v = m.get(path).copied().unwrap_or(0).saturating_add(1);
-                        m.insert(path.to_string(), v);
+                        let v = m.get(&key).copied().unwrap_or(0).saturating_add(1);
+                        m.insert(key.clone(), v);
                         v
                     })
                     .unwrap_or(1)
@@ -228,7 +292,7 @@ impl LspServer {
                             );
                         }
                         if let Ok(mut open) = self.open_files.lock() {
-                            open.remove(path);
+                            open.remove(&key);
                         }
                     }
                 }

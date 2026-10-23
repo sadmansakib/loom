@@ -100,6 +100,11 @@ pub struct LspServerDecl {
     /// Allow network access for the server process (default false).
     #[serde(default)]
     pub network: bool,
+    /// Settings served to this server's `workspace/configuration`
+    /// requests (E2). Free-form table the server interprets; absent
+    /// means `null` (server falls back to its own defaults).
+    #[serde(default)]
+    pub settings: Option<serde_json::Value>,
 }
 
 /// The parsed `.loom/lsp.toml`.

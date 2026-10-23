@@ -75,6 +75,13 @@ fn send_notification(out: &mut impl Write, method: &str, params: serde_json::Val
     );
 }
 
+fn send_request(out: &mut impl Write, id: u64, method: &str, params: serde_json::Value) {
+    write_frame(
+        out,
+        &format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{params}}}"#),
+    );
+}
+
 /// Reads one Content-Length framed message from stdin.
 fn read_frame(stdin: &mut impl Read) -> Option<serde_json::Value> {
     let mut header = Vec::new();
@@ -118,6 +125,8 @@ fn nested<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json:
 /// conversion is observable.
 fn mock_server_loop() -> ! {
     let no_pull = std::env::var("LOOM_LSP_NO_PULL").is_ok();
+    let no_rename = std::env::var("LOOM_LSP_NO_RENAME").is_ok();
+    let settings_probe = std::env::var("LOOM_LSP_SETTINGS_PROBE").is_ok();
     let mut out = std::io::stdout();
     // libtest writes its progress line without a newline; start on a
     // fresh line so the first frame stays parseable for the client.
@@ -132,6 +141,10 @@ fn mock_server_loop() -> ! {
         };
         let method = field(&msg, "method").and_then(|m| m.as_str()).unwrap_or("");
         let id = field(&msg, "id").cloned();
+        // Client responses to server-initiated requests: ingest, drop.
+        if method.is_empty() {
+            continue;
+        }
         match method {
             "initialize" => {
                 let mut caps = serde_json::json!({
@@ -140,10 +153,14 @@ fn mock_server_loop() -> ! {
                     "referencesProvider": true,
                     "documentSymbolProvider": true,
                     "hoverProvider": true,
-                    "workspaceSymbolProvider": true
+                    "workspaceSymbolProvider": true,
+                    "documentFormattingProvider": true
                 });
                 if !no_pull {
                     caps["diagnosticProvider"] = serde_json::json!({"interFileDependencies": false, "workspaceDiagnostics": false});
+                }
+                if !no_rename {
+                    caps["renameProvider"] = serde_json::json!(true);
                 }
                 let result = serde_json::json!({
                     "capabilities": caps,
@@ -154,6 +171,51 @@ fn mock_server_loop() -> ! {
                 }
             }
             "initialized" => {
+                if settings_probe {
+                    // E2 settings round-trip: ask the client for its
+                    // configuration, read the response, and surface the
+                    // served value as a pushed diagnostic on probe.rs.
+                    send_request(
+                        &mut out,
+                        9001,
+                        "workspace/configuration",
+                        serde_json::json!({"items": [{"section": null}]}),
+                    );
+                    // Other traffic (didOpen, notifications) may
+                    // interleave; wait for OUR response by id.
+                    let mut served = String::from("missing");
+                    while let Some(frame) = read_frame(&mut stdin) {
+                        if frame.get("id").and_then(|i| i.as_u64()) == Some(9001)
+                            && frame.get("result").is_some()
+                        {
+                            served = frame
+                                .get("result")
+                                .and_then(|r| r.get(0))
+                                .and_then(|v| v.get("rust_probe_value"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("missing")
+                                .to_string();
+                            break;
+                        }
+                    }
+                    let uri = file_uri(&format!("{}/src/probe.rs", ws_root()));
+                    send_notification(
+                        &mut out,
+                        "textDocument/publishDiagnostics",
+                        serde_json::json!({
+                            "uri": uri,
+                            "diagnostics": [{
+                                "range": {
+                                    "start": {"line": 0, "character": 0},
+                                    "end": {"line": 0, "character": 1}
+                                },
+                                "severity": 2,
+                                "message": format!("settings seen: {served}")
+                            }]
+                        }),
+                    );
+                    continue;
+                }
                 // Push one diagnostic for src/other.rs (absolute URI —
                 // the handler keys the cache by file path).
                 let uri = file_uri(&format!("{}/src/other.rs", ws_root()));
@@ -264,6 +326,50 @@ fn mock_server_loop() -> ! {
                     send_response(&mut out, id, result);
                 }
             }
+            "textDocument/rename" => {
+                // One text edit (median→mean on lib.rs line 3, pinned to
+                // open version 1) plus a file move: exercises both E2
+                // paths through loom's write machinery.
+                let lib = file_uri(&format!("{}/src/lib.rs", ws_root()));
+                let from = file_uri(&format!("{}/src/third.rs", ws_root()));
+                let to = file_uri(&format!("{}/src/third_renamed.rs", ws_root()));
+                let new_name = nested(&msg, &["params", "newName"])
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("mean")
+                    .to_string();
+                let result = serde_json::json!({
+                    "documentChanges": [
+                        {
+                            "textDocument": {"uri": lib, "version": 1},
+                            "edits": [{
+                                "range": {
+                                    "start": {"line": 2, "character": 7},
+                                    "end": {"line": 2, "character": 13}
+                                },
+                                "newText": new_name
+                            }]
+                        },
+                        {"kind": "rename", "oldUri": from, "newUri": to}
+                    ]
+                });
+                if let Some(id) = id {
+                    send_response(&mut out, id, result);
+                }
+            }
+            "textDocument/formatting" => {
+                // Replace the whole first line of third.rs (ASCII, so
+                // utf-16 columns == bytes) with trimmed text.
+                let result = serde_json::json!([{
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 1, "character": 0}
+                    },
+                    "newText": "fn third() {}\n"
+                }]);
+                if let Some(id) = id {
+                    send_response(&mut out, id, result);
+                }
+            }
             "shutdown" => {
                 if let Some(id) = id {
                     send_response(&mut out, id, serde_json::Value::Null);
@@ -287,6 +393,11 @@ fn workspace(name: &str) -> PathBuf {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/lib.rs"), LIB_RS).unwrap();
     std::fs::write(dir.join("src/other.rs"), "// other\n").unwrap();
+    // E2 fixtures: third.rs carries trailing whitespace for the format
+    // test and gets moved by the mock's rename response; probe.rs is
+    // the settings round-trip target.
+    std::fs::write(dir.join("src/third.rs"), "fn third() {   }   \n").unwrap();
+    std::fs::write(dir.join("src/probe.rs"), "// probe\n").unwrap();
     std::fs::create_dir_all(dir.join(".loom")).unwrap();
     dir
 }
@@ -296,6 +407,12 @@ fn mock_command_lines(exe: &str) -> String {
 }
 
 fn manifest(dir: &Path, extra_env: &[(&str, &str)]) {
+    manifest_with(dir, extra_env, "");
+}
+
+/// Manifest writer with extra `[servers.rust_analyzer]` declaration
+/// lines appended (e.g. a `settings` table for the E2 probe).
+fn manifest_with(dir: &Path, extra_env: &[(&str, &str)], decl_extra: &str) {
     let exe = std::env::current_exe().unwrap().display().to_string();
     let mut env_pairs = vec![
         (String::from("LOOM_LSP_MOCK"), String::from("1")),
@@ -310,7 +427,7 @@ fn manifest(dir: &Path, extra_env: &[(&str, &str)]) {
         .collect::<Vec<_>>()
         .join(", ");
     let body = format!(
-        "[servers.rust_analyzer]\ncommand = {}\nenv = {{ {env_body} }}\n",
+        "[servers.rust_analyzer]\ncommand = {}\nenv = {{ {env_body} }}\n{decl_extra}",
         mock_command_lines(&exe)
     );
     std::fs::write(dir.join(".loom/lsp.toml"), body).unwrap();
@@ -384,7 +501,7 @@ fn missing_binary_skips_server() {
 }
 
 #[test]
-fn attach_yields_six_tools_and_menu() {
+fn attach_yields_eight_tools_and_menu() {
     let dir = workspace("attach");
     manifest(&dir, &[]);
     let attachment = attach(&dir);
@@ -402,11 +519,14 @@ fn attach_yields_six_tools_and_menu() {
             "lsp_workspace_symbols",
             "lsp_hover",
             "lsp_diagnostics",
+            "lsp_rename",
+            "lsp_format",
         ]
     );
     let menu = attachment.menu.as_deref().expect("menu present");
     assert!(menu.contains("rust_analyzer (Rust)"), "menu: {menu}");
     assert!(menu.contains("lsp_definition"));
+    assert!(menu.contains("lsp_rename"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -606,5 +726,103 @@ fn recent_changes_sync_does_not_break_queries() {
         ))
         .expect("definition after sync");
     assert!(out.content.contains(":3:8"), "{}", out.content);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rename_applies_edits_and_moves_files() {
+    let dir = workspace("rename");
+    manifest(&dir, &[]);
+    let rt = build_runtime();
+    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let tool = find_tool(&attachment.tools, "lsp_rename");
+    let ctx = context(&dir);
+    let out = rt
+        .block_on(tool.call(
+            serde_json::json!({"path": "src/lib.rs", "symbol": "median", "new_name": "mean"}),
+            &ctx,
+        ))
+        .expect("rename call");
+    assert!(
+        out.content
+            .contains("renamed symbol to mean across 2 document change(s)"),
+        "{}",
+        out.content
+    );
+    // Text edit landed through loom's write path…
+    let lib = std::fs::read_to_string(dir.join("src/lib.rs")).unwrap();
+    assert!(lib.contains("pub fn mean("), "{lib}");
+    assert!(!lib.contains("median"), "{lib}");
+    // …and the file operation executed: third.rs → third_renamed.rs.
+    assert!(dir.join("src/third_renamed.rs").is_file());
+    assert!(!dir.join("src/third.rs").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rename_without_capability_errors() {
+    let dir = workspace("rename-unsupported");
+    manifest(&dir, &[("LOOM_LSP_NO_RENAME", "1")]);
+    let rt = build_runtime();
+    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let tool = find_tool(&attachment.tools, "lsp_rename");
+    let ctx = context(&dir);
+    let err = rt
+        .block_on(tool.call(
+            serde_json::json!({"path": "src/lib.rs", "symbol": "median", "new_name": "mean"}),
+            &ctx,
+        ))
+        .expect_err("rename must fail without the capability");
+    assert!(
+        matches!(err, loom_kernel::tool::ToolError::Execution(ref m) if m.contains("rename")),
+        "{err:?}"
+    );
+    // Nothing landed.
+    let lib = std::fs::read_to_string(dir.join("src/lib.rs")).unwrap();
+    assert!(lib.contains("median"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn format_trims_trailing_whitespace() {
+    let dir = workspace("format");
+    manifest(&dir, &[]);
+    let rt = build_runtime();
+    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let tool = find_tool(&attachment.tools, "lsp_format");
+    let ctx = context(&dir);
+    let out = rt
+        .block_on(tool.call(serde_json::json!({"path": "src/third.rs"}), &ctx))
+        .expect("format call");
+    assert!(
+        out.content.contains("formatted src/third.rs"),
+        "{}",
+        out.content
+    );
+    let third = std::fs::read_to_string(dir.join("src/third.rs")).unwrap();
+    assert_eq!(third, "fn third() {}\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn settings_reach_workspace_configuration() {
+    let dir = workspace("settings");
+    manifest_with(
+        &dir,
+        &[("LOOM_LSP_SETTINGS_PROBE", "1"), ("LOOM_LSP_NO_PULL", "1")],
+        "settings = { rust_probe_value = \"probe-77\" }\n",
+    );
+    let rt = build_runtime();
+    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let tool = find_tool(&attachment.tools, "lsp_diagnostics");
+    let ctx = context(&dir);
+    let out = rt
+        .block_on(tool.call(serde_json::json!({"path": "src/probe.rs"}), &ctx))
+        .expect("diagnostics call");
+    assert!(
+        out.content.contains("settings seen: probe-77"),
+        "{}",
+        out.content
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

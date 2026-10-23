@@ -70,6 +70,20 @@ pub fn render_position(pos: lsp_types::Position) -> String {
     format!("{}:{}", pos.line + 1, pos.character + 1)
 }
 
+/// Converts a UTF-16 code-unit offset into a byte offset within
+/// `line_text` (inverse of [`surface_to_utf16`]'s unit counting).
+/// Runs past the end clamp to the line's byte length.
+pub fn utf16_units_to_byte_offset(line_text: &str, units: u32) -> usize {
+    let mut seen = 0u32;
+    for (byte_idx, ch) in line_text.char_indices() {
+        if seen >= units {
+            return byte_idx;
+        }
+        seen += ch.len_utf16() as u32;
+    }
+    line_text.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +135,15 @@ mod tests {
     #[test]
     fn render_is_one_based() {
         assert_eq!(render_position(lsp_types::Position::new(0, 0)), "1:1");
+    }
+
+    #[test]
+    fn utf16_units_to_bytes_counts_surrogate_pairs() {
+        let line = "ab😀cd";
+        assert_eq!(utf16_units_to_byte_offset(line, 0), 0);
+        assert_eq!(utf16_units_to_byte_offset(line, 2), 2); // after a,b
+        assert_eq!(utf16_units_to_byte_offset(line, 4), 6); // after a,b,😀 (😀 spans bytes 2..6)
+        assert_eq!(utf16_units_to_byte_offset(line, 6), 8); // after c,d
+        assert_eq!(utf16_units_to_byte_offset(line, 99), line.len()); // clamp
     }
 }
