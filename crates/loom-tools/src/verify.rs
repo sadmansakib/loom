@@ -226,6 +226,41 @@ impl Tool for VerifyTool {
                     )));
                 }
             }
+            // A declared container/remote runner (item 23) takes over
+            // execution: same command table, same budgets, same
+            // evidence contract — and a present-but-broken manifest
+            // fails closed instead of silently verifying locally.
+            if let Some(runner) = crate::verify_runner::runner_for(&ctx.workspace_root)
+                .map_err(ToolError::Execution)?
+            {
+                let (outcome, notice) = runner.run(ctx, program, &args).await?;
+                let effects = ToolEffects::none().with_command(CommandEffect::new(
+                    &outcome.runner_program,
+                    outcome.runner_args.clone(),
+                    outcome.output.status.code(),
+                ));
+                let recent_changes = ctx.recent_changes();
+                let mut rendered = render(
+                    ecosystem,
+                    &outcome.runner_program,
+                    &outcome.runner_args,
+                    &outcome.output,
+                    &recent_changes,
+                    &self.budgets,
+                )
+                .with_effects(effects)
+                .with_notice(notice);
+                if outcome.pipe_hold_truncated {
+                    rendered = rendered.with_notice(loom_kernel::tool::ToolNotice::new(
+                        "stream.truncated",
+                        format!(
+                            "\"{}\" (verify) output truncated: a descendant held the pipes after exit",
+                            outcome.runner_program
+                        ),
+                    ));
+                }
+                return Ok(rendered);
+            }
             // Drivers escalate through the same policy rules as
             // `run_command`; a driver without a rule runs inside the
             // boxed default sandbox (network off).

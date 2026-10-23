@@ -3,6 +3,33 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-23 — Containerized/remote verify runners (slice F, item 23)
+
+- `.loom/verify.toml` `[runner] command` declares the verification
+  substrate: `docker run …`, `ssh host …`, anything argv-shaped. No
+  shell, no model input — `{workspace}` (embeddable, for `-v` mounts),
+  `{program}`, `{args}` (standalone only) are the whole surface. An
+  operator declaring the runner is the approval, same trust position as
+  `commands.toml`.
+- Both verification paths route through it: the standalone `verify`
+  tool and the fused edit/write verification. The evidence contract —
+  exit status, compiler-message rendering, recent-changes context,
+  `CommandEffect` audit — is byte-for-byte the same shape; only the
+  substrate moves.
+- Honesty: runners execute unconstrained (a docker/ssh command cannot
+  work under Seatbelt/bwrap), so every run carries a `verify.runner`
+  notice and the full expanded argv in `CommandEffect`. A present but
+  invalid manifest fails closed (`invalid .loom/verify.toml: …`)
+  rather than silently verifying locally; a missing manifest keeps
+  local behavior byte-identical.
+- Fixed en route: `edit_file`/`write_file` dropped fused-verify
+  notices (e.g. pipe-hold truncation) — now propagated.
+- Tests: 7 unit (manifest parse/validation, placeholder expansion
+  incl. docker `-v {workspace}:/ws` embedding) + 4 integration (mock
+  runner re-exec through both paths, fail-closed manifest). Workspace
+  1009/0, clippy 0, fmt clean. Iteration 4 open work is now only
+  worktree isolation (item 21, evidence-gated).
+
 ## 2026-10-23 — MCP slice D3: deferral probe, 12.4× upfront token cut ($0)
 
 - `docs/benchmarks/mcp-probe-ghmock.rs`: standalone std-only mock GitHub

@@ -30,6 +30,7 @@ pub mod symbols;
 pub mod syntax;
 mod text;
 mod verify;
+mod verify_runner;
 mod window;
 mod write_file;
 

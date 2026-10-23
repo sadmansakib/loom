@@ -251,8 +251,11 @@ audit records, structured `git` tools (`git_status`/`git_diff`/`git_log`
 (`[[deny]]` program blocklist, `[policy] unknown = "allow"|"ask"|"deny"`
 for unruled programs; `ask` fails closed without an interactive
 frontend — the resolver seam ships, the frontend is item 22; defaults
-byte-identical, 2026-10-23). *Open:* worktree isolation (item 21),
-containerized runners (item 23).
+byte-identical, 2026-10-23), and containerized/remote `verify` runners
+via a declared `.loom/verify.toml` runner command — same evidence
+contract, fail-closed on invalid manifests, unconstrained by necessity
+with an explicit `verify.runner` notice (2026-10-23). *Open:* worktree
+isolation (item 21).
 
 ### Iteration 5 — Skills & contextual knowledge
 
@@ -280,11 +283,10 @@ surface: facts index, `mcp_search_tools`/`mcp_load_tools`, idle
 eviction), and D3 (measurement probe: 35-tool mock GitHub server, both
 arms completed, **12.4× upfront tool-token cut** at ≥10× bar —
 `docs/daily-driver.md`), opt-in via `--mcp`. Open: remote servers via
-declared proxy commands. LSP supplies definition,
-references, symbols,
+declared proxy commands. LSP supplies definition, references, symbols,
 diagnostics, rename, type information — justified only by fewer
-exploratory model turns. Tree-sitter symbol tools (item 18) came first
-and shipped 2026-10-23 — opt-in via `--symbols`.
+exploratory model turns. Tree-sitter symbol tools (item 18)
+came first and shipped 2026-10-23 — opt-in via `--symbols`.
 
 ### Iteration 7 — Plugin system (future scope)
 
@@ -1274,7 +1276,12 @@ reproduces them.
     shows the full drive loop — open, subscribe, steer, summarize. Resume +
     steering are both shipped, so a frontend is purely additive.
 23. **Distributed verification.** Remote or containerized `verify`
-    runners with the same evidence contract.
+    runners with the same evidence contract. **Shipped 2026-10-23** —
+    `.loom/verify.toml` declares the runner argv (docker, ssh, …) with
+    `{workspace}`/`{program}`/`{args}` placeholders; both the standalone
+    `verify` tool and the fused edit/write verification path route
+    through it, the evidence pipeline is unchanged, and a broken
+    manifest fails closed rather than silently verifying locally.
 24. **Best-of-N task-time sampling** (G1, G9). Fork the prepared
     workspace snapshot into N independent child agents (same model,
     varied approach hints), run them concurrently in the existing OS

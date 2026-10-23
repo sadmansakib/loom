@@ -93,15 +93,20 @@ impl Tool for WriteFileTool {
             let mut effects = ToolEffects::none().with_file_written(relative.clone());
             let mut content = format!("wrote {written} bytes to {display}");
             let mut truncated = false;
+            // Trace-level observations from the fused verify (e.g. the
+            // unconfined-runner notice) ride the host output.
+            let mut notices = Vec::new();
             if let Some(scope) = scope {
                 let (rendered, command) = crate::fusion::run_fused(scope, ctx, &relative).await?;
                 content = format!("{content}\n\n--- verify ---\n{}", rendered.content);
                 truncated = rendered.truncated;
+                notices = rendered.notices;
                 if let Some(command) = command {
                     effects = effects.with_command(command);
                 }
             }
             let mut output = ToolOutput::new(content).with_effects(effects);
+            output.notices = notices;
             if truncated {
                 output = output.with_truncated();
             }

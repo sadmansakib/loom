@@ -212,6 +212,9 @@ impl Tool for EditFileTool {
                 .map_err(|err| ToolError::Execution(format!("edit task failed: {err}")))??;
             let (mut effects, mut content, truncated_echo) = assemble_body(&outcome, &self.budgets);
             let mut truncated = false;
+            // Trace-level observations from the fused verify (e.g. the
+            // unconfined-runner notice) ride the host output.
+            let mut notices = Vec::new();
             if let Some(scope) = scope {
                 let verify_target = outcome
                     .files
@@ -222,11 +225,13 @@ impl Tool for EditFileTool {
                     crate::fusion::run_fused(scope, ctx, &verify_target).await?;
                 content = format!("{content}\n\n--- verify ---\n{}", rendered.content);
                 truncated = rendered.truncated;
+                notices = rendered.notices;
                 if let Some(command) = command {
                     effects = effects.with_command(command);
                 }
             }
             let mut output = ToolOutput::new(content).with_effects(effects);
+            output.notices = notices;
             if truncated || truncated_echo {
                 output = output.with_truncated();
             }

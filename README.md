@@ -75,7 +75,7 @@ about, or denied via the `[policy]` verdict layer.
 | Area | State |
 |---|---|
 | Turn loop | completion gate, one-shot refusals, zero-progress + late-budget nudges, malformed tool-call recovery |
-| Tools | read/write/edit/list/search, sandboxed `run_command`, `verify`, `git_status`/`git_diff`/`git_log` (opt-in `--git`), symbol tools (`--symbols`), skills (`--skills`), read-only scout (`--scout`) |
+| Tools | read/write/edit/list/search, sandboxed `run_command`, `verify` (local, or containerized/remote via `.loom/verify.toml`), `git_status`/`git_diff`/`git_log` (opt-in `--git`), symbol tools (`--symbols`), skills (`--skills`), read-only scout (`--scout`), MCP servers (opt-in `--mcp`: stdio, allowlisted, hash-pinned, deferred loading) |
 | Safety | Seatbelt/bubblewrap, network off default, manifest escalation, allow/ask/deny verdicts, credential scrubbing, process-group kill |
 | Context | repo facts, AGENTS.md instructions, pruning + turn-age masking, per-tool output budgets (env-sweepable) |
 | Providers | DeepSeek, OpenRouter, GLM, NVIDIA, Groq, Anthropic + any OpenAI-compatible custom gateway |
@@ -83,8 +83,8 @@ about, or denied via the `[policy]` verdict layer.
 | Embedding | `loom-core` facade (ADR-021), full drive loop in `crates/loom-core/examples/frontend.rs` |
 
 Not built yet: interactive TUI/CLI surface (resume/steering/ask-mode need a
-frontend; the engine seams exist), MCP and LSP integration (roadmap
-iterations 6), parallel worktree orchestration (gated on measurement).
+frontend; the engine seams exist), LSP integration (roadmap iteration 6;
+MCP shipped), parallel worktree orchestration (gated on measurement).
 
 ## Crates
 

@@ -38,6 +38,41 @@ pub(crate) async fn run_fused(
             return Ok((note, None));
         }
     };
+    // A declared container/remote runner (item 23) executes the fused
+    // verification too — the evidence contract is shared with the
+    // standalone tool, so the substrate moves but the output does not.
+    // A broken manifest fails closed.
+    if let Some(runner) =
+        crate::verify_runner::runner_for(&ctx.workspace_root).map_err(ToolError::Execution)?
+    {
+        let (outcome, notice) = runner.run(ctx, program, &args).await?;
+        let effect = CommandEffect::new(
+            &outcome.runner_program,
+            outcome.runner_args.clone(),
+            outcome.output.status.code(),
+        );
+        let mut recent = ctx.recent_changes();
+        recent.push(changed.to_owned());
+        let mut rendered = crate::verify::render(
+            ecosystem,
+            &outcome.runner_program,
+            &outcome.runner_args,
+            &outcome.output,
+            &recent,
+            &ToolBudgets::default(),
+        )
+        .with_notice(notice);
+        if outcome.pipe_hold_truncated {
+            rendered = rendered.with_notice(loom_kernel::tool::ToolNotice::new(
+                "stream.truncated",
+                format!(
+                    "\"{}\" (verify) output truncated: a descendant held the pipes after exit",
+                    outcome.runner_program
+                ),
+            ));
+        }
+        return Ok((rendered, Some(effect)));
+    }
     let sandbox = crate::sandbox::Sandbox::resolve(
         &ctx.workspace_root,
         crate::sandbox::SandboxGrants::from_rule(None),
