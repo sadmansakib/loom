@@ -3,6 +3,25 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-23 — First bare-vs-full contrast (G4/G5 probe, $0)
+
+- Paired same-task A/B executed on the user's nano gateway (custom
+  OpenAI-compatible provider, `kilo/nvidia/nemotron-3.5-lightning:free-1M-txt`)
+  after two free vehicles failed: NIM's shared 40 RPM cap rate-stormed
+  every sweep at any `-j` (structural, not model signal), and the
+  OpenRouter key string proved invalid (401 on every probe).
+- 5 instances × 1 run per arm, official scorer both arms,
+  `swebench-contrast` over the paired artifacts: **full 1/5, bare 0/5**
+  — the single resolution (scikit-learn-14141) belongs to the harness
+  arm, which spent +71 turns iterating it past the completion gate
+  until the patch scored; the bare arm exited earlier with a failing
+  patch. Three full-arm runs hit the 100-turn ceiling in
+  run_command-heavy wander loops — the weaker-model population the
+  G4/G5 claim is about. Cache 91.5–92.3%; $0 spend.
+- Honest scope: N=1 × 5 is far below the N≥5-medians maintenance bar —
+  a directional probe, recorded in roadmap item 1, not maintenance
+  evidence for the items 4/5/6/8/10 levers.
+
 ## 2026-10-23 — Iteration 3 begins: read-only scout (roadmap item 19)
 
 - The item-19 seam shipped: `EngineConfig.scout` (opt-in `ScoutConfig

@@ -705,7 +705,22 @@ reproduces them.
      script into the CLI, which applies `EngineOverrides::bare_loop()`;
      the script itself stays byte-identical (asserted by test), and
      `swebench-contrast` renders the paired arms once both exist. The
-     G4/G5 number still waits on credit, not engineering. The number this
+     G4/G5 number still waits on credit, not engineering. **2026-10-23
+     (later): first G4/G5 contrast EXECUTED at $0** — vehicle: the
+     user's nano gateway (custom OpenAI-compatible provider,
+     `kilo/nvidia/nemotron-3.5-lightning:free-1M-txt`), 5 instances x
+     1 run per arm (django-11239, sphinx-7748, scikit-learn-14141,
+     sympy-13974, astropy-12907), official scorer both arms,
+     `swebench-contrast` over the paired artifacts. Result: **full 1/5,
+     bare 0/5** — the single resolution (scikit-learn-14141) belongs to
+     the harness arm, which spent +71 turns on it (completion-gate
+     persistence iterating a wandering weak model until the patch
+     scored); bare exited earlier with a failing patch. Directionally
+     supports G4/G5, but N=1 x 5 is far below the N>=5 medians bar:
+     recorded as a probe, not maintenance evidence. Vehicle history:
+     NIM rate-stormed structurally (40 RPM free cap), the OpenRouter
+     key proved invalid, the nano gateway held at -j2 with 91.5-92.3%
+     cache. The number this
      must produce is the G4/G5 headline in `docs/benchmarks/`: the
      claim that Loom raises a weaker model's success rate, which the
      input model profiles (item 9) also need. ~~Also shipped alongside:

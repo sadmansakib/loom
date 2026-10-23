@@ -172,6 +172,16 @@ pub fn model_capabilities(model: &str) -> Option<ModelCapabilities> {
             .with_tool_calls(true)
             .with_parallel_tool_calls(false)
             .with_reasoning(true),
+        // Nemotron 3.5 Lightning (30B total / 3B active): live-verified
+        // callable on NIM 2026-10-23 when the 3 Super slug 404'd for the
+        // test account. Same family contract — reasoning-first (content
+        // arrives after reasoning_content), tool calling trained.
+        // Context conservatively 256k until the page documents more.
+        "nvidia/nemotron-3.5-lightning-30b-a3b" => ModelCapabilities::new(262_144)
+            .with_max_output_tokens(131_072)
+            .with_tool_calls(true)
+            .with_parallel_tool_calls(false)
+            .with_reasoning(true),
         _ => return None,
     };
     Some(limits)
