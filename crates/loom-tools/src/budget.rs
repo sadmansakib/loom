@@ -46,6 +46,13 @@ pub(crate) const SKILL_BODY_HEAD_BYTES: usize = 16 * 1024;
 /// payload; past this it is cut with the standard head marker.
 pub(crate) const REPLACED_HEAD_BYTES: usize = 400;
 
+/// Turns an MCP tool stays on the session surface after its last use
+/// before the deferral system evicts it (slice D2). Eight idle turns
+/// matches the kernel default; `0` means "never evict" and is set in
+/// code, not via env (env overrides follow the ignore-invalid-and-zero
+/// convention).
+pub const MCP_IDLE_EVICT_TURNS: u32 = 8;
+
 /// Every per-tool output budget in one struct (roadmap item 20.2, the
 /// deterministic half): what was a scattered set of constants becomes
 /// data, so a frontend — or a sweep over the SWE-bench protocol — can
@@ -83,6 +90,10 @@ pub struct ToolBudgets {
     /// `replace_symbol` echo — the previous definition is context, not
     /// payload (default [`REPLACED_HEAD_BYTES`]).
     pub replace_symbol_head_bytes: usize,
+    /// Turns an idle MCP tool stays loaded before the deferral system
+    /// evicts it from the session surface (default
+    /// [`MCP_IDLE_EVICT_TURNS`]; `0` never evicts).
+    pub mcp_idle_evict_turns: u32,
 }
 
 impl Default for ToolBudgets {
@@ -96,6 +107,7 @@ impl Default for ToolBudgets {
             symbols_overview_max_bytes: SYMBOLS_OVERVIEW_MAX_BYTES,
             skill_body_head_bytes: SKILL_BODY_HEAD_BYTES,
             replace_symbol_head_bytes: REPLACED_HEAD_BYTES,
+            mcp_idle_evict_turns: MCP_IDLE_EVICT_TURNS,
         }
     }
 }
@@ -217,5 +229,6 @@ mod tests {
         assert_eq!(d.symbols_overview_max_bytes, SYMBOLS_OVERVIEW_MAX_BYTES);
         assert_eq!(d.skill_body_head_bytes, SKILL_BODY_HEAD_BYTES);
         assert_eq!(d.replace_symbol_head_bytes, REPLACED_HEAD_BYTES);
+        assert_eq!(d.mcp_idle_evict_turns, MCP_IDLE_EVICT_TURNS);
     }
 }

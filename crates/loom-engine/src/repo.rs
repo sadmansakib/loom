@@ -127,6 +127,7 @@ const LANGUAGES: &[(&str, &str)] = &[
 pub struct FsFactsSource {
     root: PathBuf,
     skills: bool,
+    mcp_menu: Option<String>,
 }
 
 impl FsFactsSource {
@@ -136,6 +137,7 @@ impl FsFactsSource {
         Self {
             root: root.into(),
             skills: false,
+            mcp_menu: None,
         }
     }
 
@@ -148,6 +150,19 @@ impl FsFactsSource {
         self.skills = enabled;
         self
     }
+
+    /// Bakes the deferred MCP catalog menu into the facts block
+    /// (slice D2). The menu is static per task — captured here, rendered
+    /// byte-stable by [`KnownFacts::render`] — because the catalog is
+    /// fixed at attach time; loads and evictions change the tool
+    /// surface, never the menu.
+    ///
+    /// [`KnownFacts::render`]: loom_kernel::context::KnownFacts::render
+    #[must_use]
+    pub fn with_mcp_menu(mut self, menu: Option<String>) -> Self {
+        self.mcp_menu = menu;
+        self
+    }
 }
 
 impl FactsSource for FsFactsSource {
@@ -156,6 +171,7 @@ impl FactsSource for FsFactsSource {
         if self.skills {
             facts.skills = scan_skills(&self.root);
         }
+        facts.mcp_menu = self.mcp_menu.clone();
         facts
     }
 }
@@ -249,6 +265,7 @@ pub fn scan(root: &Path) -> KnownFacts {
         read_instructions(root),
         Vec::new(),
         git_state(root),
+        None,
     )
 }
 

@@ -274,8 +274,11 @@ allowlist with hash-pinned tool definitions (rug-pull defense), ingestion
 hygiene for untrusted descriptions, and every MCP tool deferred behind a
 search/load meta-tool pair with idle offboarding (the ~30-tool threshold
 noted under "Measured out" is crossed by construction the moment a real
-server attaches — one GitHub server is 35 tools). Phased D1 protocol +
-hygiene → D2 deferred surface → D3 measurement. LSP supplies definition,
+server attaches — one GitHub server is 35 tools). **Shipped 2026-10-23**:
+D1 (stdio client, manifest allowlist, hygiene, pinning) and D2 (deferred
+surface: facts index, `mcp_search_tools`/`mcp_load_tools`, idle
+eviction), opt-in via `--mcp`. Open: D3 measurement probe and remote
+servers via declared proxy commands. LSP supplies definition,
 references, symbols,
 diagnostics, rename, type information — justified only by fewer
 exploratory model turns. Tree-sitter symbol tools (item 18) came first

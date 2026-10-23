@@ -162,6 +162,12 @@ pub struct KnownFacts {
     /// nothing.
     #[serde(default)]
     pub skills: Vec<SkillIndexEntry>,
+    /// Deferred MCP catalog menu (slice D2): names the attached servers'
+    /// tools and the `mcp_search_tools`/`mcp_load_tools` path to them.
+    /// Baked once at attach time — the snapshot is static per task, so
+    /// the block stays byte-stable across turns.
+    #[serde(default)]
+    pub mcp_menu: Option<String>,
     /// Git state at capture time.
     pub git: GitState,
 }
@@ -182,6 +188,7 @@ impl KnownFacts {
         instructions: Option<InstructionFile>,
         skills: Vec<SkillIndexEntry>,
         git: GitState,
+        mcp_menu: Option<String>,
     ) -> Self {
         Self {
             root,
@@ -195,6 +202,7 @@ impl KnownFacts {
             instructions,
             skills,
             git,
+            mcp_menu,
         }
     }
 
@@ -213,6 +221,7 @@ impl KnownFacts {
             && self.tree.is_empty()
             && self.instructions.is_none()
             && self.skills.is_empty()
+            && self.mcp_menu.is_none()
             && self.git.is_empty()
     }
 
@@ -262,6 +271,10 @@ impl KnownFacts {
             }
         }
         render_git(&mut out, &self.git);
+        if let Some(menu) = &self.mcp_menu {
+            out.push('\n');
+            out.push_str(menu);
+        }
         // Drop the trailing newline so the block is exactly its lines.
         out.pop();
         out
@@ -428,6 +441,7 @@ mod tests {
                 "Run cargo test first.".into(),
             )),
             skills: Vec::new(),
+            mcp_menu: None,
             git: GitState {
                 branch: Some("main".into()),
                 changed_files: vec!["src/lib.rs".into()],

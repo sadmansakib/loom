@@ -12,21 +12,29 @@
 //! class). Servers spawn through the same OS sandbox as `run_command`
 //! (network off unless declared), with a scrubbed environment.
 //!
-//! D1 is eager: every manifest server attaches with its full surviving
-//! tool set. Deferred loading (facts-block index plus
-//! `mcp_search_tools`/`mcp_load_tools`, eviction) is D2.
+//! D2 is deferred: every surviving tool is cataloged but NOT registered.
+//! The model sees a short facts-block menu plus two meta-tools —
+//! `mcp_search_tools` (deterministic scoring over the catalog) and
+//! `mcp_load_tools` (queues tools onto the session surface, which the
+//! agent loop promotes between turns and evicts after idle). Only
+//! manifest `always_load` pins attach eagerly. This keeps a 58-tool,
+//! ~55K-token five-server setup at ~0.5K upfront (docs/mcp-design.md).
 //!
-//! Phase D1 never touches the frozen default: with `EngineConfig::mcp`
+//! Phase D1 never touched the frozen default: with `EngineConfig::mcp`
 //! false (the default) no manifest is read, no process spawns, and the
-//! registry is byte-identical.
+//! registry is byte-identical. D2 keeps that property — without `--mcp`
+//! no surface exists and the loop compiles each turn from the base
+//! registry alone.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use loom_kernel::agent::{SurfacePolicy, ToolSurface};
 use loom_kernel::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -673,39 +681,49 @@ impl Tool for McpTool {
 // Attach
 // ---------------------------------------------------------------------------
 
-/// The model-facing name for one surviving tool.
+/// The model-facing name for one admitted tool, held as `Arc` so the same
+/// tool can live in the catalog (deferred), the session surface (loaded),
+/// and the registry (eager `always_load` pin) without duplication.
 struct Surviving {
-    tool: McpTool,
+    tool: Arc<McpTool>,
     model_name: String,
 }
 
+/// What attaching every manifest server produced (slice D2).
+#[derive(Default)]
+pub struct McpAttachment {
+    /// Tools to register eagerly on the base registry: the two
+    /// meta-tools (when anything is deferred) plus `always_load` pins.
+    pub tools: Vec<Arc<dyn Tool>>,
+    /// Facts-block menu naming the deferred catalog, when non-empty.
+    pub menu: Option<String>,
+    /// Session tool surface that promotes loaded tools between turns
+    /// and evicts them after idle, when non-empty.
+    pub surface: Option<Arc<ToolSurface>>,
+}
+
 /// Attaches every manifest server: spawn, handshake, `tools/list`,
-/// hygiene, pinning. Returns the surviving tools in deterministic order
-/// (server name, then server list order). Every failure is contained:
-/// a bad manifest or lockfile yields zero tools; a bad server yields
-/// zero tools for that server alone. `budgets` is reserved for D3
-/// per-server budgets; D1 uses module constants.
-pub async fn attach_mcp_tools(
-    workspace: &Path,
-    budgets: crate::budget::ToolBudgets,
-) -> Vec<Box<dyn Tool>> {
-    let _ = budgets;
+/// hygiene, pinning — then defers everything except `always_load` pins
+/// behind the catalog/meta-tool surface. Every failure is contained: a
+/// bad manifest or lockfile yields an empty attachment; a bad server
+/// contributes nothing while others proceed.
+pub async fn attach_mcp(workspace: &Path, budgets: crate::budget::ToolBudgets) -> McpAttachment {
     let manifest_path = workspace.join(MANIFEST_RELATIVE_PATH);
     let text = match std::fs::read_to_string(&manifest_path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Vec::new();
+            return McpAttachment::default();
         }
         Err(error) => {
             tracing::warn!(path = %manifest_path.display(), %error, "cannot read MCP manifest");
-            return Vec::new();
+            return McpAttachment::default();
         }
     };
     let manifest = match McpManifest::parse(&text) {
         Ok(manifest) => manifest,
         Err(error) => {
             tracing::warn!(%error, "MCP attach skipped: invalid manifest");
-            return Vec::new();
+            return McpAttachment::default();
         }
     };
     let mut lock = match load_lock(workspace) {
@@ -714,12 +732,13 @@ pub async fn attach_mcp_tools(
             // Fail closed everywhere: an unreadable lock means pins
             // cannot be verified, so no server attaches.
             tracing::warn!(%error, "MCP attach skipped: unreadable lockfile");
-            return Vec::new();
+            return McpAttachment::default();
         }
     };
     let server_names: Vec<String> = manifest.servers.keys().cloned().collect();
     let mut lock_dirty = false;
-    let mut surviving: Vec<Surviving> = Vec::new();
+    let mut eager: Vec<Surviving> = Vec::new();
+    let mut deferred: Vec<McpCatalogEntry> = Vec::new();
 
     for (name, decl) in &manifest.servers {
         match attach_server(
@@ -729,7 +748,8 @@ pub async fn attach_mcp_tools(
             &server_names,
             &mut lock,
             &mut lock_dirty,
-            &mut surviving,
+            &mut eager,
+            &mut deferred,
         )
         .await
         {
@@ -741,19 +761,44 @@ pub async fn attach_mcp_tools(
     if lock_dirty {
         write_lock(workspace, &lock);
     }
-    let mut taken: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut tools: Vec<Box<dyn Tool>> = Vec::new();
-    for entry in surviving {
-        if !taken.insert(entry.model_name.clone()) {
-            tracing::warn!(name = %entry.model_name, "MCP tool name collision after sanitizing; dropping the later one");
-            continue;
-        }
-        tools.push(Box::new(entry.tool));
+
+    // Name-collision dedup across servers in manifest order: later
+    // sanitization collisions drop. Eager pins win over catalog entries.
+    let mut taken: std::collections::BTreeSet<String> =
+        eager.iter().map(|s| s.model_name.clone()).collect();
+    deferred.retain(|entry| taken.insert(entry.model_name.clone()));
+
+    let menu = (!deferred.is_empty()).then(|| render_menu(&deferred));
+    let surface = (!deferred.is_empty()).then(|| {
+        Arc::new(ToolSurface::new(SurfacePolicy {
+            evict_after_idle_turns: budgets.mcp_idle_evict_turns,
+        }))
+    });
+
+    let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+    if let Some(surface) = &surface {
+        let catalog = Arc::new(McpCatalog { entries: deferred });
+        tools.push(Arc::new(McpSearchTools {
+            catalog: Arc::clone(&catalog),
+        }));
+        tools.push(Arc::new(McpLoadTools {
+            catalog,
+            surface: Arc::clone(surface),
+        }));
     }
-    tools
+    for entry in eager {
+        tools.push(entry.tool);
+    }
+    McpAttachment {
+        tools,
+        menu,
+        surface,
+    }
 }
 
-/// Ingests one server. Errors abort that server's tools only.
+/// Ingests one server. Errors abort that server's tools only; admitted
+/// tools split into `eager` (`always_load` pins) and `deferred` (catalog).
+#[allow(clippy::too_many_arguments)]
 async fn attach_server(
     name: &str,
     decl: &McpServerDecl,
@@ -761,7 +806,8 @@ async fn attach_server(
     server_names: &[String],
     lock: &mut McpLock,
     lock_dirty: &mut bool,
-    surviving: &mut Vec<Surviving>,
+    eager: &mut Vec<Surviving>,
+    deferred: &mut Vec<McpCatalogEntry>,
 ) -> Result<(), McpError> {
     let process = McpServerProcess::spawn(name, decl, workspace)?;
     let process = Arc::new(process);
@@ -849,7 +895,7 @@ async fn attach_server(
         };
         let model_name = mcp_tool_name(name, &raw.name);
         admitted.push(Surviving {
-            tool: McpTool {
+            tool: Arc::new(McpTool {
                 process: Arc::clone(&process),
                 server: name.to_owned(),
                 remote_name: raw.name.clone(),
@@ -858,7 +904,7 @@ async fn attach_server(
                     description: desc,
                     parameters: raw.input_schema,
                 },
-            },
+            }),
             model_name,
         });
     }
@@ -871,6 +917,328 @@ async fn attach_server(
         );
         admitted.truncate(TOOLS_MAX_PER_SERVER);
     }
-    surviving.append(&mut admitted);
+    for entry in admitted {
+        // `always_load` pins match either the remote name or the
+        // sanitized model-facing name; everything else defers.
+        let pinned = decl
+            .always_load
+            .iter()
+            .any(|pin| *pin == entry.tool.remote_name || *pin == entry.model_name);
+        if pinned {
+            eager.push(entry);
+        } else {
+            deferred.push(McpCatalogEntry {
+                one_liner: one_liner(&entry.tool.spec.description),
+                tool: entry.tool,
+                model_name: entry.model_name,
+            });
+        }
+    }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Deferred catalog + meta-tools (slice D2)
+// ---------------------------------------------------------------------------
+
+/// One cataloged (deferred) tool: the constructed [`McpTool`] plus the
+/// one-line menu rendering of its description.
+#[derive(Clone)]
+struct McpCatalogEntry {
+    tool: Arc<McpTool>,
+    model_name: String,
+    one_liner: String,
+}
+
+/// The deferred tools across every attached server, in deterministic
+/// attach order (server name, then server list order).
+struct McpCatalog {
+    entries: Vec<McpCatalogEntry>,
+}
+
+impl McpCatalog {
+    fn find(&self, model_name: &str) -> Option<&McpCatalogEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.model_name == model_name)
+    }
+}
+
+/// Caps a menu line: first sentence, else first 80 characters. Strips
+/// the imperative warning prefix — the menu names tools, it does not
+/// carry warnings (the full description keeps them).
+fn one_liner(desc: &str) -> String {
+    let clean = desc
+        .strip_prefix(IMPERATIVE_WARNING)
+        .map(str::trim_start)
+        .unwrap_or(desc);
+    let sentence_end = clean.find(". ").map(|index| index + 1);
+    let cut = sentence_end.unwrap_or(clean.len()).min(
+        clean
+            .char_indices()
+            .nth(80)
+            .map(|(index, _)| index)
+            .unwrap_or(clean.len()),
+    );
+    clean[..cut].trim_end().to_owned()
+}
+
+/// Menu entries shown before "+N more tools" takes over.
+const MENU_MAX_ENTRIES: usize = 64;
+
+/// Renders the facts-block menu for the deferred catalog.
+fn render_menu(entries: &[McpCatalogEntry]) -> String {
+    let mut out = String::from(
+        "MCP servers attached; their tools are deferred to keep context small. \
+         Find tools with mcp_search_tools, load what you need with mcp_load_tools:",
+    );
+    for (shown, entry) in entries.iter().enumerate() {
+        if shown == MENU_MAX_ENTRIES {
+            out.push_str(&format!(
+                "\n+ {} more tools; use mcp_search_tools to see them",
+                entries.len() - shown
+            ));
+            break;
+        }
+        out.push_str(&format!("\n{} — {}", entry.model_name, entry.one_liner));
+    }
+    out
+}
+
+/// Deterministic relevance scoring of one catalog entry against the
+/// query words: name word-match (5) > name substring (3) > description
+/// word-match (2) > description substring (1); a whole-query
+/// subsequence of the name rescues zero-scored entries at 1 so partial
+/// names still surface.
+fn score_entry(entry: &McpCatalogEntry, words: &[String], query: &str) -> u32 {
+    let name = entry.model_name.to_lowercase();
+    let desc = entry.tool.spec.description.to_lowercase();
+    let mut score = 0;
+    for word in words {
+        let name_hit = name
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|part| part == word);
+        if name_hit {
+            score += 5;
+        } else if name.contains(word) {
+            score += 3;
+        }
+        let desc_hit = desc
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|part| part == word);
+        if desc_hit {
+            score += 2;
+        } else if desc.contains(word) {
+            score += 1;
+        }
+    }
+    if score == 0 {
+        // Subsequence: every query character appears in name order.
+        let mut cursor = 0;
+        let matched = query
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .all(|c| {
+                if let Some(found) = name[cursor..].find(c) {
+                    cursor += found + c.len_utf8();
+                    true
+                } else {
+                    false
+                }
+            });
+        if matched {
+            score = 1;
+        }
+    }
+    score
+}
+
+/// `mcp_search_tools`: ranks the deferred catalog against a query. The
+/// model never sees the ~55K tokens of eager schemas — it searches a
+/// name+one-liner index and loads only what scores.
+pub struct McpSearchTools {
+    catalog: Arc<McpCatalog>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SearchInput {
+    /// Free-text query; each whitespace-separated word is scored
+    /// against every deferred tool's name and description.
+    query: String,
+    /// Maximum entries to return (default 10).
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Results per `mcp_search_tools` response.
+const SEARCH_DEFAULT_LIMIT: usize = 10;
+
+impl Tool for McpSearchTools {
+    fn spec(&self) -> &ToolSpec {
+        static SPEC: OnceLock<ToolSpec> = OnceLock::new();
+        SPEC.get_or_init(|| ToolSpec {
+            name: "mcp_search_tools".to_owned(),
+            description: "Search the deferred MCP tool catalog by keyword. \
+                Returns matching tool names with one-line descriptions; load \
+                the ones you need with mcp_load_tools (they become callable \
+                on the following turn)."
+                .to_owned(),
+            parameters: crate::schema::parameters::<SearchInput>(),
+        })
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
+    fn call(
+        &self,
+        input: Value,
+        _ctx: &ToolContext,
+    ) -> futures::future::BoxFuture<'static, Result<ToolOutput, ToolError>> {
+        let catalog = Arc::clone(&self.catalog);
+        Box::pin(async move {
+            let input: SearchInput = serde_json::from_value(input)
+                .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+            let words: Vec<String> = input
+                .query
+                .to_lowercase()
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect();
+            if words.is_empty() {
+                return Err(ToolError::InvalidInput(
+                    "query must contain at least one keyword".to_owned(),
+                ));
+            }
+            let query = input.query.to_lowercase().replace(' ', "");
+            let mut scored: Vec<(u32, &McpCatalogEntry)> = catalog
+                .entries
+                .iter()
+                .filter_map(|entry| {
+                    let score = score_entry(entry, &words, &query);
+                    (score > 0).then_some((score, entry))
+                })
+                .collect();
+            scored.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| a.1.model_name.cmp(&b.1.model_name))
+            });
+            let limit = input.limit.unwrap_or(SEARCH_DEFAULT_LIMIT).clamp(1, 50);
+            if scored.is_empty() {
+                return Ok(ToolOutput::new(format!(
+                    "No deferred MCP tools match {:?}.",
+                    input.query
+                )));
+            }
+            let mut out = format!(
+                "{} matching deferred tool(s), top {} shown (load with mcp_load_tools):",
+                scored.len(),
+                scored.len().min(limit)
+            );
+            for (_, entry) in scored.iter().take(limit) {
+                out.push_str(&format!("\n{} — {}", entry.model_name, entry.one_liner));
+            }
+            Ok(ToolOutput::new(out))
+        })
+    }
+}
+
+/// `mcp_load_tools`: queues named catalog tools onto the session
+/// surface. The agent loop promotes queued tools between turns
+/// (append-only, cache-stable) and evicts them again after
+/// `mcp_idle_evict_turns` unused turns.
+pub struct McpLoadTools {
+    catalog: Arc<McpCatalog>,
+    surface: Arc<ToolSurface>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct LoadInput {
+    /// Deferred tool names exactly as `mcp_search_tools` showed them
+    /// (e.g. `mcp_mock_greet`).
+    tools: Vec<String>,
+}
+
+impl Tool for McpLoadTools {
+    fn spec(&self) -> &ToolSpec {
+        static SPEC: OnceLock<ToolSpec> = OnceLock::new();
+        SPEC.get_or_init(|| ToolSpec {
+            name: "mcp_load_tools".to_owned(),
+            description: "Load deferred MCP tools onto the session tool \
+                surface by their exact names (as shown by \
+                mcp_search_tools). Loaded tools become callable on the \
+                following turn and are evicted again after several idle \
+                turns."
+                .to_owned(),
+            parameters: crate::schema::parameters::<LoadInput>(),
+        })
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
+    fn call(
+        &self,
+        input: Value,
+        _ctx: &ToolContext,
+    ) -> futures::future::BoxFuture<'static, Result<ToolOutput, ToolError>> {
+        let catalog = Arc::clone(&self.catalog);
+        let surface = Arc::clone(&self.surface);
+        Box::pin(async move {
+            let input: LoadInput = serde_json::from_value(input)
+                .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+            if input.tools.is_empty() {
+                return Err(ToolError::InvalidInput(
+                    "tools must name at least one deferred tool".to_owned(),
+                ));
+            }
+            let mut unknown = Vec::new();
+            for name in &input.tools {
+                if catalog.find(name).is_none() {
+                    unknown.push(name.as_str());
+                }
+            }
+            if !unknown.is_empty() {
+                let known: Vec<&str> = catalog
+                    .entries
+                    .iter()
+                    .map(|entry| entry.model_name.as_str())
+                    .take(8)
+                    .collect();
+                return Err(ToolError::InvalidInput(format!(
+                    "unknown tool name(s): {}. Deferred tools include: {}. Use \
+                     mcp_search_tools to list them.",
+                    unknown.join(", "),
+                    known.join(", ")
+                )));
+            }
+            let mut loaded = Vec::new();
+            let mut skipped = Vec::new();
+            for name in &input.tools {
+                let Some(entry) = catalog.find(name) else {
+                    continue;
+                };
+                let tool: Arc<dyn Tool> = entry.tool.clone();
+                match surface.queue(tool) {
+                    Ok(()) => loaded.push(name.as_str()),
+                    Err(_) => skipped.push(name.as_str()),
+                }
+            }
+            let mut out = format!(
+                "Loaded {} tool(s) onto the session surface; they are callable \
+                 from the next turn: {}.",
+                loaded.len(),
+                loaded.join(", ")
+            );
+            if !skipped.is_empty() {
+                out.push_str(&format!(
+                    " Already loaded (skipped): {}.",
+                    skipped.join(", ")
+                ));
+            }
+            Ok(ToolOutput::new(out))
+        })
+    }
 }

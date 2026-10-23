@@ -639,9 +639,14 @@ pub enum ToolRegistryError {
 /// Storage preserves registration order, so `specs()` yields a stable
 /// tool list — renaming or reordering tools mid-task would invalidate
 /// the provider's cached prompt prefix.
-#[derive(Default)]
+///
+/// Tools are held behind `Arc` so a registry can be cloned cheaply
+/// ([`ToolRegistry::shallow_clone`]). The agent loop uses that to layer
+/// a session's dynamic tool surface ([`crate::agent::ToolSurface`]) on
+/// top of the base registry without disturbing it.
+#[derive(Default, Clone)]
 pub struct ToolRegistry {
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<Arc<dyn Tool>>,
 }
 
 impl std::fmt::Debug for ToolRegistry {
@@ -662,6 +667,15 @@ impl ToolRegistry {
 
     /// Adds a tool, refusing duplicates by name.
     pub fn register(&mut self, tool: Box<dyn Tool>) -> Result<(), ToolRegistryError> {
+        self.register_arc(tool.into())
+    }
+
+    /// Adds an already-shared tool, refusing duplicates by name.
+    ///
+    /// The dynamic tool surface hands the same `Arc` it tracks to the
+    /// per-turn registry view, so dispatch and the surface stay in
+    /// lockstep without re-boxing.
+    pub fn register_arc(&mut self, tool: Arc<dyn Tool>) -> Result<(), ToolRegistryError> {
         let name = tool.spec().name.clone();
         if self.get(&name).is_some() {
             return Err(ToolRegistryError::DuplicateName { name });
@@ -694,25 +708,26 @@ impl ToolRegistry {
         self.tools.is_empty()
     }
 
-    /// Consumes the registry, yielding the registered tools in order.
-    /// For embedders that filter a built registry (the bare-loop arm
-    /// keeps the primitive tools only) rather than rebuilding one.
-    pub fn into_tools(self) -> impl Iterator<Item = Box<dyn Tool>> {
+    /// Consumes the registry, yielding the registered tools (as shared
+    /// handles) in order. For embedders that filter a built registry
+    /// (the bare-loop arm keeps the primitive tools only) rather than
+    /// rebuilding one.
+    pub fn into_arc_tools(self) -> impl Iterator<Item = Arc<dyn Tool>> {
         self.tools.into_iter()
     }
 
     /// Builds a registry from tools that are already unique by name.
     /// Order is preserved (the stable ordering the model sees).
-    pub fn from_tools<I>(tools: I) -> Self
+    pub fn from_arc_tools<I>(tools: I) -> Self
     where
-        I: IntoIterator<Item = Box<dyn Tool>>,
+        I: IntoIterator<Item = Arc<dyn Tool>>,
     {
         let mut registry = Self::new();
         for tool in tools {
-            let result = registry.register(tool);
+            let result = registry.register_arc(tool);
             debug_assert!(
                 result.is_ok(),
-                "from_tools received a duplicate tool name: {result:?}"
+                "from_arc_tools received a duplicate tool name: {result:?}"
             );
         }
         registry

@@ -39,9 +39,11 @@ use crate::transcript::{
 };
 
 pub mod retry;
+pub mod surface;
 pub mod tools;
 
 pub use retry::RetryPolicy;
+pub use surface::{DEFAULT_EVICT_AFTER_IDLE_TURNS, SurfacePolicy, ToolSurface};
 
 use tools::{MAX_TOOL_OUTPUT_BYTES, ToolBatch, ToolExposure};
 
@@ -590,6 +592,11 @@ pub struct Agent {
     /// recent-changes evidence handed to tools. `false` reduces the
     /// loop to stream → execute → commit with no loop-owned reactions.
     loop_shaping: bool,
+    /// The session's dynamic tool surface (slice D2): tools queued by
+    /// a meta-tool mid-turn, promoted at each turn boundary. `None`
+    /// for every engine that doesn't opt in — the loop then uses the
+    /// base registry unchanged.
+    surface: Option<Arc<ToolSurface>>,
 }
 
 impl Agent {
@@ -621,6 +628,7 @@ impl Agent {
             facts: Arc::new(NoFacts),
             cache: Arc::new(Mutex::new(ToolCache::new())),
             loop_shaping: true,
+            surface: None,
         }
     }
 
@@ -707,6 +715,41 @@ impl Agent {
     pub fn with_facts_source(mut self, facts: Box<dyn FactsSource>) -> Self {
         self.facts = Arc::from(facts);
         self
+    }
+
+    /// Attaches the session's dynamic tool surface (slice D2). The
+    /// surface is shared with the meta-tools that queue loads into it;
+    /// the loop promotes queues at turn boundaries, appends loaded
+    /// tools after the base registry (append-only, so the provider's
+    /// cached prompt prefix survives loads), and evicts tools idle for
+    /// the surface policy's threshold. Without a surface the loop is
+    /// byte-identical to before.
+    #[must_use]
+    pub fn with_surface(mut self, surface: Arc<ToolSurface>) -> Self {
+        self.surface = Some(surface);
+        self
+    }
+
+    /// The registry view for the current turn: the base registry with
+    /// the surface's loaded tools appended in load order. With no
+    /// surface attached this is a cheap clone of the base.
+    fn combined_registry(&self) -> ToolRegistry {
+        match &self.surface {
+            Some(surface) => surface.extend_registry(&self.registry),
+            None => self.registry.clone(),
+        }
+    }
+
+    /// Promotes queued loads and evicts idle tools at a turn boundary.
+    /// Evictions are logged, never emitted as protocol events — the
+    /// event schema stays frozen.
+    fn reconcile_surface(&self) {
+        if let Some(surface) = &self.surface {
+            let evicted = surface.end_turn();
+            if !evicted.is_empty() {
+                tracing::info!(tools = ?evicted, "tool surface evicted idle tools");
+            }
+        }
     }
 
     /// Disables the loop's evidence-shaped feedback (the bare-loop arm,
@@ -1058,6 +1101,16 @@ impl Agent {
 
             sink.emit(task_id, EventKind::TurnStarted { turn });
 
+            // The dynamic tool surface (slice D2): announce the turn,
+            // then snapshot this turn's registry view — base plus the
+            // surface's loaded tools, append-only, so every compile,
+            // dispatch, and mutation check in this turn agrees on one
+            // tool list.
+            if let Some(surface) = &self.surface {
+                surface.begin_turn(turn);
+            }
+            let turn_tools = self.combined_registry();
+
             // Queued user steering (item 25): drained once per turn
             // boundary and appended — persist-then-commit, exactly as a
             // task's opening input — so this turn's compile sees it.
@@ -1159,6 +1212,7 @@ impl Agent {
                 &capabilities,
                 &facts,
                 &prune_checkpoint,
+                &turn_tools,
             ) {
                 Ok(compiled) => compiled,
                 Err(overrun @ TaskError::Context(ContextError::BudgetExceeded { .. }))
@@ -1181,6 +1235,7 @@ impl Agent {
                         &capabilities,
                         &facts,
                         &prune_checkpoint,
+                        &turn_tools,
                     )?
                 }
                 Err(error) => return Err(error),
@@ -1233,6 +1288,7 @@ impl Agent {
                         &assistant,
                         sink,
                     )? {
+                        self.reconcile_surface();
                         continue;
                     }
                     self.commit(session, assistant, Vec::new())?;
@@ -1264,6 +1320,7 @@ impl Agent {
                             &mut failures,
                             &recent_changes(session),
                             Arc::clone(&todos),
+                            &turn_tools,
                         )
                         .await;
                     // The gate learns from every result before the turn
@@ -1284,8 +1341,7 @@ impl Agent {
                             .zip(&results)
                             .any(|(call, result)| {
                                 result.status == ToolStatus::Success
-                                    && self
-                                        .registry
+                                    && turn_tools
                                         .get(&call.name)
                                         .is_some_and(|tool| !tool.is_read_only())
                             });
@@ -1355,7 +1411,10 @@ impl Agent {
                             max_turns: self.max_turns,
                         });
                     }
-                    // Otherwise continue to the next turn.
+                    // Otherwise continue to the next turn; the surface
+                    // first promotes this turn's queued loads and evicts
+                    // idle tools.
+                    self.reconcile_surface();
                 }
                 other => {
                     // `max_tokens` / `context_limit` / `content_filter`
@@ -1410,6 +1469,7 @@ impl Agent {
     /// Compiles one turn's model request from durable state (§8): the
     /// compiler owns every context decision; the loop only passes it
     /// the inputs.
+    #[allow(clippy::too_many_arguments)]
     fn compile_turn(
         &self,
         session: &Session,
@@ -1418,6 +1478,7 @@ impl Agent {
         capabilities: &ModelCapabilities,
         facts: &crate::context::KnownFacts,
         prune_checkpoint: &Option<PruneCheckpoint>,
+        turn_tools: &ToolRegistry,
     ) -> Result<CompiledContext, TaskError> {
         let task = session
             .tasks
@@ -1427,7 +1488,7 @@ impl Agent {
         self.compiler
             .compile(ContextInput {
                 session,
-                tools: &self.registry,
+                tools: turn_tools,
                 task,
                 budget,
                 capabilities,
@@ -1692,6 +1753,7 @@ impl Agent {
         failures: &mut FailureLedger,
         recent_changes: &[String],
         todos: Arc<Mutex<crate::session::TodoList>>,
+        turn_tools: &ToolRegistry,
     ) -> Vec<ToolResult> {
         let exposure = ToolExposure::from_names(request.tools.iter().map(|spec| spec.name.clone()));
 
@@ -1748,9 +1810,18 @@ impl Agent {
         .with_cache(Some(self.cache.clone()))
         .with_projected_calls(projected_calls)
         .with_todos(Some(todos));
-        let batch = ToolBatch::new(&self.registry, &exposure)
-            .with_max_concurrency(self.max_tool_concurrency);
+        let batch =
+            ToolBatch::new(turn_tools, &exposure).with_max_concurrency(self.max_tool_concurrency);
         let ran = batch.execute(&runnable, &context).await;
+        // Surface bookkeeping (slice D2): a dispatched surface tool was
+        // used this turn, whatever the outcome — failures count as use
+        // for idleness, since the model demonstrably still sees the
+        // tool. Unknown names no-op inside the surface.
+        if let Some(surface) = &self.surface {
+            for call in runnable {
+                surface.mark_used(&call.name);
+            }
+        }
         // Dedupe key for harness notices within this batch: one event per
         // distinct (category, detail), not one per parallel call.
         let mut emitted_notices: HashSet<(String, String)> = HashSet::new();

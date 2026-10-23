@@ -3,6 +3,44 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-23 — MCP slice D2: deferred tool surface (search + load + idle eviction)
+
+Second slice of `docs/mcp-design.md`: kill the eager-schema token tax.
+With `--mcp`, advertised tools are no longer all registered; the model
+gets a ~150–500-token facts index plus two deterministic meta-tools, and
+real schemas enter the prompt only when loaded. Without `--mcp` nothing
+changes (byte-identical defaults).
+
+- Kernel: `ToolRegistry` is now Arc-backed (`register_arc`,
+  `into_arc_tools`, `from_arc_tools`); new `agent::ToolSurface` mediates
+  between-turn tool mutations — queued tools become visible at the next
+  `begin_turn` boundary, idle tools evict after
+  `evict_after_idle_turns` (default 8, `0` = never). The loop compiles
+  each turn against `base + loaded` (append-only ordering keeps the
+  cached prefix stable on load; eviction breaks the prefix only after
+  the idle threshold, by design). Evictions are logged, not evented —
+  the event schema stays frozen at 11.
+- loom-tools: `attach_mcp` returns an `McpAttachment` — meta-tools,
+  eager `always_load` tools, the facts-menu text, and the surface.
+  `mcp_search_tools(query)` ranks deferred tools deterministically
+  (word-boundary/substring scoring over name + description, no model);
+  `mcp_load_tools(tools)` queues schemas onto the surface (dedup,
+  fail-closed on unknown names). The menu lists ≤64 `name — one-liner`
+  entries and points at the meta-tools; `one_liner` strips imperative
+  warnings so hijack text never re-enters context via the index.
+- Budgets: `ToolBudgets.mcp_idle_evict_turns` (default 8) + env sweep
+  `LOOM_MCP_IDLE_EVICT_TURNS` (invalid/zero ignored).
+- Facts: `KnownFacts.mcp_menu` renders the deferred-tools index in the
+  facts block; `FsFactsSource::with_mcp_menu` bakes it at engine open.
+- Engine: `--mcp` attach path feeds the surface to the agent
+  (`with_surface`); bare arm and default path untouched.
+- Tests: 16 integration tests over the re-exec mock server — eager pin
+  + call, full deferred flow (search → load → next-turn visibility →
+  call through the combined registry → dup/unknown handling), eviction
+  unit tests, menu hygiene (imperative text absent), cap/deny-glob
+  ordering, quarantine, cross-server rejection. Workspace 999/0,
+  clippy 0, fmt clean.
+
 ## 2026-10-23 — MCP slice D1: stdio client, manifest allowlist, hygiene, pinning
 
 First implementation slice of `docs/mcp-design.md`: attach real MCP servers

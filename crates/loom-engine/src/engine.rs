@@ -309,16 +309,17 @@ impl Engine {
         config: EngineConfig,
         overrides: EngineOverrides,
     ) -> Result<Self, EngineError> {
-        Self::open_with_extra_tools(config, overrides, Vec::new())
+        Self::open_with_extra_tools(config, overrides, loom_tools::mcp::McpAttachment::default())
     }
 
-    /// [`Engine::open_with`] plus externally attached tools (MCP, D1).
-    /// Registered after every built-in opt-in surface; same failure
-    /// semantics as any other registration.
+    /// [`Engine::open_with`] plus an MCP attachment (slice D): eager
+    /// meta-tools and `always_load` pins register after every built-in
+    /// opt-in surface; the deferred surface and facts menu ride along.
+    /// Same failure semantics as any other registration.
     fn open_with_extra_tools(
         config: EngineConfig,
         overrides: EngineOverrides,
-        extra_tools: Vec<Box<dyn loom_kernel::tool::Tool>>,
+        mcp: loom_tools::mcp::McpAttachment,
     ) -> Result<Self, EngineError> {
         let workspace =
             std::fs::canonicalize(&config.workspace).map_err(|source| EngineError::Workspace {
@@ -480,9 +481,9 @@ impl Engine {
         // fails the engine open — a bad manifest, lockfile, or server
         // degrades that server to zero tools (fail closed), and the
         // frozen default registry is untouched while the flag is off.
-        for tool in extra_tools {
+        for tool in mcp.tools {
             registry
-                .register(tool)
+                .register_arc(tool)
                 .map_err(|error| EngineError::RegisterTool {
                     tool: "mcp",
                     message: error.to_string(),
@@ -496,6 +497,7 @@ impl Engine {
         let facts = (!overrides.bare_loop).then(|| {
             crate::repo::FsFactsSource::new(workspace.clone())
                 .with_skills(config.skills && !overrides.bare_loop)
+                .with_mcp_menu(mcp.menu.clone())
         });
         let compiler: Box<dyn ContextCompiler> = match overrides.compiler {
             Some(compiler) => compiler,
@@ -537,6 +539,9 @@ impl Engine {
             .with_loop_shaping(!overrides.bare_loop);
         if let Some(facts) = facts {
             agent = agent.with_facts_source(Box::new(facts));
+        }
+        if let Some(surface) = mcp.surface {
+            agent = agent.with_surface(surface);
         }
 
         // Durable sessions and artifact bodies (ADR-008, ADR-012): the same
@@ -689,19 +694,20 @@ impl Engine {
         } else {
             config
         };
-        // Slice D (iteration 6): eager MCP attach. Spawning stdio servers
-        // and handshaking is async I/O, so it lives here — the sync
-        // constructor receives the resulting tools. A missing manifest
-        // attaches nothing; a bad server degrades to zero tools for that
-        // server (fail closed), never a failed open.
-        let extra_tools = if config.mcp && !overrides.bare_loop {
+        // Slice D2: deferred MCP attach. Spawning stdio servers and
+        // handshaking is async I/O, so it lives here — the sync
+        // constructor receives the attachment (eager meta-tools +
+        // always_load pins, facts menu, session surface). A missing
+        // manifest attaches nothing; a bad server degrades to zero tools
+        // for that server (fail closed), never a failed open.
+        let mcp = if config.mcp && !overrides.bare_loop {
             let workspace = std::fs::canonicalize(&config.workspace)
                 .unwrap_or_else(|_| config.workspace.clone());
-            loom_tools::mcp::attach_mcp_tools(&workspace, config.budgets).await
+            loom_tools::mcp::attach_mcp(&workspace, config.budgets).await
         } else {
-            Vec::new()
+            loom_tools::mcp::McpAttachment::default()
         };
-        Engine::open_with_extra_tools(config, overrides, extra_tools)
+        Engine::open_with_extra_tools(config, overrides, mcp)
     }
 
     /// Creates a fresh session handle for one run.
@@ -980,9 +986,9 @@ fn compose_scout(
         |name| std::env::var(name).ok(),
     )?;
     let provider = crate::provider::build(&child, credential.secret.expose())?.provider;
-    let registry = ToolRegistry::from_tools(
+    let registry = ToolRegistry::from_arc_tools(
         build_registry(policy, child.budgets)?
-            .into_tools()
+            .into_arc_tools()
             .filter(|tool| tool.is_read_only()),
     );
     let estimator: Arc<dyn loom_kernel::context::TokenEstimator> =
@@ -1060,9 +1066,9 @@ fn bare_registry(built: ToolRegistry) -> ToolRegistry {
         "edit_file",
         "run_command",
     ];
-    ToolRegistry::from_tools(
+    ToolRegistry::from_arc_tools(
         built
-            .into_tools()
+            .into_arc_tools()
             .filter(|tool| PRIMITIVES.contains(&tool.spec().name.as_str())),
     )
 }
@@ -1117,7 +1123,7 @@ fn prune_config_for(provider: &str) -> PruneConfig {
 /// The `LOOM_*` budget knobs [`budgets_with_env`] reads, in struct
 /// order. Exported so a frontend can echo which overrides a run
 /// actually saw (sweep logs stay honest about what varied).
-pub const BUDGET_ENV_VARS: [&str; 8] = [
+pub const BUDGET_ENV_VARS: [&str; 9] = [
     "LOOM_READ_HEAD_BYTES",
     "LOOM_COMMAND_HEAD_BYTES",
     "LOOM_COMMAND_TAIL_BYTES",
@@ -1126,6 +1132,7 @@ pub const BUDGET_ENV_VARS: [&str; 8] = [
     "LOOM_SYMBOLS_OVERVIEW_MAX_BYTES",
     "LOOM_SKILL_HEAD_BYTES",
     "LOOM_REPLACE_SYMBOL_HEAD_BYTES",
+    "LOOM_MCP_IDLE_EVICT_TURNS",
 ];
 
 /// The `LOOM_PRUNE_*` knobs [`prune_with_env`] reads, in struct order.
@@ -1164,6 +1171,16 @@ pub fn budgets_with_env(
     apply(&mut budgets.symbols_overview_max_bytes, BUDGET_ENV_VARS[5]);
     apply(&mut budgets.skill_body_head_bytes, BUDGET_ENV_VARS[6]);
     apply(&mut budgets.replace_symbol_head_bytes, BUDGET_ENV_VARS[7]);
+    // The u32 slot is inline after the closure's last use (a second
+    // closure would double-borrow `warnings`). `0` = "never evict" is a
+    // code-level policy, not an env knob: keep the
+    // ignore-invalid-and-zero convention.
+    if let Some(raw) = get(BUDGET_ENV_VARS[8]) {
+        match raw.trim().parse::<u32>() {
+            Ok(value) if value > 0 => budgets.mcp_idle_evict_turns = value,
+            _ => warnings.push(format!("ignoring invalid {}={raw:?}", BUDGET_ENV_VARS[8])),
+        }
+    }
     (budgets, warnings)
 }
 
