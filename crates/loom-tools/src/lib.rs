@@ -16,6 +16,7 @@ mod exec;
 pub mod fastpath;
 mod fusion;
 pub mod git;
+mod hygiene;
 mod list_dir;
 pub mod lsp;
 pub mod mcp;

@@ -159,3 +159,52 @@ upfront tool-token cost, no search-deadlocks. Logged in
 
 Each phase is independently shippable; D2 is the one that changes the
 engine's static-registry assumption and gets the careful tests.
+
+## Remote servers (D4, shipped 2026-10-25)
+
+Remote MCP endpoints are reached **through declared local proxy
+commands**, not by a native HTTP/SSE client:
+
+```toml
+[servers.github]
+command = ["ssh", "relay.internal", "nc", "mcp.internal", "9000"]
+network = true
+```
+
+The proxy is an ordinary manifest entry. It spawns through the same
+sandbox (`network = true` is required for the relay — a proxy without
+the grant fails closed and reports zero tools), the same hygiene and
+lockfile pinning, the same search/load deferral. Nothing
+transport-specific enters the engine: the child speaks stdio
+JSON-RPC on both sides of the relay, so every D1–D3 defense applies
+unchanged, and the relay inherits the process lifecycle
+(`kill_on_drop`) instead of loom owning a socket.
+
+`LOOM_WORKSPACE` (the canonicalized workspace root) is exported into
+every spawned server's scrubbed environment so proxies can resolve
+workspace-relative paths — the same move as Claude Code's
+`CLAUDE_PROJECT_DIR` for stdio servers. A manifest `env` entry with
+that name wins.
+
+Why not native Streamable HTTP (the ecosystem default; SSE hits
+end-of-life 2026-04-01)? Three reasons, in order:
+
+1. **The security perimeter stays the OS sandbox.** A native client
+   turns every reachable URL into a potential exfiltration path and
+   pushes auth (OAuth 2.1, headers, token refresh) into the agent
+   process — code that must be right forever. A proxy command is a
+   locally declared, user-auditable argv under the same
+   network-grant policy as every other tool. The middle ground
+   others reach with private-network bridges (e.g. tailscale-mcp)
+   is the *same shape*: transport composition outside the agent.
+2. **One client, one threat model.** Remote and local servers share
+   framing, pagination caps, ping handling, and rug-pull defenses —
+   the 2025-06-18 exact-match negotiation, the 1 MiB line cap, the
+   10-page `tools/list` cap all apply. A second transport would
+   double the surface for zero new capability.
+3. **Declarative routing.** `ssh -W`, `tailscale`, a TLS shunt, a
+   kubectl port-forward — the user picks the reachability mechanism,
+   loom never hardcodes one. Proxy tests
+   (`proxy_command_reaches_remote_server_with_network_grant`,
+   `proxy_command_without_network_grant_fails_closed`) pin the
+   contract with a real TCP relay against a far server.

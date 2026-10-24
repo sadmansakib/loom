@@ -29,7 +29,107 @@ fn mcp_mock_server() {
         Ok(mode) => mode,
         Err(_) => return,
     };
-    mock_server_loop(&mode);
+    match mode.as_str() {
+        "proxy" => proxy_loop(),
+        "remote" => remote_loop(),
+        _ => mock_server_loop(&mode),
+    }
+}
+
+fn proxy_loop() -> ! {
+    use std::io::{BufRead, Write};
+    let port: u16 = std::env::var("LOOM_MCP_MOCK_PORT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut upstream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let reader = upstream.try_clone().unwrap();
+    let pump = std::thread::spawn(move || {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        for line in std::io::BufReader::new(reader).lines() {
+            match line {
+                Ok(line) => {
+                    let _ = writeln!(out, "{line}");
+                    let _ = out.flush();
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        match line {
+            Ok(line) => {
+                if writeln!(upstream, "{line}").is_err() {
+                    break;
+                }
+                let _ = upstream.flush();
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = pump.join();
+    std::process::exit(0);
+}
+
+fn remote_loop() -> ! {
+    use std::io::{BufRead, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // Fresh-line quirk: libtest's progress prefix has no trailing
+    // newline, so the port must land on its own line or the parent's
+    // u16 parser never sees it.
+    println!();
+    println!("{port}");
+    let (stream, _) = listener.accept().unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    // The fresh-line quirk from `mock_server_loop` applies here too:
+    // our responses travel through the proxy process to loom's reader.
+    writeln!(writer).unwrap();
+    let buf = std::io::BufReader::new(stream);
+    for line in buf.lines() {
+        let Ok(line) = line else { continue };
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let id = message.get("id").cloned();
+        let method = message.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        match method {
+            "initialize" => respond(
+                &mut writer,
+                id,
+                json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "serverInfo": {"name": "remote-mock", "version": "0.0.0"}
+                }),
+            ),
+            "tools/list" => respond(
+                &mut writer,
+                id,
+                json!({"tools": [tool_def(
+                    "far_greet",
+                    "Greets from the far side of a TCP relay.",
+                    text_schema(r#"{"name": {"type": "string"}}"#),
+                )]}),
+            ),
+            "tools/call" => {
+                let name = message
+                    .pointer("/params/name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                respond(
+                    &mut writer,
+                    id,
+                    json!({"content": [{"type": "text", "text": format!("far-server saw {name}")}]}),
+                );
+            }
+            _ => {}
+        }
+    }
+    std::process::exit(0);
 }
 
 fn respond(out: &mut impl Write, id: Option<serde_json::Value>, result: serde_json::Value) {
@@ -76,8 +176,13 @@ fn mock_server_loop(mode: &str) -> ! {
                     .and_then(|n| n.as_str())
                     .unwrap_or("")
                     .to_string();
+                let text = if mode == "env" {
+                    std::env::var("LOOM_WORKSPACE").unwrap_or_else(|_| "<unset>".into())
+                } else {
+                    call_result(&name).to_owned()
+                };
                 let mut result = json!({
-                    "content": [{"type": "text", "text": call_result(&name)}]
+                    "content": [{"type": "text", "text": text}]
                 });
                 if mode == "evil_result" {
                     result["isError"] = json!(true);
@@ -170,6 +275,11 @@ fn tools_for(mode: &str) -> Vec<serde_json::Value> {
             "greet",
             "Greets a person by name.",
             text_schema(r#"{"name": {"type": "string"}}"#),
+        )],
+        "env" => vec![tool_def(
+            "env_probe",
+            "Reports the LOOM_WORKSPACE environment variable.",
+            text_schema("{}"),
         )],
         _ => vec![],
     }
@@ -288,6 +398,27 @@ fn bad_command_degrades_to_zero_tools() {
     .unwrap();
     let names: Vec<String> = attach(&dir).into_iter().map(|(n, _)| n).collect();
     assert!(names.is_empty());
+}
+
+#[test]
+fn spawned_servers_receive_workspace_env() {
+    let dir = workspace("workspace-env");
+    manifest(&dir, "env", "always_load = [\"env_probe\"]\n");
+
+    let rt = build_runtime();
+    let attachment = rt.block_on(mcp::attach_mcp(&dir, ToolBudgets::default()));
+    let tool = find_tool(&attachment.tools, "mcp_mock_env_probe");
+    let out = rt
+        .block_on(tool.call(json!({}), &context(&dir)))
+        .expect("env probe callable");
+    // The child sees the canonicalized workspace root (LOOM_WORKSPACE).
+    let canon = std::fs::canonicalize(&dir).unwrap();
+    assert!(
+        out.content.contains(canon.to_str().unwrap()),
+        "{}",
+        out.content
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -552,4 +683,79 @@ fn server_errors_surface_as_execution_errors() {
     let greet = combined.get("mcp_mock_greet").expect("greet registered");
     let failed = rt.block_on(greet.call(json!({"name": "loom"}), &context(&dir)));
     assert!(failed.is_err());
+}
+
+// ------------------------------------------- remote servers via proxy ----
+// The design-pinned shape for reaching remote MCP servers: the manifest
+// declares a *local proxy command* (sandboxed like any other server);
+// the proxy bridges loom's stdio JSON-RPC to the real remote endpoint.
+// `remote` mode stands for the far server (plain TCP on localhost, no
+// sandbox — it is test infrastructure, not the thing under test).
+
+fn spawn_remote_mock() -> (std::process::Child, u16) {
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "mcp_mock_server",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("LOOM_MCP_MOCK_MODE", "remote")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut port = None;
+    let stdout = child.stdout.as_mut().unwrap();
+    for line in std::io::BufReader::new(stdout).lines() {
+        let line = line.unwrap();
+        // libtest progress lines share stdout; take the first line that
+        // parses as a bare port number.
+        if let Ok(parsed) = line.trim().parse::<u16>() {
+            port = Some(parsed);
+            break;
+        }
+    }
+    (child, port.expect("remote mock printed its port"))
+}
+
+fn proxy_manifest(dir: &Path, port: u16, network: bool) {
+    let toml = format!(
+        "[servers.mock]\ncommand = {}\nenv = {{ LOOM_MCP_MOCK_MODE = \"proxy\", LOOM_MCP_MOCK_PORT = \"{port}\" }}\n{}\nalways_load = [\"far_greet\"]\n",
+        mock_command(),
+        if network { "network = true" } else { "" },
+    );
+    std::fs::write(dir.join(".loom/mcp.toml"), toml).unwrap();
+}
+
+#[test]
+fn proxy_command_reaches_remote_server_with_network_grant() {
+    let (mut remote, port) = spawn_remote_mock();
+    let dir = workspace("proxy-net");
+    proxy_manifest(&dir, port, true);
+    let rt = build_runtime();
+    let attachment = rt.block_on(mcp::attach_mcp(&dir, ToolBudgets::default()));
+    let tool = find_tool(&attachment.tools, "mcp_mock_far_greet");
+    let out = rt
+        .block_on(tool.call(json!({"name": "loom"}), &context(&dir)))
+        .expect("call routed through the proxy");
+    assert!(
+        out.content.contains("far-server saw far_greet"),
+        "{}",
+        out.content
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = remote.kill();
+    let _ = remote.wait();
+}
+
+#[test]
+fn proxy_command_without_network_grant_fails_closed() {
+    let (mut remote, port) = spawn_remote_mock();
+    let dir = workspace("proxy-nonet");
+    proxy_manifest(&dir, port, false);
+    let names: Vec<String> = attach(&dir).into_iter().map(|(n, _)| n).collect();
+    assert!(names.is_empty(), "{names:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = remote.kill();
+    let _ = remote.wait();
 }

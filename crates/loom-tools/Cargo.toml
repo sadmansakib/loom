@@ -42,7 +42,7 @@ tower = { workspace = true }
 # CancellationToken in the search walk (per-file cancellation check);
 # `compat` adapts the LSP server child's stdin/stdout to async-lsp's
 # futures-io framed transport
-tokio-util = { workspace = true, features = ["compat"] }
+tokio-util = { workspace = true, features = ["compat", "codec"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

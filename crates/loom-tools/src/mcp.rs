@@ -39,7 +39,7 @@ use loom_kernel::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, oneshot};
 
@@ -53,8 +53,17 @@ pub const MANIFEST_RELATIVE_PATH: &str = ".loom/mcp.toml";
 pub const LOCK_RELATIVE_PATH: &str = ".loom/mcp.lock";
 
 /// Protocol version loom speaks at handshake. The server's negotiated
-/// reply is accepted as-is; loom only exercises `tools/*`.
+/// reply must match exactly or attach fails closed (spec: a client that
+/// does not support the negotiated version SHOULD disconnect).
 const PROTOCOL_VERSION: &str = "2025-06-18";
+/// Cap on one server stdout line (bytes). The codec discards oversized
+/// lines whole and keeps reading — a server that never emits a newline
+/// cannot grow reader memory without bound (broken/malicious DoS bound).
+const LINE_MAX_BYTES: usize = 1024 * 1024;
+/// Pages of `tools/list` fetched before the pagination cap warning fires.
+const LIST_MAX_PAGES: usize = 10;
+/// Tail of server stderr retained for diagnostics.
+const STDERR_TAIL_BYTES: usize = 8 * 1024;
 /// Cap on a sanitized tool description (chars).
 const DESC_MAX_CHARS: usize = 512;
 /// Cap on a tool's compact input schema (bytes). Over the cap the tool is
@@ -163,23 +172,9 @@ impl McpManifest {
 /// Whether a character is stripped from server-provided text: C0/C1
 /// control characters and the format (invisible) characters used to hide
 /// instructions or exfiltration channels — zero-width, bidi, BOM, soft
-/// hyphen (Invariant Labs' tool-poisoning vectors).
-fn is_invisible(c: char) -> bool {
-    if c.is_control() {
-        return true;
-    }
-    matches!(
-        c,
-        '\u{00AD}'       // soft hyphen
-        | '\u{061C}'     // arabic letter mark
-        | '\u{180E}'     // mongolian vowel separator
-        | '\u{200B}'..='\u{200F}' // zero-width space..right-to-left mark
-        | '\u{202A}'..='\u{202E}' // bidi embedding..pop directional
-        | '\u{2060}'..='\u{2064}' // word joiner, invisible operators
-        | '\u{2066}'..='\u{2069}' // isolated bidi overrides
-        | '\u{FEFF}'     // zero-width no-break space (BOM)
-    )
-}
+/// hyphen (Invariant Labs' tool-poisoning vectors). Shared with the
+/// result-channel stripper in [`crate::hygiene`].
+use crate::hygiene::is_invisible;
 
 /// Strips invisible characters and collapses whitespace runs to single
 /// spaces — the deterministic normal form all ingest checks run against.
@@ -338,6 +333,9 @@ pub struct McpServerProcess {
     stdin: Arc<Mutex<ChildStdin>>,
     pending: Arc<Pending>,
     next_id: AtomicU64,
+    /// Last `STDERR_TAIL_BYTES` of server stderr, retained for
+    /// diagnostics (`stderr_tail`); stderr never reaches the model.
+    stderr_tail: Arc<std::sync::Mutex<Vec<u8>>>,
     /// Set when the server emits `notifications/tools/list_changed`.
     /// D1 never acts on it mid-session (definitions are pinned); D2
     /// re-verifies against the lockfile.
@@ -363,12 +361,21 @@ impl McpServerProcess {
             .envs(&decl.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         // argv[0] resolution happens inside the child; without a PATH the
         // common `npx`/`node`/`uvx` argv forms cannot resolve at all.
         if let Ok(path) = std::env::var("PATH") {
             command.env("PATH", path);
+        }
+        // The workspace root, so proxy commands (remote-MCP relays) can
+        // resolve workspace-relative paths without hardcoding. Mirrors
+        // Claude Code's `CLAUDE_PROJECT_DIR` for stdio servers; a
+        // manifest `env` entry for the same name wins.
+        if !decl.env.contains_key("LOOM_WORKSPACE") {
+            let workspace_abs =
+                std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+            command.env("LOOM_WORKSPACE", workspace_abs);
         }
         let mut child = command.spawn().map_err(|error| McpError::Server {
             server: name.to_owned(),
@@ -382,28 +389,106 @@ impl McpServerProcess {
             server: name.to_owned(),
             message: "child stdout was not piped".to_owned(),
         })?;
+        let stderr = child.stderr.take().ok_or_else(|| McpError::Server {
+            server: name.to_owned(),
+            message: "child stderr was not piped".to_owned(),
+        })?;
 
+        // Stderr ring buffer (diagnostics only): the tail survives for
+        // `stderr_tail()` without letting a chatty server grow memory.
+        let stderr_tail: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
+        let ring = Arc::clone(&stderr_tail);
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut chunk = [0u8; 1024];
+            loop {
+                match reader.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if let Ok(mut tail) = ring.lock() {
+                            tail.extend_from_slice(&chunk[..n]);
+                            let len = tail.len();
+                            if len > STDERR_TAIL_BYTES {
+                                tail.drain(..len - STDERR_TAIL_BYTES);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let stdin: Arc<Mutex<ChildStdin>> = Arc::new(Mutex::new(stdin));
         let pending: Arc<Pending> = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
         let list_changed = Arc::new(AtomicBool::new(false));
         let reader_pending = Arc::clone(&pending);
         let reader_changed = Arc::clone(&list_changed);
+        let reader_stdin = Arc::clone(&stdin);
+        let server_name = name.to_owned();
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            // Bounded line framing: oversized lines are discarded whole
+            // (the codec resynchronizes at the next newline) instead of
+            // buffering unbounded bytes.
+            let mut framed = tokio_util::codec::FramedRead::new(
+                stdout,
+                tokio_util::codec::LinesCodec::new_with_max_length(LINE_MAX_BYTES),
+            );
+            while let Some(item) = futures::StreamExt::next(&mut framed).await {
+                let line = match item {
+                    Ok(line) => line,
+                    Err(_) => {
+                        tracing::warn!(
+                            server = %server_name,
+                            "MCP server emitted a line over the size cap; discarded"
+                        );
+                        continue;
+                    }
+                };
                 // Non-JSON lines (harness noise, logs) are skipped.
                 let Ok(value) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
-                if let Some(id) = value.get("id").and_then(Value::as_u64) {
-                    if let Ok(mut map) = reader_pending.lock()
-                        && let Some(sender) = map.remove(&id)
-                    {
-                        let _ = sender.send(Ok(value));
+                // Classify by `method` first: a server-initiated request
+                // carries BOTH `id` and `method`, and routing on `id`
+                // first would misdeliver it to a pending client request
+                // that happens to hold the same numeric id.
+                match value.get("method").and_then(Value::as_str) {
+                    Some(method) => {
+                        if let Some(id) = value.get("id").cloned() {
+                            // loom answers only the spec-required `ping`;
+                            // everything else (sampling, elicitation,
+                            // roots) is refused — those capabilities are
+                            // never declared, so a spec-compliant server
+                            // never calls them in the first place.
+                            let response = if method == "ping" {
+                                serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "result": {},
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "error": {
+                                        "code": -32601,
+                                        "message": format!("loom does not implement '{method}'"),
+                                    },
+                                })
+                            };
+                            let _ = write_raw(&reader_stdin, &response).await;
+                        } else if method == "notifications/tools/list_changed" {
+                            reader_changed.store(true, Ordering::Relaxed);
+                        }
+                        // Other notifications are ignored.
                     }
-                } else if value.get("method").and_then(Value::as_str)
-                    == Some("notifications/tools/list_changed")
-                {
-                    reader_changed.store(true, Ordering::Relaxed);
+                    None => {
+                        if let Some(id) = value.get("id").and_then(Value::as_u64)
+                            && let Ok(mut map) = reader_pending.lock()
+                            && let Some(sender) = map.remove(&id)
+                        {
+                            let _ = sender.send(Ok(value));
+                        }
+                    }
                 }
             }
             // EOF: fail every outstanding request so callers wake.
@@ -418,33 +503,46 @@ impl McpServerProcess {
         Ok(Self {
             name: name.to_owned(),
             child,
-            stdin: Arc::new(Mutex::new(stdin)),
+            stdin,
             pending,
             next_id: AtomicU64::new(1),
+            stderr_tail,
             list_changed,
         })
     }
 
     async fn write_line(&self, value: &Value) -> Result<(), McpError> {
-        let mut line = serde_json::to_string(value).map_err(|error| McpError::Server {
-            server: self.name.clone(),
-            message: format!("cannot encode request: {error}"),
-        })?;
-        line.push('\n');
-        let mut stdin = self.stdin.lock().await;
-        stdin
-            .write_all(line.as_bytes())
+        write_raw(&self.stdin, value)
             .await
             .map_err(|error| McpError::Server {
                 server: self.name.clone(),
                 message: format!("cannot write to server stdin: {error}"),
-            })?;
-        stdin.flush().await.map_err(|error| McpError::Server {
-            server: self.name.clone(),
-            message: format!("cannot write to server stdin: {error}"),
-        })
+            })
     }
 
+    /// Last `STDERR_TAIL_BYTES` of server stderr (lossy UTF-8),
+    /// diagnostics only — never surfaced to the model.
+    pub fn stderr_tail(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .map(|tail| String::from_utf8_lossy(&tail).into_owned())
+            .unwrap_or_default()
+    }
+}
+
+/// Writes one JSON-RPC line to a shared server stdin. Used by both
+/// [`McpServerProcess::write_line`] and the reader task (which answers
+/// server-initiated requests without owning the process handle).
+async fn write_raw(stdin: &Mutex<ChildStdin>, value: &Value) -> std::io::Result<()> {
+    let mut line =
+        serde_json::to_string(value).map_err(|error| std::io::Error::other(error.to_string()))?;
+    line.push('\n');
+    let mut guard = stdin.lock().await;
+    guard.write_all(line.as_bytes()).await?;
+    guard.flush().await
+}
+
+impl McpServerProcess {
     /// Sends one request and awaits its response.
     async fn request(
         &self,
@@ -483,6 +581,16 @@ impl McpServerProcess {
                 if let Ok(mut map) = self.pending.lock() {
                     map.remove(&id);
                 }
+                // The request is abandoned; tell the server to stop
+                // spending on it (spec: `notifications/cancelled`).
+                // Best effort — a dead stdin is not a second error.
+                let _ = self
+                    .write_line(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/cancelled",
+                        "params": {"id": id},
+                    }))
+                    .await;
                 Err(McpError::Server {
                     server: self.name.clone(),
                     message: format!("request '{method}' timed out or lost its reader"),
@@ -492,20 +600,36 @@ impl McpServerProcess {
     }
 
     /// The initialize handshake plus the `initialized` notification.
+    /// The server's negotiated `protocolVersion` must match exactly —
+    /// spec says a client that does not support the negotiated version
+    /// SHOULD disconnect, and loom only exercises `tools/*` on
+    /// 2025-06-18, so anything else fails the attach closed.
     pub async fn handshake(&self) -> Result<(), McpError> {
-        self.request(
-            "initialize",
-            serde_json::json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "loom",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-            }),
-            HANDSHAKE_TIMEOUT,
-        )
-        .await?;
+        let result = self
+            .request(
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "loom",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                }),
+                HANDSHAKE_TIMEOUT,
+            )
+            .await?;
+        let negotiated = result.get("protocolVersion").and_then(Value::as_str);
+        if negotiated != Some(PROTOCOL_VERSION) {
+            return Err(McpError::Server {
+                server: self.name.clone(),
+                message: format!(
+                    "server negotiated protocol version {} but loom speaks \
+                     {PROTOCOL_VERSION}; refusing attach",
+                    negotiated.unwrap_or("<missing>")
+                ),
+            });
+        }
         self.write_line(&serde_json::json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized",
@@ -519,7 +643,7 @@ impl McpServerProcess {
         let mut cursor: Option<Value> = None;
         // Bounded pagination: a server that loops on nextCursor is a bug,
         // not a reason to hang attach.
-        for _ in 0..10 {
+        for _ in 0..LIST_MAX_PAGES {
             let mut params = serde_json::json!({});
             if let Some(ref c) = cursor {
                 params["cursor"] = c.clone();
@@ -551,6 +675,15 @@ impl McpServerProcess {
             if cursor.is_none() {
                 break;
             }
+        }
+        if cursor.is_some() {
+            // Loud, not silent: tools beyond the page cap are invisible
+            // to the session, and the operator should know.
+            tracing::warn!(
+                server = %self.name,
+                pages = LIST_MAX_PAGES,
+                "tools/list pagination cap reached; further pages ignored"
+            );
         }
         Ok(tools)
     }
@@ -612,6 +745,16 @@ fn render_content(result: &Value) -> String {
             }
         }
     }
+    if parts.is_empty()
+        && let Some(structured) = result.get("structuredContent")
+        && !structured.is_null()
+        && let Ok(text) = serde_json::to_string_pretty(structured)
+    {
+        // 2025-06-18 structured results: when the content array carried
+        // nothing renderable, fall back to the structured payload as
+        // JSON text so the tool result is never silently empty.
+        parts.push(text);
+    }
     parts.join("\n")
 }
 
@@ -667,7 +810,10 @@ impl Tool for McpTool {
                 .call(&remote_name, &input, timeout)
                 .await
                 .map_err(|error| ToolError::Execution(error.to_string()))?;
-            let text = format!("[mcp:{server}]\n{}", render_content(&result));
+            let text = format!(
+                "[mcp:{server}]\n{}",
+                crate::hygiene::strip_invisible(&render_content(&result))
+            );
             let (head, _cut) = head_only(&text, RESULT_HEAD_BYTES);
             if result.get("isError").and_then(Value::as_bool) == Some(true) {
                 return Err(ToolError::Execution(head));
@@ -740,21 +886,41 @@ pub async fn attach_mcp(workspace: &Path, budgets: crate::budget::ToolBudgets) -
     let mut eager: Vec<Surviving> = Vec::new();
     let mut deferred: Vec<McpCatalogEntry> = Vec::new();
 
-    for (name, decl) in &manifest.servers {
-        match attach_server(
+    // Fetch phase (spawn, handshake, tools/list) runs concurrently so one
+    // slow server cannot serialize attach behind its full handshake
+    // timeout. Hygiene and pinning stay serial in manifest order so
+    // lockfile writes stay deterministic.
+    let fetched =
+        futures::future::join_all(manifest.servers.iter().map(|(name, decl)| async move {
+            let pair = match fetch_server(name, decl, workspace).await {
+                Ok(pair) => Some(pair),
+                Err(error) => {
+                    tracing::warn!(%error, "MCP server failed to attach");
+                    None
+                }
+            };
+            (name, decl, pair)
+        }))
+        .await;
+
+    for (name, decl, pair) in fetched {
+        let Some((process, raw_tools)) = pair else {
+            continue;
+        };
+        if let Err(error) = ingest_server(
             name,
             decl,
-            workspace,
             &server_names,
             &mut lock,
             &mut lock_dirty,
             &mut eager,
             &mut deferred,
+            process,
+            raw_tools,
         )
         .await
         {
-            Ok(()) => {}
-            Err(error) => tracing::warn!(%error, "MCP server failed to attach"),
+            tracing::warn!(%error, "MCP server failed to attach");
         }
     }
 
@@ -796,24 +962,34 @@ pub async fn attach_mcp(workspace: &Path, budgets: crate::budget::ToolBudgets) -
     }
 }
 
-/// Ingests one server. Errors abort that server's tools only; admitted
-/// tools split into `eager` (`always_load` pins) and `deferred` (catalog).
-#[allow(clippy::too_many_arguments)]
-async fn attach_server(
+/// Spawns one server and fetches its raw tool list. Errors abort that
+/// server only (the process handle drops, and `kill_on_drop` reaps it).
+async fn fetch_server(
     name: &str,
     decl: &McpServerDecl,
     workspace: &Path,
+) -> Result<(Arc<McpServerProcess>, Vec<RawTool>), McpError> {
+    let process = Arc::new(McpServerProcess::spawn(name, decl, workspace)?);
+    process.handshake().await?;
+    let raw_tools = process.tools().await?;
+    Ok((process, raw_tools))
+}
+
+/// Ingests one server's advertisement. Errors abort that server's tools
+/// only; admitted tools split into `eager` (`always_load` pins) and
+/// `deferred` (catalog).
+#[allow(clippy::too_many_arguments)]
+async fn ingest_server(
+    name: &str,
+    decl: &McpServerDecl,
     server_names: &[String],
     lock: &mut McpLock,
     lock_dirty: &mut bool,
     eager: &mut Vec<Surviving>,
     deferred: &mut Vec<McpCatalogEntry>,
+    process: Arc<McpServerProcess>,
+    raw_tools: Vec<RawTool>,
 ) -> Result<(), McpError> {
-    let process = McpServerProcess::spawn(name, decl, workspace)?;
-    let process = Arc::new(process);
-    process.handshake().await?;
-    let raw_tools = process.tools().await?;
-
     let deny: Vec<regex::Regex> = decl
         .policy
         .deny
