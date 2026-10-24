@@ -18,7 +18,10 @@ Design goal: **maximum successful work per model invocation with minimum
 context and turns.**
 
 Measured: **90/100 resolved** on a frozen 100-instance SWE-bench Verified
-sweep (official testbeds + official scorer, `deepseek-flash`, prompt v3).
+subset (first 20 dataset rows of astropy/django/scikit-learn/sphinx/sympy;
+official testbeds + official scorer, `deepseek-flash`, prompt v3, N=1).
+Not comparable to full-500 published numbers — smaller, five-repo mix;
+see docs/eval.md.
 
 ## Principles
 

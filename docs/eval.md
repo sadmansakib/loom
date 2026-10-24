@@ -169,3 +169,11 @@ no local gate can be tuned to flatter the number.
 - A run killed by the wall clock still has its patch extracted and
   scored — a timeout is an honest outcome, not a hole in the sample.
 - Baselines go in `CHANGELOG.md` with the sweep JSON alongside.
+- One headline, one binary: a sweep's batches must run the same engine
+  build, and the sweep JSON plus its official scorer report stay in the
+  eval dir (or the repo) for as long as the number is quoted — a
+  headline reconstructible only from prose is not a baseline.
+- Subset composition travels with the number: repo list, dataset rows,
+  runs-per-instance, and model are part of the claim, not footnote
+  material — a 100-of-500 five-repo subset must not read as a full-set
+  score.
