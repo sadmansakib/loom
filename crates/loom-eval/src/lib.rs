@@ -21,4 +21,5 @@
 //! Everything in the library is offline-testable except the two
 //! network edges (dataset fetch, docker), which the binary owns.
 
+pub mod selfopt;
 pub mod swebench;

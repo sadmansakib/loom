@@ -153,12 +153,15 @@ fn the_edge_cases_depend_on_the_facade_alone() {
     // public surface a real embedder would.
     assert_no_workspace_deps("loom-cli", &["loom-core"]);
     assert_still_wired("loom-cli", &["loom-core"]);
-    // `loom-eval` no longer embeds the engine at all: since the local suite
-    // was removed (2026-10-20) it orchestrates SWE-bench containers and
-    // shells out to `docker` and the `loom` CLI, so it must stay free of
-    // workspace dependencies entirely — the facade rule holds vacuously,
-    // and any future re-embedding has to arrive through `loom-core`.
-    assert_no_workspace_deps("loom-eval", &[]);
+    // `loom-eval` orchestrates SWE-bench containers and shells out to
+    // `docker` and the `loom` CLI. Its one in-process embed — the
+    // self-optimization model proposer (selfopt, 2026-10-25) — arrived
+    // through the facade per this rule: the rolling `engine`/`kernel`
+    // aliases give it `one_shot_provider` and the request types, so an
+    // arm still passes against the same public surface every other
+    // embedder uses.
+    assert_no_workspace_deps("loom-eval", &["loom-core"]);
+    assert_still_wired("loom-eval", &["loom-core"]);
 }
 
 /// The kernel's `unsafe_code = "forbid"` is the other half of "cannot leak by

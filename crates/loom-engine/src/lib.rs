@@ -52,7 +52,10 @@ pub use estimate::{
     ANTHROPIC_TOKEN_SCALE_PER_MILLE, AnthropicEstimator, O200kEstimator, estimator_for,
 };
 pub use loom_kernel::agent::TaskControl;
-pub use scout::{ANSWER_BUDGET_BYTES, ScoutConfig, ScoutTool};
+pub use scout::{ANSWER_BUDGET_BYTES, ScoutConfig, ScoutEscalation, ScoutTool};
 // The provider/effort types a frontend must name to build an `EngineConfig`;
 // re-exported so a frontend never depends on the provider crate directly.
 pub use loom_providers::{ProviderCatalog, ReasoningEffort};
+// Provider construction for frontends and the eval harness's one-shot
+// proposal calls (loom-eval `selfopt`); see `provider::one_shot_provider`.
+pub use provider::{ProviderHandle, build, one_shot_provider};

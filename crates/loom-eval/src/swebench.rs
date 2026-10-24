@@ -414,13 +414,47 @@ pub struct ContainerSpec<'a> {
     /// container script itself stays byte-identical — the env var is
     /// consumed by the loom binary, like `LOOM_SKIP_SANDBOX_PREFLIGHT`.
     pub bare: bool,
+    /// Additional `LOOM_*` environment overlay for the in-container
+    /// engine (roadmap item 20.3, the self-optimization loop's probes).
+    ///
+    /// Each pair is forwarded as `-e K=V` after the fixed env above and
+    /// before the volumes; the container script stays byte-identical —
+    /// the in-container engine applies these through the same
+    /// `LOOM_*` override seams (`budgets_with_env`, `prune_with_env`)
+    /// that a shell user would set. Names colliding with the fixed set
+    /// ([`RESERVED_CONTAINER_ENV`]) are a bug in the caller and panic
+    /// here rather than silently shadowing the run's own provider or
+    /// budget.
+    pub extra_env: &'a [(String, String)],
     /// Unique container name (`--name`), e.g. `loom-<slug>-run1`.
     pub container_name: &'a str,
 }
 
+/// Env names `ContainerSpec` already owns; [`ContainerSpec::extra_env`]
+/// entries with these names panic in [`docker_run_argv`].
+pub const RESERVED_CONTAINER_ENV: [&str; 7] = [
+    "LOOM_PROVIDER",
+    "LOOM_MODEL",
+    "LOOM_BASE_URL",
+    "LOOM_BARE",
+    "LOOM_SKIP_SANDBOX_PREFLIGHT",
+    "LOOM_TIMEOUT_SECS",
+    "LOOM_MAX_TURNS",
+];
+
 /// Assembles the `docker run` argv for one container run. Pure argv —
 /// no host shell — so paths and values survive verbatim.
 pub fn docker_run_argv(spec: &ContainerSpec<'_>) -> Vec<String> {
+    for (name, _) in spec.extra_env {
+        assert!(
+            !RESERVED_CONTAINER_ENV.contains(&name.as_str()),
+            "extra_env collides with a fixed container env var: {name}"
+        );
+        assert!(
+            name != spec.api_key_env,
+            "extra_env collides with the API key env var: {name}"
+        );
+    }
     let loom_mount = format!("{}:/loom/loom:ro", spec.loom_binary.display());
     let prompt_mount = format!("{}:/prompt.txt:ro", spec.prompt_file.display());
     let out_mount = format!("{}:/out", spec.out_dir.display());
@@ -441,6 +475,9 @@ pub fn docker_run_argv(spec: &ContainerSpec<'_>) -> Vec<String> {
     }
     if spec.bare {
         argv.extend(["-e".into(), "LOOM_BARE=1".into()]);
+    }
+    for (name, value) in spec.extra_env {
+        argv.extend(["-e".into(), format!("{name}={value}")]);
     }
     argv.extend([
         "-e".into(),
@@ -572,7 +609,7 @@ pub fn scorer_outcomes(report_json: &Path) -> std::io::Result<Vec<(String, bool)
 /// stays `None` until some event reports a cache split, so a provider
 /// that never reports one is visibly unmeasured rather than reading as
 /// a misleading 0% hit rate.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunUsage {
     /// Summed prompt tokens across model requests.
     pub input_tokens: u64,
@@ -882,6 +919,7 @@ fn docker_argv_mounts_and_env_without_a_shell() {
         timeout_secs: 3600,
         max_turns: 60,
         bare: false,
+        extra_env: &[],
         container_name: "loom-org-one-1-run1",
     };
     let argv = docker_run_argv(&spec);
@@ -949,6 +987,54 @@ fn docker_argv_mounts_and_env_without_a_shell() {
     let joined = argv.join("\n");
     assert!(joined.contains("-e\nLOOM_BARE=1\n"));
     assert!(!CONTAINER_SCRIPT.contains("LOOM_BARE"));
+
+    // The self-optimization overlay (roadmap item 20.3): forwarded after
+    // the fixed env, and the frozen script still stays byte-identical —
+    // the in-container engine consumes the knobs.
+    let overlay = vec![
+        ("LOOM_PRUNE_TRIGGER_PERCENT".to_owned(), "70".to_owned()),
+        ("LOOM_READ_HEAD_BYTES".to_owned(), "32768".to_owned()),
+    ];
+    let overlaid = ContainerSpec {
+        extra_env: &overlay,
+        container_name: "loom-org-one-1-selfopt-p1",
+        ..bare_arm
+    };
+    let argv = docker_run_argv(&overlaid);
+    let script_pos = argv.iter().position(|arg| arg == "-c").unwrap();
+    assert_eq!(argv[script_pos + 1], CONTAINER_SCRIPT);
+    let joined = argv.join("\n");
+    let overlay_pos = joined
+        .find("-e\nLOOM_PRUNE_TRIGGER_PERCENT=70\n-e\nLOOM_READ_HEAD_BYTES=32768")
+        .expect("overlay forwarded in order");
+    let fixed_pos = joined
+        .find("-e\nLOOM_TIMEOUT_SECS=3600")
+        .expect("fixed env present");
+    assert!(
+        overlay_pos > joined.find("-e\nLOOM_BARE=1").unwrap(),
+        "overlay comes after the fixed env"
+    );
+    assert!(
+        overlay_pos < joined.find("-v\n/eval/loom-linux/loom").unwrap(),
+        "overlay comes before the volumes"
+    );
+    let _ = fixed_pos;
+
+    // Reserved names are caller bugs: shadowing the run's own provider,
+    // budget, or key would corrupt the probe silently.
+    for reserved in RESERVED_CONTAINER_ENV {
+        let collision = ContainerSpec {
+            extra_env: &[(reserved.to_owned(), "1".to_owned())],
+            ..overlaid
+        };
+        let result = std::panic::catch_unwind(|| docker_run_argv(&collision));
+        assert!(result.is_err(), "reserved name must panic: {reserved}");
+    }
+    let key_collision = ContainerSpec {
+        extra_env: &[("CUSTOM_API_KEY".to_owned(), "x".to_owned())],
+        ..overlaid
+    };
+    assert!(std::panic::catch_unwind(|| docker_run_argv(&key_collision)).is_err());
 }
 
 #[test]

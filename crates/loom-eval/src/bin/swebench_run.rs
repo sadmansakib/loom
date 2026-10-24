@@ -431,6 +431,7 @@ fn main() {
                     timeout_secs: args.timeout_secs,
                     max_turns: args.max_turns,
                     bare: args.arm == "bare",
+                    extra_env: &[],
                     container_name: &container_name,
                 };
                 println!("run {slug} #{run} (attempt {attempt}) in {image}…");

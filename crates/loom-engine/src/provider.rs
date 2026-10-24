@@ -76,7 +76,7 @@ pub(crate) fn resolution_source(
 
 /// A constructed provider plus the capabilities resolved for the
 /// configured model.
-pub(crate) struct ProviderHandle {
+pub struct ProviderHandle {
     /// The adapter, ready to stream.
     pub provider: Box<dyn ModelProvider>,
     /// Capabilities for [`EngineConfig::model`], already validated
@@ -97,7 +97,7 @@ impl std::fmt::Debug for ProviderHandle {
 ///
 /// `api_key` is the resolved credential; the provider wraps it
 /// immediately, so it never travels further in the clear.
-pub(crate) fn build(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, EngineError> {
+pub fn build(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, EngineError> {
     match config.provider.as_str() {
         DEEPSEEK_PROVIDER_NAME => build_deepseek(config, api_key),
         ANTHROPIC_PROVIDER_NAME => build_anthropic(config, api_key),
@@ -316,6 +316,52 @@ fn unknown_model(config: &EngineConfig) -> EngineError {
         provider: config.provider.clone(),
         model: config.model.clone(),
     }
+}
+
+/// Builds a provider for a one-shot model call outside the engine.
+///
+/// The eval harness's self-optimization loop (roadmap item 20.3,
+/// `loom-eval`'s `selfopt` module) needs exactly one thing from this
+/// crate: a validated adapter to send a single proposal prompt through.
+/// It has no workspace, no session, no tools — so this helper fills a
+/// minimal [`EngineConfig`] (no catalog, no persistence, a throwaway
+/// database path) and routes through the same [`build`] every frontend
+/// uses, inheriting all setup-time validation: unknown provider, unknown
+/// model, reasoning requirements, and the context-window floor.
+///
+/// Catalog-driven adapters (`openrouter`, `custom`) are rejected with
+/// [`EngineError::CatalogMissing`] — they cannot resolve capabilities
+/// from data this helper does not take. Table-driven adapters
+/// (`deepseek`, `anthropic`, `glm`, `nvidia`, `groq`) work as-is.
+pub fn one_shot_provider(
+    provider: &str,
+    model: &str,
+    base_url: Option<&str>,
+    api_key: &str,
+) -> Result<ProviderHandle, EngineError> {
+    let config = EngineConfig {
+        provider: provider.to_owned(),
+        model: model.to_owned(),
+        base_url: base_url.map(str::to_owned),
+        models_url: None,
+        reasoning_effort: loom_providers::ReasoningEffort::default(),
+        account: None,
+        workspace: std::env::temp_dir().join("loom-one-shot"),
+        system_prompt: None,
+        max_turns: 1,
+        db_path: std::env::temp_dir().join("loom-one-shot").join("loom.db"),
+        persist: false,
+        catalog: None,
+        scout: None,
+        symbols: false,
+        git: false,
+        skills: false,
+        mcp: false,
+        lsp: false,
+        budgets: loom_tools::ToolBudgets::default(),
+        prune: None,
+    };
+    build(&config, api_key)
 }
 
 /// Rejects models below the pruning floor ([`MIN_CONTEXT_TOKENS`]).

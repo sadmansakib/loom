@@ -14,6 +14,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # runtime for the dataset fetch inside the swebench-run binary.
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
+# provider construction for the self-optimization loop's model
+# proposer (selfopt): the same validated adapter path every frontend
+# uses, via the facade's rolling `engine` alias (`one_shot_provider`);
+# kernel names the request types that call sends, futures drives its
+# stream. ADR-021: edge crates re-embed through `loom-core` alone.
+loom-core = { workspace = true }
+futures = { workspace = true }
 
 [lints]
 workspace = true
@@ -25,3 +32,7 @@ path = "src/bin/swebench_run.rs"
 [[bin]]
 name = "swebench-contrast"
 path = "src/bin/swebench_contrast.rs"
+
+[[bin]]
+name = "selfopt"
+path = "src/bin/selfopt.rs"
