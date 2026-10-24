@@ -21,6 +21,12 @@
 //!    `cargo metadata --no-deps --offline` for dependency updates (the
 //!    manifest-class edit: parse-validity is what a no-network sandbox
 //!    can prove; lock regeneration and builds stay with the loop).
+//!    Dependency updates stay Cargo-only: no other ecosystem has an
+//!    offline manifest-only verifier (npm's `--package-lock-only
+//!    --offline` still resolves against the registry or cache, `go
+//!    list -m` demands `go mod download`, and pip's resolvers always
+//!    consult an index — probed 2026-10-24), so those intents decline
+//!    to the agent loop instead of guessing.
 //!    Ecosystems without a deterministic workspace-local formatter
 //!    (npm, Python, Make) decline rather than guess.
 //!
@@ -1212,6 +1218,36 @@ mod tests {
         )
         .await;
         assert_eq!(attempt.decline, Some("intent-dependency-unsolved"));
+    }
+
+    #[tokio::test]
+    async fn npm_dependency_update_declines_to_the_agent_loop() {
+        // Only Cargo has an offline manifest-only verifier
+        // (`cargo metadata --no-deps --offline`). npm's lock-only mode
+        // still resolves against the registry or cache (probed
+        // 2026-10-24), so a package.json workspace must decline the
+        // dependency intent rather than guess.
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = base.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("dirs");
+        std::fs::write(
+            workspace.join("package.json"),
+            "{\"name\":\"fp_npm\",\"dependencies\":{\"lodash\":\"^4.17.20\"}}\n",
+        )
+        .expect("manifest");
+        let policy = CommandPolicy::cargo_only();
+
+        let attempt = try_fast_path(
+            &workspace,
+            "Update the dependency lodash to 4.17.21",
+            &policy,
+        )
+        .await;
+        assert_eq!(attempt.decline, Some("intent-dependency-unsolved"));
+        assert!(attempt.outcome.is_none());
+        // Nothing was touched: the manifest still pins the old range.
+        let text = std::fs::read_to_string(workspace.join("package.json")).expect("manifest");
+        assert!(text.contains("^4.17.20"));
     }
 
     #[test]
