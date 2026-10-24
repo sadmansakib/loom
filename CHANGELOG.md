@@ -3,6 +3,29 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-25 — Eval provenance: mixed-build sweeps are refused, not merely disclosed
+
+Follow-up to the honesty audit: the 90/100 headline's real failure mode
+(a sweep extended across two engine builds with nothing recording it)
+is now mechanically impossible going forward.
+
+- Every sweep report carries a `provenance` block: the sha256 of the
+  staged linux `loom` binary (hashed on the host — executing the linux
+  ELF there is impossible, and a byte digest is a stronger claim than
+  any version string), the digest of the frozen container script, the
+  prompt version (`PROMPT_VERSION`), and the runner's package version.
+  The binary digest is also dropped at `<eval-dir>/swebench/loom.sha256`.
+- `swebench-run` refuses to extend an eval dir whose recorded sweeps
+  ran a different build — the exact path that produced the mixed-build
+  v3-100 headline now exits with the two digests and the fix (fresh
+  eval dir) instead of silently mixing.
+- `swebench-contrast` refuses to contrast eval dirs that span engine
+  builds (a build-boundary contrast attributes harness changes to
+  chance); reports predating provenance warn loudly and pass.
+- Tests: sha256 FIPS vector, provenance hashing (digest changes when
+  the binary changes), mixed-build refusal, matching/legacy acceptance.
+  1108 workspace tests green.
+
 ## 2026-10-25 — Best-of-N worktree orchestration (`--best-of`); selfopt; remote MCP
 
 Roadmap item 21 (worktree isolation + merge path), item 20.3, and the

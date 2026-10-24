@@ -366,6 +366,46 @@ fn main() {
         .canonicalize()
         .unwrap_or_else(|error| panic!("{}: {error}", loom_bin.display()));
     let file_model = swebench::slug(&args.model);
+
+    // Honesty rule: one headline, one engine build. Hash the staged
+    // binary (the host cannot execute the linux ELF) and refuse to
+    // extend an eval dir whose recorded sweeps ran a different build —
+    // silently mixing builds into one number is how the v3-100
+    // headline spanned two binaries.
+    let provenance = swebench::sweep_provenance(&loom_bin)
+        .unwrap_or_else(|error| panic!("hashing {}: {error}", loom_bin.display()));
+    for entry in std::fs::read_dir(&base).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "json")
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("swebench-sweep-"))
+        {
+            let Ok(body) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(recorded) = serde_json::from_str::<serde_json::Value>(&body) else {
+                continue;
+            };
+            if let Some(digest) = swebench::recorded_loom_digest(&recorded)
+                && digest != provenance.loom_sha256
+            {
+                eprintln!(
+                    "refusing to run: {} records engine build {digest}, but the staged\n\
+                     binary is {} — a headline sweep must run one build.\n\
+                     Start a fresh --eval-dir (or remove the old sweeps) instead of\n\
+                     extending a mixed-build directory.",
+                    path.display(),
+                    provenance.loom_sha256
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+    let loom_digest_path = base.join("loom.sha256");
+    std::fs::write(&loom_digest_path, format!("{}\n", provenance.loom_sha256))
+        .unwrap_or_else(|error| panic!("{}: {error}", loom_digest_path.display()));
     // Owned rows (instance_id, model, patch): patches must outlive the
     // per-run scope they were collected in; borrowed `Prediction`s are
     // built from these at write time.
@@ -556,6 +596,13 @@ fn main() {
         "base_url": args.base_url,
         "arm": args.arm,
         "dataset": swebench::DATASET_ID,
+        "provenance": {
+            "loom_sha256": provenance.loom_sha256,
+            "loom_bytes": provenance.loom_bytes,
+            "container_script_sha256": provenance.container_script_sha256,
+            "prompt_version": provenance.prompt_version,
+            "runner_version": provenance.runner_version,
+        },
         "instances": report,
         "predictions_files": prediction_paths
             .iter()

@@ -21,6 +21,9 @@ tokio = { workspace = true, features = ["rt", "macros", "time"] }
 # stream. ADR-021: edge crates re-embed through `loom-core` alone.
 loom-core = { workspace = true }
 futures = { workspace = true }
+# binary-digest provenance for sweep reports (honesty rule: one
+# headline, one engine build — the digest is the check).
+sha2 = "0.10"
 
 [lints]
 workspace = true

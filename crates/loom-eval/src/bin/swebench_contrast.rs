@@ -115,6 +115,56 @@ fn metrics_for(dir: Option<&Path>, id: &str) -> Option<RunMetrics> {
 
 fn main() {
     let args = parse_args();
+    // Honesty rule: one headline, one engine build. The contrast is a
+    // build-vs-build claim; if both eval dirs record binary digests
+    // and any pair differs, the contrast would attribute harness
+    // changes across a build boundary — refuse. Legacy reports (no
+    // provenance) warn.
+    if let (Some(dir_a), Some(dir_b)) = (args.dir_a.as_deref(), args.dir_b.as_deref()) {
+        let digests = |dir: &Path| -> Vec<String> {
+            std::fs::read_dir(dir.join("swebench"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("swebench-sweep-"))
+                        && entry.path().extension().is_some_and(|e| e == "json")
+                })
+                .filter_map(|entry| {
+                    std::fs::read_to_string(entry.path())
+                        .ok()
+                        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+                        .and_then(|report| {
+                            loom_eval::swebench::recorded_loom_digest(&report).map(str::to_owned)
+                        })
+                })
+                .collect()
+        };
+        let (left, right) = (digests(dir_a), digests(dir_b));
+        if !left.is_empty() && !right.is_empty() {
+            for a in &left {
+                for b in &right {
+                    if a != b {
+                        eprintln!(
+                            "cannot contrast: sweep reports span two engine builds ({a} vs {b});\n\
+                             a headline number must come from one build — re-run the later\n\
+                             batch under a single binary before contrasting"
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+        } else if left.is_empty() || right.is_empty() {
+            eprintln!(
+                "warning: a sweep report predates build provenance; the contrast may span\n\
+                 engine builds (one headline, one build — docs/eval.md)"
+            );
+        }
+    }
     let a = match scorer_outcomes(&args.a) {
         Ok(a) => a,
         Err(error) => {

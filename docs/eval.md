@@ -144,7 +144,10 @@ Every sweep writes under `<eval-dir>/swebench/`:
   format; the scorer keys by `instance_id`, so repeated runs write
   per-run files and never duplicate rows;
 - `swebench-sweep-<model>.json` — per-instance runs, exit codes, patch
-  sizes, token usage, and the predictions-file inventory. Each row's
+  sizes, token usage, the predictions-file inventory, and a
+  `provenance` block: the sha256 of the staged linux `loom` binary
+  (also kept alongside as `loom.sha256`), the digest of the frozen
+  container script, the prompt version, and the runner's version. Each row's
   `usage` carries `input_tokens`, `cached_input_tokens`,
   `output_tokens`, `model_requests`, and `hit_rate` summed from the
   run's `model_completed` events (the deepseek adapter parses
@@ -172,7 +175,11 @@ no local gate can be tuned to flatter the number.
 - One headline, one binary: a sweep's batches must run the same engine
   build, and the sweep JSON plus its official scorer report stay in the
   eval dir (or the repo) for as long as the number is quoted — a
-  headline reconstructible only from prose is not a baseline.
+  headline reconstructible only from prose is not a baseline. The
+  harness enforces the first half mechanically: every sweep report
+  records the staged binary's sha256, `swebench-run` refuses to extend
+  an eval dir whose recorded sweeps ran a different build, and
+  `swebench-contrast` refuses to contrast across builds.
 - Subset composition travels with the number: repo list, dataset rows,
   runs-per-instance, and model are part of the claim, not footnote
   material — a 100-of-500 five-repo subset must not read as a full-set
