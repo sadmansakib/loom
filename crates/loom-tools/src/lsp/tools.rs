@@ -150,6 +150,10 @@ fn finish(server: &LspServer, mut body: String) -> Result<ToolOutput, ToolError>
     if body.is_empty() {
         body = "(no results)".to_string();
     }
+    // Server text is untrusted: strip the invisible-character class
+    // (zero-width, bidi, controls) before it enters the transcript.
+    // Layout survives — results are often code.
+    let body = crate::hygiene::strip_invisible(&body);
     let (shaped, cut) = head_only(&body, HEAD_BYTES);
     let mut out = ToolOutput::new(format!("[lsp:{}]\n{shaped}", server.name));
     if cut {
@@ -470,6 +474,7 @@ impl Tool for LspWorkspaceSymbolsTool {
             if body.is_empty() {
                 body = format!("(no results for {:?})", input.query);
             }
+            let body = crate::hygiene::strip_invisible(&body);
             let (shaped, cut) = head_only(&body, HEAD_BYTES);
             let mut out = ToolOutput::new(format!("[lsp:{}]\n{shaped}", inner.server_list()));
             if cut {
@@ -580,7 +585,16 @@ impl Tool for LspDiagnosticsTool {
                 .to_string_lossy()
                 .to_string();
             let pull_supported = server.capabilities.diagnostic_provider.is_some();
-            let diagnostics = if pull_supported {
+            // True when the served diagnostics predate the document
+            // version the server has been told about (push cache only).
+            let possibly_stale = |ver: Option<i32>| match ver {
+                Some(v) => match server.open_version(&cache_path) {
+                    Some(open) => open > v.max(0) as u32,
+                    None => false,
+                },
+                None => false,
+            };
+            let (diagnostics, stale) = if pull_supported {
                 let params = lsp_types::DocumentDiagnosticParams {
                     text_document: lsp_types::TextDocumentIdentifier {
                         uri: document_uri(&server, &input.path)?,
@@ -593,11 +607,17 @@ impl Tool for LspDiagnosticsTool {
                 match server.request::<DocumentDiagnosticRequest>(params).await {
                     Ok(lsp_types::DocumentDiagnosticReportResult::Report(
                         lsp_types::DocumentDiagnosticReport::Full(full),
-                    )) => full.full_document_diagnostic_report.items,
-                    Ok(_) => server.cached_diagnostics(&cache_path),
+                    )) => (full.full_document_diagnostic_report.items, false),
+                    Ok(_) => {
+                        let (d, v) = server.cached_diagnostics_versioned(&cache_path);
+                        let stale = possibly_stale(v);
+                        (d, stale)
+                    }
                     Err(e) => {
                         tracing::warn!(server = %server.name, "pull diagnostics failed: {e}");
-                        server.cached_diagnostics(&cache_path)
+                        let (d, v) = server.cached_diagnostics_versioned(&cache_path);
+                        let stale = possibly_stale(v);
+                        (d, stale)
                     }
                 }
             } else {
@@ -609,9 +629,10 @@ impl Tool for LspDiagnosticsTool {
                 const STEP_MS: u64 = 50;
                 let mut waited = 0;
                 loop {
-                    let cached = server.cached_diagnostics(&cache_path);
+                    let (cached, v) = server.cached_diagnostics_versioned(&cache_path);
+                    let stale = possibly_stale(v);
                     if !cached.is_empty() || waited >= BOUND_MS {
-                        break cached;
+                        break (cached, stale);
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(STEP_MS)).await;
                     waited += STEP_MS;
@@ -630,6 +651,9 @@ impl Tool for LspDiagnosticsTool {
                     render_position(d.range.start),
                     d.message.lines().next().unwrap_or("")
                 ));
+            }
+            if stale && !diagnostics.is_empty() {
+                body.push_str("(note: these diagnostics were published before the latest text version; possibly stale)\n");
             }
             finish(&server, body)
         })

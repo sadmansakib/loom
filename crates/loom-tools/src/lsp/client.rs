@@ -33,10 +33,15 @@ const INIT_TIMEOUT_SECS: u64 = 60;
 /// Wall-time cap for one LSP request.
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
+/// Push diagnostics cache entry: latest diagnostics plus the document
+/// version they were computed against (`None` when the server omitted
+/// it). The version drives the stale-diagnostics note.
+type VersionedDiagnostics = (Vec<lsp_types::Diagnostic>, Option<i32>);
+
 /// Shared per-server state, owned by the router and read by tools.
 pub(crate) struct ServerState {
-    /// Push diagnostics cache: file path key -> latest diagnostics.
-    pub diagnostics: Mutex<BTreeMap<String, Vec<lsp_types::Diagnostic>>>,
+    /// Push diagnostics cache: file path key -> [`VersionedDiagnostics`].
+    pub diagnostics: Mutex<BTreeMap<String, VersionedDiagnostics>>,
     /// Manifest-provided settings served to `workspace/configuration`.
     pub settings: serde_json::Value,
     /// Capabilities the server registered dynamically (recorded, unused).
@@ -57,6 +62,10 @@ pub struct LspServer {
     pub(crate) state: Arc<ServerState>,
     /// Open documents: workspace-relative-or-absolute path -> version.
     open_files: Mutex<BTreeMap<String, u32>>,
+    /// Serializes `ensure_open` across concurrent tool calls so two
+    /// first-time callers cannot both send `didOpen` for one document
+    /// (check-then-act race: the second open would desync versions).
+    opening: tokio::sync::Mutex<()>,
     /// True when the server negotiated UTF-8 position encoding.
     utf8_positions: bool,
     /// Workspace root (file paths resolve against it).
@@ -66,6 +75,19 @@ pub struct LspServer {
 impl LspServer {
     /// The push-diagnostics cache snapshot for one file.
     pub fn cached_diagnostics(&self, path: &str) -> Vec<lsp_types::Diagnostic> {
+        self.cached_diagnostics_versioned(path).0
+    }
+
+    /// The push-diagnostics cache snapshot for one file, plus the
+    /// document version it was published against (None when the
+    /// server omitted it). Callers compare against
+    /// [`Self::open_version`]: a cached version below the open
+    /// version means the diagnostics predate the latest local text
+    /// and are possibly stale.
+    pub fn cached_diagnostics_versioned(
+        &self,
+        path: &str,
+    ) -> (Vec<lsp_types::Diagnostic>, Option<i32>) {
         self.state
             .diagnostics
             .lock()
@@ -118,6 +140,12 @@ impl LspServer {
     /// True when the server negotiated UTF-8 position encoding.
     pub(crate) fn uses_utf8_positions(&self) -> bool {
         self.utf8_positions
+    }
+
+    /// Workspace root — the confinement boundary for every
+    /// server-supplied file path (WorkspaceEdit application).
+    pub(crate) fn workspace_root(&self) -> &std::path::Path {
+        &self.root
     }
 
     /// The currently open version for a path (None when not open) —
@@ -197,6 +225,16 @@ impl LspServer {
     /// disk content (docs/lsp-design.md §5: lazy open, disk truth).
     pub(crate) async fn ensure_open(&self, path: &str) -> Result<(), String> {
         let key = self.open_key(path);
+        {
+            let open = self.open_files.lock().map_err(|e| e.to_string())?;
+            if open.contains_key(&key) {
+                return Ok(());
+            }
+        }
+        // Fast path missed: take the open lock for the whole
+        // read-then-didOpen-then-insert sequence. Concurrent callers
+        // queue here and re-check, so exactly one didOpen per document.
+        let _guard = self.opening.lock().await;
         {
             let open = self.open_files.lock().map_err(|e| e.to_string())?;
             if open.contains_key(&key) {
@@ -328,7 +366,9 @@ impl LspServer {
         let text_line = line_at(&text, line);
         let col_chars = column.unwrap_or(1);
         if self.utf8_positions {
-            Ok(crate::lsp::position::surface_to_utf8(line, col_chars))
+            Ok(crate::lsp::position::surface_to_utf8(
+                line, col_chars, &text_line,
+            ))
         } else {
             Ok(crate::lsp::position::surface_to_utf16(
                 line, col_chars, &text_line,
@@ -617,6 +657,7 @@ pub(crate) async fn spawn_server(
         _drive: drive,
         state,
         open_files: Mutex::new(BTreeMap::new()),
+        opening: tokio::sync::Mutex::new(()),
         utf8_positions,
         root: workspace.to_path_buf(),
     }))
@@ -676,7 +717,7 @@ fn build_router(state: Arc<ServerState>) -> Router<Arc<ServerState>> {
                     if params.diagnostics.is_empty() {
                         cache.remove(&path);
                     } else {
-                        cache.insert(path, params.diagnostics);
+                        cache.insert(path, (params.diagnostics, params.version));
                     }
                 }
                 std::ops::ControlFlow::Continue(())

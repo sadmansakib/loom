@@ -55,12 +55,22 @@ pub fn surface_to_utf16(line: u32, column_chars: u32, text_of_line: &str) -> lsp
 }
 
 /// Converts a 1-based (line, column-char) surface position to an LSP
-/// zero-based position for servers that negotiated `utf-8` (the
-/// character offset passes through unchanged).
-pub fn surface_to_utf8(line: u32, column_chars: u32) -> lsp_types::Position {
+/// zero-based position for servers that negotiated `utf-8`. Under
+/// utf-8 encoding the LSP `character` field counts UTF-8 code units
+/// (bytes), NOT chars: the line text must be walked so multibyte
+/// characters before the column are counted with their byte length
+/// (mirrors the utf-16 branch; both need the line's text).
+pub fn surface_to_utf8(line: u32, column_chars: u32, text_of_line: &str) -> lsp_types::Position {
+    let mut bytes = 0u32;
+    for (i, ch) in text_of_line.chars().enumerate() {
+        if i as u32 >= column_chars.saturating_sub(1) {
+            break;
+        }
+        bytes += ch.len_utf8() as u32;
+    }
     lsp_types::Position {
         line: line.saturating_sub(1),
-        character: column_chars.saturating_sub(1),
+        character: bytes,
     }
 }
 
@@ -126,8 +136,20 @@ mod tests {
     }
 
     #[test]
-    fn utf8_conversion_passes_chars_through() {
-        let pos = surface_to_utf8(3, 7);
+    fn utf8_conversion_counts_bytes_not_chars() {
+        // "ab😀cd" — 😀 spans bytes 2..6; column 5 (1-based, after c)
+        // is byte offset 7 (a,b = 2 bytes, 😀 = 4, c = 1), not char
+        // offset 4.
+        let line = "ab😀cd";
+        let pos = surface_to_utf8(1, 5, line);
+        assert_eq!(pos.line, 0);
+        assert_eq!(pos.character, 7);
+        // Column past the line end clamps to the line's byte length.
+        let pos = surface_to_utf8(1, 99, line);
+        assert_eq!(pos.character, 8);
+        // ASCII lines: bytes == chars - 1 (the old assumption, now
+        // only true here).
+        let pos = surface_to_utf8(3, 7, "plain ascii");
         assert_eq!(pos.line, 2);
         assert_eq!(pos.character, 6);
     }
