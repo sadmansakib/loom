@@ -418,13 +418,25 @@ impl Engine {
         };
         let mut registry = registry;
         if let Some(agent) = scout_agent {
-            let timeout = config
-                .scout
-                .as_ref()
-                .map(|cfg| cfg.timeout_secs)
-                .unwrap_or(120);
+            let cfg = config.scout.as_ref();
+            let timeout = cfg.map(|cfg| cfg.timeout_secs).unwrap_or(120);
+            let mut tool = ScoutTool::new(agent, timeout);
+            if let Some(cfg) = cfg {
+                tool = tool.with_model_label(cfg.model.clone());
+                // Escalation target (multi-model cascade): a second child
+                // agent on the strong model, same turns/timeout budgets,
+                // no escalation of its own — one hop, never a chain.
+                if let Some(esc) = cfg.escalation.as_ref() {
+                    let mut esc_cfg = ScoutConfig::new(esc.provider.clone(), esc.model.clone());
+                    esc_cfg.max_turns = cfg.max_turns;
+                    esc_cfg.timeout_secs = cfg.timeout_secs;
+                    let esc_agent =
+                        Arc::new(compose_scout(&esc_cfg, &config, &workspace, &policy)?);
+                    tool = tool.with_escalation(esc_agent, esc.model.clone());
+                }
+            }
             registry
-                .register(Box::new(ScoutTool::new(agent, timeout)))
+                .register(Box::new(tool))
                 .map_err(|error| EngineError::RegisterTool {
                     tool: "scout",
                     message: error.to_string(),

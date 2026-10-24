@@ -150,13 +150,31 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     };
     // The scout arm (roadmap item 19): off unless both flags are given;
     // the bare arm never carries it (it measures the plain loop).
+    let escalation = match (
+        args.scout_escalation.as_deref(),
+        args.scout_escalation_model.as_deref(),
+    ) {
+        (Some(_), None) => anyhow::bail!("--scout-escalation requires --scout-escalation-model"),
+        (None, Some(_)) => anyhow::bail!("--scout-escalation-model requires --scout-escalation"),
+        (Some(provider), Some(model)) => {
+            if args.scout.is_none() || args.scout_model.is_none() {
+                anyhow::bail!("--scout-escalation requires --scout and --scout-model");
+            }
+            Some((provider.to_owned(), model.to_owned()))
+        }
+        (None, None) => None,
+    };
     let scout = match (args.scout.as_deref(), args.scout_model.as_deref()) {
         (Some(provider), Some(model)) => {
             if bare_arm {
                 eprintln!("note: --scout is ignored in the bare-loop arm");
                 None
             } else {
-                Some(ScoutConfig::new(provider.to_owned(), model.to_owned()))
+                let mut config = ScoutConfig::new(provider.to_owned(), model.to_owned());
+                if let Some((esc_provider, esc_model)) = escalation {
+                    config = config.with_escalation(esc_provider, esc_model);
+                }
+                Some(config)
             }
         }
         (Some(_), None) => anyhow::bail!("--scout requires --scout-model"),

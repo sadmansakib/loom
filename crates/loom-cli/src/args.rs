@@ -127,6 +127,18 @@ pub struct RunArgs {
     #[arg(long, value_name = "MODEL")]
     pub scout_model: Option<String>,
 
+    /// Escalation target for the scout (multi-model cascade): when the
+    /// cheap model's answer looks weak (timeout, failure, empty, missing
+    /// file:line pointers, truncated), the question is retried once on
+    /// this stronger provider and both answers are returned, labeled.
+    /// Requires `--scout`/`--scout-model`.
+    #[arg(long, value_name = "PROVIDER")]
+    pub scout_escalation: Option<String>,
+
+    /// Model for `--scout-escalation`; required together with it.
+    #[arg(long, value_name = "MODEL")]
+    pub scout_escalation_model: Option<String>,
+
     /// Enable the tree-sitter symbol tools (roadmap item 18):
     /// `symbols_overview` and `replace_symbol` join the registry.
     /// Off by default.
