@@ -18,6 +18,7 @@ use std::process::Command;
 
 use ignore::WalkBuilder;
 use loom_kernel::context::{FactsSource, GitState, InstructionFile, KnownFacts, SkillIndexEntry};
+use loom_tools::skills::split_frontmatter;
 
 /// How deep into the tree the walk descends. Enough to reach
 /// `crates/<crate>/src` and `crates/<crate>/tests` in a monorepo, bounded so a
@@ -286,9 +287,10 @@ pub fn scan(root: &Path) -> KnownFacts {
 /// description = first non-empty line stripped of heading syntax, bounded.
 ///
 /// Infallible like the rest of the scan: a missing or unreadable directory
-/// degrades to an empty index, which renders nothing. Flat files only —
-/// subdirectories are ignored (a nested skill is a later concern, not a
-/// silent surprise).
+/// degrades to an empty index, which renders nothing. Two file shapes
+/// count: flat `<name>.md` and `<name>/SKILL.md` (Agent Skills
+/// convention) — the flat file wins a same-name collision because it is
+/// what `load_skill` serves first.
 pub(crate) fn scan_skills(root: &Path) -> Vec<SkillIndexEntry> {
     let dir = SKILLS_DIR
         .iter()
@@ -296,46 +298,82 @@ pub(crate) fn scan_skills(root: &Path) -> Vec<SkillIndexEntry> {
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
-    let mut skills: Vec<SkillIndexEntry> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            if !entry.file_type().is_ok_and(|t| t.is_file()) {
-                return None;
-            }
+    let mut flat: Vec<SkillIndexEntry> = Vec::new();
+    let mut nested: Vec<SkillIndexEntry> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|t| t.is_file()) {
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                return None;
+                continue;
             }
-            let stem = path.file_stem()?.to_str()?.to_owned();
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
             // A stem that cannot be typed as a `load_skill` argument adds
             // noise, not capability.
             if stem.is_empty() {
-                return None;
+                continue;
             }
-            let description = skill_description(&path);
-            Some(SkillIndexEntry::new(stem, description))
-        })
-        .collect();
+            if let Some(index_entry) = skill_index_entry(&path, stem) {
+                flat.push(index_entry);
+            }
+        } else if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.is_empty() {
+                continue;
+            }
+            let skill_md = path.join("SKILL.md");
+            if !skill_md.is_file() {
+                continue;
+            }
+            if let Some(index_entry) = skill_index_entry(&skill_md, name) {
+                nested.push(index_entry);
+            }
+        }
+    }
+    let flat_names: BTreeSet<String> = flat.iter().map(|e| e.name.clone()).collect();
+    let mut skills = flat;
+    skills.extend(nested.into_iter().filter(|e| !flat_names.contains(&e.name)));
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     skills.truncate(SKILLS_MAX_FILES);
     skills
 }
 
-/// Derives a bounded one-line description from a skill file's head: the
-/// first non-empty line, stripped of Markdown heading markers and
-/// surrounding whitespace.
-fn skill_description(path: &Path) -> String {
+/// Builds one menu entry from a skill file's bounded head: frontmatter
+/// `description` when present, else the first non-empty body line
+/// stripped of heading markers. A frontmatter `name` that disagrees
+/// with the file stem keeps the skill off the menu — mislabeled
+/// metadata must not become a silent alias for a different name.
+fn skill_index_entry(path: &Path, stem: &str) -> Option<SkillIndexEntry> {
     let Ok(bytes) = std::fs::read(path) else {
-        return String::new();
+        // Listed but unreadable: an empty description keeps the menu
+        // honest about the shape without failing the scan.
+        return Some(SkillIndexEntry::new(stem.to_owned(), String::new()));
     };
     let head = truncate_utf8_head(&bytes, SKILL_DESCRIPTION_READ_BYTES);
-    let line = head
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("");
-    let stripped = line.trim_start_matches('#').trim();
-    truncate_utf8_head(stripped.as_bytes(), SKILL_DESCRIPTION_MAX_BYTES)
+    let (frontmatter, body) = split_frontmatter(&head);
+    if let Some(declared) = &frontmatter.name
+        && declared != stem
+    {
+        return None;
+    }
+    let description = match &frontmatter.description {
+        Some(desc) => desc.clone(),
+        None => body
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("")
+            .trim_start_matches('#')
+            .trim()
+            .to_owned(),
+    };
+    Some(SkillIndexEntry::new(
+        stem.to_owned(),
+        truncate_utf8_head(description.as_bytes(), SKILL_DESCRIPTION_MAX_BYTES),
+    ))
 }
 
 /// Orders detected languages by frequency, ties by name, for a stable fact.
@@ -576,6 +614,58 @@ mod tests {
 
     fn tempdir() -> tempfile::TempDir {
         tempfile::tempdir().expect("create tempdir")
+    }
+
+    #[test]
+    fn scan_skills_reads_flat_and_dir_shapes() {
+        let dir = tempdir();
+        let root = dir.path();
+        let skills = root.join(".agents").join("skills");
+        fs::create_dir_all(skills.join("triage")).unwrap();
+        fs::write(skills.join("release.md"), "# Release checklist\n").unwrap();
+        fs::write(
+            skills.join("triage").join("SKILL.md"),
+            "---\nname: triage\ndescription: sort incoming issues\n---\nBody.\n",
+        )
+        .unwrap();
+
+        let entries = scan_skills(root);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "release");
+        assert!(entries[0].description.contains("Release checklist"));
+        assert_eq!(entries[1].name, "triage");
+        // Frontmatter description feeds the menu one-liner.
+        assert_eq!(entries[1].description, "sort incoming issues");
+    }
+
+    #[test]
+    fn scan_skills_rejects_mismatched_frontmatter_names() {
+        let dir = tempdir();
+        let root = dir.path();
+        let skills = root.join(".agents").join("skills");
+        fs::create_dir_all(skills.join("triage")).unwrap();
+        fs::write(
+            skills.join("triage").join("SKILL.md"),
+            "---\nname: totally-different\n---\nBody.\n",
+        )
+        .unwrap();
+
+        assert!(scan_skills(root).is_empty());
+    }
+
+    #[test]
+    fn scan_skills_flat_wins_over_dir() {
+        let dir = tempdir();
+        let root = dir.path();
+        let skills = root.join(".agents").join("skills");
+        fs::create_dir_all(skills.join("both")).unwrap();
+        fs::write(skills.join("both.md"), "flat").unwrap();
+        fs::write(skills.join("both").join("SKILL.md"), "dir").unwrap();
+
+        let entries = scan_skills(root);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "both");
+        assert_eq!(entries[0].description, "flat");
     }
 
     #[test]
