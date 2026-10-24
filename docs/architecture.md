@@ -640,6 +640,29 @@ session id. Frontends clone the recorder, fan one clone out next to
 their rendering sink, and poll the retained handle on their own cadence;
 one recorder tracks one task, so concurrent runs each get their own.
 
+Above the engine sits one composition: best-of-N parallel rollouts
+(roadmap item 21, `engine::worktrees`, CLI `--best-of N`). The module
+checks the workspace is inside a git repository (fail-closed otherwise —
+parallel rollouts need one `HEAD` to branch from), materializes N
+detached worktrees under `.loom/worktrees/`, and runs N full child
+engines concurrently (semaphore-bounded, default 3): each child gets the
+same task, the same frozen facts compiler, a worktree-local database,
+and its own provider built from a resolved-once credential, so a
+catalog-driven adapter is fetched once and every child behaves exactly
+like a normal run. Selection is deterministic code, not a judge model:
+candidates rank by completion (`end_turn`/`fast_path`), then fewest
+failure markers (loop nudges, failed tool calls, task failures — the
+`micro` taxonomy Harness² uses for its all-rollouts-fail fallback), then
+turns, then model requests. The winner's patch (`git diff --cached`,
+captured from every child even on failure, the same extraction the eval
+harness uses) is applied to the parent workspace with `git apply`; a
+failed apply keeps every worktree for forensics rather than guessing.
+Cancellation propagates to all children through their `TaskControl`s,
+and a run that produces no non-empty patch reports no winner instead of
+inventing one. The honest cost: N rollouts multiply model spend, which
+is why the flag is opt-in and the report carries each child's usage;
+the delegated-economics trigger (item 19) still decides when N>1 pays.
+
 Provider selection lives in one private engine module
 (`provider.rs`), the only place that names concrete adapters. It matches
 the configured provider name against the adapters' `PROVIDER_NAME`

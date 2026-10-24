@@ -251,33 +251,76 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     for warning in &prune_warnings {
         eprintln!("warning: {warning}");
     }
-    let engine = runtime.block_on(Engine::open_async_with(
-        EngineConfig {
-            provider: args.provider,
-            model: args.model,
-            base_url: args.base_url,
-            models_url: args.models_url,
-            reasoning_effort: args.reasoning_effort,
-            account: args.account,
-            workspace: args.workspace,
-            system_prompt,
-            max_turns: args.max_turns,
-            db_path,
-            persist: !args.no_save,
-            catalog: None,
-            scout,
-            symbols,
-            git,
-            skills,
-            mcp,
-            lsp,
-            budgets,
-            prune: Some(prune),
-        },
-        overrides,
-    ))?;
+    let config = EngineConfig {
+        provider: args.provider,
+        model: args.model,
+        base_url: args.base_url,
+        models_url: args.models_url,
+        reasoning_effort: args.reasoning_effort,
+        account: args.account,
+        workspace: args.workspace.clone(),
+        system_prompt,
+        max_turns: args.max_turns,
+        db_path,
+        persist: !args.no_save,
+        catalog: None,
+        scout,
+        symbols,
+        git,
+        skills,
+        mcp,
+        lsp,
+        budgets,
+        prune: Some(prune),
+    };
 
     let input = args.task.join(" ");
+
+    // The parallel-rollout arm (roadmap item 21): N isolated worktrees,
+    // one deterministic winner, its patch applied here. The catalog
+    // sequencing and credential resolution are shared with the single
+    // run — one fetch, one keychain read, N cheap provider rebuilds.
+    if let Some(requested) = args.best_of {
+        if bare_arm {
+            anyhow::bail!("--best-of cannot combine with the LOOM_BARE arm");
+        }
+        if args.session.is_some() {
+            anyhow::bail!("--best-of starts fresh parallel rollouts; --session continues one");
+        }
+        let n = requested.clamp(2, 8);
+        let config = runtime.block_on(Engine::resolve_catalog(config))?;
+        let factory = loom_core::engine::worktrees::provider_factory(&config)?;
+        let token = tokio_util::sync::CancellationToken::new();
+        let signal_token = token.clone();
+        let signal = runtime.spawn(async move {
+            signal_token.cancelled().await;
+            // Second Ctrl-C during rollout teardown aborts outright.
+            if tokio::signal::ctrl_c().await.is_ok() {
+                std::process::exit(130);
+            }
+        });
+        let report = runtime.block_on(loom_core::engine::worktrees::best_of_n(
+            config,
+            factory,
+            &input,
+            loom_core::engine::worktrees::BestOfNConfig {
+                n,
+                concurrency: 3,
+                keep_worktrees: false,
+            },
+            &token,
+        ))?;
+        signal.abort();
+        print_best_of_n(&report, args.json);
+        runtime.shutdown_timeout(Duration::from_secs(5));
+        return Ok(if report.applied {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
+    }
+
+    let engine = runtime.block_on(Engine::open_async_with(config, overrides))?;
 
     let decision_log = DecisionLog::default();
     let (sink, renderer_thread, tracer_thread) =
@@ -344,6 +387,53 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 ExitCode::FAILURE
             })
         }
+    }
+}
+
+/// Renders the parallel-rollout report (roadmap item 21): one block per
+/// rollout with its failure markers and spend footer, then the winner
+/// and the merge note. `--json` emits one machine-readable object.
+fn print_best_of_n(report: &loom_core::engine::worktrees::BestOfNReport, json: bool) {
+    if json {
+        let runs: Vec<_> = report
+            .runs
+            .iter()
+            .map(|run| {
+                serde_json::json!({
+                    "index": run.index,
+                    "end_reason": run.end_reason,
+                    "markers": run.markers,
+                    "patch_bytes": run.patch.len(),
+                    "cost": run.cost_note,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "runs": runs,
+                "winner": report.winner,
+                "applied": report.applied,
+                "apply_note": report.apply_note,
+            })
+        );
+        return;
+    }
+    for run in &report.runs {
+        println!(
+            "rollout {}: end_reason={}, markers={}, patch {} B",
+            run.index,
+            run.end_reason.as_deref().unwrap_or("-"),
+            run.markers,
+            run.patch.len()
+        );
+        if !run.cost_note.is_empty() {
+            println!("  {}", run.cost_note);
+        }
+    }
+    match report.winner {
+        Some(_index) => println!("winner: {}", report.apply_note),
+        None => println!("{}", report.apply_note),
     }
 }
 

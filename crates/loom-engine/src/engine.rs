@@ -648,31 +648,12 @@ impl Engine {
         }
     }
 
-    /// Opens the engine, fetching the OpenRouter catalog first when one is
-    /// needed and not already supplied.
-    ///
-    /// The asynchronous counterpart of [`Engine::open`]: capabilities are
-    /// resolved from the catalog, so `openrouter` runs must obtain one
-    /// before the synchronous open. The sequencing — resolve the
-    /// credential, fetch, cache beside the database, fall back to a stale
-    /// cache — lives here ([`crate::catalog`]) so every frontend gets it
-    /// identically instead of re-implementing it before `open`. A config
-    /// that already carries a catalog, or names a provider that needs
-    /// none, skips the network entirely.
-    ///
-    /// Await this from the frontend's async context; everything after the
-    /// optional fetch is the same blocking work [`Engine::open`] documents.
-    pub async fn open_async(config: EngineConfig) -> Result<Self, EngineError> {
-        Self::open_async_with(config, EngineOverrides::default()).await
-    }
-
-    /// [`Engine::open_async`] with embedder overrides
-    /// ([`EngineOverrides`]) — the catalog sequencing of the async open
-    /// composed with the substitution points of [`Engine::open_with`].
-    pub async fn open_async_with(
-        config: EngineConfig,
-        overrides: EngineOverrides,
-    ) -> Result<Self, EngineError> {
+    /// Resolves the config's model catalog exactly the way
+    /// [`Engine::open_async`] does — the sequencing every frontend (and the
+    /// worktree orchestrator, which opens N engines from one config) should
+    /// reuse instead of re-implementing. A config that already carries a
+    /// catalog, or names a provider that needs none, skips the network.
+    pub async fn resolve_catalog(config: EngineConfig) -> Result<EngineConfig, EngineError> {
         // `custom` is described entirely by user-supplied URLs: the
         // chat base URL is mandatory and the catalog comes from the
         // models URL (explicit or defaulted from the base). Its cache
@@ -738,6 +719,37 @@ impl Engine {
         } else {
             config
         };
+        Ok(config)
+    }
+}
+
+impl Engine {
+    /// Opens the engine, fetching the OpenRouter catalog first when one is
+    /// needed and not already supplied.
+    ///
+    /// The asynchronous counterpart of [`Engine::open`]: capabilities are
+    /// resolved from the catalog, so `openrouter` runs must obtain one
+    /// before the synchronous open. The sequencing — resolve the
+    /// credential, fetch, cache beside the database, fall back to a stale
+    /// cache — lives here ([`crate::catalog`]) so every frontend gets it
+    /// identically instead of re-implementing it before `open`. A config
+    /// that already carries a catalog, or names a provider that needs
+    /// none, skips the network entirely.
+    ///
+    /// Await this from the frontend's async context; everything after the
+    /// optional fetch is the same blocking work [`Engine::open`] documents.
+    pub async fn open_async(config: EngineConfig) -> Result<Self, EngineError> {
+        Self::open_async_with(config, EngineOverrides::default()).await
+    }
+
+    /// [`Engine::open_async`] with embedder overrides
+    /// ([`EngineOverrides`]) — the catalog sequencing of the async open
+    /// composed with the substitution points of [`Engine::open_with`].
+    pub async fn open_async_with(
+        config: EngineConfig,
+        overrides: EngineOverrides,
+    ) -> Result<Self, EngineError> {
+        let config = Self::resolve_catalog(config).await?;
         // Slice D2: deferred MCP attach. Spawning stdio servers and
         // handshaking is async I/O, so it lives here — the sync
         // constructor receives the attachment (eager meta-tools +

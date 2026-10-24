@@ -83,8 +83,9 @@ about, or denied via the `[policy]` verdict layer.
 | Embedding | `loom-core` facade (ADR-021), full drive loop in `crates/loom-core/examples/frontend.rs` |
 
 Not built yet: interactive TUI/CLI surface (resume/steering/ask-mode need a
-frontend; the engine seams exist), parallel worktree orchestration
-(gated on measurement).
+frontend; the engine seams exist). Parallel best-of-N worktree rollouts
+ship opt-in (`--best-of N`, roadmap item 21); delegation economics at
+N>1 remain a measurement question (roadmap item 19 trigger).
 
 ## Crates
 

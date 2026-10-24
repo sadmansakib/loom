@@ -43,6 +43,7 @@ pub mod repo;
 pub mod scout;
 pub mod trace;
 pub mod trace_stats;
+pub mod worktrees;
 
 pub use engine::{
     BUDGET_ENV_VARS, Continuation, Engine, EngineConfig, EngineError, EngineOverrides,

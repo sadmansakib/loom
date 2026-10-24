@@ -187,8 +187,8 @@ blocks the parent.
   context. If the parent skims, cross-check buys citation diffing, not
   truth.
 - **Delegation economics remain unmeasured at scale.** Footers make spend
-  visible; the parked trigger (item 19) decides whether item 21's
-  parallel worktree agents are worth building.
+  visible; the parked trigger (item 19) decides when best-of-N rollouts
+  (item 21, now shipped opt-in) are worth their multiplied spend.
 
 ## CLI
 

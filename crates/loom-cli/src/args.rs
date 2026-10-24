@@ -170,6 +170,14 @@ pub struct RunArgs {
     /// default.
     #[arg(long)]
     pub lsp: bool,
+
+    /// Parallel rollouts (roadmap item 21): run the task on N isolated
+    /// git worktrees concurrently, select one rollout deterministically
+    /// (completion, then fewest failure markers, then fewest turns), and
+    /// apply its patch to this workspace. Requires a git repository;
+    /// clamps to 2..=8. Off by default.
+    #[arg(long, value_name = "N")]
+    pub best_of: Option<usize>,
 }
 
 /// Arguments for `loom auth`.

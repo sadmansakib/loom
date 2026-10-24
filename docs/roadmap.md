@@ -261,8 +261,8 @@ frontend — the resolver seam ships, the frontend is item 22; defaults
 byte-identical, 2026-10-23), and containerized/remote `verify` runners
 via a declared `.loom/verify.toml` runner command — same evidence
 contract, fail-closed on invalid manifests, unconstrained by necessity
-with an explicit `verify.runner` notice (2026-10-23). *Open:* worktree
-isolation (item 21).
+with an explicit `verify.runner` notice (2026-10-23). *Open:* the
+delegated-economics measurement over item 21's rollout reports.
 
 ### Iteration 5 — Skills & contextual knowledge
 
@@ -1318,9 +1318,19 @@ reproduces them.
     the deterministic-controller principle and the never-worse
     contract. Recursion stays offline in the eval harness, where the
     maintenance bar rules.
-21. **Parallel orchestration.** Worktree-per-agent isolation with a
-    merge path, above the engine. Only after item 19 shows delegation
-    pays.
+21. **Parallel orchestration.** **Shipped 2026-10-25** —
+    `engine::worktrees` best-of-N rollouts, CLI `--best-of N` (2..=8,
+    semaphore-bounded, opt-in): N detached git worktrees under
+    `.loom/worktrees/`, N full child engines (same task, frozen
+    compiler, worktree-local DB, per-child provider from a
+    resolved-once credential), deterministic winner selection —
+    completion (`end_turn`/`fast_path`), then fewest failure markers
+    (loop nudges, failed tool calls, task failures; the `micro`
+    taxonomy Harness² uses for its all-rollouts-fail fallback), then
+    turns, then model requests — winner patch applied via `git apply`,
+    worktrees kept on apply failure for forensics, fail-closed outside
+    a git repository. Item 24's vary-the-harness dimensioning and the
+    delegated-economics measurement remain open on top of it.
 22. **Frontends.** A TUI or desktop client. The facade contract is now
     ready: `loom-core` roots a stable surface (driving API + `TaskControl`/
     `EventSink`/`EventKind`/`Session`/ids) with a documented semver split

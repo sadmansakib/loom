@@ -3,11 +3,26 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
-## 2026-10-25 — Self-optimization outer loop (`selfopt`); remote MCP via declared proxies
+## 2026-10-25 — Best-of-N worktree orchestration (`--best-of`); selfopt; remote MCP
 
-Roadmap items 20.3 and the iteration-6 remainder. Research-grounded
-(docs/selfopt-design.md; Harness² arXiv 2610.14224, GEPA arXiv
+Roadmap item 21 (worktree isolation + merge path), item 20.3, and the
+iteration-6 remainder. Research-grounded (docs/subagents-design.md,
+docs/selfopt-design.md; Harness² arXiv 2610.14224, GEPA arXiv
 2507.19457, remote-MCP landscape survey).
+
+- **Best-of-N rollouts (`loom-engine::worktrees`)**: `--best-of N`
+  (clamped 2..=8) runs N full child engines concurrently
+  (semaphore-bounded, default 3) on detached git worktrees under
+  `.loom/worktrees/` — same task, frozen facts compiler, worktree-local
+  DB, per-child provider built from a resolved-once credential.
+  Deterministic winner selection: completion (`end_turn`/`fast_path`),
+  then fewest failure markers (loop nudges, failed tool calls, task
+  failures — Harness²'s all-rollouts-fail fallback taxonomy), then
+  turns, then model requests. Winner patch (`git diff --cached`,
+  captured from every child even on failure) applied via `git apply`;
+  apply failure keeps all worktrees for forensics. Fail-closed outside
+  a git repository; cancellation propagates to every child; no
+  non-empty patch ⇒ reported no-winner, never a guessed one.
 
 - **`selfopt` (loom-eval)**: offline Propose–Probe–Compose loop over
   existing SWE-bench sweep artifacts. Rule proposer (13 registered
