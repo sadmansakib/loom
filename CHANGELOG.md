@@ -3,6 +3,172 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-10-25 — Self-optimization outer loop (`selfopt`); remote MCP via declared proxies
+
+Roadmap items 20.3 and the iteration-6 remainder. Research-grounded
+(docs/selfopt-design.md; Harness² arXiv 2610.14224, GEPA arXiv
+2507.19457, remote-MCP landscape survey).
+
+- **`selfopt` (loom-eval)**: offline Propose–Probe–Compose loop over
+  existing SWE-bench sweep artifacts. Rule proposer (13 registered
+  `LOOM_*` knobs, deterministic halve/double) + one-shot model
+  proposer (any provider; reads knob table, per-instance medians,
+  failure counts, ledger lessons; strict JSON contract; invalid
+  overlays dropped, never clamped). Probes = docker re-runs with env
+  overlays via `ContainerSpec::extra_env` — `CONTAINER_SCRIPT` stays
+  byte-identical, reserved env names rejected. Adoption gate: median
+  input-token improvement ≥5%, event non-regression ≥−10%, failures
+  non-increasing. Winning overlays merged and the merge re-probed.
+  Lessons enter `selfopt-ledger.json` only with contrast evidence.
+  `--dry-run`/`--rules-only` for zero-cost planning.
+- **Engine**: `one_shot_provider` + `ProviderHandle`/`build` exported
+  so off-loop callers get the same validated provider construction
+  (catalog/window/reasoning checks) as the engine.
+- **Remote MCP (D4)**: a manifest `command` that is a local relay
+  (`ssh -W`, tailscale, TCP shunt) reaches remote servers under the
+  unchanged stdio contract — same sandbox (network grant required,
+  fails closed), hygiene, pinning, deferral. `LOOM_WORKSPACE`
+  (canonicalized workspace root) exported to every spawned server so
+  proxies resolve workspace paths (mirrors `CLAUDE_PROJECT_DIR`);
+  manifest `env` wins on collision. Tests pin the contract with a
+  real TCP relay against a far server.
+- MCP client hardening en route: stderr retained as diagnostics only
+  (8 KiB tail, never shown to the model), 1 MiB line-cap framing,
+  10-page `tools/list` pagination cap, server-initiated requests
+  answered for `ping` only (sampling/elicitation/roots refused),
+  protocol version exact-match fail-closed, concurrent server fetch
+  phase (lockfile writes stay serial).
+
+## 2026-10-25 — Subagents: multi-model collaboration (cascade, cross-check, fan-out)
+
+Research-grounded scout upgrade (docs/subagents-design.md; Cognition,
+Anthropic, FrugalGPT, MoA, routing literature). One delegation level
+stays — recursion remains structurally impossible — but the single hop
+now composes multiple models:
+
+- **Cascade escalation**: `--scout-escalation`/`--scout-escalation-model`
+  name a strong model; a deterministic gate (timeout, failed run, empty
+  answer, budget truncation, zero `file:line` pointers) re-runs the same
+  capsule once on it, both answers returned labeled. No learned judge, no
+  chains — one hop, same budgets.
+- **Cross-check**: `cross_check: true` runs both models on the same
+  capsule and appends an agreement note computed from citation-set
+  intersection/diff. The parent model stays the aggregator.
+- **Fan-out**: `questions: [...]` (≤3) runs parallel labeled capsules
+  (`[scout i/N]`), fail-soft over the cap, never queues.
+- **Provenance footers**: every answer ends `(model: X, N turn(s))`,
+  counted from the transcript — spend visible at point of use.
+- Engine composes the escalation child with the primary's budgets;
+  `ScoutConfig::with_escalation`, `ScoutEscalation` exported.
+- Clippy hardening en route: LSP `PlanOp` slimmed (flags resolved at plan
+  time) and a real bug fixed — `Delete` with `ignore_if_not_exists` on a
+  missing file no longer enters the plan (was a guaranteed mid-batch
+  rollback before).
+
+Workspace green (40 suites, engine 112 with 11 new scout tests), clippy
+clean.
+
+## 2026-10-24 — Residual-risk closure: result hygiene, LSP batch atomicity, skills L3
+
+Closes the three residuals left open by the robustness audit:
+
+- **Result-channel hygiene** (`hygiene.rs`): MCP tool results and LSP
+  read-tool output (hover/diagnostics/symbols/references via the shared
+  `finish()` choke point) are now stripped of invisible/bidi/zero-width
+  characters (Invariant-Labs exfiltration class) while preserving code
+  layout — whitespace survives, unlike the description-grade sanitizer.
+  `mcp::sanitize_text` reuses the shared char set.
+- **LSP WorkspaceEdit atomicity** (`lsp/apply.rs`): all IO preconditions
+  (exists/overwrite/missing) checked at plan time; every op captures an
+  undo snapshot (original bytes / remove-created / rename-back with
+  replaced-target restore). Mid-batch IO failure rolls back the applied
+  prefix in reverse order; effects and `didChange` notes fire only on
+  full commit. Rollback failures are reported loudly
+  ("ROLLBACK INCOMPLETE: …").
+- **Skills L3 — bundled resources** (`skills.rs`): dir-shaped skill
+  bodies append a bounded "bundled files" listing (depth ≤4, ≤16
+  entries, `+N more`); the new `resource` input serves one bundled file
+  head-capped under workspace confinement (`..`/backslash/absolute
+  rejected). Scripts are data: read, never executed — execution stays
+  behind `run_command` policy.
+
+Workspace green (40 suites), clippy clean. Semantic result-content
+attacks remain a documented residual (deterministic detection is noise,
+per mcp-design.md §6).
+
+## 2026-10-24 — Robustness hardening: spec-compliance + security audit fixes (LSP/MCP/skills/scout)
+
+Deep-research audit against MCP 2025-06-18, LSP 3.17, Agent Skills
+conventions, and the 2025-26 multi-agent/security literature; every
+accepted finding fixed. Full `cargo test --workspace` green (40 suites),
+clippy clean.
+
+- **LSP client (crates/loom-tools/src/lsp/)**: `surface_to_utf8` now
+  converts char columns to BYTE offsets for utf-8 servers (was passing
+  chars through — wrong positions on multibyte lines; rust-analyzer
+  negotiates utf-8); `ensure_open` serialized behind a dedicated mutex
+  (didOpen race); PublishDiagnostics cached with `params.version` and
+  `lsp_diagnostics` appends a "possibly stale" note when the cache
+  lags the open-file version. Known-cosmetic `render_position`
+  char-vs-byte display on utf-8 servers documented as accepted.
+- **LSP WorkspaceEdit application (apply.rs, rewritten)**: every
+  create/rename/delete/edit path now resolves through
+  `resolve_within(workspace_root)` — a server-proposed URI outside the
+  workspace is refused (write-confusion class closed); two-phase
+  plan/apply surfaces all semantic errors (confinement, version
+  guard, range/overlap) before any IO; same-position inserts now land
+  in array order per spec (bottom-up application previously reversed
+  them); zero-copy `str::from_utf8` per edit (was O(n²) lossy rebuilds).
+- **MCP client (crates/loom-tools/src/mcp.rs)**: JSON-RPC reader
+  classifies by `method` first — a server-initiated request whose id
+  collides with a pending client id can no longer be misrouted as its
+  response; server-initiated requests are answered deterministically
+  (`ping` → `{}`, anything else → METHOD_NOT_FOUND, matching the
+  no-sampling/no-elicitation posture); stdout lines capped at 1 MiB via
+  `LinesCodec` (oversized lines discarded, stream continues — memory
+  DoS bound); timeouts send `notifications/cancelled`; handshake
+  validates the negotiated `protocolVersion` and fails the attach on
+  mismatch; `tools/call` results render `structuredContent` as JSON
+  when the content array carries nothing renderable; `tools/list`
+  pagination-cap stop is a loud warning, not silent; the spawn +
+  handshake + tools/list fetch phase runs concurrently across servers
+  (hygiene/pinning stays serial in manifest order so lockfile writes
+  stay deterministic); stderr is captured to an 8 KB ring with a
+  `stderr_tail()` accessor instead of `/dev/null`.
+- **Skills (loom-tools/src/skills.rs, loom-engine/src/repo.rs)**: both
+  file shapes resolve — flat `.agents/skills/<name>.md` and
+  `<name>/SKILL.md` (Agent Skills convention; flat wins a same-name
+  collision); optional `---` frontmatter (single-line `name:`/
+  `description:` subset) is stripped before the body budget and feeds
+  the facts-menu one-liner; a frontmatter `name` disagreeing with the
+  file stem keeps the skill off the menu (mislabeled ≠ alias). Body
+  loading and menu scanning share one parser (`split_frontmatter`).
+- **Scout (loom-engine/src/scout.rs)**: parallel-scout cap
+  (`SCOUT_CONCURRENCY = 3`) enforced with a `try_acquire` semaphore —
+  over-cap calls fail soft with an immediate "at capacity" instead of
+  queueing child spends; `with_concurrency` for tests/config.
+- **Test harness (tests/mcp_stdio.rs)**: remote mock emits a fresh
+  line before its port announcement (libtest's progress prefix could
+  glue itself to the port line and wedge the parser); both
+  proxy-command tests now pass reliably.
+
+## 2026-10-24 — Fast-path non-Cargo dependency updates: declined on evidence
+
+- Closed the iteration-2 open tail: `update/bump <dep> to <version>`
+  stays Cargo-only. Probed the candidate ecosystems (2026-10-24):
+  npm's `--package-lock-only --offline` still resolves against the
+  registry or cache (`cache mode is 'only-if-cached' but no cached
+  response`), `go list -m` demands `go mod download` for any unsummed
+  requirement, and pip's resolvers always consult an index — none has
+  an offline manifest-only verifier, so the fast path would be
+  guessing. Non-Cargo dependency intents keep declining to the agent
+  loop; module docs record the rationale and the probe evidence.
+- Pinned by `npm_dependency_update_declines_to_the_agent_loop`
+  (package.json workspace + dependency intent → declined, manifest
+  untouched). Revisit triggers live in the roadmap: an ecosystem
+  growing a parse-only verifier, or networked verification getting a
+  policy story.
+
 ## 2026-10-24 — LSP call hierarchy + $0 turn-economy probe (slice E3)
 
 - `lsp_call_hierarchy` (capability-gated): prepare + incoming/outgoing

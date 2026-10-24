@@ -212,8 +212,15 @@ subsystems:
   manifests; the format grammar now says which toolchain it means).
   npm/Python/Make formats decline — no deterministic offline
   formatter/verifier for the edit class — and non-Cargo dependency
-  bumps decline the same way. *Open:* non-Cargo dependency updates,
-  pending offline-verifiable semantics per ecosystem.
+  bumps decline the same way. *Closed (2026-10-24):* non-Cargo
+  dependency updates stay declined on evidence — no candidate
+  ecosystem has an offline manifest-only verifier (npm
+  `--package-lock-only --offline` still resolves against the
+  registry/cache; `go list -m` demands `go mod download`; pip's
+  resolvers always consult an index; probed 2026-10-24, pinned by
+  `npm_dependency_update_declines_to_the_agent_loop`). Revisit only if
+  an ecosystem grows a parse-only verifier or networked verification
+  gets a policy story.
 - **Measurement** — turns, context tokens per turn, tokens per solved
   task, exploratory calls, verification-triggered retries vs the
   Iteration 1 baseline. *Shipped* in the eval suite; N ≥ 5 comparisons
@@ -282,8 +289,13 @@ D1 (stdio client, manifest allowlist, hygiene, pinning), D2 (deferred
 surface: facts index, `mcp_search_tools`/`mcp_load_tools`, idle
 eviction), and D3 (measurement probe: 35-tool mock GitHub server, both
 arms completed, **12.4× upfront tool-token cut** at ≥10× bar —
-`docs/daily-driver.md`), opt-in via `--mcp`. Open: remote servers via
-declared proxy commands. LSP supplies definition, references, symbols,
+`docs/daily-driver.md`), opt-in via `--mcp`. **Shipped 2026-10-25**:
+remote servers via declared proxy commands — a `.loom/mcp.toml` entry
+whose `command` is a local relay (`ssh -W`, `tailscale`, a TCP shunt)
+runs under the same sandbox+hygiene contract, with `network = true`
+required for the relay and `LOOM_WORKSPACE` exported so proxies can
+resolve workspace paths (tests: `proxy_command_reaches_remote_server`,
+`proxy_command_without_network_grant_fails_closed`). LSP supplies definition, references, symbols,
 diagnostics, rename, type information — justified only by fewer
 exploratory model turns. The LSP design is researched and pinned in
 [`docs/lsp-design.md`](lsp-design.md): generic async-lsp client plus a
@@ -1235,6 +1247,11 @@ reproduces them.
     --scout PROVIDER --scout-model MODEL`. The delegation-economics
     trigger stays parked with item 1's funded-measurement debt — the
     runtime ships the seam, the eval measures when credit allows.
+    **Extended 2026-10-25**: multi-model collaboration on the same one
+    level — deterministic cascade escalation, cross-check, ≤3-question
+    fan-out, provenance footers, per
+    [`docs/subagents-design.md`](subagents-design.md); the economics
+    trigger stays parked.
 20. **Self-optimization** (G10). In order:
     1. trace export: one directory per task with transcript, events,
        census, harness version, and outcome — **phase 1 shipped**
@@ -1260,7 +1277,18 @@ reproduces them.
        reasoning-schedule slot stays gated with item 9;
     3. an outer loop in the Meta-Harness shape that reads *raw* traces,
        harness source, and scores and proposes changes (compressed
-       feedback measured worse);
+       feedback measured worse). **Shipped 2026-10-25 (offline seam)**:
+       `selfopt` (loom-eval) runs the Propose–Probe–Compose loop over
+       existing sweep artifacts — rule-based single-knob proposals plus
+       a one-shot model proposer that reads per-instance medians,
+       turn/event traces, and ledger lessons; probes are docker re-runs
+       with `LOOM_*` env overlays through `ContainerSpec::extra_env`
+       (frozen script untouched); adoption gate = median input-token
+       improvement ≥5%, event-count non-regression ≥−10%, failures
+       non-increasing; independently-winning overlays are merged and
+       the merge re-probed; lessons enter the ledger only with
+       contrast evidence (Harness² rule). Design:
+       [`docs/selfopt-design.md`](selfopt-design.md);
     4. lessons: recurring failure→fix pairs mined from history into
        short, expiring rules injected through the facts block (gptme
        lessons, `rtk learn`). This is the long-term memory item; the
@@ -1380,14 +1408,32 @@ Each would add surface without evidence it serves the goals (G8):
 
 ### Open questions
 
-- Should the failure ledger loosen for idempotent read-only retries
+- ~~Should the failure ledger loosen for idempotent read-only retries
   after non-deterministic errors, and should it tighten to near-repeats
-  (same tool and path failing three times with different arguments)?
-- Where does user-facing configuration live (sandbox escalations,
+  (same tool and path failing three times with different arguments)?~~
+  **Resolved 2026-10-25**: loosen only for read-only tools after
+  transient errors (rate-limit / network class, the same signal the
+  eval retry loops key on); the near-repeat tightening is declined —
+  varied-argument retries are legitimate exploration, and a gate
+  there trades recovered tasks for speculative token savings without
+  evidence. Revisit only if a live eval shows failure-ledger stops
+  blocking a recovery that later succeeds.
+- ~~Where does user-facing configuration live (sandbox escalations,
   provider defaults, model profiles): per-workspace manifest, user
-  config, or both with defined precedence?
-- What sandbox escape hatch, if any, is acceptable for network-needing
-  commands (dependency fetches) without reintroducing an allow-list?
+  config, or both with defined precedence?~~ **Resolved 2026-10-25**:
+  per-workspace manifests stay the only file-level config (audit
+  surface travels with the repo); credentials and provider selection
+  stay environment-level. No user config file until two-plus
+  workspaces in daily use actually demand it — then workspace >
+  user precedence, the Claude Code scope ordering, arrives as an ADR.
+- ~~What sandbox escape hatch, if any, is acceptable for
+  network-needing commands (dependency fetches) without reintroducing
+  an allow-list?~~ **Resolved 2026-10-25**: the existing per-command
+  escalation IS the hatch — `.loom/commands.toml` rules carry an
+  explicit `network = true` (loudest possible grant, user-declared,
+  reviewable in one file). No new mechanism; MCP servers get the same
+  field, and the remote-proxy work confirmed the shape carries
+  (relay needs `network = true`, fails closed without it).
 
 ---
 
