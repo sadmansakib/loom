@@ -39,7 +39,9 @@ use loom_eval::selfopt::{
     self as opt, ADOPT_MIN_TOKEN_IMPROVEMENT_PERCENT, Decision, LedgerEntry, Lesson, Overlay,
     Proposal, ProposalClass, RunStat,
 };
-use loom_eval::swebench::{self, ContainerSpec, api_key_envs, docker_run_argv, testbed_image};
+use loom_eval::swebench::{
+    self, AgentKind, ContainerSpec, api_key_envs, docker_run_argv, testbed_image,
+};
 
 struct Args {
     eval_dir: PathBuf,
@@ -245,6 +247,7 @@ fn probe_run(
     const RATE_LIMIT_COOLDOWN_SECS: u64 = 120;
     for attempt in 1..=MAX_ATTEMPTS {
         let spec = ContainerSpec {
+            agent: AgentKind::Loom,
             image: &testbed_image(instance),
             loom_binary: loom_bin,
             prompt_file: &prompt_path,

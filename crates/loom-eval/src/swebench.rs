@@ -382,6 +382,51 @@ sandbox = false
 EOF
 if [ -n "${LOOM_BASE_URL:-}" ]; then set -- --base-url "$LOOM_BASE_URL"; else set --; fi; timeout "$LOOM_TIMEOUT_SECS" /loom/loom run --json --no-save --provider "$LOOM_PROVIDER" --model "$LOOM_MODEL" "$@" --max-turns "$LOOM_MAX_TURNS" --workspace /testbed "$(cat /prompt.txt)" > /out/run.json 2> /out/run.err; status=$?; rm -rf /testbed/.loom; cd /testbed && git add -A && git diff --cached > /out/patch.diff 2> /out/patch.err; exit $status"#;
 
+/// Which agent the container runs. `Loom` is the product under test;
+/// `Mini` swaps in mini-swe-agent — the published 100-line bash-only
+/// baseline — while the prompt, image, patch extraction, and scoring
+/// stay byte-identical, so a loom-vs-mini contrast isolates the agent
+/// loop itself rather than the harness around it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentKind {
+    /// The staged loom binary (`CONTAINER_SCRIPT`).
+    #[default]
+    Loom,
+    /// mini-swe-agent from PyPI (`MINI_CONTAINER_SCRIPT`).
+    Mini,
+}
+
+/// The script for the [`AgentKind::Mini`] baseline arm. Same contract
+/// as [`CONTAINER_SCRIPT`]: env in, `patch.diff` + `run.err` out, the
+/// patch extracted even when the agent fails or times out — partial
+/// work still scores. The agent runs through litellm's OpenAI
+/// provider, so the model becomes `openai/<name>` and the endpoint is
+/// `OPENAI_BASE_URL`/`OPENAI_API_BASE`; the key arrives as
+/// `OPENAI_API_KEY` (the runner renames the provider key to match).
+/// No `/out/run.json`: mini emits no event stream, so turn/token
+/// metrics read as zero for this arm and contrasts carry score deltas
+/// only. Their shipped `swebench.yaml` is used verbatim — its prompts
+/// and step limit ARE the baseline being measured.
+pub const MINI_CONTAINER_SCRIPT: &str = r#"python -m pip install -q mini-swe-agent && CFG=$(python -c 'import pathlib, minisweagent; print(pathlib.Path(minisweagent.__file__).parent / "config" / "swebench.yaml")') && cd /testbed && export OPENAI_BASE_URL="$LOOM_BASE_URL" OPENAI_API_BASE="$LOOM_BASE_URL" && timeout "$LOOM_TIMEOUT_SECS" mini --config "$CFG" --model "openai/$LOOM_MODEL" -t "$(cat /prompt.txt)" --exit-immediately > /out/run.log 2> /out/run.err; status=$?; cd /testbed && git add -A && git diff --cached > /out/patch.diff 2> /out/patch.err; exit $status"#;
+
+impl AgentKind {
+    /// Parses the `--agent` flag value (`loom` / `mini`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "loom" => Some(Self::Loom),
+            "mini" => Some(Self::Mini),
+            _ => None,
+        }
+    }
+}
+
+/// The container script for an agent kind.
+pub fn container_script(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::Loom => CONTAINER_SCRIPT,
+        AgentKind::Mini => MINI_CONTAINER_SCRIPT,
+    }
+}
 /// One isolated agent run: a container per (instance, run).
 pub struct ContainerSpec<'a> {
     /// Docker image (see [`testbed_image`]).
@@ -406,6 +451,10 @@ pub struct ContainerSpec<'a> {
     pub api_key_env: &'a str,
     /// The API key value forwarded via `-e`.
     pub api_key: &'a str,
+    /// Which agent the container runs (see [`AgentKind`]). Controls the
+    /// script `docker_run_argv` executes; the loom binary mount stays
+    /// for both arms — provenance hashes it either way.
+    pub agent: AgentKind,
     /// Wall-clock budget for the whole loom run, in seconds.
     pub timeout_secs: u64,
     /// `--max-turns` budget for the in-container loom run.
@@ -499,7 +548,7 @@ pub fn docker_run_argv(spec: &ContainerSpec<'_>) -> Vec<String> {
         spec.image.into(),
         "sh".into(),
         "-c".into(),
-        CONTAINER_SCRIPT.into(),
+        container_script(spec.agent).into(),
     ]);
     argv
 }
@@ -753,12 +802,12 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Reads and hashes the staged binary; fails loudly rather than
 /// stamping a report with no provenance.
-pub fn sweep_provenance(loom_bin: &Path) -> std::io::Result<SweepProvenance> {
+pub fn sweep_provenance(loom_bin: &Path, agent: AgentKind) -> std::io::Result<SweepProvenance> {
     let bytes = std::fs::read(loom_bin)?;
     Ok(SweepProvenance {
         loom_sha256: sha256_hex(&bytes),
         loom_bytes: bytes.len() as u64,
-        container_script_sha256: sha256_hex(CONTAINER_SCRIPT.as_bytes()),
+        container_script_sha256: sha256_hex(container_script(agent).as_bytes()),
         prompt_version: PROMPT_VERSION,
         runner_version: env!("CARGO_PKG_VERSION"),
     })
@@ -991,6 +1040,7 @@ fn api_key_envs_mirror_the_engine_auth_table() {
 #[test]
 fn docker_argv_mounts_and_env_without_a_shell() {
     let spec = ContainerSpec {
+        agent: AgentKind::Loom,
         image: "sweb.eval.x86_64.org__one-1:latest",
         loom_binary: Path::new("/eval/loom-linux/loom"),
         prompt_file: Path::new("/eval/swebench/instances/org-one-1/prompt-run1.txt"),
@@ -1048,6 +1098,7 @@ fn docker_argv_mounts_and_env_without_a_shell() {
     assert!(CONTAINER_SCRIPT.contains("set -- --base-url \"$LOOM_BASE_URL\""));
 
     let gateway = ContainerSpec {
+        agent: AgentKind::Loom,
         base_url: Some("https://free.empexaura.com/v1"),
         provider: "custom",
         model: "nano-model",
@@ -1080,6 +1131,7 @@ fn docker_argv_mounts_and_env_without_a_shell() {
         ("LOOM_READ_HEAD_BYTES".to_owned(), "32768".to_owned()),
     ];
     let overlaid = ContainerSpec {
+        agent: AgentKind::Loom,
         extra_env: &overlay,
         container_name: "loom-org-one-1-selfopt-p1",
         ..bare_arm
@@ -1307,7 +1359,7 @@ fn sweep_provenance_hashes_the_staged_binary_and_script() {
     std::fs::create_dir_all(&dir).unwrap();
     let bin = dir.join("loom");
     std::fs::write(&bin, b"pretend elf").unwrap();
-    let provenance = sweep_provenance(&bin).unwrap();
+    let provenance = sweep_provenance(&bin, AgentKind::Loom).unwrap();
     assert_eq!(provenance.loom_sha256, sha256_hex(b"pretend elf"));
     assert_eq!(provenance.loom_bytes, 11);
     assert_eq!(
@@ -1318,7 +1370,7 @@ fn sweep_provenance_hashes_the_staged_binary_and_script() {
     // A different binary must yield a different digest — the whole
     // point of the mixed-build guard.
     std::fs::write(&bin, b"pretend elf v2").unwrap();
-    let rebuilt = sweep_provenance(&bin).unwrap();
+    let rebuilt = sweep_provenance(&bin, AgentKind::Loom).unwrap();
     assert_ne!(rebuilt.loom_sha256, provenance.loom_sha256);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1357,4 +1409,71 @@ fn span_one_build_refuses_mixed_builds() {
     .unwrap_err();
     assert!(error.contains("two engine builds"), "{error}");
     assert!(error.contains("aa") && error.contains("bb"), "{error}");
+}
+
+#[test]
+fn mini_agent_arm_selects_its_script_and_opens_the_openai_dialect() {
+    // Same spec shape as the loom arm, one field flipped: the argv must
+    // run MINI_CONTAINER_SCRIPT and the key must ride as OPENAI_API_KEY
+    // (litellm reads nothing else).
+    let spec = ContainerSpec {
+        agent: AgentKind::Mini,
+        image: "sweb.eval.x86_64.org__one-1:latest",
+        loom_binary: Path::new("/eval/swebench/loom-linux/loom"),
+        prompt_file: Path::new("/eval/swebench/instances/org-one-1/prompt-run1.txt"),
+        out_dir: Path::new("/eval/swebench/instances/org-one-1/run-1"),
+        provider: "kilo",
+        model: "nano-model",
+        base_url: Some("https://free.empexaura.com/v1"),
+        api_key_env: "OPENAI_API_KEY",
+        api_key: "nano-test",
+        timeout_secs: 3600,
+        max_turns: 60,
+        bare: false,
+        extra_env: &[],
+        container_name: "mini-org-one-1-run1",
+    };
+    let argv = docker_run_argv(&spec);
+    let script_pos = argv.iter().position(|arg| arg == "-c").unwrap();
+    assert_eq!(argv[script_pos + 1], MINI_CONTAINER_SCRIPT);
+    let joined = argv.join("\n");
+    assert!(joined.contains("-e\nOPENAI_API_KEY=nano-test"));
+    assert!(joined.contains("-e\nLOOM_BASE_URL=https://free.empexaura.com/v1"));
+}
+
+#[test]
+fn mini_script_keeps_the_shared_extraction_contract() {
+    // The baseline arm must score the same way the loom arm does: the
+    // patch is extracted even after a failure (`status=$?` then diff,
+    // not `set -e` semantics), and the model is routed through
+    // litellm's OpenAI provider against the forwarded base URL.
+    assert!(
+        MINI_CONTAINER_SCRIPT.contains(
+            "status=$?; cd /testbed && git add -A && git diff --cached > /out/patch.diff"
+        )
+    );
+    assert!(MINI_CONTAINER_SCRIPT.contains("--model \"openai/$LOOM_MODEL\""));
+    assert!(MINI_CONTAINER_SCRIPT.contains("OPENAI_BASE_URL=\"$LOOM_BASE_URL\""));
+    // Their shipped swebench config is the baseline being measured —
+    // never a hand-rolled prompt.
+    assert!(MINI_CONTAINER_SCRIPT.contains("swebench.yaml"));
+}
+
+#[test]
+fn provenance_hashes_the_selected_agents_script() {
+    let dir = std::env::temp_dir().join(format!("loom-prov-mini-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("loom");
+    std::fs::write(&bin, b"pretend elf").unwrap();
+    let loom = sweep_provenance(&bin, AgentKind::Loom).expect("provenance");
+    let mini = sweep_provenance(&bin, AgentKind::Mini).expect("provenance");
+    assert_eq!(
+        loom.container_script_sha256,
+        sha256_hex(CONTAINER_SCRIPT.as_bytes())
+    );
+    assert_eq!(
+        mini.container_script_sha256,
+        sha256_hex(MINI_CONTAINER_SCRIPT.as_bytes())
+    );
+    assert_ne!(loom.container_script_sha256, mini.container_script_sha256);
 }

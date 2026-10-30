@@ -1,8 +1,10 @@
 //! `swebench-run`: orchestrates a SWE-bench Verified sweep in container
-//! isolation. One container per (instance, run); the agent is a linux
-//! loom binary bind-mounted into the official per-instance testbed
-//! image; the patch is extracted inside the container (never on the
-//! host); the official scorer consumes the emitted predictions files.
+//! isolation. One container per (instance, run); the agent is either a
+//! linux loom binary bind-mounted into the official per-instance
+//! testbed image (default) or mini-swe-agent from PyPI (`--agent mini`,
+//! the published baseline arm); the patch is extracted inside the
+//! container (never on the host); the official scorer consumes the
+//! emitted predictions files.
 //!
 //! Host prerequisites: docker. Missing testbed images are pulled
 //! automatically from the swebench Docker Hub prebuilts — the same
@@ -20,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use loom_eval::swebench::{
-    self, ContainerSpec, EXPECTED_ROWS, Prediction, RunUsage, SweInstance, api_key_envs,
+    self, AgentKind, ContainerSpec, EXPECTED_ROWS, Prediction, RunUsage, SweInstance, api_key_envs,
     build_prompt, dataset_cache_path, docker_run_argv, fetch_dataset_verified, load_dataset_cached,
     run_outcome, run_usage, select_instances, testbed_image,
 };
@@ -42,6 +44,9 @@ struct Args {
     max_turns: usize,
     /// `full` (default) or `bare` — the roadmap-item-1 A/B arm.
     arm: String,
+    /// `loom` (default) or `mini` — the agent under test
+    /// (`AgentKind`).
+    agent: String,
     eval_dir: PathBuf,
 }
 
@@ -74,6 +79,11 @@ fn usage() -> ! {
                        runs cannot collide)
   --no-pull            never pull missing testbed images; skip the instance
                        with the local build command printed instead
+  --agent <name>       agent under test: `loom` (default) or `mini`
+                       (mini-swe-agent via PyPI; runs through litellm's
+                       OpenAI dialect, so the key travels as
+                       OPENAI_API_KEY and --base-url is required —
+                       registry providers auto-fill it)
   --provider <name>    provider for the in-container loom (default $LOOM_EVAL_PROVIDER or deepseek)
   --model <name>       model for the in-container loom (default $LOOM_EVAL_MODEL or deepseek-flash)
   --base-url <url>     chat API base URL for OpenAI-compatible gateways (custom provider);
@@ -121,6 +131,7 @@ fn parse_args() -> Args {
         // --timeout-secs still bounds wall clock.
         max_turns: 100,
         arm: std::env::var("LOOM_EVAL_ARM").unwrap_or_else(|_| "full".into()),
+        agent: "loom".into(),
         eval_dir: std::env::var("LOOM_EVAL_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("target/eval")),
@@ -144,6 +155,7 @@ fn parse_args() -> Args {
             "--timeout-secs" => args.timeout_secs = value().parse().unwrap_or_else(|_| usage()),
             "--max-turns" => args.max_turns = value().parse().unwrap_or_else(|_| usage()),
             "--arm" => args.arm = value(),
+            "--agent" => args.agent = value(),
             "--eval-dir" => args.eval_dir = PathBuf::from(value()),
             "--help" | "-h" => usage(),
             _ => usage(),
@@ -163,6 +175,20 @@ fn parse_args() -> Args {
     }
     if args.arm != "full" && args.arm != "bare" {
         eprintln!("--arm must be `full` or `bare`");
+        std::process::exit(2);
+    }
+    if args.agent != "loom" && args.agent != "mini" {
+        eprintln!("--agent must be `loom` or `mini`");
+        std::process::exit(2);
+    }
+    // mini-swe-agent speaks litellm's OpenAI dialect: it needs an
+    // explicit --base-url (registry providers auto-fill it just above,
+    // so this only fires for vendors with baked-in endpoints).
+    if args.agent == "mini" && args.base_url.is_none() {
+        eprintln!(
+            "--agent mini routes traffic through an OpenAI-compatible endpoint: \
+             pass --base-url (or use a `loom provider add`-ed provider)"
+        );
         std::process::exit(2);
     }
     // A named provider (`loom provider add`) already recorded its
@@ -364,6 +390,13 @@ fn main() {
     }
 
     let (key_env, key_value) = resolve_api_key(&args.provider);
+    // mini-swe-agent authenticates through litellm, which only reads
+    // OPENAI_API_KEY; carry the same secret under that name.
+    let key_env = if args.agent == "mini" {
+        "OPENAI_API_KEY".to_owned()
+    } else {
+        key_env
+    };
     let loom_bin = match (&args.loom_bin, args.build_loom) {
         (Some(path), _) => path.clone(),
         (None, true) => build_loom_linux(&base),
@@ -392,8 +425,11 @@ fn main() {
     // extend an eval dir whose recorded sweeps ran a different build —
     // silently mixing builds into one number is how the v3-100
     // headline spanned two binaries.
-    let provenance = swebench::sweep_provenance(&loom_bin)
-        .unwrap_or_else(|error| panic!("hashing {}: {error}", loom_bin.display()));
+    let provenance = swebench::sweep_provenance(
+        &loom_bin,
+        AgentKind::parse(&args.agent).expect("validated in parse_args"),
+    )
+    .unwrap_or_else(|error| panic!("hashing {}: {error}", loom_bin.display()));
     for entry in std::fs::read_dir(&base).into_iter().flatten().flatten() {
         let path = entry.path();
         if path.extension().is_some_and(|e| e == "json")
@@ -481,6 +517,7 @@ fn main() {
             let mut outcome = (0usize, None);
             for attempt in 1..=MAX_ATTEMPTS {
                 let spec = ContainerSpec {
+                    agent: AgentKind::parse(&args.agent).expect("validated in parse_args"),
                     image: &image,
                     loom_binary: &loom_bin,
                     prompt_file: &prompt_path,
