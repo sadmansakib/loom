@@ -324,16 +324,18 @@ pub fn scored_image(instance_id: &str) -> String {
 /// Env vars that may carry the provider's API key, mirroring the
 /// engine's auth table (`loom-engine` `provider_env_names`). The first
 /// one set on the host is forwarded into the container.
-pub fn api_key_envs(provider: &str) -> &'static [&'static str] {
+pub fn api_key_envs(provider: &str) -> Vec<String> {
     match provider {
-        "deepseek" => &["DEEPSEEK_API_KEY"],
-        "anthropic" => &["ANTHROPIC_API_KEY"],
-        "openrouter" => &["OPENROUTER_API_KEY"],
-        "glm" => &["ZAI_API_KEY", "Z_AI_API_KEY"],
-        "nvidia" => &["NVIDIA_API_KEY", "NIM_API_KEY"],
-        "groq" => &["GROQ_API_KEY"],
-        "custom" => &["CUSTOM_API_KEY"],
-        _ => &[],
+        "deepseek" => vec!["DEEPSEEK_API_KEY".into()],
+        "anthropic" => vec!["ANTHROPIC_API_KEY".into()],
+        "openrouter" => vec!["OPENROUTER_API_KEY".into()],
+        "glm" => vec!["ZAI_API_KEY".into(), "Z_AI_API_KEY".into()],
+        "nvidia" => vec!["NVIDIA_API_KEY".into(), "NIM_API_KEY".into()],
+        "groq" => vec!["GROQ_API_KEY".into()],
+        "custom" => vec!["CUSTOM_API_KEY".into()],
+        // A named provider (`loom provider add`) derives its env var
+        // the same way the engine does (`registry::env_var_name`).
+        other => vec![loom_core::engine::registry::env_var_name(other)],
     }
 }
 
@@ -982,7 +984,8 @@ fn api_key_envs_mirror_the_engine_auth_table() {
     assert_eq!(api_key_envs("deepseek"), ["DEEPSEEK_API_KEY"]);
     assert_eq!(api_key_envs("custom"), ["CUSTOM_API_KEY"]);
     assert_eq!(api_key_envs("glm"), ["ZAI_API_KEY", "Z_AI_API_KEY"]);
-    assert!(api_key_envs("nope").is_empty());
+    // Named providers derive their key var the engine's way.
+    assert_eq!(api_key_envs("orcarouter"), ["ORCAROUTER_API_KEY"]);
 }
 
 #[test]

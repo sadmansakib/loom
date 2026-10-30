@@ -94,7 +94,9 @@ fn usage() -> ! {
 Knobs mirror the environment forms: LOOM_EVAL_SWEBENCH_INSTANCES,
 LOOM_EVAL_SWEBENCH_REPOS, LOOM_EVAL_PROVIDER, LOOM_EVAL_MODEL,
 LOOM_EVAL_BASE_URL, LOOM_EVAL_DIR, LOOM_EVAL_SWEBENCH_JSONL (dataset override).
-The API key is read from the provider's env var (e.g. DEEPSEEK_API_KEY)."
+The API key comes from the loom account store (`loom auth login <provider>`)
+or the provider's env var (e.g. DEEPSEEK_API_KEY). Named providers
+(`loom provider add`) pick up their recorded --base-url automatically."
     );
     std::process::exit(2);
 }
@@ -163,6 +165,16 @@ fn parse_args() -> Args {
         eprintln!("--arm must be `full` or `bare`");
         std::process::exit(2);
     }
+    // A named provider (`loom provider add`) already recorded its
+    // endpoint; fill --base-url from the registry so callers needn't
+    // restate it (the eval containers run registry-less).
+    if args.base_url.is_none()
+        && let Some(entry) =
+            loom_core::engine::registry::ProviderRegistry::load(&loom_core::paths::db_path())
+                .get(&args.provider)
+    {
+        args.base_url = Some(entry.base_url.clone());
+    }
     args
 }
 
@@ -171,18 +183,26 @@ fn repo_root() -> PathBuf {
 }
 
 fn resolve_api_key(provider: &str) -> (String, String) {
-    for name in api_key_envs(provider) {
-        if let Ok(value) = std::env::var(name)
-            && !value.trim().is_empty()
-        {
-            return (name.to_string(), value);
+    // The engine's single resolution order (ADR-009): the active
+    // `loom auth login <provider>` account, then the provider's env
+    // vars. Either way the key is carried into the container under the
+    // provider's first env-var name.
+    match loom_core::engine::auth::Auth::open(&loom_core::paths::db_path())
+        .and_then(|auth| auth.resolve(provider, None))
+    {
+        Ok(credential) => (
+            api_key_envs(provider).into_iter().next().unwrap(),
+            credential.secret.expose().to_owned(),
+        ),
+        Err(_) => {
+            eprintln!(
+                "no API key for provider `{provider}`: run `loom auth login {provider}` \
+                 or export one of {} (see swebench-run --help)",
+                api_key_envs(provider).join(" / ")
+            );
+            std::process::exit(2);
         }
     }
-    eprintln!(
-        "no API key for provider `{provider}`: export one of {} (see swebench-run --help)",
-        api_key_envs(provider).join(" / ")
-    );
-    std::process::exit(2);
 }
 
 /// Cross-builds the linux loom binary inside a docker rust image and
@@ -452,8 +472,10 @@ fn main() {
             // Free-tier gateways rate-limit under concurrent sweeps; a
             // 429-killed run is infrastructure, not model competence,
             // so it is retried after a cooldown before it can count.
-            const MAX_ATTEMPTS: usize = 3;
-            const RATE_LIMIT_COOLDOWN_SECS: u64 = 120;
+            // Free capacity comes in windows (shared pools), so retry
+            // persistently: 10 x 3min ≈ 30min of waiting per run.
+            const MAX_ATTEMPTS: usize = 10;
+            const RATE_LIMIT_COOLDOWN_SECS: u64 = 180;
             let mut exit_code = -1;
             let mut patch = String::new();
             let mut outcome = (0usize, None);

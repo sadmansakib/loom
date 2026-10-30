@@ -137,11 +137,11 @@ fn parse_args() -> Args {
 
 /// The provider's key, resolved exactly the way `swebench-run` does.
 fn resolve_api_key(provider: &str) -> (String, String) {
-    for env in api_key_envs(provider) {
+    for env in &api_key_envs(provider) {
         if let Ok(value) = std::env::var(env)
             && !value.is_empty()
         {
-            return ((*env).to_owned(), value);
+            return (env.clone(), value);
         }
     }
     eprintln!(
