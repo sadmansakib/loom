@@ -1066,6 +1066,9 @@ impl Agent {
         // COMPLETION_REFUSAL_CAP), so "done" always refers to a state
         // some green check actually covered.
         let mut completion = CompletionGate::default();
+        // Bounded `max_tokens` continuations (§5.1): each one injects a
+        // continue reminder instead of failing the task.
+        let mut continuations: u8 = 0;
 
         // The hard-stop token the stream and tool paths select on
         // (§6.5–§6.6); the pause is a turn-boundary decision and never
@@ -1417,10 +1420,45 @@ impl Agent {
                     // idle tools.
                     self.reconcile_surface();
                 }
+                StopReason::MaxTokens if !has_calls && continuations < MAX_TOKENS_CONTINUATIONS => {
+                    // Standard continue pattern: commit the truncated
+                    // reply, then ask the model to resume exactly where
+                    // it stopped. Bounded — a model that can never finish
+                    // within the cap still surfaces the failure.
+                    continuations += 1;
+                    self.commit(session, assistant, Vec::new())?;
+                    let reminder = Item::User {
+                        text: MAX_TOKENS_CONTINUATION_PROMPT.to_owned(),
+                    };
+                    if let Some(store) = &self.store {
+                        store
+                            .append_item(&session.id, session.next_index(), &reminder)
+                            .map_err(persistence)?;
+                    }
+                    session
+                        .push_item(reminder)
+                        .map_err(|error| TaskError::Internal(error.to_string()))?;
+                    sink.emit(
+                        task_id,
+                        EventKind::LoopNudge {
+                            text: MAX_TOKENS_CONTINUATION_PROMPT.to_owned(),
+                        },
+                    );
+                    accounting.turns = turn;
+                    accounting.sync(session, task_id);
+                    if turn == self.max_turns {
+                        return Err(TaskError::MaxTurns {
+                            max_turns: self.max_turns,
+                        });
+                    }
+                    self.reconcile_surface();
+                    continue;
+                }
                 other => {
-                    // `max_tokens` / `context_limit` / `content_filter`
-                    // (and any future reason). The reply is committed first
-                    // so it stays inspectable, then the task fails.
+                    // `context_limit` / `content_filter` (and any future
+                    // reason), or `max_tokens` past the continuation cap.
+                    // The reply is committed first so it stays inspectable,
+                    // then the task fails.
                     if has_calls {
                         return Err(TaskError::Protocol(format!(
                             "{} response carried tool calls",
@@ -2070,6 +2108,17 @@ impl CompletionGate {
 /// until green, but bounded — three nudges that each end in another
 /// unverified edit mean the model is stalling, not verifying.
 const COMPLETION_REFUSAL_CAP: u8 = 3;
+
+/// Ceiling on continue-reminders per task after `max_tokens` truncation:
+/// enough for a reasoning model's long final answer, but bounded so a
+/// model that never terminates still surfaces the failure.
+const MAX_TOKENS_CONTINUATIONS: u8 = 4;
+
+/// Injected user item when generation hits the output limit: the field's
+/// standard resume protocol — the model already sees its committed
+/// partial reply as the previous assistant turn.
+const MAX_TOKENS_CONTINUATION_PROMPT: &str = "Your reply hit the output token limit and was cut off. Continue \
+     exactly where you left off — do not repeat any earlier content.";
 
 /// Whether a result is a green command run: successful, command-shaped
 /// (`$ …`), and reporting exit status 0.

@@ -892,14 +892,17 @@ async fn tool_round_trip_executes_and_commits_one_turn_per_model_response() {
 }
 
 #[tokio::test]
-async fn max_tokens_commits_the_assistant_then_fails() {
-    let provider = FakeProvider::new(
-        capabilities(),
-        vec![completed(
-            assistant("truncated", StopReason::MaxTokens, Vec::new()),
+async fn max_tokens_past_the_continuation_cap_fails() {
+    // One more truncation than the cap allows: every committed partial is
+    // followed by a continue reminder until the cap, then the task fails.
+    let mut replies = Vec::new();
+    for i in 0..5 {
+        replies.push(completed(
+            assistant(&format!("truncated {i}"), StopReason::MaxTokens, Vec::new()),
             usage(15, 4, None),
-        )],
-    );
+        ));
+    }
+    let provider = FakeProvider::new(capabilities(), replies);
     let mut session = Session::new(SessionId::new());
     let (sink, _receiver) = ChannelEventSink::new();
     let control = TaskControl::new();
@@ -916,13 +919,55 @@ async fn max_tokens_commits_the_assistant_then_fails() {
             stop_reason: "max_tokens"
         }
     ));
-    // The truncated reply is still committed for inspection.
-    assert_eq!(session.transcript.len(), 2);
-    assert!(matches!(&session.transcript[1], Item::Assistant(a) if a.content == "truncated"));
+    // Every truncated reply plus its continue reminder is committed;
+    // the fifth truncation ends the task with no further reminder.
+    let reminders = session
+        .transcript
+        .iter()
+        .filter(|i| matches!(i, Item::User { text } if text.contains("output token limit")))
+        .count();
+    assert_eq!(reminders, 4, "capped at MAX_TOKENS_CONTINUATIONS");
 
     let record = &session.tasks[0];
     assert_eq!(record.status, TaskStatus::Failed);
     assert_eq!(record.end_reason.as_deref(), Some("max_tokens"));
+}
+#[tokio::test]
+async fn max_tokens_truncation_continues_to_a_real_answer() {
+    // The recovery contract: truncate once, get the continue reminder,
+    // finish normally — the task succeeds instead of failing on §13's
+    // unrecoverable-stop list.
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            completed(
+                assistant("part one of the answ", StopReason::MaxTokens, Vec::new()),
+                usage(15, 4, None),
+            ),
+            completed(
+                assistant("er.", StopReason::EndTurn, Vec::new()),
+                usage(20, 2, None),
+            ),
+        ],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, _receiver) = ChannelEventSink::new();
+    let control = TaskControl::new();
+    let agent = agent(provider, ToolRegistry::new(), 10);
+
+    let summary = agent
+        .run_task(&mut session, "go", &sink, &control)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.model_requests, 2);
+    assert!(
+        session
+            .transcript
+            .iter()
+            .any(|i| matches!(i, Item::User { text } if text.contains("Continue"))),
+        "the continue reminder is a persisted user item"
+    );
 }
 
 #[tokio::test]
