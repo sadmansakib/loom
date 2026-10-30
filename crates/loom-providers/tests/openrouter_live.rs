@@ -4,6 +4,8 @@
 //! catalog. They are `#[ignore]`d, so the default `cargo test` never
 //! touches the network:
 //!
+//! Either run `loom auth login openrouter` once, or export the key:
+//!
 //! ```text
 //! OPENROUTER_API_KEY=sk-or-… cargo test -p loom-providers \
 //!     --test openrouter_live -- --ignored --nocapture
@@ -18,7 +20,7 @@
 
 use futures::StreamExt;
 use loom_kernel::model::{
-    Message, ModelError, ModelEvent, ModelProvider, ModelRequest, ModelResponse,
+    Message, ModelError, ModelErrorKind, ModelEvent, ModelProvider, ModelRequest, ModelResponse,
 };
 use loom_kernel::tool::ToolSpec;
 use loom_providers::{
@@ -27,12 +29,12 @@ use loom_providers::{
 };
 use serde_json::json;
 
-/// Live key from the environment; fail loudly when absent.
+mod live_key;
+
+/// Live key from the loom account store or `OPENROUTER_API_KEY`; fail
+/// loudly when absent.
 fn api_key() -> String {
-    match std::env::var("OPENROUTER_API_KEY") {
-        Ok(key) if !key.is_empty() => key,
-        _ => panic!("OPENROUTER_API_KEY must be set for live tests"),
-    }
+    live_key::live_key("openrouter", "OPENROUTER_API_KEY")
 }
 
 /// The live catalog, fetched with production defaults.
@@ -81,23 +83,41 @@ async fn collect(
     out
 }
 
-/// The single authoritative `Completed` event of a successful request.
-#[expect(clippy::unwrap_used)]
-fn expect_completed(events: Vec<Result<ModelEvent, ModelError>>) -> ModelResponse {
-    let completed = events
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .find_map(|e| match e {
-            ModelEvent::Completed(response) => Some(response),
-            _ => None,
-        })
-        .unwrap();
+/// The `Completed` event of a free-model request, or `None` to skip.
+///
+/// Free upstreams churn: rate limits, overload, and exhausted quota are
+/// infrastructure states, not adapter regressions (the same philosophy as
+/// the catalog skip). Any other failure — auth, protocol — still panics.
+fn free_completed(events: Vec<Result<ModelEvent, ModelError>>) -> Option<ModelResponse> {
+    let mut churn: Option<String> = None;
+    let mut completed: Option<ModelResponse> = None;
+    for event in events {
+        match event {
+            Ok(ModelEvent::Completed(response)) => completed = Some(response),
+            Err(error) => {
+                println!("error:  {error}");
+                if error.kind.is_retryable() || matches!(error.kind, ModelErrorKind::QuotaExhausted)
+                {
+                    churn = Some(error.to_string());
+                }
+            }
+            Ok(event) => println!("event:  {event:?}"),
+        }
+    }
+    let completed = match completed {
+        Some(response) => response,
+        None if churn.is_some() => {
+            println!("skipped: free upstream unavailable");
+            return None;
+        }
+        None => panic!("no Completed event (see events above)"),
+    };
     println!("stop_reason:  {:?}", completed.message.stop_reason);
     println!("tool_calls:   {}", completed.message.tool_calls.len());
     println!("content:      {:?}", completed.message.content);
     println!("usage:        {:?}", completed.usage);
     println!("cost_usd:     {:?}", completed.usage.cost_usd);
-    completed
+    Some(completed)
 }
 
 fn plain_request(model: &str, prompt: &str) -> ModelRequest {
@@ -169,7 +189,9 @@ async fn free_model_plain_roundtrip() {
     let provider = provider(catalog);
     let request = plain_request(&model, "Reply with exactly one word: pong");
     let events = collect(provider.stream(&request)).await;
-    let completed = expect_completed(events);
+    let Some(completed) = free_completed(events) else {
+        return;
+    };
     assert!(!completed.message.content.is_empty());
     assert!(completed.usage.input_tokens > 0);
     assert!(completed.usage.output_tokens > 0);
@@ -192,7 +214,9 @@ async fn free_model_accepts_tools() {
     let mut request = plain_request(&model, "Call the list_files tool. Do not answer in prose.");
     request.tools = vec![list_files_tool()];
     let events = collect(provider.stream(&request)).await;
-    let completed = expect_completed(events);
+    let Some(completed) = free_completed(events) else {
+        return;
+    };
     // Free upstreams are sloppy: either a tool call or a prose answer is
     // acceptable, but a tool call must carry a usable argument object.
     for call in &completed.message.tool_calls {

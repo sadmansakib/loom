@@ -4,6 +4,8 @@
 //! (bounded by small `max_tokens`). Every test is `#[ignore]`d, so the
 //! default `cargo test` never touches the network:
 //!
+//! Either run `loom auth login deepseek` once, or export the key:
+//!
 //! ```text
 //! DEEPSEEK_API_KEY=sk-… cargo test -p loom-providers \
 //!     --test deepseek_live -- --ignored --nocapture
@@ -22,12 +24,12 @@ use loom_kernel::transcript::{ToolCallId, ToolResult, ToolStatus};
 use loom_providers::{DeepSeekConfig, DeepSeekProvider, ReasoningEffort, ThinkingMode};
 use serde_json::json;
 
-/// Live key from the environment; fail loudly when absent.
+mod live_key;
+
+/// Live key from the loom account store or `DEEPSEEK_API_KEY`; fail
+/// loudly when absent.
 fn api_key() -> String {
-    match std::env::var("DEEPSEEK_API_KEY") {
-        Ok(key) if !key.is_empty() => key,
-        _ => panic!("DEEPSEEK_API_KEY must be set for live tests"),
-    }
+    live_key::live_key("deepseek", "DEEPSEEK_API_KEY")
 }
 
 #[expect(clippy::expect_used)]

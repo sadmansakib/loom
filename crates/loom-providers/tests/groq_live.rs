@@ -3,6 +3,8 @@
 //! These tests hit `https://api.groq.com/openai/v1` and are `#[ignore]`d,
 //! so the default `cargo test` never touches the network:
 //!
+//! Either run `loom auth login groq` once, or export the key:
+//!
 //! ```text
 //! GROQ_API_KEY=gsk_… cargo test -p loom-providers \
 //!     --test groq_live -- --ignored --nocapture
@@ -23,12 +25,12 @@ use loom_kernel::tool::ToolSpec;
 use loom_providers::{GroqConfig, GroqProvider, TimeoutConfig};
 use serde_json::json;
 
-/// Live key from the environment; fail loudly when absent.
+mod live_key;
+
+/// Live key from the loom account store or `GROQ_API_KEY`; fail loudly
+/// when absent.
 fn api_key() -> String {
-    match std::env::var("GROQ_API_KEY") {
-        Ok(key) if !key.is_empty() => key,
-        _ => panic!("GROQ_API_KEY must be set for live tests"),
-    }
+    live_key::live_key("groq", "GROQ_API_KEY")
 }
 
 /// The model exercised when the caller does not pick one. `qwen/qwen3.8-27b`
