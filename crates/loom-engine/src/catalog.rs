@@ -26,6 +26,42 @@ use crate::engine::EngineError;
 /// How long a fetched catalog is considered fresh.
 const CATALOG_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Catalog fetch budgets: a `/models` list is one small JSON response,
+/// not a minutes-long stream — a wedged gateway must not hold an
+/// engine open for the chat-path header timeout.
+const CATALOG_TIMEOUTS: loom_providers::TimeoutConfig = loom_providers::TimeoutConfig {
+    connect: Duration::from_secs(30),
+    header: Duration::from_secs(30),
+    idle: Duration::from_secs(30),
+    stall: Duration::from_secs(30),
+};
+
+/// Catalog-fetch retry cadence: one immediate retry after a beat.
+const CATALOG_ATTEMPTS: u32 = 2;
+const CATALOG_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Runs `fetch` up to [`CATALOG_ATTEMPTS`] times, giving transient
+/// failures (429/5xx bursts on shared free gateways) a second chance
+/// before the caller falls back to a stale cache or errors out.
+async fn fetch_with_retries<T, E, F, Fut>(mut fetch: F, retry_delay: Duration) -> Result<T, E>
+where
+    E: std::fmt::Display,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    for attempt in 1..=CATALOG_ATTEMPTS {
+        match fetch().await {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt < CATALOG_ATTEMPTS => {
+                tracing::warn!(attempt, %error, "catalog fetch failed, retrying");
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the loop returns on its final attempt")
+}
+
 /// The cache file beside the database.
 ///
 /// Kept next to `loom.db` so all durable state lives in one directory the
@@ -66,10 +102,9 @@ pub async fn load(
     let credential = auth.resolve(provider, account)?;
     let base = base_url.unwrap_or(loom_providers::OPENROUTER_DEFAULT_BASE_URL);
 
-    match loom_providers::fetch_catalog(
-        base,
-        credential.secret.expose(),
-        loom_providers::TimeoutConfig::default(),
+    match fetch_with_retries(
+        || loom_providers::fetch_catalog(base, credential.secret.expose(), CATALOG_TIMEOUTS),
+        CATALOG_RETRY_DELAY,
     )
     .await
     {
@@ -125,10 +160,15 @@ pub async fn load_custom(
 
     let credential = auth.resolve(provider, account)?;
 
-    match loom_providers::fetch_custom_catalog(
-        models_url,
-        credential.secret.expose(),
-        loom_providers::TimeoutConfig::default(),
+    match fetch_with_retries(
+        || {
+            loom_providers::fetch_custom_catalog(
+                models_url,
+                credential.secret.expose(),
+                CATALOG_TIMEOUTS,
+            )
+        },
+        CATALOG_RETRY_DELAY,
     )
     .await
     {
@@ -205,6 +245,38 @@ fn write_cache(path: &Path, catalog: &OpenRouterCatalog) -> std::io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn a_transient_catalog_failure_succeeds_on_the_retry() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let attempts = Arc::new(AtomicU32::new(0));
+        let seen = attempts.clone();
+        let fetch = move || {
+            let first = seen.fetch_add(1, Ordering::SeqCst) == 0;
+            async move { if first { Err("transient") } else { Ok(7_u32) } }
+        };
+        let value = fetch_with_retries(fetch, Duration::ZERO)
+            .await
+            .expect("second attempt wins");
+        assert_eq!(value, 7);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_persistent_catalog_failure_exhausts_both_attempts() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let attempts = Arc::new(AtomicU32::new(0));
+        let seen = attempts.clone();
+        let fetch = move || {
+            let _ = seen.fetch_add(1, Ordering::SeqCst);
+            async { Err::<u32, &str>("down") }
+        };
+        assert!(fetch_with_retries(fetch, Duration::ZERO).await.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), CATALOG_ATTEMPTS);
+    }
 
     fn catalog(fetched_at: u64) -> OpenRouterCatalog {
         OpenRouterCatalog {

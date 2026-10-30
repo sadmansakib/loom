@@ -43,6 +43,13 @@ impl ProviderRegistry {
         };
         serde_json::from_str(&body).unwrap_or_else(|error| {
             tracing::warn!(%error, "ignoring an unreadable provider registry");
+            // Registry entries are user-authored, unlike the derived
+            // catalog caches: keep the bytes for recovery so a later
+            // `provider add` save cannot silently wipe them.
+            let _ = std::fs::copy(
+                registry_path(db_path),
+                registry_path(db_path).with_extension("invalid"),
+            );
             Self::default()
         })
     }
@@ -158,7 +165,12 @@ mod tests {
 
         let path = registry_path(&db_path);
         std::fs::write(&path, b"not json").expect("writes");
+        std::fs::write(&path, b"not json").expect("writes");
         assert!(ProviderRegistry::load(&db_path).entries().next().is_none());
+        // The unreadable bytes are kept for recovery, not wiped by the
+        // next `provider add` save.
+        let salvaged = registry_path(&db_path).with_extension("invalid");
+        assert!(std::fs::read(&salvaged).is_ok_and(|bytes| bytes == b"not json"));
         let _ = std::fs::remove_dir_all(db_path.parent().expect("parent"));
     }
 
