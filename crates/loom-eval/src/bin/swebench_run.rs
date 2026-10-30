@@ -183,16 +183,6 @@ fn parse_args() -> Args {
         eprintln!("--agent must be `loom` or `mini`");
         std::process::exit(2);
     }
-    // mini-swe-agent speaks litellm's OpenAI dialect: it needs an
-    // explicit --base-url (registry providers auto-fill it just above,
-    // so this only fires for vendors with baked-in endpoints).
-    if args.agent == "mini" && args.base_url.is_none() {
-        eprintln!(
-            "--agent mini routes traffic through an OpenAI-compatible endpoint: \
-             pass --base-url (or use a `loom provider add`-ed provider)"
-        );
-        std::process::exit(2);
-    }
     // A named provider (`loom provider add`) already recorded its
     // endpoint; fill --base-url from the registry so callers needn't
     // restate it (the eval containers run registry-less).
@@ -202,6 +192,16 @@ fn parse_args() -> Args {
                 .get(&args.provider)
     {
         args.base_url = Some(entry.base_url.clone());
+    }
+    // mini-swe-agent speaks litellm's OpenAI dialect: it needs an
+    // explicit --base-url (registry providers auto-fill it just below,
+    // so this only fires for vendors with baked-in endpoints).
+    if args.agent == "mini" && args.base_url.is_none() {
+        eprintln!(
+            "--agent mini routes traffic through an OpenAI-compatible endpoint: \
+             pass --base-url (or use a `loom provider add`-ed provider)"
+        );
+        std::process::exit(2);
     }
     args
 }

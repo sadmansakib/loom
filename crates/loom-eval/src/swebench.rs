@@ -407,7 +407,19 @@ pub enum AgentKind {
 /// metrics read as zero for this arm and contrasts carry score deltas
 /// only. Their shipped `swebench.yaml` is used verbatim — its prompts
 /// and step limit ARE the baseline being measured.
-pub const MINI_CONTAINER_SCRIPT: &str = r#"python -m pip install -q mini-swe-agent && CFG=$(python -c 'import pathlib, minisweagent; print(pathlib.Path(minisweagent.__file__).parent / "config" / "swebench.yaml")') && cd /testbed && export OPENAI_BASE_URL="$LOOM_BASE_URL" OPENAI_API_BASE="$LOOM_BASE_URL" && timeout "$LOOM_TIMEOUT_SECS" mini --config "$CFG" --model "openai/$LOOM_MODEL" -t "$(cat /prompt.txt)" --exit-immediately > /out/run.log 2> /out/run.err; status=$?; cd /testbed && git add -A && git diff --cached > /out/patch.diff 2> /out/patch.err; exit $status"#;
+/// mini-swe-agent, run headless inside the testbed we already provide.
+///
+/// Recipe per their v2 docs (docs/advanced/v2_migration.md, environments.md):
+/// `-c swebench.yaml` loads their published SWE-bench protocol (prompts,
+/// 250-step limit, tool-calling); `-c environment.environment_class=local`
+/// overrides their docker backend because this container IS the testbed
+/// (no nested docker). `MSWEA_CONFIGURED` skips the first-run wizard,
+/// `MSWEA_COST_TRACKING=ignore_errors` tolerates gateways that return no
+/// cost metadata, `-y --exit-immediately` makes the run non-interactive,
+/// and `mcp` satisfies a litellm import. The `git diff --cached` below
+/// mirrors their official harness's patch extraction (unstaged work would
+/// be lost otherwise).
+pub const MINI_CONTAINER_SCRIPT: &str = r#"python -m pip install -q mini-swe-agent mcp && cd /testbed && export OPENAI_BASE_URL="$LOOM_BASE_URL" OPENAI_API_BASE="$LOOM_BASE_URL" MSWEA_CONFIGURED=1 MSWEA_COST_TRACKING=ignore_errors && timeout "$LOOM_TIMEOUT_SECS" mini -y --exit-immediately -c swebench.yaml -c environment.environment_class=local --model "openai/$LOOM_MODEL" -t "$(cat /prompt.txt)" > /out/run.log 2> /out/run.err; status=$?; cd /testbed && git add -A && git diff --cached > /out/patch.diff 2> /out/patch.err; exit $status"#;
 
 impl AgentKind {
     /// Parses the `--agent` flag value (`loom` / `mini`).
