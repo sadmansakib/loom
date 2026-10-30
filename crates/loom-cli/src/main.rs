@@ -13,6 +13,7 @@ mod args;
 mod auth_command;
 mod instructions;
 mod output;
+mod provider_command;
 mod run;
 mod sessions_command;
 mod stats_command;
@@ -26,6 +27,7 @@ fn main() -> ExitCode {
     let outcome = match cli.command {
         Command::Run(args) => run::run(*args),
         Command::Auth(args) => auth_command::run(args.command).map(|()| ExitCode::SUCCESS),
+        Command::Provider(args) => provider_command::run(args.command).map(|()| ExitCode::SUCCESS),
         Command::Sessions => sessions_command::run(),
         Command::Stats(args) => stats_command::run(args),
     };

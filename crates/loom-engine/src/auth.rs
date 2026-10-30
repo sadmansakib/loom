@@ -43,27 +43,30 @@ pub const DEFAULT_PROVIDER: &str = DEEPSEEK_PROVIDER_NAME;
 
 /// Ordered environment-variable fallback names for a provider (ADR-009).
 ///
-/// Adapter-declared in spirit; an unknown provider has no fallback and
-/// resolves only from saved accounts.
-pub fn provider_env_names(provider: &str) -> &'static [&'static str] {
+/// Built-ins declare theirs statically; any other name (the named custom
+/// providers from `loom provider add`, or a typo) falls back to the
+/// derived `{NAME}_API_KEY` spelling, matching the registry's naming
+/// rule. Auth is name-generic — the adapter check happens later, at
+/// provider build.
+pub fn provider_env_names(provider: &str) -> Vec<String> {
     match provider {
-        DEEPSEEK_PROVIDER_NAME => &["DEEPSEEK_API_KEY"],
-        ANTHROPIC_PROVIDER_NAME => &["ANTHROPIC_API_KEY"],
-        OPENROUTER_PROVIDER_NAME => &["OPENROUTER_API_KEY"],
-        GLM_PROVIDER_NAME => &["ZAI_API_KEY", "Z_AI_API_KEY"],
-        NVIDIA_PROVIDER_NAME => &["NVIDIA_API_KEY", "NIM_API_KEY"],
-        GROQ_PROVIDER_NAME => &["GROQ_API_KEY"],
-        CUSTOM_PROVIDER_NAME => &["CUSTOM_API_KEY"],
-        _ => &[],
+        DEEPSEEK_PROVIDER_NAME => vec!["DEEPSEEK_API_KEY".to_owned()],
+        ANTHROPIC_PROVIDER_NAME => vec!["ANTHROPIC_API_KEY".to_owned()],
+        OPENROUTER_PROVIDER_NAME => vec!["OPENROUTER_API_KEY".to_owned()],
+        GLM_PROVIDER_NAME => vec!["ZAI_API_KEY".to_owned(), "Z_AI_API_KEY".to_owned()],
+        NVIDIA_PROVIDER_NAME => vec!["NVIDIA_API_KEY".to_owned(), "NIM_API_KEY".to_owned()],
+        GROQ_PROVIDER_NAME => vec!["GROQ_API_KEY".to_owned()],
+        CUSTOM_PROVIDER_NAME => vec!["CUSTOM_API_KEY".to_owned()],
+        other => vec![crate::registry::env_var_name(other)],
     }
 }
 
 /// One environment fallback: its name and whether it currently holds a
 /// non-empty value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvVarState {
     /// The variable name, as [`provider_env_names`] lists it.
-    pub name: &'static str,
+    pub name: String,
     /// Whether the variable is set to a non-empty value.
     pub set: bool,
 }
@@ -85,10 +88,10 @@ fn provider_env_state_with(
     get_env: impl Fn(&str) -> Option<String>,
 ) -> Vec<EnvVarState> {
     provider_env_names(provider)
-        .iter()
-        .map(|&name| EnvVarState {
+        .into_iter()
+        .map(|name| EnvVarState {
+            set: get_env(&name).is_some_and(|value| !value.is_empty()),
             name,
-            set: get_env(name).is_some_and(|value| !value.is_empty()),
         })
         .collect()
 }
@@ -774,7 +777,7 @@ pub fn resolve(
 
     // 3. Provider environment fallback.
     let names = provider_env_names(provider);
-    for name in names {
+    for name in &names {
         if let Some(value) = get_env(name)
             && !value.is_empty()
         {
@@ -788,7 +791,7 @@ pub fn resolve(
 
     Err(AuthError::NoCredential {
         provider: provider.to_owned(),
-        env: names.iter().map(|name| (*name).to_owned()).collect(),
+        env: names,
     })
 }
 
@@ -816,18 +819,13 @@ fn secret_for(
         }
         Method::Environment => {
             for name in provider_env_names(&account.provider) {
-                if let Some(value) = get_env(name)
-                    && !value.is_empty()
-                {
+                if let Some(value) = get_env(&name) {
                     return Ok(SecretString::new(value));
                 }
             }
             Err(AuthError::NoCredential {
                 provider: account.provider.clone(),
-                env: provider_env_names(&account.provider)
-                    .iter()
-                    .map(|name| (*name).to_owned())
-                    .collect(),
+                env: provider_env_names(&account.provider),
             })
         }
     }
@@ -974,7 +972,7 @@ pub fn login(
             return Err(AuthError::Invalid(format!(
                 "environment credentials are never stored; export {} and `loom run` \
                  will pick it up automatically",
-                quote_names(provider_env_names(&provider))
+                quote_names(&provider_env_names(&provider))
             )));
         }
         Method::Key => {
@@ -1094,7 +1092,7 @@ pub fn remove_account(
 }
 
 /// Renders environment-variable names for the "export one of these" message.
-fn quote_names(names: &[&str]) -> String {
+fn quote_names(names: &[String]) -> String {
     if names.is_empty() {
         String::from("the provider's key variable")
     } else {
@@ -1219,19 +1217,24 @@ mod tests {
 
     #[test]
     fn env_var_names_cover_every_shipped_provider() {
-        assert_eq!(provider_env_names("deepseek"), &["DEEPSEEK_API_KEY"]);
-        assert_eq!(provider_env_names("anthropic"), &["ANTHROPIC_API_KEY"]);
-        assert_eq!(provider_env_names("openrouter"), &["OPENROUTER_API_KEY"]);
-        assert_eq!(provider_env_names("glm"), &["ZAI_API_KEY", "Z_AI_API_KEY"]);
+        assert_eq!(provider_env_names("deepseek"), vec!["DEEPSEEK_API_KEY"]);
+        assert_eq!(provider_env_names("anthropic"), vec!["ANTHROPIC_API_KEY"]);
+        assert_eq!(provider_env_names("openrouter"), vec!["OPENROUTER_API_KEY"]);
+        assert_eq!(
+            provider_env_names("glm"),
+            vec!["ZAI_API_KEY", "Z_AI_API_KEY"]
+        );
         assert_eq!(
             provider_env_names("nvidia"),
-            &["NVIDIA_API_KEY", "NIM_API_KEY"]
+            vec!["NVIDIA_API_KEY", "NIM_API_KEY"]
         );
-        assert_eq!(provider_env_names("groq"), &["GROQ_API_KEY"]);
-        assert_eq!(provider_env_names("custom"), &["CUSTOM_API_KEY"]);
-        assert!(provider_env_names("nope").is_empty());
+        assert_eq!(provider_env_names("groq"), vec!["GROQ_API_KEY"]);
+        assert_eq!(provider_env_names("custom"), vec!["CUSTOM_API_KEY"]);
+        // Any other name (a `loom provider add` name, or a typo) derives
+        // its fallback.
+        assert_eq!(provider_env_names("nope"), vec!["NOPE_API_KEY"]);
+        assert_eq!(provider_env_names("my-gateway"), vec!["MY_GATEWAY_API_KEY"]);
     }
-
     #[test]
     fn env_state_marks_only_populated_names() {
         // glm declares two fallbacks in order; only a set, non-empty
@@ -1243,11 +1246,11 @@ mod tests {
             state,
             vec![
                 EnvVarState {
-                    name: "ZAI_API_KEY",
+                    name: "ZAI_API_KEY".to_owned(),
                     set: true
                 },
                 EnvVarState {
-                    name: "Z_AI_API_KEY",
+                    name: "Z_AI_API_KEY".to_owned(),
                     set: false
                 },
             ]
@@ -1257,12 +1260,18 @@ mod tests {
         assert_eq!(
             state,
             vec![EnvVarState {
-                name: "DEEPSEEK_API_KEY",
+                name: "DEEPSEEK_API_KEY".to_owned(),
                 set: false
             }]
         );
-        // Unknown providers have no fallbacks to report.
-        assert!(provider_env_state_with("nope", |_| None).is_empty());
+        // Any other name reports its derived fallback, unset here.
+        assert_eq!(
+            provider_env_state_with("nope", |_| None),
+            vec![EnvVarState {
+                name: "NOPE_API_KEY".to_owned(),
+                set: false
+            }]
+        );
     }
 
     #[test]

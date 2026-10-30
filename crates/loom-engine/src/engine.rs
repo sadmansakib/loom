@@ -659,27 +659,45 @@ impl Engine {
         // models URL (explicit or defaulted from the base). Its cache
         // is keyed to the URL, and a fetch failure is fatal — the
         // adapter has no built-in table to fall back to.
-        let config = if config.catalog.is_none() && config.provider == CUSTOM_PROVIDER_NAME {
-            let Some(base_url) = config.base_url.clone() else {
-                return Err(EngineError::MissingBaseUrl {
-                    provider: config.provider.clone(),
-                });
-            };
-            let models_url = config
-                .models_url
-                .clone()
-                .unwrap_or_else(|| format!("{}/models", base_url.trim_end_matches('/')));
-            let auth = crate::auth::Auth::open(&config.db_path)?;
-            let catalog = crate::catalog::load_custom(
-                &auth,
-                config.account.as_deref(),
-                &models_url,
-                &config.db_path,
-            )
-            .await?;
-            EngineConfig {
-                catalog: Some(ProviderCatalog::Custom(catalog)),
-                ..config
+        let config = if config.catalog.is_none() {
+            // `custom` is described entirely by user-supplied URLs; a
+            // registry name (`loom provider add`) carries them in the
+            // registry instead, with explicit flags winning over both.
+            let registry = crate::registry::ProviderRegistry::load(&config.db_path);
+            let named = registry.get(&config.provider).cloned();
+            let is_custom = config.provider == CUSTOM_PROVIDER_NAME
+                || named.is_some()
+                || config.base_url.is_some();
+            if is_custom {
+                let Some(base_url) = config
+                    .base_url
+                    .clone()
+                    .or_else(|| named.as_ref().map(|entry| entry.base_url.clone()))
+                else {
+                    return Err(EngineError::MissingBaseUrl {
+                        provider: config.provider.clone(),
+                    });
+                };
+                let models_url = config
+                    .models_url
+                    .clone()
+                    .or_else(|| named.as_ref().and_then(|entry| entry.models_url.clone()))
+                    .unwrap_or_else(|| format!("{}/models", base_url.trim_end_matches('/')));
+                let auth = crate::auth::Auth::open(&config.db_path)?;
+                let catalog = crate::catalog::load_custom(
+                    &auth,
+                    &config.provider,
+                    config.account.as_deref(),
+                    &models_url,
+                    &config.db_path,
+                )
+                .await?;
+                EngineConfig {
+                    catalog: Some(ProviderCatalog::Custom(catalog)),
+                    ..config
+                }
+            } else {
+                config
             }
         } else {
             config
@@ -1286,7 +1304,9 @@ pub fn prune_with_env(
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     /// The requested provider has no adapter in this build.
-    #[error("unknown provider `{0}`: no adapter is registered for it")]
+    #[error(
+        "unknown provider `{0}`: no adapter is registered for it (register an OpenAI-compatible gateway with `loom provider add`)"
+    )]
     UnknownProvider(String),
     /// A catalog-driven provider was selected without a catalog.
     #[error("provider `{provider}` needs a model catalog, but none was loaded")]

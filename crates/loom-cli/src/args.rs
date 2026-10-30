@@ -28,6 +28,8 @@ pub enum Command {
     Run(Box<RunArgs>),
     /// Manage saved provider credentials (`loom.db` + OS keychain).
     Auth(AuthArgs),
+    /// Manage named custom providers (`providers.json` beside `loom.db`).
+    Provider(ProviderArgs),
     /// List persisted sessions (`loom.db`), oldest first.
     Sessions,
     /// Transcript analytics over stored sessions (or exported traces).
@@ -51,10 +53,12 @@ pub struct RunArgs {
     pub json: bool,
 
     /// Provider adapter to use (`deepseek`, `anthropic`, `openrouter`,
-    /// `glm`, `nvidia`, `groq`, `custom`). Required — Loom picks no
-    /// provider for you. `custom` connects to any OpenAI-compatible
-    /// endpoint and additionally requires `--base-url` (plus an API key
-    /// via `loom auth login custom` or `CUSTOM_API_KEY`).
+    /// `glm`, `nvidia`, `groq`, `custom`) or a name registered with
+    /// `loom provider add`. Required — Loom picks no provider for you.
+    /// `custom` connects to any OpenAI-compatible endpoint and
+    /// additionally requires `--base-url` (plus an API key via
+    /// `loom auth login custom` or `CUSTOM_API_KEY`); named providers
+    /// carry their URLs in the registry.
     #[arg(long)]
     pub provider: String,
 
@@ -65,12 +69,13 @@ pub struct RunArgs {
 
     /// Override the provider base URL (proxies and gateways). For
     /// `--provider custom` this is the chat API base URL and is
-    /// required.
+    /// required; for a named provider it overrides the registry
+    /// default.
     #[arg(long)]
     pub base_url: Option<String>,
 
-    /// Model-catalog URL for `--provider custom`: the endpoint whose
-    /// `GET` lists the gateway's models. Defaults to
+    /// Model-catalog URL for `--provider custom` and named providers:
+    /// the endpoint whose `GET` lists the gateway's models. Defaults to
     /// `{--base-url}/models`. Ignored by other providers.
     #[arg(long, value_name = "URL")]
     pub models_url: Option<String>,
@@ -276,6 +281,37 @@ pub struct RemoveArgs {
     pub provider: String,
 }
 
+/// Arguments for `loom provider`.
+#[derive(Debug, Args)]
+pub struct ProviderArgs {
+    /// The command to run.
+    #[command(subcommand)]
+    pub command: ProviderCommand,
+}
+
+/// `loom provider` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum ProviderCommand {
+    /// Register a named OpenAI-compatible gateway.
+    Add {
+        /// Provider name: lowercase letters, digits, and hyphens,
+        /// starting with a letter; must not be a built-in provider.
+        name: String,
+        /// Chat API base URL; `chat/completions` is appended.
+        #[arg(long, value_name = "URL")]
+        base_url: String,
+        /// Model-catalog URL; defaults to `{--base-url}/models`.
+        #[arg(long, value_name = "URL")]
+        models_url: Option<String>,
+    },
+    /// List registered providers.
+    List,
+    /// Remove a registered provider (its saved accounts stay).
+    Remove {
+        /// Provider name.
+        name: String,
+    },
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +374,46 @@ mod tests {
             args.models_url.as_deref(),
             Some("http://localhost:4000/v1/models")
         );
+    }
+
+    #[test]
+    fn provider_subcommands_parse() {
+        let cli = parse(&[
+            "loom",
+            "provider",
+            "add",
+            "orcarouter",
+            "--base-url",
+            "https://api.orcarouter.ai/v1",
+        ]);
+        let Command::Provider(args) = cli.command else {
+            panic!("expected `provider`");
+        };
+        match args.command {
+            ProviderCommand::Add {
+                name,
+                base_url,
+                models_url,
+            } => {
+                assert_eq!(name, "orcarouter");
+                assert_eq!(base_url, "https://api.orcarouter.ai/v1");
+                assert_eq!(models_url, None);
+            }
+            _ => panic!("expected `add`"),
+        }
+
+        assert!(matches!(
+            parse(&["loom", "provider", "list"]).command,
+            Command::Provider(ProviderArgs {
+                command: ProviderCommand::List
+            })
+        ));
+        assert!(matches!(
+            parse(&["loom", "provider", "remove", "orcarouter"]).command,
+            Command::Provider(ProviderArgs {
+                command: ProviderCommand::Remove { name }
+            }) if name == "orcarouter"
+        ));
     }
 
     #[test]

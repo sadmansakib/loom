@@ -106,7 +106,29 @@ pub fn build(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, Eng
         NVIDIA_PROVIDER_NAME => build_nvidia(config, api_key),
         GROQ_PROVIDER_NAME => build_groq(config, api_key),
         CUSTOM_PROVIDER_NAME => build_custom(config, api_key),
-        other => Err(EngineError::UnknownProvider(other.to_owned())),
+        // Not a built-in adapter: route through the custom adapter when
+        // `loom provider add` registered this name, so several gateways
+        // can coexist under their own names. Explicit `--base-url`
+        // overrides the registry; anything else is a typo.
+        other => {
+            let entry = crate::registry::ProviderRegistry::load(&config.db_path)
+                .get(other)
+                .cloned();
+            match entry {
+                Some(entry) => {
+                    let mut config = config.clone();
+                    if config.base_url.is_none() {
+                        config.base_url = Some(entry.base_url);
+                    }
+                    build_custom(&config, api_key)
+                }
+                // No registry entry, but an explicit `--base-url` (the
+                // eval containers run nameless, registry-less): treat it
+                // as a custom gateway too.
+                None if config.base_url.is_some() => build_custom(config, api_key),
+                None => Err(EngineError::UnknownProvider(other.to_owned())),
+            }
+        }
     }
 }
 
@@ -549,6 +571,59 @@ mod tests {
         let config = custom_catalog_config("typo", r#"[{"id": "real"}]"#);
         let error = build(&config, "key").expect_err("must reject");
         assert!(matches!(error, EngineError::UnknownModel { .. }));
+    }
+    #[test]
+    fn named_custom_provider_builds_from_the_registry() {
+        let dir = std::env::temp_dir().join("loom-engine-named-provider-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let mut registry = crate::registry::ProviderRegistry::default();
+        registry.upsert(
+            "gateway",
+            crate::registry::RegistryEntry {
+                base_url: "http://gateway.test/v1".to_owned(),
+                models_url: None,
+            },
+        );
+        registry.save(&dir.join("loom.db")).expect("saves");
+
+        let mut config = crate::engine::test_config();
+        config.provider = "gateway".to_owned();
+        config.model = "vendor/model".to_owned();
+        config.db_path = dir.join("loom.db");
+        // No `--base-url`: the registry entry supplies the endpoint.
+        config.base_url = None;
+        config.catalog = Some(ProviderCatalog::Custom(
+            loom_providers::parse_custom_catalog(
+                r#"[{"id":"vendor/model","context_window":200000}]"#,
+                "http://gateway.test/v1/models",
+                1,
+            )
+            .expect("fixture"),
+        ));
+        let handle = build(&config, "key").expect("builds");
+        assert_eq!(handle.capabilities.max_context_tokens, 200_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn named_custom_provider_builds_with_explicit_base_url_and_no_registry() {
+        // The eval containers run nameless and registry-less: an
+        // explicit base URL must be enough for a named provider.
+        let mut config = crate::engine::test_config();
+        config.provider = "gateway".to_owned();
+        config.model = "vendor/model".to_owned();
+        config.base_url = Some("http://gateway.test/v1".to_owned());
+        config.catalog = Some(ProviderCatalog::Custom(
+            loom_providers::parse_custom_catalog(
+                r#"[{"id":"vendor/model","context_window":200000}]"#,
+                "http://gateway.test/v1/models",
+                1,
+            )
+            .expect("fixture"),
+        ));
+        let handle = build(&config, "key").expect("builds");
+        assert_eq!(handle.capabilities.max_context_tokens, 200_000);
     }
 
     #[test]

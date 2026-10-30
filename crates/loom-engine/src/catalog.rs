@@ -34,9 +34,11 @@ pub fn catalog_path(db_path: &Path) -> PathBuf {
     db_path.with_file_name("openrouter-models.json")
 }
 
-/// The `custom` adapter's cache file beside the database.
-pub fn custom_catalog_path(db_path: &Path) -> PathBuf {
-    db_path.with_file_name("custom-models.json")
+/// The `custom` adapter's cache file beside the database, one per provider
+/// name (`custom`, or a name from the provider registry) so multiple named
+/// gateways do not evict each other's catalogs.
+pub fn custom_catalog_path(db_path: &Path, provider: &str) -> PathBuf {
+    db_path.with_file_name(format!("{provider}-models.json"))
 }
 
 /// Returns the credential-resolved, fresh-if-possible catalog.
@@ -95,7 +97,9 @@ fn is_fresh(catalog: &OpenRouterCatalog, now: u64) -> bool {
 }
 
 /// Returns the credential-resolved, fresh-if-possible catalog for the
-/// `custom` adapter.
+/// `custom` adapter, serving both `--provider custom` and the named
+/// providers registered through `loom provider add` (`provider` selects
+/// the credential and the cache file).
 ///
 /// Same discipline as [`load`], with one addition: the cache is only
 /// usable when it was fetched from *this* `models_url`. A custom cache
@@ -105,11 +109,12 @@ fn is_fresh(catalog: &OpenRouterCatalog, now: u64) -> bool {
 /// short-circuit and the stale fallback require the URL to match.
 pub async fn load_custom(
     auth: &Auth,
+    provider: &str,
     account: Option<&str>,
     models_url: &str,
     db_path: &Path,
 ) -> Result<CustomCatalog, EngineError> {
-    let path = custom_catalog_path(db_path);
+    let path = custom_catalog_path(db_path, provider);
     let cached = read_custom_cache(&path);
 
     if let Some(cached) = &cached
@@ -118,7 +123,7 @@ pub async fn load_custom(
         return Ok(cached.clone());
     }
 
-    let credential = auth.resolve(loom_providers::CUSTOM_PROVIDER_NAME, account)?;
+    let credential = auth.resolve(provider, account)?;
 
     match loom_providers::fetch_custom_catalog(
         models_url,
@@ -246,8 +251,12 @@ mod tests {
         let path = catalog_path(Path::new("/var/data/loom.db"));
         assert_eq!(path, Path::new("/var/data/openrouter-models.json"));
         assert_eq!(
-            custom_catalog_path(Path::new("/var/data/loom.db")),
+            custom_catalog_path(Path::new("/var/data/loom.db"), "custom"),
             Path::new("/var/data/custom-models.json")
+        );
+        assert_eq!(
+            custom_catalog_path(Path::new("/var/data/loom.db"), "orcarouter"),
+            Path::new("/var/data/orcarouter-models.json")
         );
     }
 
@@ -262,7 +271,7 @@ mod tests {
     #[test]
     fn custom_cache_round_trips_through_the_file() {
         let dir = std::env::temp_dir().join("loom-engine-custom-catalog-test");
-        let path = custom_catalog_path(&dir.join("loom.db"));
+        let path = custom_catalog_path(&dir.join("loom.db"), "custom");
         let original = custom_catalog("http://gateway.test/models", 1_700_000_000);
         write_custom_cache(&path, &original).expect("writes");
         assert_eq!(read_custom_cache(&path), Some(original));

@@ -818,7 +818,11 @@ Five adapters ship:
   and the free tier is unbilled.
 - **Custom** — any OpenAI-compatible endpoint the user points at:
   `--provider custom --base-url <chat API> [--models-url <catalog API>]`
-  plus a key. There is no default base URL; missing one fails the open
+  plus a key. Named gateways (`loom provider add <name> --base-url …`,
+  persisted in `providers.json` beside the database) ride the same
+  adapter under their own name, credential env `{NAME}_API_KEY`, and
+  one catalog cache per name (`<name>-models.json`). There is no
+  default base URL; missing one fails the open
   with a pointed error. The catalog reader is schema-tolerant across
   the shapes seen in the wild — `{data: [...]}` (OpenAI, OpenRouter,
   most gateways), `{models: [...]}`, or a bare array — and sniffs
