@@ -120,8 +120,14 @@ fn main() {
     // and any pair differs, the contrast would attribute harness
     // changes across a build boundary — refuse. Legacy reports (no
     // provenance) warn.
+    //
+    // Same rule for the model: a scaffold contrast (loom vs mini) is
+    // only a scaffold claim when both sides ran the same provider/
+    // model pair. Different models across sides conflate scaffold
+    // effect with model effect — refuse rather than print a number
+    // that reads as a harness delta.
     if let (Some(dir_a), Some(dir_b)) = (args.dir_a.as_deref(), args.dir_b.as_deref()) {
-        let digests = |dir: &Path| -> Vec<String> {
+        let sweep_field = |dir: &Path, field: &str| -> Vec<String> {
             std::fs::read_dir(dir.join("swebench"))
                 .into_iter()
                 .flatten()
@@ -139,12 +145,23 @@ fn main() {
                         .ok()
                         .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
                         .and_then(|report| {
-                            loom_eval::swebench::recorded_loom_digest(&report).map(str::to_owned)
+                            if field == "loom_sha256" {
+                                loom_eval::swebench::recorded_loom_digest(&report)
+                                    .map(str::to_owned)
+                            } else {
+                                report
+                                    .get(field)
+                                    .and_then(|value| value.as_str())
+                                    .map(str::to_owned)
+                            }
                         })
                 })
                 .collect()
         };
-        let (left, right) = (digests(dir_a), digests(dir_b));
+        let (left, right) = (
+            sweep_field(dir_a, "loom_sha256"),
+            sweep_field(dir_b, "loom_sha256"),
+        );
         if !left.is_empty() && !right.is_empty() {
             for a in &left {
                 for b in &right {
@@ -164,7 +181,51 @@ fn main() {
                  engine builds (one headline, one build — docs/eval.md)"
             );
         }
+        // Model parity: both sides must name the same provider/model
+        // pair. A side with no recorded pair (or none readable) warns
+        // rather than refuses — parity simply cannot be verified.
+        let pairs = |dir: &Path| -> Vec<String> {
+            let providers = sweep_field(dir, "provider");
+            let models = sweep_field(dir, "model");
+            providers
+                .into_iter()
+                .zip(models)
+                .map(|(provider, model)| format!("{provider}/{model}"))
+                .collect::<Vec<_>>()
+        };
+        let (pairs_a, pairs_b) = (pairs(dir_a), pairs(dir_b));
+        match (
+            (pairs_a.first(), pairs_a.len()),
+            (pairs_b.first(), pairs_b.len()),
+        ) {
+            ((Some(a), 1), (Some(b), 1)) => {
+                if a != b {
+                    eprintln!(
+                        "cannot contrast: sides ran different models ({a} vs {b});\n\
+                         a scaffold contrast must hold the model fixed — re-run one\n\
+                         side on the other's model before contrasting"
+                    );
+                    std::process::exit(1);
+                }
+            }
+            ((Some(_), n), _) if n > 1 => {
+                eprintln!(
+                    "warning: eval dir A mixes multiple provider/model pairs; the contrast headline is not single-model"
+                )
+            }
+            (_, (Some(_), n)) if n > 1 => {
+                eprintln!(
+                    "warning: eval dir B mixes multiple provider/model pairs; the contrast headline is not single-model"
+                )
+            }
+            _ => {
+                eprintln!(
+                    "warning: provider/model not recorded in both eval dirs; model parity unverified"
+                )
+            }
+        }
     }
+
     let a = match scorer_outcomes(&args.a) {
         Ok(a) => a,
         Err(error) => {
