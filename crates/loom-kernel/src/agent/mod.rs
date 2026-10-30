@@ -1061,9 +1061,10 @@ impl Agent {
         // failure forces a change of approach instead of trial and error.
         let mut failures = FailureLedger::default();
 
-        // Completion gate (roadmap item 8): an EndTurn is refused once
-        // while unverified mutations are outstanding, so "done" always
-        // refers to a state some green check actually covered.
+        // Completion gate (roadmap item 8): an EndTurn is refused
+        // while unverified mutations are outstanding (bounded by
+        // COMPLETION_REFUSAL_CAP), so "done" always refers to a state
+        // some green check actually covered.
         let mut completion = CompletionGate::default();
 
         // The hard-stop token the stream and tool paths select on
@@ -1501,12 +1502,14 @@ impl Agent {
     }
 
     /// The refusal half of the completion gate (roadmap item 8): when
-    /// files changed since the last green check and nothing was refused
-    /// yet, commit the assistant's reply, append a refusal as a normal
-    /// user item — persisted, projected, and answered like any other
-    /// turn, quoting the changed paths and the original task — and let
-    /// the loop take one more turn. Returns `true` when the refusal
-    /// fired; the caller then continues instead of finishing.
+    /// files changed since the last green check and the refusal cap
+    /// allows it, commit the assistant's reply, append a refusal as a
+    /// normal user item — persisted, projected, and answered like any
+    /// other turn, quoting the changed paths and the original task —
+    /// and let the loop take one more turn. The gate loops: every
+    /// unverified edit re-arms it until green or the cap. Returns
+    /// `true` when the refusal fired; the caller then continues
+    /// instead of finishing.
     #[allow(clippy::too_many_arguments)]
     fn refuse_completion_once(
         &self,
@@ -1521,14 +1524,14 @@ impl Agent {
         // Pending verification takes precedence: the green-check gap is
         // the sharper failure. The test-consultation nudge (2026-10-23)
         // fires on the next EndTurn if the task still never ran tests.
-        let pending_refusal = completion.pending() && !completion.refused;
+        let pending_refusal = completion.pending() && completion.can_refuse();
         let test_refusal = completion.untested() && !completion.test_refused;
         if !self.loop_shaping || turn >= self.max_turns || !(pending_refusal || test_refusal) {
             return Ok(false);
         }
         let text = if pending_refusal {
-            completion.refused = true;
-            completion_refusal(session)
+            completion.refusals += 1;
+            completion_refusal(session, completion.refusals)
         } else {
             completion.test_refused = true;
             test_consultation_refusal(session)
@@ -2013,15 +2016,19 @@ fn ledger_key(call: &ToolCall) -> (String, String) {
 /// last green check the model ran. "Green check" is detected from the
 /// result shape every command-bearing tool shares (`$ cmd` first, an
 /// `exit status: 0` line), covering `verify`, `run_command`, and the fused
-/// edit check alike.
+/// edit check alike. The refusal loops until green, capped by
+/// [`COMPLETION_REFUSAL_CAP`].
 #[derive(Default)]
 struct CompletionGate {
     /// Mutation epoch: bumped on every committed file write or delete.
     mutations: u64,
     /// The epoch that had a green check; `None` when nothing ever passed.
     verified_at: Option<u64>,
-    /// Whether the one-shot refusal already fired.
-    refused: bool,
+    /// How many unverified-mutation refusals fired (capped by
+    /// [`COMPLETION_REFUSAL_CAP`]: the gate loops until green, but a
+    /// model that edits past three refusals without a check is
+    /// stalling, not verifying).
+    refusals: u8,
     /// Whether any committed result ran a test-like command this task.
     tested: bool,
     /// Whether the one-shot test-consultation refusal already fired.
@@ -2052,7 +2059,17 @@ impl CompletionGate {
     fn untested(&self) -> bool {
         self.mutations > 0 && !self.tested
     }
+
+    /// Whether the unverified-mutation refusal may still fire.
+    fn can_refuse(&self) -> bool {
+        self.refusals < COMPLETION_REFUSAL_CAP
+    }
 }
+
+/// Ceiling on unverified-mutation refusals per task: the gate loops
+/// until green, but bounded — three nudges that each end in another
+/// unverified edit mean the model is stalling, not verifying.
+const COMPLETION_REFUSAL_CAP: u8 = 3;
 
 /// Whether a result is a green command run: successful, command-shaped
 /// (`$ …`), and reporting exit status 0.
@@ -2221,7 +2238,7 @@ fn command_runs_tests(content: &str) -> bool {
 
 /// The one-shot refusal text: changed paths plus the original task,
 /// head-bounded so an oversized instruction cannot balloon the turn.
-fn completion_refusal(session: &Session) -> String {
+fn completion_refusal(session: &Session, attempt: u8) -> String {
     let paths = recent_changes(session);
     let instruction = session
         .transcript
@@ -2233,10 +2250,12 @@ fn completion_refusal(session: &Session) -> String {
         .unwrap_or_default();
     let instruction_head = instruction.chars().take(800).collect::<String>();
     format!(
-        "Hold on — these files changed since the last green check: {}. \
-         Before finishing, run the relevant checks (verify, cargo test, \
-         cargo check) and fix what fails. If the checks pass, the task is \
-         complete. Original task: {}",
+        "Hold on (verification reminder {attempt} of {COMPLETION_REFUSAL_CAP}) — these files \
+         changed since the last green check: {}. Before finishing: (1) review your full diff \
+         (`git diff`) hunk by hunk against the original task and revert anything the task did \
+         not ask for — reworded messages, formatting, unrelated files; (2) run the relevant \
+         checks (the project's test suite, verify, cargo test) and fix what fails. If every \
+         hunk is task-scoped and the checks pass, the task is complete. Original task: {}",
         paths.join(", "),
         instruction_head,
     )
@@ -2477,10 +2496,10 @@ fn duration_millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletionGate, DEFAULT_RESERVED_OUTPUT_TOKENS, MAX_RESERVED_OUTPUT_TOKENS,
-        OutputReservation, ZERO_PROGRESS_TURNS, append_failure_hint, completion_refusal,
-        derive_reserved_output_tokens, green_check, late_budget_due, visible_call_ids,
-        zero_progress_due,
+        COMPLETION_REFUSAL_CAP, CompletionGate, DEFAULT_RESERVED_OUTPUT_TOKENS,
+        MAX_RESERVED_OUTPUT_TOKENS, OutputReservation, ZERO_PROGRESS_TURNS, append_failure_hint,
+        completion_refusal, derive_reserved_output_tokens, green_check, late_budget_due,
+        visible_call_ids, zero_progress_due,
     };
     use crate::model::{Message, ModelCapabilities, ModelRequest, StopReason};
     use crate::session::Session;
@@ -2743,9 +2762,25 @@ mod tests {
                 &["src/lib.rs"],
             )))
             .unwrap();
-        let text = completion_refusal(&session);
+        let text = completion_refusal(&session, 1);
         assert!(text.contains("src/lib.rs"), "{text}");
         assert!(text.contains("fix the bug"), "{text}");
         assert!(text.contains("cargo test"), "{text}");
+        assert!(text.contains("git diff"), "must direct a diff self-review");
+        assert!(text.contains("reminder 1 of 3"), "{text}");
+    }
+
+    #[test]
+    fn the_gate_refuses_until_the_cap_then_gives_up() {
+        let mut gate = CompletionGate::default();
+        gate.note(&gate_result("edited src/lib.rs", &["src/lib.rs"]));
+        assert!(gate.pending() && gate.can_refuse(), "fresh gate can refuse");
+        gate.note(&gate_result("edited again", &["src/lib.rs"]));
+        gate.refusals = COMPLETION_REFUSAL_CAP;
+        assert!(gate.pending(), "mutations are still outstanding, but…");
+        assert!(
+            !gate.can_refuse(),
+            "…the cap stops refiring: three ignored nudges = stalling"
+        );
     }
 }

@@ -530,7 +530,7 @@ async fn end_turn_completes_the_task_and_commits_the_assistant() {
 }
 
 #[tokio::test]
-async fn an_unverified_finish_is_refused_once_then_accepted() {
+async fn an_unverified_finish_is_refused_until_the_cap_then_accepted() {
     // Roadmap item 8: a write lands, the model tries to finish without a
     // green check, the loop injects one refusal quoting the changed path
     // and the original task, and a second EndTurn completes the task.
@@ -565,6 +565,14 @@ async fn an_unverified_finish_is_refused_once_then_accepted() {
                 assistant("truly done", StopReason::EndTurn, Vec::new()),
                 usage(40, 9, None),
             ),
+            completed(
+                assistant("actually done", StopReason::EndTurn, Vec::new()),
+                usage(50, 11, None),
+            ),
+            completed(
+                assistant("final answer", StopReason::EndTurn, Vec::new()),
+                usage(60, 13, None),
+            ),
         ],
     );
     let requests = provider.requests_handle();
@@ -578,9 +586,9 @@ async fn an_unverified_finish_is_refused_once_then_accepted() {
         .await
         .unwrap();
 
-    // Four model requests: write, verification refusal, test-consultation
-    // refusal, accepted finish.
-    assert_eq!(summary.model_requests, 4);
+    // Six model requests: write, three green-check refusals (the cap),
+    // one test-consultation refusal, accepted finish.
+    assert_eq!(summary.model_requests, 6);
     // Schema 11: every loop-owned nudge is also an event, not just a
     // transcript item — both refusals surface here.
     let mut nudges = Vec::new();
@@ -589,23 +597,30 @@ async fn an_unverified_finish_is_refused_once_then_accepted() {
             nudges.push(text);
         }
     }
-    assert_eq!(nudges.len(), 2, "both one-shot refusals emit LoopNudge");
-    assert!(nudges[0].contains("since the last green check"));
-    assert!(nudges[1].contains("no existing test suite"));
-    let requests = requests.lock().unwrap();
-    let green_refusal = requests[2].messages.iter().any(
-        |m| matches!(m, Message::User { text } if text.contains("since the last green check")),
-    );
-    let test_refusal = requests[3]
-        .messages
+    let green_nudges: Vec<&String> = nudges
         .iter()
-        .any(|m| matches!(m, Message::User { text } if text.contains("no existing test suite")));
+        .filter(|t| t.contains("verification reminder"))
+        .collect();
+    assert_eq!(green_nudges.len(), 3, "green refusals fire up to the cap");
+    assert!(green_nudges[0].contains("reminder 1 of 3"));
+    assert!(green_nudges[1].contains("reminder 2 of 3"));
+    assert!(green_nudges[2].contains("reminder 3 of 3"));
     assert!(
-        green_refusal,
-        "the verification refusal must reach the model"
+        nudges.iter().any(|t| t.contains("no existing test suite")),
+        "the one-shot test-consultation refusal fires"
     );
+    let requests = requests.lock().unwrap();
+    let refusal_at = |i: usize, needle: &str| {
+        requests[i]
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::User { text } if text.contains(needle)))
+    };
+    assert!(refusal_at(2, "verification reminder 1 of 3"));
+    assert!(refusal_at(3, "verification reminder 2 of 3"));
+    assert!(refusal_at(4, "verification reminder 3 of 3"));
     assert!(
-        test_refusal,
+        refusal_at(5, "no existing test suite"),
         "the test-consultation refusal must reach the model"
     );
     drop(requests);
@@ -617,7 +632,7 @@ async fn an_unverified_finish_is_refused_once_then_accepted() {
             .iter()
             .any(|i| matches!(i, Item::User { text } if text.contains("Hold on")))
     );
-    assert_eq!(summary.turns, 4);
+    assert_eq!(summary.turns, 6);
 }
 
 #[tokio::test]
