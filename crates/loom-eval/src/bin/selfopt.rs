@@ -249,7 +249,7 @@ fn probe_run(
         let spec = ContainerSpec {
             agent: AgentKind::Loom,
             image: &testbed_image(instance),
-            loom_binary: loom_bin,
+            loom_binary: Some(loom_bin),
             prompt_file: &prompt_path,
             out_dir: &out_dir,
             provider,

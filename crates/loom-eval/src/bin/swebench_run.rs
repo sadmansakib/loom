@@ -1,10 +1,11 @@
 //! `swebench-run`: orchestrates a SWE-bench Verified sweep in container
-//! isolation. One container per (instance, run); the agent is either a
-//! linux loom binary bind-mounted into the official per-instance
-//! testbed image (default) or mini-swe-agent from PyPI (`--agent mini`,
-//! the published baseline arm); the patch is extracted inside the
-//! container (never on the host); the official scorer consumes the
-//! emitted predictions files.
+//! isolation. One container per (instance, run); the agent is
+//! mini-swe-agent from PyPI (default — the published baseline whose
+//! score gives loom's number meaning through `swebench-contrast`) or
+//! the staged linux loom binary bind-mounted into the official
+//! per-instance testbed image (`--agent loom`); the patch is extracted
+//! inside the container (never on the host); the official scorer
+//! consumes the emitted predictions files.
 //!
 //! Host prerequisites: docker. Missing testbed images are pulled
 //! automatically from the swebench Docker Hub prebuilts — the same
@@ -44,7 +45,7 @@ struct Args {
     max_turns: usize,
     /// `full` (default) or `bare` — the roadmap-item-1 A/B arm.
     arm: String,
-    /// `loom` (default) or `mini` — the agent under test
+    /// `mini` (default) or `loom` — the agent under test
     /// (`AgentKind`).
     agent: String,
     eval_dir: PathBuf,
@@ -79,8 +80,9 @@ fn usage() -> ! {
                        runs cannot collide)
   --no-pull            never pull missing testbed images; skip the instance
                        with the local build command printed instead
-  --agent <name>       agent under test: `loom` (default) or `mini`
-                       (mini-swe-agent via PyPI; runs through litellm's
+  --agent <name>       agent under test: `mini` (default) or `loom`
+                       (mini = mini-swe-agent from PyPI, the published
+                       baseline loom is contrasted against; runs through litellm's
                        OpenAI dialect, so the key travels as
                        OPENAI_API_KEY and --base-url is required —
                        registry providers auto-fill it)
@@ -89,11 +91,11 @@ fn usage() -> ! {
   --base-url <url>     chat API base URL for OpenAI-compatible gateways (custom provider);
                       forwarded as --base-url to the in-container loom
                       (default $LOOM_EVAL_BASE_URL, unset for vendors with default endpoints)
-  --loom-bin <path>    linux x86_64 loom binary (default <eval-dir>/swebench/loom-linux/loom)
-  --build-loom         cross-build the linux binary inside a docker rust image
+  --loom-bin <path>    linux x86_64 loom binary (--agent loom only) (default <eval-dir>/swebench/loom-linux/loom)
+  --build-loom         cross-build the linux binary inside a docker rust image (--agent loom only)
   --timeout-secs <n>   wall-clock budget per run (default 3600)
   --max-turns <n>      --max-turns for the in-container loom run (default 100)
-  --arm <full|bare>    harness arm (default $LOOM_EVAL_ARM or full): `bare`
+  --arm <full|bare>    harness arm (--agent loom only; default $LOOM_EVAL_ARM or full): `bare`
                        forwards LOOM_BARE=1 so the in-container loom strips
                        every harness lever (facts, pruning, completion gate,
                        failure ledger, fast paths) — the roadmap-item-1 A/B
@@ -131,7 +133,7 @@ fn parse_args() -> Args {
         // --timeout-secs still bounds wall clock.
         max_turns: 100,
         arm: std::env::var("LOOM_EVAL_ARM").unwrap_or_else(|_| "full".into()),
-        agent: "loom".into(),
+        agent: std::env::var("LOOM_EVAL_AGENT").unwrap_or_else(|_| "mini".into()),
         eval_dir: std::env::var("LOOM_EVAL_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("target/eval")),
@@ -397,27 +399,36 @@ fn main() {
     } else {
         key_env
     };
-    let loom_bin = match (&args.loom_bin, args.build_loom) {
-        (Some(path), _) => path.clone(),
-        (None, true) => build_loom_linux(&base),
-        (None, false) => {
-            let default = base.join("loom-linux/loom");
-            if !default.exists() {
-                eprintln!(
-                    "no linux loom binary at {} — pass --loom-bin or --build-loom",
-                    default.display()
-                );
-                std::process::exit(2);
+    let agent = AgentKind::parse(&args.agent).expect("validated in parse_args");
+    // Only the loom arm runs a build; mini needs no staged binary,
+    // mount, or digest — its provenance records the script hash alone.
+    let loom_bin = if agent == AgentKind::Loom {
+        let loom_bin = match (&args.loom_bin, args.build_loom) {
+            (Some(path), _) => path.clone(),
+            (None, true) => build_loom_linux(&base),
+            (None, false) => {
+                let default = base.join("loom-linux/loom");
+                if !default.exists() {
+                    eprintln!(
+                        "no linux loom binary at {} — pass --loom-bin or --build-loom",
+                        default.display()
+                    );
+                    std::process::exit(2);
+                }
+                default
             }
-            default
-        }
+        };
+        // Docker reads `-v src:dst` with a RELATIVE src as a named
+        // volume, not a bind mount — the mounted path must be absolute.
+        Some(
+            loom_bin
+                .canonicalize()
+                .unwrap_or_else(|error| panic!("{}: {error}", loom_bin.display())),
+        )
+    } else {
+        None
     };
 
-    // Docker reads `-v src:dst` with a RELATIVE src as a named volume,
-    // not a bind mount — every mounted path must be absolute.
-    let loom_bin = loom_bin
-        .canonicalize()
-        .unwrap_or_else(|error| panic!("{}: {error}", loom_bin.display()));
     let file_model = swebench::slug(&args.model);
 
     // Honesty rule: one headline, one engine build. Hash the staged
@@ -425,11 +436,8 @@ fn main() {
     // extend an eval dir whose recorded sweeps ran a different build —
     // silently mixing builds into one number is how the v3-100
     // headline spanned two binaries.
-    let provenance = swebench::sweep_provenance(
-        &loom_bin,
-        AgentKind::parse(&args.agent).expect("validated in parse_args"),
-    )
-    .unwrap_or_else(|error| panic!("hashing {}: {error}", loom_bin.display()));
+    let provenance = swebench::sweep_provenance(loom_bin.as_deref(), agent)
+        .unwrap_or_else(|error| panic!("hashing the staged loom binary: {error}"));
     for entry in std::fs::read_dir(&base).into_iter().flatten().flatten() {
         let path = entry.path();
         if path.extension().is_some_and(|e| e == "json")
@@ -444,24 +452,29 @@ fn main() {
             let Ok(recorded) = serde_json::from_str::<serde_json::Value>(&body) else {
                 continue;
             };
-            if let Some(digest) = swebench::recorded_loom_digest(&recorded)
-                && digest != provenance.loom_sha256
+            // A mini run records no digest; so does a pre-provenance
+            // report. Both extend freely — only two DIFFERENT loom
+            // builds in one eval dir are refused.
+            if let Some(digest) = provenance.loom_sha256.as_deref()
+                && let Some(recorded) = swebench::recorded_loom_digest(&recorded)
+                && recorded != digest
             {
                 eprintln!(
-                    "refusing to run: {} records engine build {digest}, but the staged\n\
-                     binary is {} — a headline sweep must run one build.\n\
+                    "refusing to run: {path} records engine build {recorded}, but the staged\n\
+                     binary is {digest} — a headline sweep must run one build.\n\
                      Start a fresh --eval-dir (or remove the old sweeps) instead of\n\
                      extending a mixed-build directory.",
-                    path.display(),
-                    provenance.loom_sha256
+                    path = path.display()
                 );
                 std::process::exit(2);
             }
         }
     }
     let loom_digest_path = base.join("loom.sha256");
-    std::fs::write(&loom_digest_path, format!("{}\n", provenance.loom_sha256))
-        .unwrap_or_else(|error| panic!("{}: {error}", loom_digest_path.display()));
+    if let Some(loom_sha256) = provenance.loom_sha256.as_deref() {
+        std::fs::write(&loom_digest_path, format!("{loom_sha256}\n"))
+            .unwrap_or_else(|error| panic!("{}: {error}", loom_digest_path.display()));
+    }
     // Owned rows (instance_id, model, patch): patches must outlive the
     // per-run scope they were collected in; borrowed `Prediction`s are
     // built from these at write time.
@@ -517,9 +530,9 @@ fn main() {
             let mut outcome = (0usize, None);
             for attempt in 1..=MAX_ATTEMPTS {
                 let spec = ContainerSpec {
-                    agent: AgentKind::parse(&args.agent).expect("validated in parse_args"),
+                    agent,
                     image: &image,
-                    loom_binary: &loom_bin,
+                    loom_binary: loom_bin.as_deref(),
                     prompt_file: &prompt_path,
                     out_dir: &out_dir,
                     provider: &args.provider,

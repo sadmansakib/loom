@@ -432,7 +432,9 @@ pub struct ContainerSpec<'a> {
     /// Docker image (see [`testbed_image`]).
     pub image: &'a str,
     /// Host path to the linux loom binary; bind-mounted at `/loom/loom`.
-    pub loom_binary: &'a Path,
+    /// `None` for arms that run no loom build (mini) — no mount, and
+    /// provenance records no digest for the sweep.
+    pub loom_binary: Option<&'a Path>,
     /// Host path to the prompt file; bind-mounted read-only at `/prompt.txt`.
     pub prompt_file: &'a Path,
     /// Host output directory; bind-mounted at `/out` (run.json, run.err,
@@ -506,7 +508,6 @@ pub fn docker_run_argv(spec: &ContainerSpec<'_>) -> Vec<String> {
             "extra_env collides with the API key env var: {name}"
         );
     }
-    let loom_mount = format!("{}:/loom/loom:ro", spec.loom_binary.display());
     let prompt_mount = format!("{}:/prompt.txt:ro", spec.prompt_file.display());
     let out_mount = format!("{}:/out", spec.out_dir.display());
     let timeout = spec.timeout_secs.to_string();
@@ -521,6 +522,10 @@ pub fn docker_run_argv(spec: &ContainerSpec<'_>) -> Vec<String> {
         "-e".into(),
         format!("LOOM_MODEL={}", spec.model),
     ];
+    // Only loom-running arms carry the binary; mini needs no mount.
+    let loom_mount = spec
+        .loom_binary
+        .map(|loom_binary| format!("{}:/loom/loom:ro", loom_binary.display()));
     if let Some(base_url) = spec.base_url {
         argv.extend(["-e".into(), format!("LOOM_BASE_URL={base_url}")]);
     }
@@ -540,11 +545,14 @@ pub fn docker_run_argv(spec: &ContainerSpec<'_>) -> Vec<String> {
         "-e".into(),
         format!("{}={}", spec.api_key_env, spec.api_key),
         "-v".into(),
-        loom_mount,
-        "-v".into(),
         prompt_mount,
         "-v".into(),
         out_mount,
+    ]);
+    if let Some(loom_mount) = loom_mount {
+        argv.extend(["-v".into(), loom_mount]);
+    }
+    argv.extend([
         spec.image.into(),
         "sh".into(),
         "-c".into(),
@@ -774,10 +782,13 @@ pub const PROMPT_VERSION: &str = "3";
 /// exact failure behind the v3-100 headline spanning two builds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepProvenance {
-    /// sha256 of the staged linux loom binary, hex.
-    pub loom_sha256: String,
+    /// sha256 of the staged linux loom binary, hex. `None` for agent
+    /// arms that run no loom build (mini) — there is no engine build
+    /// to attribute, and the span guard treats it like the
+    /// pre-provenance legacy case.
+    pub loom_sha256: Option<String>,
     /// Size of the staged binary in bytes (cheap cross-check).
-    pub loom_bytes: u64,
+    pub loom_bytes: Option<u64>,
     /// sha256 of the frozen container script, hex.
     pub container_script_sha256: String,
     /// [`PROMPT_VERSION`] at sweep time.
@@ -800,13 +811,22 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex
 }
 
-/// Reads and hashes the staged binary; fails loudly rather than
-/// stamping a report with no provenance.
-pub fn sweep_provenance(loom_bin: &Path, agent: AgentKind) -> std::io::Result<SweepProvenance> {
-    let bytes = std::fs::read(loom_bin)?;
+/// Reads and hashes the staged binary (when the arm runs one); fails
+/// loudly rather than stamping a report with no provenance.
+pub fn sweep_provenance(
+    loom_bin: Option<&Path>,
+    agent: AgentKind,
+) -> std::io::Result<SweepProvenance> {
+    let loom_sha256 = match loom_bin {
+        Some(loom_bin) => {
+            let bytes = std::fs::read(loom_bin)?;
+            Some((sha256_hex(&bytes), bytes.len() as u64))
+        }
+        None => None,
+    };
     Ok(SweepProvenance {
-        loom_sha256: sha256_hex(&bytes),
-        loom_bytes: bytes.len() as u64,
+        loom_sha256: loom_sha256.as_ref().map(|(digest, _)| digest.clone()),
+        loom_bytes: loom_sha256.map(|(_, bytes)| bytes),
         container_script_sha256: sha256_hex(container_script(agent).as_bytes()),
         prompt_version: PROMPT_VERSION,
         runner_version: env!("CARGO_PKG_VERSION"),
@@ -1042,7 +1062,7 @@ fn docker_argv_mounts_and_env_without_a_shell() {
     let spec = ContainerSpec {
         agent: AgentKind::Loom,
         image: "sweb.eval.x86_64.org__one-1:latest",
-        loom_binary: Path::new("/eval/loom-linux/loom"),
+        loom_binary: Some(Path::new("/eval/loom-linux/loom")),
         prompt_file: Path::new("/eval/swebench/instances/org-one-1/prompt-run1.txt"),
         out_dir: Path::new("/eval/swebench/instances/org-one-1/run-1"),
         provider: "deepseek",
@@ -1359,9 +1379,12 @@ fn sweep_provenance_hashes_the_staged_binary_and_script() {
     std::fs::create_dir_all(&dir).unwrap();
     let bin = dir.join("loom");
     std::fs::write(&bin, b"pretend elf").unwrap();
-    let provenance = sweep_provenance(&bin, AgentKind::Loom).unwrap();
-    assert_eq!(provenance.loom_sha256, sha256_hex(b"pretend elf"));
-    assert_eq!(provenance.loom_bytes, 11);
+    let provenance = sweep_provenance(Some(&bin), AgentKind::Loom).unwrap();
+    assert_eq!(
+        provenance.loom_sha256.as_deref(),
+        Some(sha256_hex(b"pretend elf").as_str())
+    );
+    assert_eq!(provenance.loom_bytes, Some(11));
     assert_eq!(
         provenance.container_script_sha256,
         sha256_hex(CONTAINER_SCRIPT.as_bytes())
@@ -1370,7 +1393,7 @@ fn sweep_provenance_hashes_the_staged_binary_and_script() {
     // A different binary must yield a different digest — the whole
     // point of the mixed-build guard.
     std::fs::write(&bin, b"pretend elf v2").unwrap();
-    let rebuilt = sweep_provenance(&bin, AgentKind::Loom).unwrap();
+    let rebuilt = sweep_provenance(Some(&bin), AgentKind::Loom).unwrap();
     assert_ne!(rebuilt.loom_sha256, provenance.loom_sha256);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1419,7 +1442,7 @@ fn mini_agent_arm_selects_its_script_and_opens_the_openai_dialect() {
     let spec = ContainerSpec {
         agent: AgentKind::Mini,
         image: "sweb.eval.x86_64.org__one-1:latest",
-        loom_binary: Path::new("/eval/swebench/loom-linux/loom"),
+        loom_binary: None,
         prompt_file: Path::new("/eval/swebench/instances/org-one-1/prompt-run1.txt"),
         out_dir: Path::new("/eval/swebench/instances/org-one-1/run-1"),
         provider: "kilo",
@@ -1439,6 +1462,8 @@ fn mini_agent_arm_selects_its_script_and_opens_the_openai_dialect() {
     let joined = argv.join("\n");
     assert!(joined.contains("-e\nOPENAI_API_KEY=nano-test"));
     assert!(joined.contains("-e\nLOOM_BASE_URL=https://free.empexaura.com/v1"));
+    // No loom build runs in this arm: no mount, nothing to shadow.
+    assert!(!joined.contains("/loom/loom"));
 }
 
 #[test]
@@ -1465,8 +1490,8 @@ fn provenance_hashes_the_selected_agents_script() {
     std::fs::create_dir_all(&dir).unwrap();
     let bin = dir.join("loom");
     std::fs::write(&bin, b"pretend elf").unwrap();
-    let loom = sweep_provenance(&bin, AgentKind::Loom).expect("provenance");
-    let mini = sweep_provenance(&bin, AgentKind::Mini).expect("provenance");
+    let loom = sweep_provenance(Some(&bin), AgentKind::Loom).expect("provenance");
+    let mini = sweep_provenance(Some(&bin), AgentKind::Mini).expect("provenance");
     assert_eq!(
         loom.container_script_sha256,
         sha256_hex(CONTAINER_SCRIPT.as_bytes())
