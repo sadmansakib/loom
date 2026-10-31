@@ -2144,6 +2144,12 @@ struct CompletionGate {
     mutations: u64,
     /// The epoch that had a green check; `None` when nothing ever passed.
     verified_at: Option<u64>,
+    /// The epoch that had a green run of the FULL suite (bare runner,
+    /// no file filters). A narrow green (`pytest one_file.py`) passes
+    /// while an untouched regression fails elsewhere — the exact
+    /// pytest-7490 hard-mix loss (2026-10-31 N=20): FAIL_TO_PASS 2/2
+    /// green, one PASS_TO_PASS regressed.
+    suite_green_at: Option<u64>,
     /// How many unverified-mutation refusals fired (capped by
     /// [`COMPLETION_REFUSAL_CAP`]: the gate loops until green, but a
     /// model that edits past three refusals without a check is
@@ -2188,6 +2194,9 @@ impl CompletionGate {
         }
         if green_check(result) {
             self.verified_at = Some(self.mutations);
+            if runs_full_suite(&result.content) {
+                self.suite_green_at = Some(self.mutations);
+            }
             let command = result
                 .content
                 .lines()
@@ -2206,9 +2215,11 @@ impl CompletionGate {
         }
     }
 
-    /// Whether unverified mutations are outstanding.
+    /// Whether unverified mutations are outstanding: the FULL suite
+    /// must be green at the current epoch — a narrow green does not
+    /// settle (pytest-7490 loss, 2026-10-31).
     fn pending(&self) -> bool {
-        self.mutations > 0 && self.verified_at != Some(self.mutations)
+        self.mutations > 0 && self.suite_green_at != Some(self.mutations)
     }
 
     /// Whether files changed but no test-like command ran (2026-10-23
@@ -2422,6 +2433,50 @@ fn command_runs_tests(content: &str) -> bool {
         .any(|line| line[2..].to_ascii_lowercase().contains("test"))
 }
 
+/// Whether a result shows a green run of the FULL suite: a recognized
+/// test runner invoked bare (env prefixes allowed) with at most
+/// directory arguments — no file filters, no `-k`, no node ids. This
+/// is the settle condition for [`CompletionGate`]: `pytest
+/// testing/test_skipping.py` passing while an untouched PASS_TO_PASS
+/// test regresses is the exact pytest-7490 miss (2026-10-31 N=20).
+/// Whole-directory arguments (`pytest tests/`) still count as full.
+fn runs_full_suite(content: &str) -> bool {
+    /// Command heads that run a project's suite.
+    const RUNNERS: &[&[&str]] = &[
+        &["pytest"],
+        &["py.test"],
+        &["python", "-m", "pytest"],
+        &["python3", "-m", "pytest"],
+        &["python", "-m", "unittest"],
+        &["cargo", "test"],
+        &["go", "test"],
+        &["npm", "test"],
+        &["yarn", "test"],
+        &["tox"],
+        &["make", "test"],
+        &["jest"],
+    ];
+    content
+        .lines()
+        .filter(|line| line.starts_with("$ "))
+        .any(|line| {
+            let tokens: Vec<&str> = line[2..].split_whitespace().collect();
+            // Skip leading env assignments (`FOO=1 pytest …`).
+            let rest = tokens
+                .iter()
+                .position(|token| !token.contains('='))
+                .map(|start| &tokens[start..])
+                .unwrap_or(&[]);
+            let runner = RUNNERS.iter().copied().find(|head| rest.starts_with(head));
+            match runner {
+                // Every remaining argument must be a whole directory —
+                // anything else (a file, -k, ::node) narrows the run.
+                Some(head) => rest[head.len()..].iter().all(|token| token.ends_with('/')),
+                None => false,
+            }
+        })
+}
+
 /// The one-shot refusal text: changed paths plus the original task,
 /// head-bounded so an oversized instruction cannot balloon the turn.
 fn completion_refusal(session: &Session, attempt: u8) -> String {
@@ -2437,11 +2492,14 @@ fn completion_refusal(session: &Session, attempt: u8) -> String {
     let instruction_head = instruction.chars().take(800).collect::<String>();
     format!(
         "Hold on (verification reminder {attempt} of {COMPLETION_REFUSAL_CAP}) — these files \
-         changed since the last green check: {}. Before finishing: (1) review your full diff \
-         (`git diff`) hunk by hunk against the original task and revert anything the task did \
-         not ask for — reworded messages, formatting, unrelated files; (2) run the relevant \
-         checks (the project's test suite, verify, cargo test) and fix what fails. If every \
-         hunk is task-scoped and the checks pass, the task is complete. Original task: {}",
+         changed since the last full-suite green check: {}. Before finishing: (1) review your \
+         full diff (`git diff`) hunk by hunk against the original task and revert anything the \
+         task did not ask for — reworded messages, formatting, unrelated files; (2) run the \
+         FULL suite bare (e.g. `pytest` / `cargo test` at the repo root, no file filters, no \
+         -k) and fix what fails anywhere in the suite, not just in the file you changed; (3) \
+         keep HEAD on the base commit — never stash, checkout, or commit; every change lives \
+         in the working tree so the final diff applies cleanly to the original state. If every \
+         hunk is task-scoped and the full suite passes, the task is complete. Original task: {}",
         paths.join(", "),
         instruction_head,
     )
@@ -2953,10 +3011,35 @@ mod tests {
     fn a_fused_write_with_a_green_check_lands_verified() {
         let mut gate = CompletionGate::default();
         gate.note(&gate_result(
-            "edited src/lib.rs\n--- verify ---\n$ cargo check\nexit status: 0",
+            "edited src/lib.rs\n--- verify ---\n$ cargo test\nexit status: 0",
             &["src/lib.rs"],
         ));
-        assert!(!gate.pending(), "effects bump before the green pin");
+        assert!(!gate.pending(), "effects bump before the full-suite green");
+    }
+
+    #[test]
+    fn a_narrow_green_does_not_settle_the_gate() {
+        // The pytest-7490 hard-mix loss (2026-10-31): one test file
+        // green while an untouched regression fails elsewhere.
+        let mut gate = CompletionGate::default();
+        gate.note(&gate_result("edited src/lib.rs", &["src/lib.rs"]));
+        gate.note(&gate_result(
+            "$ pytest testing/test_skipping.py\nexit status: 0",
+            &[],
+        ));
+        assert!(gate.pending(), "a file-filtered run is not the full suite");
+        gate.note(&gate_result("$ pytest -k skip\nexit status: 0", &[]));
+        assert!(gate.pending(), "-k narrows the run");
+        gate.note(&gate_result("$ pytest testing/\nexit status: 0", &[]));
+        assert!(
+            !gate.pending(),
+            "a whole-directory run covers the suite and settles"
+        );
+        gate.note(&gate_result("edited src/main.rs", &["src/main.rs"]));
+        gate.note(&gate_result("$ cargo check\nexit status: 0", &[]));
+        assert!(gate.pending(), "a compile check is not a suite run");
+        gate.note(&gate_result("$ FOO=1 pytest\nexit status: 0", &[]));
+        assert!(!gate.pending(), "bare runner with env prefix settles");
     }
 
     #[test]

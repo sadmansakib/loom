@@ -717,9 +717,10 @@ async fn the_bare_loop_never_refuses_an_unverified_finish() {
 
 #[tokio::test]
 async fn a_fused_green_check_still_gets_one_test_consultation_refusal() {
-    // The fused `exit status: 0` check satisfies the verification gate,
-    // but `cargo check` is not a test run: the first EndTurn gets the
-    // once-only test-consultation nudge, the second completes.
+    // The fused `exit status: 0` check is a compile check, not a suite
+    // run: verification refusals fire until the cap, then the
+    // once-only test-consultation nudge, then completion (pytest-7490:
+    // a narrow green while the suite regresses must not settle).
     let mut registry = ToolRegistry::new();
     registry
         .register(Box::new(WritingTool {
@@ -748,6 +749,18 @@ async fn a_fused_green_check_still_gets_one_test_consultation_refusal() {
                 assistant("really done", StopReason::EndTurn, Vec::new()),
                 usage(30, 7, None),
             ),
+            completed(
+                assistant("still done", StopReason::EndTurn, Vec::new()),
+                usage(40, 9, None),
+            ),
+            completed(
+                assistant("truly done", StopReason::EndTurn, Vec::new()),
+                usage(50, 11, None),
+            ),
+            completed(
+                assistant("final", StopReason::EndTurn, Vec::new()),
+                usage(60, 13, None),
+            ),
         ],
     );
     let requests = provider.requests_handle();
@@ -761,19 +774,22 @@ async fn a_fused_green_check_still_gets_one_test_consultation_refusal() {
         .await
         .unwrap();
 
-    assert_eq!(summary.model_requests, 3, "one nudge turn, then done");
+    assert_eq!(
+        summary.model_requests, 6,
+        "3 verification refusals, one test-consultation, then done"
+    );
     let requests = requests.lock().unwrap();
     assert!(
-        requests[2].messages.iter().any(
+        requests[5].messages.iter().any(
             |m| matches!(m, Message::User { text } if text.contains("no existing test suite"))
         ),
-        "the test-consultation nudge must reach the model"
+        "the test-consultation nudge must reach the model after the cap"
     );
     assert!(
-        !requests.iter().any(|r| r.messages.iter().any(
-            |m| matches!(m, Message::User { text } if text.contains("since the last green check"))
+        requests.iter().any(|r| r.messages.iter().any(
+            |m| matches!(m, Message::User { text } if text.contains("since the last full-suite green check"))
         )),
-        "the verification refusal must not fire when the check is green"
+        "a compile check is not a suite run: the verification refusal must fire"
     );
 }
 
