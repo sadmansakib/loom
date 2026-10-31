@@ -233,23 +233,68 @@ fn json_kind(value: &Value) -> &'static str {
     }
 }
 
-/// Splits `args` that arrived as one string, tolerating the two near-array
-/// shapes the model actually emits: a leading `=` before the array
-/// (`"=[\"ls\", \"-l\"]"`) and a bracketed list whose inner tokens are not
-/// quoted (`"[test, r2574, --quiet]"`). Each has exactly one reading, and
-/// rejecting it costs a turn to retry.
+/// Splits `args` that arrived as one string, tolerating the near-array
+/// shapes the model actually emits. Observed storms (xarray-4687, 100
+/// turns lost): `args` as a valid JSON array string with a shell
+/// pipeline appended OUTSIDE the brackets —
+/// `"[\"-c\", \"grep -n x f\"] | head -5"` — which the old
+/// strip-suffix path couldn't salvage, tokenizing the brackets as argv.
+/// Each shape has exactly one reading; rejecting it costs a turn, and a
+/// run of them costs the task.
 fn split_args_lenient(text: &str) -> Vec<String> {
     let trimmed = text.trim().trim_start_matches('=').trim();
+    if let Some((items, remainder)) = parse_array_prefix(trimmed) {
+        return fold_remainder(items, remainder);
+    }
     if let Some(inner) = trimmed
         .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))
     {
-        // Valid JSON array text never reaches here — `args_from_value`
-        // parses it first — so the separators are commas that the model
-        // left unquoted; `split_args` still honours any quotes present.
+        // Unquoted bracketed list ("[test, r2574, --quiet]"):
+        // separators are commas the model left unquoted.
         return split_args(&inner.replace(',', " "));
     }
     split_args(trimmed)
+}
+
+/// Longest valid JSON-array prefix of `text`, plus whatever follows it.
+/// Brackets inside quoted strings are handled by the parser itself.
+fn parse_array_prefix(text: &str) -> Option<(Vec<String>, String)> {
+    let bytes = text.as_bytes();
+    let mut end = None;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b']' && serde_json::from_str::<Vec<String>>(&text[..=index]).is_ok() {
+            end = Some(index + 1);
+            break;
+        }
+    }
+    end.map(|end| {
+        let items = serde_json::from_str::<Vec<String>>(&text[..end]);
+        (items.unwrap_or_default(), text[end..].to_string())
+    })
+}
+
+/// A trailing `| pipeline` (or `2>&1` redirects) outside the array
+/// belongs to the shell command, which is the array's last element when
+/// the program is a shell — append it there so `sh -c "grep … | head"`
+/// runs as intended. Anything else after `]` is unreadable: refuse with
+/// the shape explained, which is cheaper than a garbage execution.
+fn fold_remainder(mut items: Vec<String>, remainder: String) -> Vec<String> {
+    let rest = remainder.trim();
+    if rest.is_empty() {
+        return items;
+    }
+    if (rest.starts_with('|') || rest.starts_with("2>"))
+        && let Some(last) = items.last_mut()
+    {
+        last.push(' ');
+        last.push_str(rest);
+        return items;
+    }
+    // Unreadable tail: keep the salvage deterministic, not silent —
+    // surface the junk as a final arg the command will visibly fail on.
+    items.push(rest.to_string());
+    items
 }
 
 /// Splits a command line the way a shell would tokenize it — whitespace
@@ -889,6 +934,32 @@ mod tests {
         assert!(output.content.contains("hello world"), "{}", output.content);
     }
 
+    #[tokio::test]
+    async fn args_as_json_array_string_with_trailing_pipeline_runs() {
+        // xarray-4687 storm shape: the model serializes args as a JSON
+        // array STRING with a shell pipeline appended outside the
+        // brackets. Salvage must run the intended pipeline, not tokenize
+        // the brackets into argv (which cost 100 turns before this fix).
+        let (_guard, root) = temp_root();
+        let tool = RunCommandTool::with_allowed(["sh"]);
+        let output = run(
+            &tool,
+            &root,
+            json!({"program": "sh", "args": "[\"-c\", \"printf 'first\\nsecond\\n'\"] | tail -1"}),
+        )
+        .await
+        .expect("salvaged");
+        assert!(
+            output.content.contains("second"),
+            "pipeline must run as the model intended: {}",
+            output.content
+        );
+        assert!(
+            !output.content.contains("cannot open"),
+            "brackets must not leak into argv: {}",
+            output.content
+        );
+    }
     #[tokio::test]
     async fn args_as_a_bracketed_list_without_quotes_are_coerced() {
         let (_guard, root) = temp_root();
