@@ -257,6 +257,10 @@ pub fn build_prompt(instance: &SweInstance) -> String {
          directory. You have file tools and a shell: explore the code and edit the \
          source to fix it.\n\n\
          Rules:\n\
+         - Plan before editing: reproduce the bug, name the exact faulty \
+         code path in one or two sentences, and say what change will fix it \
+         and why — then edit. Planning-first beats direct issue-to-patch on \
+         hard tasks (planning→repair studies, 2025).\n\
          - Fix the root cause in the source; do not paper over the symptom.\n\
          - Fix exactly the reported defect: no new restrictions, errors on \
          previously working inputs, API changes, or renames unless the issue \
@@ -778,12 +782,50 @@ pub fn slug(id: &str) -> String {
     id.replace(['/', ':'], "-")
 }
 
+/// Best-of-N selection across an instance's runs (Trae/Agentless
+/// majority voting, adapted to visible signals only): among non-empty
+/// patches, the most frequent normalized diff wins — independent runs
+/// converging on the same change is evidence the fix is real, while a
+/// one-off diff is more likely a lucky or broken path. Ties go to the
+/// earlier run (cache-friendlier, run-1-compatible); if every patch is
+/// empty the first (empty) patch is returned so the scorer still gets
+/// its one row per instance.
+pub fn select_patch<'a>(patches: &[&'a str]) -> &'a str {
+    let normalize = |patch: &str| {
+        patch
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let mut best: Option<(&'a str, usize)> = None; // (patch, count)
+    for patch in patches.iter().filter(|patch| !patch.trim().is_empty()) {
+        let normalized = normalize(patch);
+        let count = patches
+            .iter()
+            .filter(|other| normalize(other) == normalized)
+            .count();
+        // Strictly greater: ties keep the earlier run's patch.
+        if best
+            .map(|(_, best_count)| count > best_count)
+            .unwrap_or(true)
+        {
+            best = Some((patch, count));
+        }
+    }
+    match best {
+        Some((patch, _)) => patch,
+        // All runs empty: scorer still needs the row.
+        None => patches.first().copied().unwrap_or(""),
+    }
+}
+
 // ------------------------------------------------------- provenance ---
 
 /// The frozen prompt's version marker (doc comment on
 /// [`build_prompt`] is the changelog; this is the machine-readable
 /// digest input). Bumping it invalidates every recorded baseline.
-pub const PROMPT_VERSION: &str = "3";
+pub const PROMPT_VERSION: &str = "4";
 
 /// Provenance stamped into every sweep report so a headline number is
 /// attributable to one engine build, one container script, and one
@@ -1367,6 +1409,26 @@ fn predictions_write_the_official_shape() {
     assert_eq!(parsed["model_name_or_path"], "deepseek-flash");
     assert_eq!(parsed["model_patch"], "--- a/x\n+++ b/x\n");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn selection_takes_the_majority_patch() {
+    let a = "--- a/x\n+++ b/x\n@@\n-old\n+new ";
+    let b = "--- a/x\n+++ b/x\n@@\n-old\n+different";
+    // Trailing whitespace differences normalize away: a == c.
+    let c = "--- a/x\n+++ b/x\n@@\n-old\n+new";
+    assert_eq!(select_patch(&[b, a, c]), a, "2-of-3 majority wins");
+    assert_eq!(
+        select_patch(&[a, b]),
+        a,
+        "ties go to the earlier run (run-1 compatible)"
+    );
+    assert_eq!(select_patch(&["", a, ""]), a, "empty patches never win");
+    assert_eq!(
+        select_patch(&["", ""]).trim(),
+        "",
+        "all-empty still yields a row"
+    );
 }
 
 #[test]

@@ -662,9 +662,45 @@ fn main() {
         prediction_paths.push(path);
     }
 
+    // Best-of-N selection (Trae/Agentless majority voting): when an
+    // instance ran more than once, the most frequent normalized diff
+    // across runs becomes the sweep's prediction — independent runs
+    // converging on the same change is stronger evidence than any
+    // single rollout. Rows stay in instance order because outcomes
+    // were re-assembled in selection order above.
+    if args.runs > 1 && !predictions.is_empty() {
+        let mut selected_rows: Vec<(String, String, String)> = Vec::new();
+        for index in 0..predictions[0].len() {
+            let patches: Vec<&str> = predictions
+                .iter()
+                .map(|rows| rows[index].2.as_str())
+                .collect();
+            let (instance_id, model, _) = &predictions[0][index];
+            selected_rows.push((
+                instance_id.clone(),
+                model.clone(),
+                swebench::select_patch(&patches).to_owned(),
+            ));
+        }
+        let borrowed: Vec<Prediction<'_>> = selected_rows
+            .iter()
+            .map(|(instance_id, model, patch)| Prediction {
+                instance_id,
+                model_name_or_path: model,
+                model_patch: patch,
+            })
+            .collect();
+        let path = base.join(format!("predictions-{file_model}-selected.jsonl"));
+        swebench::write_predictions(&path, &borrowed);
+        prediction_paths.push(path.clone());
+        println!("best-of-{} selection: {}", args.runs, path.display());
+    }
+
     let sweep = serde_json::json!({
         "provider": args.provider,
         "model": args.model,
+        "runs": args.runs,
+        "selection": if args.runs > 1 { "majority-normalized-diff" } else { "single-run" },
         "base_url": args.base_url,
         "arm": args.arm,
         "dataset": swebench::DATASET_ID,
