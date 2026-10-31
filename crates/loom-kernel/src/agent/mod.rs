@@ -1564,15 +1564,22 @@ impl Agent {
         // fires on the next EndTurn if the task still never ran tests.
         let pending_refusal = completion.pending() && completion.can_refuse();
         let test_refusal = completion.untested() && !completion.test_refused;
-        if !self.loop_shaping || turn >= self.max_turns || !(pending_refusal || test_refusal) {
+        let oracle_refusal = completion.unproven() && !completion.oracle_refused;
+        if !self.loop_shaping
+            || turn >= self.max_turns
+            || !(pending_refusal || test_refusal || oracle_refusal)
+        {
             return Ok(false);
         }
         let text = if pending_refusal {
             completion.refusals += 1;
             completion_refusal(session, completion.refusals)
-        } else {
+        } else if test_refusal {
             completion.test_refused = true;
             test_consultation_refusal(session)
+        } else {
+            completion.oracle_refused = true;
+            acceptance_oracle_refusal(session)
         };
         sink.emit(task_id, EventKind::LoopNudge { text: text.clone() });
         self.commit(session, assistant.clone(), Vec::new())?;
@@ -2071,6 +2078,18 @@ struct CompletionGate {
     tested: bool,
     /// Whether the one-shot test-consultation refusal already fired.
     test_refused: bool,
+    /// Whether the task mutated any test-shaped file. A test the agent
+    /// itself authored is the cheapest executable oracle for new
+    /// behavior (Agentless/Syncause reproduce-first, 2026-10-31).
+    test_mutation: bool,
+    /// Non-test files this task wrote, so a later green command that
+    /// executes one of them counts as an agent-authored check.
+    authored: Vec<String>,
+    /// Whether an agent-authored check satisfied the oracle: a mutated
+    /// test file, or a green command executing a file the task wrote.
+    oracle_ok: bool,
+    /// Whether the one-shot acceptance-oracle refusal already fired.
+    oracle_refused: bool,
 }
 
 impl CompletionGate {
@@ -2079,8 +2098,33 @@ impl CompletionGate {
         if !result.effects.files_written.is_empty() || !result.effects.files_deleted.is_empty() {
             self.mutations += 1;
         }
+        if result
+            .effects
+            .files_written
+            .iter()
+            .any(|path| is_test_path(path))
+        {
+            self.test_mutation = true;
+        }
+        for path in &result.effects.files_written {
+            if !is_test_path(path) && !self.authored.contains(path) {
+                self.authored.push(path.clone());
+            }
+        }
         if green_check(result) {
             self.verified_at = Some(self.mutations);
+            let command = result
+                .content
+                .lines()
+                .find(|line| line.starts_with("$ "))
+                .unwrap_or_default();
+            if self
+                .authored
+                .iter()
+                .any(|path| command.contains(path.as_str()))
+            {
+                self.oracle_ok = true;
+            }
         }
         if command_runs_tests(&result.content) {
             self.tested = true;
@@ -2098,10 +2142,28 @@ impl CompletionGate {
         self.mutations > 0 && !self.tested
     }
 
+    /// Whether mutations exist that no agent-authored check exercises.
+    /// The project's own suite predates the change and passes green on
+    /// wrong code — only a check the task itself authored can falsify
+    /// new behavior.
+    fn unproven(&self) -> bool {
+        self.mutations > 0 && !self.test_mutation && !self.oracle_ok
+    }
+
     /// Whether the unverified-mutation refusal may still fire.
     fn can_refuse(&self) -> bool {
         self.refusals < COMPLETION_REFUSAL_CAP
     }
+}
+
+/// Whether a path looks like a test file by standard conventions:
+/// a `tests`/`test` directory segment, or a `test_*`/`*_test.*` basename.
+fn is_test_path(path: &str) -> bool {
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    path.split('/')
+        .any(|segment| segment == "tests" || segment == "test")
+        || basename.starts_with("test_")
+        || basename.contains("_test.")
 }
 
 /// Ceiling on unverified-mutation refusals per task: the gate loops
@@ -2339,6 +2401,40 @@ fn test_consultation_refusal(session: &Session) -> String {
     )
 }
 
+/// The acceptance-oracle refusal (2026-10-31): mutations exist, checks
+/// ran green, but nothing the agent itself authored exercises the new
+/// behavior — the project's suite predates the change and passes green
+/// on wrong code (astropy 13398: 63 old tests green, 8 hidden ITRS
+/// tests red). Agentless/Syncause reproduce-first: demand a minimal
+/// check derived from the task's own acceptance criteria. One-shot:
+/// a model that ignores it once will not write a better oracle nagged.
+fn acceptance_oracle_refusal(session: &Session) -> String {
+    let paths = recent_changes(session);
+    let instruction = session
+        .transcript
+        .iter()
+        .find_map(|item| match item {
+            Item::User { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let instruction_head = instruction.chars().take(800).collect::<String>();
+    format!(
+        "Hold on — these files changed and existing checks pass, but no check you \
+         wrote yourself exercises the new behavior: {}. The project's own suite \
+         predates your change and stays green on wrong code. Before finishing: \
+         (1) derive the task's acceptance criteria (the concrete expected \
+         behavior stated or implied in the task, e.g. an example input/output); \
+         (2) write a minimal throwaway check for it — a test file or a small \
+         script is fine; (3) run it and fix whatever fails; a fresh check that \
+         passes on old code and fails before your fix is the ideal. If the task \
+         genuinely has no observable behavior change (pure refactor, formatting, \
+         docs), say so in one line and finish. Original task: {}",
+        paths.join(", "),
+        instruction_head,
+    )
+}
+
 /// Workspace-relative paths the task has mutated so far (2F, ADR-017).
 ///
 /// Derived from the recorded [`ToolEffects`](crate::tool::ToolEffects) on
@@ -2546,8 +2642,9 @@ fn duration_millis(duration: Duration) -> u64 {
 mod tests {
     use super::{
         COMPLETION_REFUSAL_CAP, CompletionGate, DEFAULT_RESERVED_OUTPUT_TOKENS,
-        MAX_RESERVED_OUTPUT_TOKENS, OutputReservation, ZERO_PROGRESS_TURNS, append_failure_hint,
-        completion_refusal, derive_reserved_output_tokens, green_check, late_budget_due,
+        MAX_RESERVED_OUTPUT_TOKENS, OutputReservation, ZERO_PROGRESS_TURNS,
+        acceptance_oracle_refusal, append_failure_hint, completion_refusal,
+        derive_reserved_output_tokens, green_check, is_test_path, late_budget_due,
         visible_call_ids, zero_progress_due,
     };
     use crate::model::{Message, ModelCapabilities, ModelRequest, StopReason};
@@ -2785,6 +2882,69 @@ mod tests {
             &["src/lib.rs"],
         ));
         assert!(!gate.pending(), "effects bump before the green pin");
+    }
+
+    #[test]
+    fn the_gate_demands_an_agent_authored_oracle_for_new_behavior() {
+        let mut gate = CompletionGate::default();
+        gate.note(&gate_result(
+            "edited src/transform.rs",
+            &["src/transform.rs"],
+        ));
+        // Old suite green on changed code: verified and tested, but the
+        // new behavior has no oracle — the 13398 trap.
+        gate.note(&gate_result("$ pytest tests/\nexit status: 0\n", &[]));
+        assert!(
+            !gate.pending(),
+            "green after the write settles verification"
+        );
+        assert!(!gate.untested(), "a test-like command ran");
+        assert!(
+            gate.unproven(),
+            "no check the agent authored exercises the change"
+        );
+
+        // A test-file mutation is an authored oracle.
+        gate.note(&gate_result(
+            "$ cat >> tests/test_transform.py\nexit status: 0",
+            &["tests/test_transform.py"],
+        ));
+        assert!(!gate.unproven(), "mutating a test file provides the oracle");
+    }
+
+    #[test]
+    fn running_a_task_authored_script_satisfies_the_oracle() {
+        let mut gate = CompletionGate::default();
+        gate.note(&gate_result("wrote check_fix.py", &["check_fix.py"]));
+        gate.note(&gate_result("$ python check_fix.py\nexit status: 0\n", &[]));
+        assert!(
+            !gate.unproven(),
+            "a green run of a file this task wrote is an authored check"
+        );
+    }
+
+    #[test]
+    fn the_oracle_refusal_quotes_the_acceptance_criteria_demand() {
+        let mut session = Session::new(crate::id::SessionId::new());
+        session
+            .push_item(Item::User {
+                text: "make the transform handle straight-overhead inputs".to_owned(),
+            })
+            .unwrap();
+        let text = acceptance_oracle_refusal(&session);
+        assert!(text.contains("acceptance criteria"), "{text}");
+        assert!(text.contains("straight-overhead"), "{text}");
+        assert!(text.contains("pure refactor"), "{text}");
+    }
+
+    #[test]
+    fn test_path_heuristics_match_standard_conventions() {
+        assert!(is_test_path("tests/test_transform.py"));
+        assert!(is_test_path("src/foo/test_helper.rs"));
+        assert!(is_test_path("test_transform.py"));
+        assert!(is_test_path("src/lib_test.go"));
+        assert!(!is_test_path("src/transform.rs"));
+        assert!(!is_test_path("src/testing_utilities.rs"));
     }
 
     #[test]

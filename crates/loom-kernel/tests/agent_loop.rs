@@ -258,6 +258,9 @@ struct WritingTool {
     /// The command the fused check echoes; "cargo test" makes the
     /// result count as a test run for the completion gate.
     check: &'static str,
+    /// Whether the written file is test-shaped; a test-file write
+    /// satisfies the acceptance-oracle gate.
+    test_path: bool,
 }
 
 impl Tool for WritingTool {
@@ -274,7 +277,12 @@ impl Tool for WritingTool {
         _input: Value,
         _ctx: &'a ToolContext,
     ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
-        let mut effects = ToolEffects::default().with_file_written("src/lib.rs".to_owned());
+        let path = if self.test_path {
+            "tests/test_lib.rs"
+        } else {
+            "src/lib.rs"
+        };
+        let mut effects = ToolEffects::default().with_file_written(path.to_owned());
         effects = effects.with_command(CommandEffect::new(
             "cargo",
             vec!["check".to_owned()],
@@ -282,11 +290,11 @@ impl Tool for WritingTool {
         ));
         let content = if self.green {
             format!(
-                "edited src/lib.rs\n--- verify ---\n$ {}\nexit status: 0",
-                self.check
+                "edited {}\n--- verify ---\n$ {}\nexit status: 0",
+                path, self.check
             )
         } else {
-            String::from("edited src/lib.rs")
+            format!("edited {path}")
         };
         Box::pin(async move { Ok(ToolOutput::new(content).with_effects(effects)) })
     }
@@ -540,6 +548,7 @@ async fn an_unverified_finish_is_refused_until_the_cap_then_accepted() {
             spec: spec("write"),
             green: false,
             check: "cargo check",
+            test_path: false,
         }))
         .unwrap();
     let provider = FakeProvider::new(
@@ -573,6 +582,10 @@ async fn an_unverified_finish_is_refused_until_the_cap_then_accepted() {
                 assistant("final answer", StopReason::EndTurn, Vec::new()),
                 usage(60, 13, None),
             ),
+            completed(
+                assistant("done for real", StopReason::EndTurn, Vec::new()),
+                usage(70, 15, None),
+            ),
         ],
     );
     let requests = provider.requests_handle();
@@ -586,9 +599,10 @@ async fn an_unverified_finish_is_refused_until_the_cap_then_accepted() {
         .await
         .unwrap();
 
-    // Six model requests: write, three green-check refusals (the cap),
-    // one test-consultation refusal, accepted finish.
-    assert_eq!(summary.model_requests, 6);
+    // Seven model requests: write, three green-check refusals (the
+    // cap), one test-consultation refusal, one acceptance-oracle
+    // refusal, accepted finish.
+    assert_eq!(summary.model_requests, 7);
     // Schema 11: every loop-owned nudge is also an event, not just a
     // transcript item — both refusals surface here.
     let mut nudges = Vec::new();
@@ -623,6 +637,16 @@ async fn an_unverified_finish_is_refused_until_the_cap_then_accepted() {
         refusal_at(5, "no existing test suite"),
         "the test-consultation refusal must reach the model"
     );
+    assert!(
+        refusal_at(6, "acceptance criteria"),
+        "the acceptance-oracle refusal must reach the model"
+    );
+    assert!(
+        nudges
+            .iter()
+            .any(|t| t.contains("no check you wrote yourself")),
+        "the one-shot acceptance-oracle refusal fires"
+    );
     drop(requests);
 
     // Both refusals persist in the transcript as user items.
@@ -632,7 +656,7 @@ async fn an_unverified_finish_is_refused_until_the_cap_then_accepted() {
             .iter()
             .any(|i| matches!(i, Item::User { text } if text.contains("Hold on")))
     );
-    assert_eq!(summary.turns, 6);
+    assert_eq!(summary.turns, 7);
 }
 
 #[tokio::test]
@@ -647,6 +671,7 @@ async fn the_bare_loop_never_refuses_an_unverified_finish() {
             spec: spec("write"),
             green: false,
             check: "cargo check",
+            test_path: false,
         }))
         .unwrap();
     let provider = FakeProvider::new(
@@ -701,6 +726,7 @@ async fn a_fused_green_check_still_gets_one_test_consultation_refusal() {
             spec: spec("write"),
             green: true,
             check: "cargo check",
+            test_path: true,
         }))
         .unwrap();
     let provider = FakeProvider::new(
@@ -761,6 +787,7 @@ async fn a_fused_green_test_run_finishes_without_any_refusal() {
             spec: spec("write"),
             green: true,
             check: "cargo test",
+            test_path: true,
         }))
         .unwrap();
     let provider = FakeProvider::new(
