@@ -70,6 +70,18 @@ pub const ZERO_PROGRESS_TURNS: u32 = 12;
 /// recovering, and burning turns on it helps nobody.
 pub const MALFORMED_ARGUMENT_TURNS_LIMIT: u32 = 3;
 
+/// The failed-call loop breaker (2026-10-31): consecutive turns in
+/// which every tool call *failed* (well-formed but rejected — wrong
+/// shape, denied, unusable) before a corrective nudge fires. Unlike
+/// unparseable arguments, these are recoverable — the same model
+/// self-corrected mid-run — so the first response is a nudge quoting
+/// the error, not task failure.
+pub const FAILED_CALL_TURNS_NUDGE: u32 = 5;
+/// Consecutive all-failed turns that fail the task outright: a model
+/// still failing every call after the corrective nudge is stuck.
+/// (The 13398 oracle run burned 130 of 250 turns here.)
+pub const FAILED_CALL_TURNS_LIMIT: u32 = 10;
+
 /// Whether the zero-progress nudge is due: enough turns have passed
 /// without a change, and this stall has not been nudged yet.
 fn zero_progress_due(turns_since_mutation: u32, nudged: bool) -> bool {
@@ -1086,6 +1098,13 @@ impl Agent {
         // Malformed-salvage bookkeeping: consecutive turns in which
         // every tool call carried unparseable (salvaged) arguments.
         let mut malformed_turns: u32 = 0;
+        // A pending failed-call nudge, applied after the turn commits.
+        let mut failed_call_nudge: Option<String> = None;
+
+        // Failed-call bookkeeping (2026-10-31): consecutive turns in
+        // which every tool call failed with a non-success status.
+        let mut failed_call_turns: u32 = 0;
+        let mut failure_nudged: bool = false;
 
         for turn in 1..=self.max_turns {
             // A pause requested before the task or during the previous
@@ -1370,11 +1389,67 @@ impl Agent {
                     } else {
                         malformed_turns = 0;
                     }
+
+                    // The failed-call loop breaker: well-formed calls the
+                    // tools rejected (wrong shape, denied) are
+                    // recoverable — nudge with the error text — but a
+                    // model still failing everything after the nudge is
+                    // stuck (13398: 130 all-failed turns, uncounted).
+                    let any_succeeded = !results.is_empty()
+                        && results
+                            .iter()
+                            .any(|result| result.status == ToolStatus::Success);
+                    if !results.is_empty() && !any_succeeded && !all_malformed {
+                        failed_call_turns += 1;
+                        if failed_call_turns >= FAILED_CALL_TURNS_LIMIT {
+                            return Err(TaskError::Protocol(
+                                "every tool call failed in \
+                                 FAILED_CALL_TURNS_LIMIT consecutive turns"
+                                    .into(),
+                            ));
+                        }
+                        if failed_call_turns >= FAILED_CALL_TURNS_NUDGE && !failure_nudged {
+                            failure_nudged = true;
+                            let sample = results
+                                .iter()
+                                .find(|result| result.status != ToolStatus::Success)
+                                .map(|result| result.content.chars().take(300).collect::<String>())
+                                .unwrap_or_default();
+                            // Applied after this turn commits, so the
+                            // transcript keeps assistant-then-nudge order.
+                            failed_call_nudge = Some(format!(
+                                "Every tool call in the last {failed_call_turns} turns \
+                                 failed. Latest error: {sample}Stop guessing: re-read the \
+                                 tool's expected fields from its description, then send one \
+                                 correctly shaped call. For shell pipelines, run the \
+                                 pipeline through `bash -c \"…\"` rather than passing \
+                                 shell syntax where a bare program name is expected."
+                            ));
+                        }
+                    } else if any_succeeded {
+                        failed_call_turns = 0;
+                        failure_nudged = false;
+                    }
                     // A batch interrupted by cancellation still commits its
                     // completed results plus cancelled fillers (§6.1, §10).
                     self.commit(session, assistant, results)?;
                     accounting.turns = turn;
                     accounting.sync(session, task_id);
+                    // The failed-call corrective nudge lands after the
+                    // commit: transcript order stays assistant-then-
+                    // nudge, and the next model request sees it.
+                    if let Some(text) = failed_call_nudge.take() {
+                        let notice = Item::User { text: text.clone() };
+                        sink.emit(task_id, EventKind::LoopNudge { text });
+                        if let Some(store) = &self.store {
+                            store
+                                .append_item(&session.id, session.next_index(), &notice)
+                                .map_err(persistence)?;
+                        }
+                        session
+                            .push_item(notice)
+                            .map_err(|error| TaskError::Internal(error.to_string()))?;
+                    }
                     if mutated {
                         turns_since_mutation = 0;
                         nudged = false;

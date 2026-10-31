@@ -2925,3 +2925,104 @@ async fn steering_queued_mid_batch_is_applied_at_the_next_turn_boundary() {
         "events: {kinds:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Failed-call loop breaker (2026-10-31)
+// ---------------------------------------------------------------------------
+
+/// Varied-argument failing calls: each turn's call differs so the
+/// repeated-call guard cannot catch it — the 13398 storm shape.
+fn varied_boom_calls(count: usize) -> Vec<Script> {
+    (1..=count)
+        .map(|i| {
+            completed(
+                assistant(
+                    "",
+                    StopReason::ToolCalls,
+                    vec![tool_call(
+                        &format!("call_{i}"),
+                        "boom",
+                        json!({ "attempt": i }),
+                    )],
+                ),
+                usage(i as u64 * 10, 1, None),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_storm_of_varied_failed_calls_is_nudged_then_fails_the_task() {
+    let (registry, invocations) = registry_for_repeat();
+    let provider = FakeProvider::new(capabilities(), varied_boom_calls(20));
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let agent = agent(provider, registry, 30);
+
+    let result = agent
+        .run_task(&mut session, "fix it", &sink, &TaskControl::new())
+        .await;
+
+    assert!(result.is_err(), "ten all-failed turns fail the task");
+    let nudges: Vec<String> = drain(&mut receiver)
+        .into_iter()
+        .filter_map(|kind| match kind {
+            EventKind::LoopNudge { text } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        nudges.iter().any(|t| t.starts_with("Every tool call")),
+        "the corrective nudge fires before the limit: {nudges:?}"
+    );
+    assert!(
+        session.transcript.iter().any(|item| matches!(item,
+            Item::User { text } if text.contains("bash -c"))),
+        "the nudge teaches the shell-pipeline escape in the transcript"
+    );
+    assert_eq!(*invocations.lock().unwrap(), 10, "stops at the limit");
+}
+
+#[tokio::test]
+async fn a_recovery_after_the_failed_call_nudge_completes_normally() {
+    let (registry, _invocations) = registry_for_repeat();
+    let mut script = varied_boom_calls(5);
+    script.push(completed(
+        assistant(
+            "recovered",
+            StopReason::ToolCalls,
+            vec![tool_call("call_ok", "echo", json!({ "say": "hi" }))],
+        ),
+        usage(100, 2, None),
+    ));
+    script.push(completed(
+        assistant("done", StopReason::EndTurn, Vec::new()),
+        usage(110, 3, None),
+    ));
+    let provider = FakeProvider::new(capabilities(), script);
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let agent = agent(provider, registry, 30);
+
+    let summary = agent
+        .run_task(&mut session, "fix it", &sink, &TaskControl::new())
+        .await
+        .unwrap();
+
+    assert_eq!(summary.model_requests, 7);
+    let nudges: Vec<String> = drain(&mut receiver)
+        .into_iter()
+        .filter_map(|kind| match kind {
+            EventKind::LoopNudge { text } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        nudges
+            .iter()
+            .filter(|t| t.starts_with("Every tool call"))
+            .count(),
+        1,
+        "one corrective nudge, not a nag"
+    );
+}
