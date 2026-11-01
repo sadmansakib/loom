@@ -1,0 +1,78 @@
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 00000000..d721ed8e
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,19 @@
++import sys
++sys.path = ['/testbed'] + sys.path
++
++import numpy as np
++import xarray as xr
++
++# MCVE from issue
++da = xr.DataArray(1)
++da.attrs['foo'] = 'bar'
++res = xr.where(da==0, -1, da)
++print(res.attrs)
++
++# First example
++data = xr.DataArray(np.ones([10,10], dtype=np.int8))
++data.attrs["attr_1"] = "test1"
++data.attrs["attr_2"] = "test2"
++data2 = xr.where(data == 1, 5, 0)
++print(data2.attrs)
++print(data2.dtype)
+diff --git a/test_trace.py b/test_trace.py
+new file mode 100644
+index 00000000..5f658dd5
+--- /dev/null
++++ b/test_trace.py
+@@ -0,0 +1,9 @@
++import sys
++sys.path.insert(0, '/testbed')
++import numpy as np
++import xarray as xr
++
++da = xr.DataArray(1)
++da.attrs['foo'] = 'bar'
++res = xr.where(da==0, -1, da)
++print(res.attrs)
+diff --git a/test_trace2.py b/test_trace2.py
+new file mode 100644
+index 00000000..a581d802
+--- /dev/null
++++ b/test_trace2.py
+@@ -0,0 +1,20 @@
++import sys
++sys.path.insert(0, '/testbed')
++import numpy as np
++import xarray as xr
++from xarray.core import computation, duck_array_ops
++
++da = xr.DataArray(1)
++da.attrs['foo'] = 'bar'
++# trace
++res = computation.apply_ufunc(
++    duck_array_ops.where,
++    da == 0,
++    da,
++    -1,
++    join="exact",
++    dataset_join="exact",
++    dask="allowed",
++    keep_attrs=True,
++)
++print(res.attrs)
+diff --git a/xarray/core/computation.py b/xarray/core/computation.py
+index 9fe93c88..0066f196 100644
+--- a/xarray/core/computation.py
++++ b/xarray/core/computation.py
+@@ -1817,6 +1817,7 @@ def where(cond, x, y):
+         join="exact",
+         dataset_join="exact",
+         dask="allowed",
++        keep_attrs=True,
+     )
+ 
+ 

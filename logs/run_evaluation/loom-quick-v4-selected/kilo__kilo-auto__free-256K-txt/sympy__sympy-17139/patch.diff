@@ -1,0 +1,43 @@
+diff --git a/sympy/simplify/fu.py b/sympy/simplify/fu.py
+index ad1130ef9..6e76b2dc5 100755
+--- a/sympy/simplify/fu.py
++++ b/sympy/simplify/fu.py
+@@ -501,24 +501,30 @@ def _f(rv):
+         if not (rv.is_Pow and rv.base.func == f):
+             return rv
+ 
+-        if (rv.exp < 0) == True:
++        exp = rv.exp
++        if getattr(exp, 'is_negative', False) is True:
+             return rv
+-        if (rv.exp > max) == True:
++        if getattr(exp, 'is_number', False) and exp.is_complex and not exp.is_real:
+             return rv
+-        if rv.exp == 2:
++        try:
++            if (exp > max) == True:
++                return rv
++        except Exception:
++            return rv
++        if exp == 2:
+             return h(g(rv.base.args[0])**2)
+         else:
+-            if rv.exp == 4:
++            if exp == 4:
+                 e = 2
+             elif not pow:
+-                if rv.exp % 2:
++                if exp % 2:
+                     return rv
+-                e = rv.exp//2
++                e = exp // 2
+             else:
+-                p = perfect_power(rv.exp)
++                p = perfect_power(exp)
+                 if not p:
+                     return rv
+-                e = rv.exp//2
++                e = exp // 2
+             return h(g(rv.base.args[0])**2)**e
+ 
+     return bottom_up(rv, _f)

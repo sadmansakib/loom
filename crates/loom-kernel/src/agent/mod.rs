@@ -2499,7 +2499,10 @@ fn completion_refusal(session: &Session, attempt: u8) -> String {
          -k) and fix what fails anywhere in the suite, not just in the file you changed; (3) \
          keep HEAD on the base commit — never stash, checkout, or commit; every change lives \
          in the working tree so the final diff applies cleanly to the original state. If every \
-         hunk is task-scoped and the full suite passes, the task is complete. Original task: {}",
+         hunk is task-scoped and the full suite passes, the task is complete. \
+         For a Python repo the full-suite command is exactly: pytest -q (from the repo root, \
+         nothing else on the command line). Run that one command now and paste its tail. \
+         Original task: {}",
         paths.join(", "),
         instruction_head,
     )

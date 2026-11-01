@@ -248,7 +248,10 @@ pub fn select_instances<'a>(
 /// sweep diagnosed two process misses; v2 baseline = 23/25. Both v3
 /// rules mirror the field-standard prompts — SWE-agent's
 /// always-replicate-first tip and the standard harness's
-/// minimal-changes-to-non-tests step.)
+/// minimal-changes-to-non-tests step.) v5, 2026-10-31: the repro rule now
+/// demands the issue's example verbatim — same nesting, same definitions —
+/// after sphinx-9281 died to __qualname__ on a test-local enum the model's
+/// simplified repro (module-level class) could never expose.
 pub fn build_prompt(instance: &SweInstance) -> String {
     let mut prompt = format!(
         "You are an autonomous software engineer fixing a real issue in a GitHub repository.\n\n\
@@ -273,7 +276,10 @@ pub fn build_prompt(instance: &SweInstance) -> String {
          own example when it has one — that fails (nonzero exit) while the bug \
          is present; after the fix, run it again and confirm it passes and that \
          the behavior matches what the issue says is correct, including any \
-         exact expected values it states.\n\
+         exact expected values it states. Copy the issue's example exactly — \
+         define classes and functions where the issue defines them (a class \
+         nested in a function behaves differently from a module-level one: \
+         __qualname__, name mangling, scoping); do not simplify its shape.\n\
          - Before finishing, run the repository's existing tests that cover the \
          files you changed, and make sure they still pass.\n\
          - Delete any scratch or reproduction scripts you created along the way; \
@@ -825,7 +831,7 @@ pub fn select_patch<'a>(patches: &[&'a str]) -> &'a str {
 /// The frozen prompt's version marker (doc comment on
 /// [`build_prompt`] is the changelog; this is the machine-readable
 /// digest input). Bumping it invalidates every recorded baseline.
-pub const PROMPT_VERSION: &str = "4";
+pub const PROMPT_VERSION: &str = "5";
 
 /// Provenance stamped into every sweep report so a headline number is
 /// attributable to one engine build, one container script, and one
