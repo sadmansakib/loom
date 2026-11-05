@@ -29,6 +29,13 @@
 //!   is applied.
 //! - **Forensics on merge failure.** If the winning patch does not apply,
 //!   worktrees are kept (not cleaned) so the run can be inspected.
+//! - **Shared-prefix optionality.** With `shared_prefix_turns` set, one
+//!   exploratory prefix rollout runs first in worktree 0; its session
+//!   database and its patch are seeded into every sibling, and all N
+//!   rollouts continue that session. The shared turns are paid once and
+//!   the byte-stable projection makes them a provider prefix-cache hit
+//!   in every child (item 28; SWE-Replay, arXiv 2601.22129). Default
+//!   off — forked rollouts trade diversity for the shared spend.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -37,6 +44,7 @@ use std::sync::Arc;
 use crate::engine::{Engine, EngineConfig, EngineError, EngineOverrides};
 use loom_kernel::agent::{TaskControl, TaskSummary};
 use loom_kernel::event::{ChannelEventSink, EventKind};
+use loom_kernel::id::SessionId;
 use loom_kernel::model::ModelProvider;
 use tokio::sync::Semaphore;
 
@@ -58,6 +66,11 @@ pub struct BestOfNConfig {
     pub concurrency: usize,
     /// Keep worktrees (and the winning patch's siblings) for inspection.
     pub keep_worktrees: bool,
+    /// Fork rollouts from a shared exploratory prefix of this many turns
+    /// (item 28): one prefix rollout runs in worktree 0, then every
+    /// rollout continues its session. `None` (default) runs every child
+    /// from turn 0 as before.
+    pub shared_prefix_turns: Option<u32>,
 }
 
 impl Default for BestOfNConfig {
@@ -66,6 +79,7 @@ impl Default for BestOfNConfig {
             n: 3,
             concurrency: 3,
             keep_worktrees: false,
+            shared_prefix_turns: None,
         }
     }
 }
@@ -110,6 +124,9 @@ pub struct BestOfNReport {
     pub apply_note: String,
     /// Where the worktrees lived; removed unless kept for forensics.
     pub worktrees_root: PathBuf,
+    /// The shared-prefix spend note (turns, requests, tokens, session id)
+    /// when `shared_prefix_turns` produced a seeded prefix, else `None`.
+    pub prefix_note: Option<String>,
 }
 
 /// Errors that abort the orchestration before or between rollouts. Child
@@ -277,6 +294,7 @@ fn winner_index(runs: &[RolloutReport]) -> Option<usize> {
 /// One rollout: open a child engine on the worktree, run the task, count
 /// failure markers from the event stream, and capture the patch whatever
 /// the outcome.
+#[allow(clippy::too_many_arguments)] // one flat call site per rollout kind
 async fn run_rollout(
     index: usize,
     worktree: PathBuf,
@@ -284,7 +302,13 @@ async fn run_rollout(
     provider_factory: ProviderFactory,
     task: String,
     cancellation: &tokio_util::sync::CancellationToken,
-) -> RolloutReport {
+    // Continuation seed for shared-prefix mode: the prefix session to
+    // continue and the steering input that starts every fork (identical
+    // across children so the first forked request stays byte-stable).
+    resume: Option<(SessionId, String)>,
+    // Whether to capture the worktree patch on return.
+    capture: bool,
+) -> (RolloutReport, Option<SessionId>) {
     let mut report = RolloutReport {
         index,
         worktree: worktree.clone(),
@@ -296,13 +320,13 @@ async fn run_rollout(
     };
     if cancellation.is_cancelled() {
         report.end_reason = Some("cancelled".to_owned());
-        return report;
+        return (report, None);
     }
     let provider = match provider_factory(index) {
         Ok(provider) => provider,
         Err(err) => {
             report.end_reason = Some(format!("provider_error: {err}"));
-            return report;
+            return (report, None);
         }
     };
     let mut config = base_config;
@@ -318,10 +342,9 @@ async fn run_rollout(
         Ok(engine) => engine,
         Err(err) => {
             report.end_reason = Some(format!("open_error: {err}"));
-            return report;
+            return (report, None);
         }
     };
-    let mut session = engine.new_session();
     let (sink, mut receiver) = ChannelEventSink::new();
     let control = TaskControl::new();
     let watcher = {
@@ -332,8 +355,26 @@ async fn run_rollout(
             control.cancel();
         })
     };
-    let outcome = engine.run_task(&mut session, &task, &sink, &control).await;
+    // Shared-prefix forks continue the seeded session with one steering
+    // input; fresh rollouts start a new session on the task itself.
+    let (outcome, session) = if let Some((id, input)) = resume.as_ref() {
+        match engine
+            .continue_session(id, input.clone(), &sink, &control)
+            .await
+        {
+            Ok(continuation) => (continuation.outcome, continuation.session),
+            Err(err) => {
+                report.end_reason = Some(format!("prefix_load_error: {err}"));
+                return (report, None);
+            }
+        }
+    } else {
+        let mut session = engine.new_session();
+        let outcome = engine.run_task(&mut session, &task, &sink, &control).await;
+        (outcome, session)
+    };
     watcher.abort();
+    let session_id = session.id;
     let mut nudges = 0u64;
     let mut failed_end = 0u64;
     while let Ok(envelope) = receiver.try_recv() {
@@ -362,10 +403,12 @@ async fn run_rollout(
         .last()
         .and_then(|task_record| task_record.end_reason.clone())
         .or(Some("run_error".to_owned()));
-    if !cancellation.is_cancelled() {
+    // The shared-prefix rollout skips capture: its patch is taken after the
+    // session database is staged (capture removes the `.loom` directory).
+    if capture && !cancellation.is_cancelled() {
         report.patch = capture_patch(&worktree).await;
     }
-    report
+    (report, Some(session_id))
 }
 
 /// Resolves the credential once (the same order as [`Engine::open`]) and
@@ -398,7 +441,7 @@ pub fn provider_factory(config: &EngineConfig) -> Result<ProviderFactory, Engine
 /// unless [`BestOfNConfig::keep_worktrees`] is set or the patch failed to
 /// apply — in both cases the trees stay for inspection.
 pub async fn best_of_n(
-    config: EngineConfig,
+    mut config: EngineConfig,
     provider_factory: ProviderFactory,
     task: &str,
     cfg: BestOfNConfig,
@@ -449,6 +492,37 @@ pub async fn best_of_n(
         }
         worktrees.push(dir);
     }
+    // Item 28: optionally fork every rollout from one shared exploratory
+    // prefix instead of turn 0. Failures abort the whole orchestration —
+    // a half-seeded fleet would silently drop the sharing we promised.
+    let prefix = match cfg.shared_prefix_turns {
+        Some(turns) => {
+            // Seeding and continuing sessions needs the session store;
+            // force persistence on for the whole fleet (item 28).
+            config.persist = true;
+            match run_shared_prefix(
+                turns.max(1),
+                &worktrees,
+                &config,
+                &provider_factory,
+                task,
+                cancellation,
+                &root,
+            )
+            .await
+            {
+                Ok(prefix) => Some(prefix),
+                Err(err) => {
+                    clean_worktrees(&repo_root, &root, n).await;
+                    return Err(err);
+                }
+            }
+        }
+        None => None,
+    };
+    let resume = prefix
+        .as_ref()
+        .map(|prefix| (prefix.session_id, SHARED_PREFIX_INPUT.to_owned()));
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut children = Vec::with_capacity(n);
     for (index, worktree) in worktrees.into_iter().enumerate() {
@@ -457,9 +531,21 @@ pub async fn best_of_n(
         let provider_factory = provider_factory.clone();
         let task = task.to_owned();
         let token = cancellation.clone();
+        let resume = resume.clone();
         children.push(tokio::spawn(async move {
             let _permit = permit_source.acquire_owned().await;
-            run_rollout(index, worktree, base_config, provider_factory, task, &token).await
+            run_rollout(
+                index,
+                worktree,
+                base_config,
+                provider_factory,
+                task,
+                &token,
+                resume,
+                true,
+            )
+            .await
+            .0
         }));
     }
     let mut runs = Vec::with_capacity(n);
@@ -511,7 +597,149 @@ pub async fn best_of_n(
         applied,
         apply_note,
         worktrees_root: root,
+        prefix_note: prefix.map(|prefix| prefix.note),
     })
+}
+
+/// Steering input that starts every shared-prefix fork. Identical across
+/// children so the first forked request stays byte-stable (item 28).
+const SHARED_PREFIX_INPUT: &str = "Continue the task above to completion; the earlier turns already happened. Verify your work before finishing.";
+
+/// A seeded shared prefix (item 28): the session every rollout continues
+/// and the note the report shows for the once-paid spend.
+struct SharedPrefix {
+    session_id: SessionId,
+    note: String,
+}
+
+/// Runs the shared exploratory prefix (item 28) in worktree 0 under a
+/// hard `turns` ceiling, then seeds the fleet: the prefix patch is applied
+/// to every sibling so each starts from the prefix-final tree, and the
+/// session database (WAL sidecars included) is copied so each child
+/// continues the same transcript. Worktree 0 keeps running in place.
+///
+/// Stopping at the turn ceiling is the expected ending, not a failure; only
+/// open/provider errors and cancellation abort the orchestration.
+async fn run_shared_prefix(
+    turns: u32,
+    worktrees: &[PathBuf],
+    base_config: &EngineConfig,
+    provider_factory: &ProviderFactory,
+    task: &str,
+    cancellation: &tokio_util::sync::CancellationToken,
+    root: &Path,
+) -> Result<SharedPrefix, WorktreeError> {
+    let worktree = worktrees[0].clone();
+    let mut config = base_config.clone();
+    config.workspace = worktree.clone();
+    config.db_path = worktree.join(".loom").join("loom.db");
+    config.max_turns = turns;
+    let (report, session_id) = run_rollout(
+        0,
+        worktree.clone(),
+        config,
+        provider_factory.clone(),
+        task.to_owned(),
+        cancellation,
+        None,
+        false,
+    )
+    .await;
+    if cancellation.is_cancelled() {
+        return Err(WorktreeError::new("shared prefix cancelled"));
+    }
+    if let Some(reason) = report.end_reason.as_deref()
+        && (reason.starts_with("open_error") || reason.starts_with("provider_error"))
+    {
+        return Err(WorktreeError::new(format!(
+            "shared prefix failed in worktree 0: {reason}"
+        )));
+    }
+    let session_id = session_id
+        .ok_or_else(|| WorktreeError::new("shared prefix produced no session to continue"))?;
+    // Stage the session database before `capture_patch` deletes the
+    // worktree's `.loom` directory; the WAL sidecars carry committed
+    // turns that a dropped connection may not have checkpointed.
+    let staged = root.join("prefix-db");
+    stage_session_db(&worktree.join(".loom"), &staged).await?;
+    let patch = capture_patch(&worktree).await;
+    seed_worktree(&worktree, &staged, "").await?;
+    for sibling in worktrees.iter().skip(1) {
+        seed_worktree(sibling, &staged, &patch).await?;
+    }
+    Ok(SharedPrefix {
+        session_id,
+        note: format!(
+            "session {session_id} (ceiling {turns}): {}",
+            report.cost_note
+        ),
+    })
+}
+
+/// Copies the session database and its WAL sidecars from `loom_dir` into
+/// `staged` so siblings can be seeded from one durable snapshot.
+async fn stage_session_db(loom_dir: &Path, staged: &Path) -> Result<(), WorktreeError> {
+    tokio::fs::create_dir_all(staged)
+        .await
+        .map_err(|err| WorktreeError::new(format!("create {}: {err}", staged.display())))?;
+    for name in ["loom.db", "loom.db-wal", "loom.db-shm"] {
+        let source = loom_dir.join(name);
+        if !tokio::fs::try_exists(&source).await.unwrap_or(false) {
+            // Sidecars are optional; the database itself is not.
+            if name == "loom.db" {
+                return Err(WorktreeError::new(format!(
+                    "stage {} from {}",
+                    name,
+                    loom_dir.display()
+                )));
+            }
+            continue;
+        }
+        let dest = staged.join(name);
+        if let Err(err) = tokio::fs::copy(&source, &dest).await {
+            return Err(WorktreeError::new(format!(
+                "stage {} to {}: {err}",
+                name,
+                dest.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Seeds one worktree: restores the session database (a missing `.loom`
+/// in worktree 0 is expected after `capture_patch`) and applies the prefix
+/// patch when there is one. Worktree 0 gets an empty patch — its tree
+/// already carries the prefix changes.
+async fn seed_worktree(worktree: &Path, staged: &Path, patch: &str) -> Result<(), WorktreeError> {
+    let loom_dir = worktree.join(".loom");
+    tokio::fs::create_dir_all(&loom_dir)
+        .await
+        .map_err(|err| WorktreeError::new(format!("create {}: {err}", loom_dir.display())))?;
+    for name in ["loom.db", "loom.db-wal", "loom.db-shm"] {
+        let source = staged.join(name);
+        if tokio::fs::try_exists(&source).await.unwrap_or(false) {
+            let dest = loom_dir.join(name);
+            tokio::fs::copy(&source, &dest).await.map_err(|err| {
+                WorktreeError::new(format!(
+                    "copy {} to {}: {err}",
+                    source.display(),
+                    dest.display()
+                ))
+            })?;
+        }
+    }
+    if !patch.is_empty() {
+        git_with_stdin(worktree, &["apply", "--whitespace=nowarn"], patch)
+            .await
+            .map_err(|err| {
+                WorktreeError::new(format!(
+                    "seed prefix patch in {}: {err}",
+                    worktree.display()
+                ))
+            })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -653,6 +881,7 @@ mod tests {
                 n: 2,
                 concurrency: 2,
                 keep_worktrees: false,
+                shared_prefix_turns: None,
             },
             &token,
         )
@@ -666,6 +895,43 @@ mod tests {
         assert_eq!(answer, "best-of-n winner\n");
         assert!(!report.worktrees_root.exists(), "worktrees cleaned up");
         assert!(report.runs[0].patch.contains("answer.txt"));
+    }
+
+    #[tokio::test]
+    async fn shared_prefix_seeds_the_fleet() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let repo = git_repo(base.path()).await;
+        let token = tokio_util::sync::CancellationToken::new();
+        // Factory(0) serves both the prefix rollout and rollout 0 (script
+        // re-cloned per call): write the file, then end. Rollout 1 ends
+        // immediately on the seeded tree.
+        let factory = factory_for(vec![
+            write_then_end_script(),
+            vec![ScriptedProvider::end_turn_script("done")],
+        ]);
+        let report = best_of_n(
+            test_config(&repo, &base.path().join("loom.db")),
+            factory,
+            "write the answer file",
+            BestOfNConfig {
+                n: 2,
+                concurrency: 2,
+                keep_worktrees: false,
+                shared_prefix_turns: Some(1),
+            },
+            &token,
+        )
+        .await
+        .expect("best-of-n");
+        // Every child carries the prefix write, so the winner patch lands
+        // the prefix's file even when the winning child only ended the turn.
+        assert!(report.applied, "no patch applied");
+        assert!(report.prefix_note.is_some(), "prefix spend not reported");
+        let answer = tokio::fs::read_to_string(repo.join("answer.txt"))
+            .await
+            .expect("winner patch applied");
+        assert_eq!(answer, "best-of-n winner\n");
+        assert!(!report.worktrees_root.exists(), "worktrees cleaned up");
     }
 
     #[tokio::test]
@@ -685,6 +951,7 @@ mod tests {
                 n: 2,
                 concurrency: 2,
                 keep_worktrees: false,
+                shared_prefix_turns: None,
             },
             &token,
         )
@@ -715,6 +982,7 @@ mod tests {
                 n: 2,
                 concurrency: 2,
                 keep_worktrees: false,
+                shared_prefix_turns: None,
             },
             &token,
         )

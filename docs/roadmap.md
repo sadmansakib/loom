@@ -1487,6 +1487,19 @@ model tier under them (arXiv 2607.06906).
     (arXiv 2601.22129): −17.4% cost, +3.8% resolve vs naive scaling.
     Risk: correlated failures from lost diversity — re-measure on the
     frozen subset. Seam: `engine::worktrees` + kernel session fork.
+    *Implementation shipped 2026-11:* `BestOfNConfig.shared_prefix_turns`
+    (CLI `--best-of-prefix-turns T`, default off) runs one prefix rollout
+    in worktree 0 under a hard turn ceiling, stages its session database
+    (WAL sidecars included) plus its patch, seeds every sibling, and has
+    all N rollouts `continue_session` on the same steering input — the
+    prefix turns are paid once and the byte-stable projection makes them
+    a provider prefix-cache hit per child. Persistence is forced on for
+    the fleet (seeding needs the store); stopping at the ceiling is the
+    expected prefix ending; open/provider errors and cancellation abort
+    fail-closed with cleanup. Cut deliberately: no per-child prefix
+    divergence steering (same provider sampling is the whole point).
+    Open tail: the frozen-subset re-measure (cost and correlated-failure
+    rate vs turn-0 forks) before any default-on recommendation.
 29. **Execution-based selection filter** (G1, G9). Before item 21's
     ranking, run the existing fixed-table `verify` in each candidate
     worktree and drop candidates that fail the existing suite — no

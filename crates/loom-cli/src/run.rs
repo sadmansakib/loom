@@ -323,6 +323,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 n,
                 concurrency: 3,
                 keep_worktrees: false,
+                shared_prefix_turns: args.best_of_prefix_turns,
             },
             &token,
         ))?;
@@ -431,9 +432,13 @@ fn print_best_of_n(report: &loom_core::engine::worktrees::BestOfNReport, json: b
                 "winner": report.winner,
                 "applied": report.applied,
                 "apply_note": report.apply_note,
+                "prefix": report.prefix_note,
             })
         );
         return;
+    }
+    if let Some(note) = &report.prefix_note {
+        println!("shared prefix — {note}");
     }
     for run in &report.runs {
         println!(

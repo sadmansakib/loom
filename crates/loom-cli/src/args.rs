@@ -183,6 +183,13 @@ pub struct RunArgs {
     /// clamps to 2..=8. Off by default.
     #[arg(long, value_name = "N")]
     pub best_of: Option<usize>,
+
+    /// Shared-prefix fork (roadmap item 28): with --best-of, run one
+    /// exploratory prefix of this many turns first, then fork all rollouts
+    /// from its session so the shared turns are paid once (and hit the
+    /// provider prefix cache in every child). Off by default.
+    #[arg(long, value_name = "TURNS")]
+    pub best_of_prefix_turns: Option<u32>,
 }
 
 /// Arguments for `loom auth`.

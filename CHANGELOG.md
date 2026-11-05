@@ -3,6 +3,21 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Shared-prefix best-of-N fork (roadmap item 28)
+
+Research-grounded (SWE-Replay, arXiv 2601.22129: −17.4% cost, +3.8%
+resolve over naive parallel scaling): fork parallel rollouts from one
+shared exploratory prefix instead of turn 0, so the shared turns are
+paid once and hit the provider prefix cache in every child.
+
+- `--best-of-prefix-turns T` (with `--best-of`) runs one prefix rollout
+  in worktree 0 under a hard T-turn ceiling, then seeds its session
+  database and working-tree patch into every sibling; all N rollouts
+  continue that session with identical steering input.
+- Default off; report gains a `prefix_note` with the once-paid spend.
+  Fail-closed: prefix open/provider errors or cancellation abort the
+  orchestration and clean the worktrees.
+
 
 ## 2026-11 — Per-task tool-menu policy (roadmap item 30)
 
