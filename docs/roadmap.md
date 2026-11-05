@@ -1355,6 +1355,17 @@ adds four more framing findings and backlog items 26–31 below.
        the event-count gate that later variants would pass), split
        candidate promotion from deployment selection (ParetoSaddler,
        arXiv 2611.02079) — the arithmetic gate stays for deployment.
+       *Implementation shipped 2026-11:* `Decision` carries its gate
+       metrics; `selfopt --tier lite` exports the best single adopted
+       overlay, `heavy` (default) the re-probed merge — both earned
+       their own probes; the report gains a Pareto-frontier table over
+       (input, events, failures); instance selection is hard-first
+       (`order_instances`: any-failure instances, then total baseline
+       tokens desc); promotion/deployment split — input+failing gates
+       passing with only the events trade blocking now marks the
+       proposal `promoted` in the ledger and report instead of
+       discarding it; `LedgerEntry.promoted` serde-defaults so old
+       ledgers load.
 21. **Parallel orchestration.** **Shipped 2026-10-25** —
     `engine::worktrees` best-of-N rollouts, CLI `--best-of N` (2..=8,
     semaphore-bounded, opt-in): N detached git worktrees under
@@ -1479,6 +1490,19 @@ model tier under them (arXiv 2607.06906).
     when only file ids/mtimes changed; repeat-verify after
     non-mutating turns. Seam: a controller decision cache over the
     existing effects/side-channel state.
+    *Disposition 2026-11: evidence-skipped, architecture mismatch.* The
+    loop is append-only with one model call per turn — request N+1
+    strictly extends request N, so there is never a "following
+    reasoning call" over unchanged state to skip; HarnessMM's reuse
+    presupposes mutable-state re-deliberation, which the deterministic
+    controller deliberately does not have. Guard primitive 1 is
+    already native (`execute_batch` runs every runnable call in the
+    batch regardless of individual failure — an in-flight plan cannot
+    be interrupted by a sibling's failure); primitives 2 and 3 have no
+    seam (no repeated deliberation exists to skip; verification is
+    fused into the mutating call and synchronous). Reopen only if the
+    loop ever gains a separate deliberation step or an effects-state
+    re-planning path.
 28. **Shared-prefix best-of-N fork** (G1, G2, G9). Items 21/24 run N
     children from turn 0; fork them from a shared exploratory prefix
     (facts compile + first K turns) instead — sessions persist and the

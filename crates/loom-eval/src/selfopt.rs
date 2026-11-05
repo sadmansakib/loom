@@ -614,7 +614,7 @@ pub const ADOPT_MIN_TOKEN_IMPROVEMENT_PERCENT: f64 = 5.0;
 pub const EVENTS_REGRESSION_MAX_PERCENT: f64 = 10.0;
 
 /// The verdict on one probed proposal.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Decision {
     /// Proposal label.
     pub label: String,
@@ -622,15 +622,33 @@ pub struct Decision {
     pub adopted: bool,
     /// The numbers behind the verdict, rendered as one line.
     pub reason: String,
+    /// Median input-token improvement percent (positive = fewer).
+    #[serde(default)]
+    pub input_improvement_pct: f64,
+    /// Median event-count improvement percent (positive = fewer).
+    #[serde(default)]
+    pub events_improvement_pct: f64,
+    /// Baseline failed runs (for tier ranking).
+    #[serde(default)]
+    pub baseline_failures: usize,
+    /// Probe failed runs (for tier ranking).
+    #[serde(default)]
+    pub probe_failures: usize,
+    /// Promotion/deployment split (ParetoSaddler): input and failure
+    /// gates passed — the candidate stays in play for later sweeps —
+    /// but the events gate blocked deployment.
+    #[serde(default)]
+    pub promoted: bool,
 }
 
 /// Applies the adoption gate to one comparison: median input tokens
 /// down ≥ [`ADOPT_MIN_TOKEN_IMPROVEMENT_PERCENT`], events not up beyond
 /// [`EVENTS_REGRESSION_MAX_PERCENT`], and no new failed runs.
 pub fn decide(label: &str, comparison: &Comparison) -> Decision {
-    let adopted = comparison.median_input_improvement_pct >= ADOPT_MIN_TOKEN_IMPROVEMENT_PERCENT
-        && comparison.median_events_improvement_pct >= -EVENTS_REGRESSION_MAX_PERCENT
-        && comparison.probe_failures <= comparison.baseline_failures;
+    let input_ok = comparison.median_input_improvement_pct >= ADOPT_MIN_TOKEN_IMPROVEMENT_PERCENT;
+    let events_ok = comparison.median_events_improvement_pct >= -EVENTS_REGRESSION_MAX_PERCENT;
+    let failures_ok = comparison.probe_failures <= comparison.baseline_failures;
+    let adopted = input_ok && events_ok && failures_ok;
     let reason = format!(
         "input {:+.1}%, events {:+.1}%, failures {}→{}",
         comparison.median_input_improvement_pct,
@@ -642,7 +660,63 @@ pub fn decide(label: &str, comparison: &Comparison) -> Decision {
         label: label.to_owned(),
         adopted,
         reason,
+        input_improvement_pct: comparison.median_input_improvement_pct,
+        events_improvement_pct: comparison.median_events_improvement_pct,
+        baseline_failures: comparison.baseline_failures,
+        probe_failures: comparison.probe_failures,
+        // Deployed only on the full gate; promoted when everything but
+        // the events trade cleared, so the ledger keeps the candidate.
+        promoted: !adopted && input_ok && failures_ok,
     }
+}
+
+/// Labels of adopted proposals on the Pareto frontier of (input
+/// improvement, events improvement, probe failures) — HarnessPro's
+/// cost tiers: each frontier entry is a defensible operating point,
+/// no other adopted overlay beats it on all three. Input order.
+pub fn pareto_frontier(decisions: &[Decision]) -> Vec<String> {
+    let adopted: Vec<&Decision> = decisions.iter().filter(|d| d.adopted).collect();
+    adopted
+        .iter()
+        .filter(|d| {
+            !adopted.iter().any(|other| {
+                other.label != d.label
+                    && other.input_improvement_pct >= d.input_improvement_pct
+                    && other.events_improvement_pct >= d.events_improvement_pct
+                    && other.probe_failures <= d.probe_failures
+                    && (other.input_improvement_pct > d.input_improvement_pct
+                        || other.events_improvement_pct > d.events_improvement_pct
+                        || other.probe_failures < d.probe_failures)
+            })
+        })
+        .map(|d| d.label.clone())
+        .collect()
+}
+
+/// Instance ids ordered for probing, hard-first (RHO): instances with
+/// any failed baseline run come first — they carry the most signal
+/// per probe dollar — then by total baseline input tokens descending,
+/// ties by id. Every instance keeps exactly one entry.
+pub fn order_instances(runs: &[RunStat]) -> Vec<String> {
+    #[derive(Default)]
+    struct Agg {
+        failed: bool,
+        input_tokens: u64,
+    }
+    let mut agg: std::collections::BTreeMap<String, Agg> = Default::default();
+    for run in runs {
+        let entry = agg.entry(run.instance.clone()).or_default();
+        entry.failed |= run.task_failed.is_some();
+        entry.input_tokens += run.usage.input_tokens;
+    }
+    let mut ordered: Vec<(String, Agg)> = agg.into_iter().collect();
+    ordered.sort_by(|a, b| {
+        b.1.failed
+            .cmp(&a.1.failed)
+            .then(b.1.input_tokens.cmp(&a.1.input_tokens))
+            .then(a.0.cmp(&b.0))
+    });
+    ordered.into_iter().map(|(id, _)| id).collect()
 }
 
 // ------------------------------------------------------ compose ---
@@ -699,6 +773,11 @@ pub struct LedgerEntry {
     pub decisions: Vec<Decision>,
     /// Labels adopted into the merged overlay.
     pub adopted: Vec<String>,
+    /// Labels promoted but not deployed (events gate blocked): kept
+    /// as candidates for later sweeps. Serde-defaulted — old ledgers
+    /// predate the promotion/deployment split.
+    #[serde(default)]
+    pub promoted: Vec<String>,
     /// The merged overlay that resulted (empty when nothing adopted).
     pub merged: Overlay,
     /// Contrast-supported lessons only.
@@ -1033,21 +1112,66 @@ mod tests {
         let decision = decide("p", &comparison);
         assert!(decision.adopted, "{}", decision.reason);
 
-        // Token win but events regress beyond the gate: rejected.
+        // Token win but events regress beyond the gate: rejected, but
+        // promoted (input and failure gates passed).
         let flailing = vec![
             run_stat("a", 1, 500, 60, false),
             run_stat("b", 1, 1000, 80, false),
         ];
         let comparison = compare(&baseline, &flailing);
-        assert!(!decide("p", &comparison).adopted);
+        let decision = decide("p", &comparison);
+        assert!(!decision.adopted);
+        assert!(decision.promoted, "{}", decision.reason);
 
-        // New failures: rejected regardless of tokens.
+        // New failures: rejected regardless of tokens, not promoted.
         let dying = vec![
             run_stat("a", 1, 100, 10, true),
             run_stat("b", 1, 100, 10, true),
         ];
         let comparison = compare(&baseline, &dying);
-        assert!(!decide("p", &comparison).adopted);
+        let decision = decide("p", &comparison);
+        assert!(!decision.adopted);
+        assert!(!decision.promoted);
+    }
+
+    #[test]
+    fn pareto_frontier_drops_dominated_overlays() {
+        let decision = |label: &str, input: f64, events: f64, failures: usize| Decision {
+            label: label.to_owned(),
+            adopted: true,
+            input_improvement_pct: input,
+            events_improvement_pct: events,
+            probe_failures: failures,
+            ..Decision::default()
+        };
+        // b beats a on everything; c trades failures for events.
+        let decisions = vec![
+            decision("a", 10.0, 5.0, 2),
+            decision("b", 20.0, 6.0, 1),
+            decision("c", 12.0, 0.0, 0),
+            Decision {
+                label: "rejected".to_owned(),
+                adopted: false,
+                input_improvement_pct: 99.0,
+                ..Decision::default()
+            },
+        ];
+        let frontier = pareto_frontier(&decisions);
+        assert_eq!(frontier, vec!["b".to_owned(), "c".to_owned()]);
+    }
+
+    #[test]
+    fn order_instances_puts_failures_first_then_cost() {
+        let runs = vec![
+            run_stat("cheap", 1, 100, 10, false),
+            run_stat("hard", 1, 500, 30, true),
+            run_stat("mid", 1, 300, 20, false),
+            run_stat("mid", 2, 100, 20, false), // runs aggregate
+        ];
+        assert_eq!(
+            order_instances(&runs),
+            vec!["hard".to_owned(), "mid".to_owned(), "cheap".to_owned()]
+        );
     }
 
     #[test]
@@ -1098,8 +1222,10 @@ mod tests {
                 label: "p".to_owned(),
                 adopted: true,
                 reason: "input +6.0%".to_owned(),
+                ..Decision::default()
             }],
             adopted: vec!["p".to_owned()],
+            promoted: vec!["q".to_owned()],
             merged: overlay(&[("LOOM_PRUNE_TRIGGER_PERCENT", "70")]),
             lessons: vec![Lesson {
                 statement: "prune earlier on test-loop-heavy tasks".to_owned(),
@@ -1111,6 +1237,18 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].lessons[0].statement, entry.lessons[0].statement);
         assert_eq!(loaded[0].merged, entry.merged);
+        // Old ledgers without `promoted` load as empty.
+        let legacy = serde_json::json!([{
+            "timestamp": "t", "sweep": "s", "provider": "p", "model": "m",
+            "base_overlay": {}, "proposals": [], "decisions": [],
+            "adopted": [], "merged": {}, "lessons": []
+        }]);
+        std::fs::write(dir.join("legacy.json"), legacy.to_string()).unwrap();
+        assert!(
+            load_ledger(&dir.join("legacy.json")).unwrap()[0]
+                .promoted
+                .is_empty()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

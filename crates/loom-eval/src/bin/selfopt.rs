@@ -59,6 +59,7 @@ struct Args {
     timeout_secs: u64,
     max_turns: usize,
     ledger: Option<PathBuf>,
+    tier: String,
 }
 
 fn usage() -> ! {
@@ -84,6 +85,9 @@ fn usage() -> ! {
   --timeout-secs <n>    wall-clock budget per probe run (default 3600)
   --max-turns <n>       --max-turns for the in-container loom run (default 100)
   --ledger <path>       lessons ledger (default <eval-dir>/swebench/selfopt-ledger.json)
+  --tier <name>         which verified overlay to export (default heavy;
+                        lite = the single best adopted overlay, heavy = the
+                        re-probed merge)
 
 The API key comes from the provider's env var (e.g. DEEPSEEK_API_KEY)."
     );
@@ -109,6 +113,7 @@ fn parse_args() -> Args {
         timeout_secs: 3600,
         max_turns: 100,
         ledger: None,
+        tier: "heavy".to_owned(),
     };
     let mut rest = std::env::args().skip(1);
     while let Some(flag) = rest.next() {
@@ -131,6 +136,14 @@ fn parse_args() -> Args {
             "--timeout-secs" => args.timeout_secs = value().parse().unwrap_or_else(|_| usage()),
             "--max-turns" => args.max_turns = value().parse().unwrap_or_else(|_| usage()),
             "--ledger" => args.ledger = Some(PathBuf::from(value())),
+            "--tier" => {
+                let tier = value();
+                if tier != "lite" && tier != "heavy" {
+                    eprintln!("--tier must be lite or heavy, got {tier}");
+                    usage();
+                }
+                args.tier = tier;
+            }
             _ => usage(),
         }
     }
@@ -432,14 +445,8 @@ fn main() {
         println!("ledger: {} retained lesson(s)", lessons.len());
     }
 
-    // Selected instances: the baseline's own, capped, deterministic order.
-    let mut instances: Vec<String> = baseline
-        .runs
-        .iter()
-        .map(|run| run.instance.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    // Selected instances: hard-first (RHO) — capped, deterministic.
+    let mut instances: Vec<String> = opt::order_instances(&baseline.runs);
     instances.truncate(args.instances);
     let baseline_runs: Vec<RunStat> = baseline
         .runs
@@ -584,6 +591,34 @@ fn main() {
     } else if let [only] = adopted.as_slice() {
         merged = only.overlay.clone();
     }
+    // Tiers (HarnessPro): the merge is `heavy`; `lite` is the single
+    // best adopted overlay. Both earned their own probes — no
+    // unverified interpolation between them.
+    let frontier = opt::pareto_frontier(&decisions);
+    let promoted_labels: Vec<String> = decisions
+        .iter()
+        .filter(|d| d.promoted)
+        .map(|d| d.label.clone())
+        .collect();
+    let exported: Overlay = if args.tier == "lite" {
+        decisions
+            .iter()
+            .filter(|d| d.adopted)
+            .max_by(|a, b| {
+                a.input_improvement_pct
+                    .total_cmp(&b.input_improvement_pct)
+                    .then(b.probe_failures.cmp(&a.probe_failures))
+            })
+            .and_then(|best| {
+                adopted
+                    .iter()
+                    .find(|p| p.label == best.label)
+                    .map(|p| p.overlay.clone())
+            })
+            .unwrap_or_else(|| merged.clone())
+    } else {
+        merged.clone()
+    };
 
     // Lessons: only contrast-supported statements (GEPA rule) — each
     // individually adopted proposal earned its own probe contrast.
@@ -622,6 +657,7 @@ fn main() {
         proposals: proposals.clone(),
         decisions: decisions.clone(),
         adopted: adopted.iter().map(|p| p.label.clone()).collect(),
+        promoted: promoted_labels.clone(),
         merged: merged.clone(),
         lessons: new_lessons.clone(),
     };
@@ -639,15 +675,48 @@ fn main() {
     ));
     for (index, decision) in decisions.iter().enumerate() {
         let proposal = &proposals[index];
-        let verdict = if decision.adopted { "ADOPT" } else { "reject" };
+        let verdict = if decision.adopted {
+            "ADOPT"
+        } else if decision.promoted {
+            "promoted"
+        } else {
+            "reject"
+        };
         report.push_str(&format!(
             "| `{}` | {} | {:?} | {verdict} | {} |\n",
             decision.label, proposal.origin, proposal.class, decision.reason,
         ));
     }
-    if !merged.is_empty() {
-        report.push_str("\n## winning overlay\n\n```sh\n");
-        for (env, value) in &merged {
+    if !frontier.is_empty() {
+        report.push_str("\n## tiers (Pareto frontier over input/events/failures)\n\n| overlay | input | events | failures | frontier |\n|---|---|---|---|---|\n");
+        for decision in decisions.iter().filter(|d| d.adopted) {
+            let on = frontier.contains(&decision.label);
+            report.push_str(&format!(
+                "| `{}` | {:+.1}% | {:+.1}% | {} | {} |\n",
+                decision.label,
+                decision.input_improvement_pct,
+                decision.events_improvement_pct,
+                decision.probe_failures,
+                if on { "yes" } else { "dominated" },
+            ));
+        }
+        report.push_str("\n`--tier` exports one verified point: lite = best single overlay, heavy = the re-probed merge.\n");
+    }
+    if !promoted_labels.is_empty() {
+        report.push_str("\n## promoted, not deployed\n\n");
+        for decision in decisions.iter().filter(|d| d.promoted) {
+            report.push_str(&format!(
+                "- **{}** — input and failure gates passed; the events trade blocked deployment ({})\n",
+                decision.label, decision.reason
+            ));
+        }
+    }
+    if !exported.is_empty() {
+        report.push_str(&format!(
+            "\n## exported overlay ({} tier)\n\n```sh\n",
+            args.tier
+        ));
+        for (env, value) in &exported {
             report.push_str(&format!("export {env}={value}\n"));
         }
         report.push_str("```\n");
@@ -667,9 +736,10 @@ fn main() {
     std::fs::write(&report_path, &report)
         .unwrap_or_else(|error| panic!("{}: {error}", report_path.display()));
     println!(
-        "\ndone: {} adopted, merge {} — report {}, ledger {}",
+        "\ndone: {} adopted ({} promoted), exported {} tier — report {}, ledger {}",
         adopted.len(),
-        if merged.is_empty() { "none" } else { "adopted" },
+        promoted_labels.len(),
+        args.tier,
         report_path.display(),
         ledger_path.display()
     );

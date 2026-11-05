@@ -3,6 +3,27 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+
+## 2026-11 — selfopt tiers, hard-first coreset, promotion split (roadmap item 20.5)
+
+Research-grounded: HarnessPro (arXiv 2610.26770) beats RHO by +2.0 pp
+pass at −26.1% cost shipping a tiered product instead of one winner;
+RHO's hard-task coreset (arXiv 2606.05922) concentrates probes on
+prior-failure instances; ParetoSaddler (arXiv 2611.02079) splits
+candidate promotion from deployment selection.
+
+- `selfopt --tier lite|heavy` (default heavy): lite exports the best
+  single adopted overlay, heavy the re-probed merge — both earned
+  their own probes, nothing unverified in between.
+- Report gains a Pareto-frontier table over (input, events,
+  failures); `Decision` carries its gate metrics.
+- Instance selection is hard-first: prior-failure instances, then
+  total baseline input tokens descending (`order_instances`).
+- Promotion/deployment split: proposals that pass the input and
+  failure gates but trip only the events gate are `promoted` in
+  ledger and report (kept as candidates) instead of discarded;
+  `LedgerEntry.promoted` serde-defaults, old ledgers load unchanged.
+  The arithmetic adoption gate still rules deployment.
 ## 2026-11 — Shared-prefix best-of-N fork (roadmap item 28)
 
 Research-grounded (SWE-Replay, arXiv 2601.22129: −17.4% cost, +3.8%
