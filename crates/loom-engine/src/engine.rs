@@ -1277,11 +1277,12 @@ pub fn turn_budget_with_env(
 }
 
 /// The `LOOM_PRUNE_*` knobs [`prune_with_env`] reads, in struct order.
-pub const PRUNE_ENV_VARS: [&str; 4] = [
+pub const PRUNE_ENV_VARS: [&str; 5] = [
     "LOOM_PRUNE_TRIGGER_PERCENT",
     "LOOM_PRUNE_FLOOR_TOKENS",
     "LOOM_PRUNE_MIN_RECLAIM_TOKENS",
     "LOOM_PRUNE_TAIL_TOKENS",
+    "LOOM_PHASE_MASK_TURNS",
 ];
 
 /// Applies `LOOM_*` per-tool budget overrides (roadmap item 20.2) over
@@ -1347,6 +1348,14 @@ pub fn prune_with_env(
     apply(&mut config.floor_tokens, PRUNE_ENV_VARS[1]);
     apply(&mut config.min_reclaim_tokens, PRUNE_ENV_VARS[2]);
     apply(&mut config.protected_tail_tokens, PRUNE_ENV_VARS[3]);
+    // Option<usize> slot: any positive value enables phase-aware
+    // retention with that window; 0/invalid warn and stay off.
+    if let Some(raw) = get(PRUNE_ENV_VARS[4]) {
+        match raw.trim().parse::<usize>() {
+            Ok(value) if value > 0 => config.phase_mask_turns = Some(value),
+            _ => warnings.push(format!("ignoring invalid {}={raw:?}", PRUNE_ENV_VARS[4])),
+        }
+    }
     (config, warnings)
 }
 

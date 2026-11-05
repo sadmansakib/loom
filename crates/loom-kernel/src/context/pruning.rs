@@ -109,6 +109,15 @@ pub struct PruneConfig {
     /// full history (18.0 vs 15.0), and a window-relative trigger never
     /// fires on a large context. `None` disables the behavior.
     pub age_mask_turns: Option<usize>,
+    /// Phase-aware retention (roadmap item 10): once the loop is in
+    /// the writing phase (a trailing assistant turn wrote or deleted a
+    /// file), stub successful read-only results older than this many
+    /// assistant turns even below the `age_mask_turns` window —
+    /// TokenPilot's lifecycle finding that exploration reads lose
+    /// value fastest once editing starts. `None` (the default) keeps
+    /// the shipped behavior; selfopt-gated like every other stub
+    /// class.
+    pub phase_mask_turns: Option<usize>,
     /// History elision window (roadmap item 12, deterministic half):
     /// tool calls older than this many assistant turns have their
     /// arguments reduced to a signature (long strings elided), and
@@ -164,6 +173,7 @@ impl Default for PruneConfig {
             protected_tail_turns: 3,
             stale_error_turns: 4,
             age_mask_turns: Some(8),
+            phase_mask_turns: None,
             elide_turns: Some(8),
             elide_arg_chars: 160,
             elide_reasoning: None,
@@ -195,6 +205,10 @@ pub enum StubReason {
     /// A user item after the task brief was replaced with a stub
     /// (history elision). The brief itself is never elided.
     ElidedUser,
+    /// A read-only result masked by phase-aware retention: the loop
+    /// entered the writing phase and this read is older than
+    /// `phase_mask_turns`.
+    WritingPhase,
     /// An assistant reasoning trace was dropped from the projection
     /// (history elision, provider-gated via
     /// [`PruneConfig::elide_reasoning`]). Assistant text is only
@@ -213,6 +227,9 @@ impl StubReason {
         match self {
             Self::DuplicateRead => {
                 "[pruned] duplicate of a later identical read-only call; re-run the tool to recover the content"
+            }
+            Self::WritingPhase => {
+                "[pruned] exploration read masked in the writing phase; re-run the tool to recover the content"
             }
             Self::SupersededRead => {
                 "[pruned] the file changed after this read; re-run the tool for the current content"
@@ -558,10 +575,11 @@ impl ContextCompiler for PruningContextCompiler {
         let trigger = self.config.trigger_tokens(budget.max_input_tokens);
         let window_triggered = compiled.census.total > trigger;
         let age_masking = self.config.age_mask_turns.is_some();
+        let phase_masking = self.config.phase_mask_turns.is_some();
         let elision_enabled = self.config.elide_turns.is_some()
             || self.config.elide_reasoning.is_some()
             || self.config.elide_assistant_text.is_some();
-        if window_triggered || age_masking || elision_enabled {
+        if window_triggered || age_masking || phase_masking || elision_enabled {
             let mut decisions = decide(
                 session,
                 tools,
@@ -1063,6 +1081,9 @@ struct TranscriptFacts {
     user_at: Vec<usize>,
     /// `(index, changed paths)` per tool result that wrote or deleted.
     writes: Vec<(usize, Vec<String>)>,
+    /// Assistant turn of the most recent write/delete, for writing-phase
+    /// detection.
+    last_write_turn: Option<usize>,
 }
 
 impl TranscriptFacts {
@@ -1095,6 +1116,7 @@ impl TranscriptFacts {
         let mut assistant_text_at: Vec<AssistantTextFacts> = Vec::new();
         let mut user_at: Vec<usize> = Vec::new();
         let mut writes: Vec<(usize, Vec<String>)> = Vec::new();
+        let mut last_write_turn: Option<usize> = None;
         let mut turn = 0usize;
         let mut assistant_ordinal = 0usize;
         for (index, item) in transcript.iter().enumerate() {
@@ -1148,6 +1170,7 @@ impl TranscriptFacts {
                         let mut changed = result.effects.files_written.clone();
                         changed.extend(result.effects.files_deleted.iter().cloned());
                         writes.push((index, changed));
+                        last_write_turn = Some(turn);
                     }
                     results.push(ResultFacts {
                         index,
@@ -1170,6 +1193,7 @@ impl TranscriptFacts {
             assistant_at,
             user_at,
             writes,
+            last_write_turn,
         }
     }
 
@@ -1394,6 +1418,50 @@ fn mask_aged_reads(
     }
 }
 
+/// How close to the tail a write must sit for the loop to count as in
+/// the writing phase. A constant, not a knob: detection is a
+/// deterministic phase classifier, and selfopt sweeps the *mask* window
+/// (`LOOM_PHASE_MASK_TURNS`), not the classifier.
+const WRITING_PHASE_DETECT_TURNS: usize = 3;
+
+/// Pass 5b — phase-aware retention (roadmap item 10): while the loop is
+/// in the writing phase (a write/delete within the trailing
+/// `WRITING_PHASE_DETECT_TURNS` assistant turns), stub successful
+/// read-only results older than `phase_mask_turns` — a tighter window
+/// than turn-age masking, because exploration reads lose their value
+/// fastest once editing starts. Runs after [`mask_aged_reads`] so an
+/// already-masked read keeps its more general reason; the protected
+/// tail always wins.
+fn mask_writing_phase_reads(
+    facts: &TranscriptFacts,
+    protected_from: usize,
+    config: PruneConfig,
+    total_turns: usize,
+    estimator: &dyn TokenEstimator,
+    pass: &mut DecisionSet,
+) {
+    let Some(max_age) = config.phase_mask_turns else {
+        return;
+    };
+    let writing = facts
+        .last_write_turn
+        .is_some_and(|t| total_turns.saturating_sub(t) <= WRITING_PHASE_DETECT_TURNS);
+    if !writing {
+        return;
+    }
+    for earlier in &facts.results {
+        if !pass.eligible(earlier, protected_from) {
+            continue;
+        }
+        if earlier.status == ToolStatus::Success
+            && earlier.read_call.is_some()
+            && total_turns.saturating_sub(earlier.turn) > max_age
+        {
+            pass.add(earlier, StubReason::WritingPhase, estimator);
+        }
+    }
+}
+
 /// Pass 6 — argument elision: tool calls older than `elide_turns`
 /// assistant turns have their arguments reduced to a signature — every
 /// string longer than `elide_arg_chars` becomes `[pruned N chars]`,
@@ -1612,6 +1680,14 @@ fn decide(
         &mut pass,
     );
     mask_aged_reads(
+        &facts,
+        protected_from,
+        config,
+        total_turns,
+        estimator,
+        &mut pass,
+    );
+    mask_writing_phase_reads(
         &facts,
         protected_from,
         config,
@@ -2109,6 +2185,101 @@ mod tests {
         .expect("compiles");
         assert!(compiled.prune_checkpoint.is_none());
         assert!(messages_serialized(&compiled.request.messages).contains("contentxxxx"));
+    }
+
+    /// Phase-aware retention (roadmap item 10): with age masking off
+    /// and a tight phase window (2), a recent write puts the loop in
+    /// the writing phase and the old exploration read is masked with
+    /// `WritingPhase`.
+    #[test]
+    fn phase_masking_stubs_exploration_reads_during_writing() {
+        let items = vec![
+            Item::User {
+                text: "go".to_owned(),
+            },
+            assistant_calls("explore", vec![read_call("c1", "src/other.rs")]),
+            result("c1", &big("explore", 100)),
+            assistant_text("filler one"),
+            assistant_text("filler two"),
+            assistant_text("filler three"),
+            assistant_calls("editing", vec![write_call("c2", "src/a.rs")]),
+            written_result("c2", "src/a.rs"),
+            assistant_calls("recent", vec![read_call("c3", "src/b.rs")]),
+            result("c3", &big("recent", 100)),
+        ];
+        let session = session_with(items);
+        let compiled = compiler(PruneConfig {
+            age_mask_turns: None,
+            phase_mask_turns: Some(2),
+            ..PruneConfig::default()
+        })
+        .compile(input(&session, None))
+        .expect("compiles");
+        let checkpoint = compiled
+            .prune_checkpoint
+            .as_ref()
+            .expect("phase mask fired");
+        assert_eq!(
+            checkpoint.stubs,
+            vec![StubDecision {
+                call_id: "c1".to_owned(),
+                reason: StubReason::WritingPhase,
+            }]
+        );
+    }
+
+    /// No write within the detection window: no writing phase, no
+    /// phase stubs, even with `phase_mask_turns` set.
+    #[test]
+    fn phase_masking_silent_without_a_recent_write() {
+        let items = vec![
+            Item::User {
+                text: "go".to_owned(),
+            },
+            assistant_calls("editing", vec![write_call("c2", "src/a.rs")]),
+            written_result("c2", "src/a.rs"),
+            assistant_text("filler one"),
+            assistant_calls("explore", vec![read_call("c1", "src/a.rs")]),
+            result("c1", &big("explore", 100)),
+            assistant_text("filler two"),
+            assistant_text("filler three"),
+            assistant_text("filler four"),
+            assistant_text("filler five"),
+        ];
+        let session = session_with(items);
+        let compiled = compiler(PruneConfig {
+            age_mask_turns: None,
+            phase_mask_turns: Some(2),
+            ..PruneConfig::default()
+        })
+        .compile(input(&session, None))
+        .expect("compiles");
+        assert!(compiled.prune_checkpoint.is_none());
+        assert!(messages_serialized(&compiled.request.messages).contains("explorexxxx"));
+    }
+
+    /// Default config keeps the shipped behavior: phase-aware
+    /// retention is off, a recent write plus an old read stubs nothing.
+    #[test]
+    fn phase_masking_off_by_default() {
+        let items = vec![
+            Item::User {
+                text: "go".to_owned(),
+            },
+            assistant_calls("explore", vec![read_call("c1", "src/a.rs")]),
+            result("c1", &big("explore", 100)),
+            assistant_text("filler one"),
+            assistant_text("filler two"),
+            assistant_calls("editing", vec![write_call("c2", "src/a.rs")]),
+            written_result("c2", "src/a.rs"),
+            assistant_text("filler three"),
+        ];
+        let session = session_with(items);
+        let compiled = compiler(PruneConfig::default())
+            .compile(input(&session, None))
+            .expect("compiles");
+        assert!(compiled.prune_checkpoint.is_none());
+        assert!(messages_serialized(&compiled.request.messages).contains("explorexxxx"));
     }
 
     /// Feeding the checkpoint back keeps the projection byte-stable: the

@@ -81,7 +81,9 @@ use tokio_util::sync::CancellationToken;
 /// budgets for the tool events.
 /// v12 adds `TurnBudgetExtended` (item 26: a staged turn budget was
 /// extended at a turn boundary on deterministic progress evidence).
-pub const EVENT_SCHEMA_VERSION: u16 = 12;
+/// v13 adds the `WritingPhase` stub reason (item 10: phase-aware
+/// retention masked exploration reads during the writing phase).
+pub const EVENT_SCHEMA_VERSION: u16 = 13;
 
 /// The evidence that justified a [`EventKind::TurnBudgetExtended`] grant
 /// (item 26): state the loop already tracks, never a model call.

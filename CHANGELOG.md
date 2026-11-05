@@ -4,6 +4,21 @@ All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
 
+## 2026-11 — Phase-aware retention (roadmap item 10)
+
+Research-grounded (TokenPilot, arXiv 2609.17133: lifecycle-aware
+eviction beats recency — exploration reads lose most of their value
+once the agent starts editing).
+
+- Writing phase = any file written/deleted within the last 3 turns
+  (deterministic classifier, no model call, not a sweepable knob).
+- New `WritingPhase` stub reason (event schema v13): during the
+  writing phase, stub successful read-only results older than
+  `phase_mask_turns` turns. Pass runs after turn-age masking, behind
+  the same reclaim gate and checkpoint freeze.
+- `PruneConfig::phase_mask_turns` (default `None` = off), env
+  `LOOM_PHASE_MASK_TURNS`, selfopt knob floor 1 / ceiling 16.
+
 ## 2026-11 — selfopt tiers, hard-first coreset, promotion split (roadmap item 20.5)
 
 Research-grounded: HarnessPro (arXiv 2610.26770) beats RHO by +2.0 pp

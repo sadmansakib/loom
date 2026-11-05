@@ -189,6 +189,15 @@ pub const KNOBS: &[Knob] = &[
         doc: "reclaim below this is not worth a rewrite of the window",
     },
     Knob {
+        env: "LOOM_PHASE_MASK_TURNS",
+        name: "phase_mask_turns",
+        default: 0,
+        floor: 1,
+        ceiling: 16,
+        unit: "turns",
+        doc: "0 = off; during the writing phase, stub exploration reads older than this window",
+    },
+    Knob {
         env: "LOOM_PRUNE_TAIL_TOKENS",
         name: "prune_tail_tokens",
         default: 20_000,

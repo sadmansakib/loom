@@ -1024,6 +1024,11 @@ adds four more framing findings and backlog items 26–31 below.
       once the loop deterministically detects the writing phase (recent
       turns carry `edit_file`/`write_file` calls) — lifecycle-aware
       eviction per TokenPilot; selfopt-gated like every other stub class.
+      *Implementation shipped 2026-11:* `PruneConfig::phase_mask_turns`
+      (env `LOOM_PHASE_MASK_TURNS`, selfopt-gated, default off), writing
+      phase = a write/deleted effect within the last 3 turns, stub reason
+      `WritingPhase` (event schema v13), pass runs after turn-age masking
+      behind the same reclaim gate and checkpoint freeze.
     - Stubs stay one line: models rarely use recovery hints (Fan et al.).
     Every addition keeps the checkpoint freeze: one cache miss per
     decision. Seam: `PruningContextCompiler`, census.
