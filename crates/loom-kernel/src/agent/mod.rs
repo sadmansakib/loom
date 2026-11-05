@@ -13,7 +13,7 @@
 //! imports a concrete provider or tool (ADR-001): both arrive as
 //! trait objects and a registry.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -77,6 +77,13 @@ pub const MALFORMED_ARGUMENT_TURNS_LIMIT: u32 = 3;
 /// self-corrected mid-run — so the first response is a nudge quoting
 /// the error, not task failure.
 pub const FAILED_CALL_TURNS_NUDGE: u32 = 5;
+
+/// The edit-stall threshold (roadmap item 30): consecutive failed
+/// edit-family calls on one file after which the loop injects the
+/// file's symbol outline as context. Two, because the failure ledger
+/// already refuses the *identical* retry — a second distinct failure
+/// on the same file is a shape problem, not bad luck.
+pub const EDIT_STALL_TURNS: u32 = 2;
 /// Consecutive all-failed turns that fail the task outright: a model
 /// still failing every call after the corrective nudge is stuck.
 /// (The 13398 oracle run burned 130 of 250 turns here.)
@@ -1128,6 +1135,11 @@ impl Agent {
         // failure forces a change of approach instead of trial and error.
         let mut failures = FailureLedger::default();
 
+        // Item 30 stall-breaker state: per-file consecutive edit-family
+        // failures, answered (once per stall) by injecting the file's
+        // symbol outline — deterministic context, not a model call.
+        let mut edit_stalls = EditStalls::default();
+
         // Completion gate (roadmap item 8): an EndTurn is refused
         // while unverified mutations are outstanding (bounded by
         // COMPLETION_REFUSAL_CAP), so "done" always refers to a state
@@ -1321,6 +1333,38 @@ impl Agent {
                     .push_item(notice)
                     .map_err(|error| TaskError::Internal(error.to_string()))?;
             }
+            // Item 30 stall-breaker: two consecutive failed edit-family
+            // calls on one file mean the model is fighting the file's
+            // shape, not one unlucky call. The loop answers with that
+            // file's symbol outline — deterministic context fetched
+            // without a model call (TokenEconomizer, arXiv 2610.22732) —
+            // and only when `symbols_overview` is registered, so the
+            // frozen baseline surface is unchanged. Injected once per
+            // stall; a success on the file resets the counter.
+            if let Some((path, count)) = edit_stalls.stalled_file()
+                && let Some(outline) = self.symbol_outline(&turn_tools, &path, &hard).await
+            {
+                edit_stalls.resolved(&path);
+                let notice = Item::User {
+                    text: format!(
+                        "{count} consecutive edits failed on {path}. Here is the file's \
+                         symbol outline:\n{outline}"
+                    ),
+                };
+                let nudge_text = match &notice {
+                    Item::User { text } => text.clone(),
+                    _ => String::new(),
+                };
+                sink.emit(task_id, EventKind::LoopNudge { text: nudge_text });
+                if let Some(store) = &self.store {
+                    store
+                        .append_item(&session.id, session.next_index(), &notice)
+                        .map_err(persistence)?;
+                }
+                session
+                    .push_item(notice)
+                    .map_err(|error| TaskError::Internal(error.to_string()))?;
+            }
             // a. Compile the model request from durable state (§8). The
             //    compiler owns every context decision; the loop only passes
             //    it the inputs. When even the compiler's rescue arm cannot
@@ -1469,6 +1513,12 @@ impl Agent {
                                         .get(&call.name)
                                         .is_some_and(|tool| !tool.is_read_only())
                             });
+                    // Item 30 stall-breaker bookkeeping: per-file
+                    // consecutive edit-family failures feed the outline
+                    // injection next turn.
+                    for (call, result) in assistant.tool_calls.iter().zip(&results) {
+                        edit_stalls.note(call, result);
+                    }
                     // A batch that was entirely salvaged (unparseable)
                     // calls counts toward the malformed ceiling; three
                     // in a row fails the task before the commit, per
@@ -1948,6 +1998,27 @@ impl Agent {
         }
     }
 
+    /// Runs `symbols_overview` on `path` without spending a model call
+    /// (item 30 stall-breaker). `None` when the tool is not registered
+    /// or declines the file; a failure stays silent — the injection is
+    /// best-effort context, never a task error.
+    async fn symbol_outline(
+        &self,
+        turn_tools: &ToolRegistry,
+        path: &str,
+        cancellation: &CancellationToken,
+    ) -> Option<String> {
+        let tool = turn_tools.get("symbols_overview")?;
+        let input = serde_json::json!({ "path": path });
+        let context = ToolContext::new(
+            self.config.workspace_root.clone(),
+            cancellation.clone(),
+            self.tool_timeout,
+        );
+        let output = tool.call(input, &context).await.ok()?;
+        Some(output.content)
+    }
+
     /// Executes one assistant turn's tool calls through the tool engine
     /// (§10), emitting start/complete events and counting outcomes.
     ///
@@ -2229,6 +2300,62 @@ fn ledger_key(call: &ToolCall) -> (String, String) {
         call.name.clone(),
         serde_json::to_string(&*call.arguments).unwrap_or_default(),
     )
+}
+
+/// Per-file edit-stall state (roadmap item 30): consecutive failed
+/// edit-family calls per workspace-relative path. Any success on the
+/// path clears it — the stall is over, whatever else the batch did.
+#[derive(Default)]
+struct EditStalls {
+    consecutive_failures: BTreeMap<String, u32>,
+}
+
+impl EditStalls {
+    /// Learns from one finished call, exactly like the completion gate
+    /// and failure ledger do.
+    fn note(&mut self, call: &ToolCall, result: &ToolResult) {
+        let Some(path) = edit_target(call) else {
+            return;
+        };
+        match result.status {
+            ToolStatus::Success => {
+                self.consecutive_failures.remove(&path);
+            }
+            ToolStatus::Error(_) => {
+                *self.consecutive_failures.entry(path).or_default() += 1;
+            }
+            ToolStatus::Cancelled { .. } => {}
+        }
+    }
+
+    /// The first path at or past [`EDIT_STALL_TURNS`], if any. BTreeMap
+    /// order makes the pick deterministic when several files stall.
+    fn stalled_file(&self) -> Option<(String, u32)> {
+        self.consecutive_failures
+            .iter()
+            .find(|(_, count)| **count >= EDIT_STALL_TURNS)
+            .map(|(path, count)| (path.clone(), *count))
+    }
+
+    /// Forgets a stall the loop has answered.
+    fn resolved(&mut self, path: &str) {
+        self.consecutive_failures.remove(path);
+    }
+}
+
+/// The workspace-relative `path` argument of an edit-family call, when
+/// it carries one. Refused repeats and malformed calls never reach
+/// [`EditStalls::note`]'s caller with different shapes — every tool in
+/// the family names its target `path`.
+fn edit_target(call: &ToolCall) -> Option<String> {
+    const EDIT_TOOLS: [&str; 3] = ["edit_file", "write_file", "replace_symbol"];
+    if !EDIT_TOOLS.contains(&call.name.as_str()) {
+        return None;
+    }
+    call.arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 /// Completion-gate state for one task (roadmap item 8).
@@ -3119,6 +3246,60 @@ mod tests {
             ids,
             ["call-a".to_owned()].into_iter().collect::<HashSet<_>>()
         );
+    }
+
+    #[test]
+    fn edit_stalls_count_per_file_and_clear_on_success() {
+        use super::{EDIT_STALL_TURNS, EditStalls, edit_target};
+        let call = |name: &str, path: &str| crate::transcript::ToolCall {
+            id: crate::transcript::ToolCallId::try_from("call_1".to_owned()).unwrap(),
+            name: name.to_owned(),
+            arguments: crate::transcript::ToolArguments::try_from(serde_json::json!({
+                "path": path,
+            }))
+            .expect("arguments"),
+        };
+        let result = |call: &crate::transcript::ToolCall, error: bool| {
+            let status = if error {
+                ToolStatus::Error(crate::transcript::ToolFailure::Execution)
+            } else {
+                ToolStatus::Success
+            };
+            ToolResult::new(call.id.clone(), status, String::new(), false)
+        };
+
+        // Only edit-family calls with a path argument count.
+        let read = call("read_file", "src/lib.rs");
+        assert!(edit_target(&read).is_none());
+        let edit = call("edit_file", "src/lib.rs");
+        assert_eq!(edit_target(&edit).as_deref(), Some("src/lib.rs"));
+
+        // Two consecutive failures on one file reach the threshold.
+        let mut stalls = EditStalls::default();
+        stalls.note(&edit, &result(&edit, true));
+        assert!(stalls.stalled_file().is_none());
+        stalls.note(&edit, &result(&edit, true));
+        assert_eq!(
+            stalls.stalled_file(),
+            Some(("src/lib.rs".to_owned(), EDIT_STALL_TURNS))
+        );
+
+        // A success on the file clears the stall; another file is
+        // independent.
+        let other = call("write_file", "src/main.rs");
+        stalls.note(&other, &result(&other, true));
+        stalls.note(&other, &result(&other, true));
+        assert_eq!(
+            stalls.stalled_file(),
+            Some(("src/lib.rs".to_owned(), EDIT_STALL_TURNS))
+        );
+        stalls.note(&edit, &result(&edit, false));
+        assert_eq!(
+            stalls.stalled_file(),
+            Some(("src/main.rs".to_owned(), EDIT_STALL_TURNS))
+        );
+        stalls.resolved("src/main.rs");
+        assert!(stalls.stalled_file().is_none());
     }
 
     fn gate_result(content: &str, written: &[&str]) -> ToolResult {

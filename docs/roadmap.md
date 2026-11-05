@@ -1509,6 +1509,18 @@ model tier under them (arXiv 2607.06906).
     −18–31% tokens, Pass@1 up in 4/5 settings). Prune only on certain
 
     facts; a wrongly pruned tool is a task loss.
+    *Implementation shipped 2026-11:* (a) the symbol pair is pruned at
+    engine open when the facts scan finds none of Rust/Python/TypeScript
+    — the opt-in flag no longer registers dead schema bytes; (b) the
+    table-driven stall-breaker: two consecutive failed edit-family calls
+    on one file (`EDIT_STALL_TURNS`; the failure ledger already refuses
+    the identical retry, so a second *distinct* failure is a shape
+    problem) injects that file's `symbols_overview` outline as a
+    `LoopNudge` — deterministic context, zero model calls, once per
+    stall, only when the symbol tools are registered so the frozen
+    baseline surface is unchanged. The model-profile menu from item 9
+    stays gated on its funded eval key. Open tail: live-eval deltas
+    (tokens, turns-to-recovery) on the frozen subset.
 31. **Symbol-cued search output** (G1, G2, G4). Attach a one-line
     enclosing-symbol + sibling map (tree-sitter from item 18) to each
     `search` match group: "correct file, wrong function" causes 44–58%

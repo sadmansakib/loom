@@ -449,7 +449,19 @@ impl Engine {
         }
         // Roadmap item 18: tree-sitter symbol tools. Opt-in via
         // `EngineConfig::symbols`; the bare-loop arm never carries them.
-        if config.symbols && !overrides.bare_loop {
+        // Roadmap item 30: the symbol tools serve Rust, Python, and
+        // TypeScript/TSX only, so an opted-in flag still prunes them from
+        // a workspace whose deterministic facts scan finds none of those
+        // languages — schema bytes saved with zero wrong-tool risk (the
+        // tools cannot serve absent languages). The scan here is the same
+        // one the loop performs per task; this is the menu decision, made
+        // once at open before turn 1.
+        let symbol_languages = ["Rust", "Python", "TypeScript"];
+        let symbols_served = crate::repo::scan(&workspace)
+            .languages
+            .iter()
+            .any(|language| symbol_languages.contains(&language.as_str()));
+        if config.symbols && !overrides.bare_loop && symbols_served {
             registry
                 .register(Box::new(
                     loom_tools::SymbolsOverviewTool::default().with_budgets(config.budgets),
@@ -1907,6 +1919,30 @@ mod tests {
         }))]
     }
 
+    /// One script: an `edit_file` turn whose `old_string` matches nothing,
+    /// so the call fails deterministically without touching the file.
+    fn edit_file_miss_script(path: &str, old: &str) -> Vec<Result<ModelEvent, ModelError>> {
+        use loom_kernel::transcript::{ToolArguments, ToolCall, ToolCallId};
+        let call = ToolCall {
+            id: ToolCallId::try_from(format!("call-{}", std::process::id())).unwrap(),
+            name: "edit_file".to_owned(),
+            arguments: ToolArguments::try_from(serde_json::json!({
+                "path": path,
+                "old_string": old,
+                "new_string": "x",
+            }))
+            .expect("arguments"),
+        };
+        vec![Ok(ModelEvent::Completed(ModelResponse {
+            message: AssistantMessage {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![call],
+                stop_reason: StopReason::ToolCalls,
+            },
+            usage: Usage::default(),
+        }))]
+    }
     /// One script: a non-mutating `run_command` turn.
     fn echo_command_script() -> Vec<Result<ModelEvent, ModelError>> {
         use loom_kernel::transcript::{ToolArguments, ToolCall, ToolCallId};
@@ -2538,6 +2574,72 @@ mod tests {
         assert!(content.contains("struct Config"), "{content}");
     }
 
+    #[tokio::test]
+    async fn symbols_tools_are_pruned_without_a_served_language() {
+        // Item 30: an opted-in flag still prunes the symbol tools when
+        // the facts scan finds no Rust/Python/TypeScript — a Go-only
+        // workspace never sees them.
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = base.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("mkdir");
+        std::fs::write(workspace.join("main.go"), "package main\n").expect("write");
+        let mut config = test_config();
+        config.workspace = workspace;
+        config.db_path = base.path().join("loom.db");
+        config.max_turns = 2;
+        config.symbols = true;
+        let provider = Box::new(FakeProvider::scripted(vec![
+            symbols_overview_script(),
+            FakeProvider::end_turn_script("done"),
+        ]));
+        let kinds =
+            run_symbols_task(config, EngineOverrides::default().with_provider(provider)).await;
+        assert!(
+            overview_content(&kinds).is_none(),
+            "a workspace with no served language must not expose symbols_overview"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_failed_edits_on_one_file_inject_its_symbol_outline() {
+        // Item 30 stall-breaker: two consecutive failed edits on one
+        // file answer with that file's symbol outline — deterministic
+        // context, no extra model call.
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = base.path().join("ws");
+        std::fs::create_dir_all(workspace.join("src")).expect("mkdir");
+        std::fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn target() -> u32 {\n    1\n}\n",
+        )
+        .expect("write");
+        let mut config = test_config();
+        config.workspace = workspace;
+        config.db_path = base.path().join("loom.db");
+        config.max_turns = 5;
+        config.symbols = true;
+        let provider = Box::new(FakeProvider::scripted(vec![
+            edit_file_miss_script("src/lib.rs", "absent-one"),
+            edit_file_miss_script("src/lib.rs", "absent-two"),
+            FakeProvider::end_turn_script("done"),
+        ]));
+        let kinds =
+            run_symbols_task(config, EngineOverrides::default().with_provider(provider)).await;
+        let nudge = kinds
+            .iter()
+            .find_map(|kind| match kind {
+                EventKind::LoopNudge { text } if text.contains("consecutive edits failed") => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .expect("stall-breaker nudge fired after two failed edits");
+        assert!(nudge.contains("src/lib.rs"), "{nudge}");
+        assert!(
+            nudge.contains("target"),
+            "the outline names the file's symbols: {nudge}"
+        );
+    }
     #[tokio::test]
     async fn symbols_tools_stay_out_of_the_default_and_bare_registries() {
         // Default: the call fails as an unknown tool.

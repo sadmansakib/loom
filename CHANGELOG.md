@@ -4,6 +4,20 @@ All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
 
+## 2026-11 — Per-task tool-menu policy (roadmap item 30)
+
+Research-grounded (empirical harness study arXiv 2609.20804;
+TokenEconomizer arXiv 2610.22732): pruning on deterministic facts saves
+schema tokens with zero wrong-tool risk, and answering edit stalls with
+context beats answering them with retries.
+
+- `symbols_overview`/`replace_symbol` are pruned at engine open when
+  the workspace's facts scan finds none of Rust/Python/TypeScript; an
+  opted-in flag no longer registers tools the workspace cannot serve.
+- Two consecutive failed edit-family calls on one file inject that
+  file's symbol outline (`LoopNudge`, no model call), once per stall;
+  any success on the file resets the counter. Inert in the bare-loop
+  arm — the baseline surface is unchanged.
 ## 2026-11 — Symbol-cued search output (roadmap item 31)
 
 Research-grounded (RepoNav arXiv 2609.08355): "correct file, wrong
