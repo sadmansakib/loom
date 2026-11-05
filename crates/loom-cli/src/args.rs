@@ -190,6 +190,12 @@ pub struct RunArgs {
     /// provider prefix cache in every child). Off by default.
     #[arg(long, value_name = "TURNS")]
     pub best_of_prefix_turns: Option<u32>,
+
+    /// Harness variation (roadmap item 24): with --best-of, child 0 keeps
+    /// the config while later children cycle terse/verbose tool budgets and
+    /// reasoning effort — diversity without a second model. Off by default.
+    #[arg(long)]
+    pub best_of_vary: bool,
 }
 
 /// Arguments for `loom auth`.

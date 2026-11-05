@@ -46,6 +46,7 @@ use loom_kernel::agent::{TaskControl, TaskSummary};
 use loom_kernel::event::{ChannelEventSink, EventKind};
 use loom_kernel::id::SessionId;
 use loom_kernel::model::ModelProvider;
+use loom_providers::ReasoningEffort;
 use tokio::sync::Semaphore;
 
 /// Builds one provider instance per rollout. Providers are moved into
@@ -71,6 +72,12 @@ pub struct BestOfNConfig {
     /// rollout continues its session. `None` (default) runs every child
     /// from turn 0 as before.
     pub shared_prefix_turns: Option<u32>,
+    /// Vary each rollout's harness instead of its model (item 24):
+    /// child 0 keeps the config unchanged while later children cycle
+    /// through terse (halved tool budgets, `Low` reasoning effort) and
+    /// verbose (doubled tool budgets, wider edit echo) variants. Default
+    /// off — identical children maximize prefix-cache reuse.
+    pub vary_harness: bool,
 }
 
 impl Default for BestOfNConfig {
@@ -80,6 +87,7 @@ impl Default for BestOfNConfig {
             concurrency: 3,
             keep_worktrees: false,
             shared_prefix_turns: None,
+            vary_harness: false,
         }
     }
 }
@@ -127,6 +135,9 @@ pub struct BestOfNReport {
     /// The shared-prefix spend note (turns, requests, tokens, session id)
     /// when `shared_prefix_turns` produced a seeded prefix, else `None`.
     pub prefix_note: Option<String>,
+    /// Set when `vary_harness` diversified the fleet's configs (item 24):
+    /// describes the child cycle, else `None`.
+    pub harness_note: Option<String>,
 }
 
 /// Errors that abort the orchestration before or between rollouts. Child
@@ -291,6 +302,33 @@ fn winner_index(runs: &[RolloutReport]) -> Option<usize> {
         .map(|run| run.index)
 }
 
+/// Harness variation for child `index` under `vary_harness` (item 24):
+/// diversify rollouts without changing the model. Child 0 always keeps
+/// the given config (the baseline anchor and the shared-prefix rollout);
+/// later children cycle terse → verbose so a fleet never runs identical
+/// configs. Deterministic in `index` alone, so reruns reproduce.
+fn vary_child_config(config: &EngineConfig, index: usize) -> EngineConfig {
+    let mut child = config.clone();
+    match index {
+        0 => {}
+        i if i % 3 == 1 => {
+            let b = &mut child.budgets;
+            b.read_file_head_bytes = (b.read_file_head_bytes / 2).max(1);
+            b.command_head_bytes = (b.command_head_bytes / 2).max(1);
+            b.command_tail_bytes = (b.command_tail_bytes / 2).max(1);
+            b.edit_echo_context_lines = 1;
+            child.reasoning_effort = ReasoningEffort::Low;
+        }
+        _ => {
+            let b = &mut child.budgets;
+            b.read_file_head_bytes *= 2;
+            b.command_head_bytes *= 2;
+            b.command_tail_bytes *= 2;
+            b.edit_echo_context_lines = 6;
+        }
+    }
+    child
+}
 /// One rollout: open a child engine on the worktree, run the task, count
 /// failure markers from the event stream, and capture the patch whatever
 /// the outcome.
@@ -527,7 +565,11 @@ pub async fn best_of_n(
     let mut children = Vec::with_capacity(n);
     for (index, worktree) in worktrees.into_iter().enumerate() {
         let permit_source = semaphore.clone();
-        let base_config = config.clone();
+        let base_config = if cfg.vary_harness {
+            vary_child_config(&config, index)
+        } else {
+            config.clone()
+        };
         let provider_factory = provider_factory.clone();
         let task = task.to_owned();
         let token = cancellation.clone();
@@ -598,6 +640,9 @@ pub async fn best_of_n(
         apply_note,
         worktrees_root: root,
         prefix_note: prefix.map(|prefix| prefix.note),
+        harness_note: cfg.vary_harness.then(|| {
+            "child 0 baseline; later children cycle terse (halved tool budgets, low reasoning effort) and verbose (doubled budgets, wider edit echo)".to_owned()
+        }),
     })
 }
 
@@ -804,6 +849,39 @@ mod tests {
         config
     }
 
+    #[test]
+    fn vary_child_config_cycles_terse_and_verbose() {
+        let workspace = std::env::temp_dir().join("loom-vary-test");
+        let base = test_config(&workspace, &workspace.join("loom.db"));
+        let zero = vary_child_config(&base, 0);
+        assert_eq!(
+            zero.budgets.read_file_head_bytes,
+            base.budgets.read_file_head_bytes
+        );
+        assert_eq!(zero.reasoning_effort, base.reasoning_effort);
+
+        let terse = vary_child_config(&base, 1);
+        assert_eq!(
+            terse.budgets.read_file_head_bytes,
+            base.budgets.read_file_head_bytes / 2
+        );
+        assert_eq!(terse.budgets.edit_echo_context_lines, 1);
+        assert_eq!(terse.reasoning_effort, ReasoningEffort::Low);
+
+        let verbose = vary_child_config(&base, 2);
+        assert_eq!(
+            verbose.budgets.command_head_bytes,
+            base.budgets.command_head_bytes * 2
+        );
+        assert_eq!(verbose.budgets.edit_echo_context_lines, 6);
+        // The cycle repeats deterministically.
+        assert_eq!(
+            vary_child_config(&base, 4).budgets.read_file_head_bytes,
+            terse.budgets.read_file_head_bytes
+        );
+        // The base config is never mutated.
+        assert_eq!(base.budgets.edit_echo_context_lines, 3);
+    }
     /// A script whose first turn writes one file, second turn ends.
     fn write_then_end_script() -> Vec<Vec<Result<ModelEvent, ModelError>>> {
         let call = ToolCall {
@@ -882,6 +960,7 @@ mod tests {
                 concurrency: 2,
                 keep_worktrees: false,
                 shared_prefix_turns: None,
+                vary_harness: false,
             },
             &token,
         )
@@ -918,6 +997,7 @@ mod tests {
                 concurrency: 2,
                 keep_worktrees: false,
                 shared_prefix_turns: Some(1),
+                vary_harness: false,
             },
             &token,
         )
@@ -952,6 +1032,7 @@ mod tests {
                 concurrency: 2,
                 keep_worktrees: false,
                 shared_prefix_turns: None,
+                vary_harness: false,
             },
             &token,
         )
@@ -983,6 +1064,7 @@ mod tests {
                 concurrency: 2,
                 keep_worktrees: false,
                 shared_prefix_turns: None,
+                vary_harness: false,
             },
             &token,
         )

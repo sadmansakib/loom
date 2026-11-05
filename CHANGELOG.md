@@ -4,6 +4,19 @@ All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
 
+
+## 2026-11 — Vary-the-harness best-of-N (roadmap item 24)
+
+Research-grounded (Harness², arXiv 2610.14224: harness edits diversify
+rollouts as much as approach hints, without paying for a second model).
+
+- `--best-of-vary` / `BestOfNConfig.vary_harness` (default off):
+  child 0 keeps the config (baseline anchor and shared-prefix
+  rollout); later children cycle terse (halved read/command tool
+  budgets, 1-line edit echo, `Low` reasoning effort) and verbose
+  (doubled budgets, 6-line edit echo) variants.
+- Deterministic in child index — reruns reproduce the fleet;
+  `harness_note` on the report, printed in JSON and text output.
 ## 2026-11 — Phase-aware retention (roadmap item 10)
 
 Research-grounded (TokenPilot, arXiv 2609.17133: lifecycle-aware

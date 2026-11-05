@@ -1430,6 +1430,13 @@ adds four more framing findings and backlog items 26–31 below.
     domain edits that diversify rollouts without changing the model;
     the N traces are then free contrast evidence for item 20's lesson
     mining.
+      *Implementation shipped 2026-11:* `--best-of-vary` /
+      `BestOfNConfig.vary_harness` (default off). Child 0 keeps the
+      config; later children cycle terse (halved read/command tool
+      budgets, edit echo 1 line, `Low` reasoning effort) and verbose
+      (doubled budgets, 6-line edit echo) variants — deterministic in
+      child index, model unchanged, `harness_note` reported. Todo
+      granularity has no knob yet (kernel-owned todo format is fixed).
 25. **Queued user steering** (G1, G2). **Shipped 2026-10-16** — the
     `TaskControl::steer` seam queues user messages on the control (shared via
     `Arc` across clones); the turn loop drains them at each turn boundary and
