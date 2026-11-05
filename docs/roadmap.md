@@ -14,7 +14,7 @@ This document has three layers:
 1. **Vision** — goals, principles, and the iteration sequence (stable;
    changes need an ADR-level reason).
 2. **Status** — what is shipped and verified in the codebase today.
-3. **Backlog** — numbered, evidence-gated items (1–25), each mapped to an
+3. **Backlog** — numbered, evidence-gated items (1–31), each mapped to an
    iteration, the goals it serves, and the seam it plugs into.
 
 It is a roadmap, not a promise. The companion `architecture.md` describes
@@ -273,7 +273,14 @@ lists skill names plus one-line descriptions (first heading of each
 `*.md`, flat scan, ≤64 entries), and the opt-in `load_skill` tool
 (`--skills`) serves bodies on demand at a 16 KiB head, through the same
 context-compiler seam, never a second prompt mechanism. *Open:* learned
-lessons (item 20.4) reuse the same seam.
+lessons (item 20.4) reuse the same seam. The 2026 skill-memory line sets
+the shape for what a learned skill may be (Memp, arXiv 2508.06433;
+MUSE-Autoskill, arXiv 2605.27366): bounded procedural instructions or
+executable script skills — never freeform notes — lifecycle-managed
+(create/evaluate/refine/retire, so the library cannot monotonically
+grow), retrieval-gated (SWE-ContextBench, arXiv 2602.08316: bad
+retrieval gives negative transfer), and compilable once by a strong
+model then served to cheaper tiers (Memp's strong→weak transfer, G4).
 
 ### Iteration 6 — MCP & LSP integration
 
@@ -605,6 +612,9 @@ measurement (item 1) — with cost/turns as the primary discriminating
 metrics and pass rate as the co-equal success constraint — and
 vendor-reported numbers are treated as hypotheses until Loom's own eval
 reproduces them.
+A 2026-11 sweep of 74 harness papers
+([`docs/lit-review-2026-11-harness-papers.md`](lit-review-2026-11-harness-papers.md))
+adds four more framing findings and backlog items 26–31 below.
 
 ### Near term — measurement and the cheapest wins
 
@@ -793,6 +803,14 @@ reproduces them.
      2026-10-17.~~ Store schema v2 writes the observed event stream
      alongside the transcript, and item 1's `loom stats` section above
      is the consumer.
+   - **Frozen-subset suite audit** (2026-11): UTBoost (arXiv 2506.09289)
+     amplified SWE-bench's own suites and found 345
+     erroneously-passing patches — 24.4% of Verified leaderboard entries
+     affected — so the subset's official P2P/F2P verdicts are hypotheses
+     too. One-off deterministic re-grade of the frozen 100 with
+     amplified suites; weak-suite instances flagged in the provenance
+     block; any headline that flips gets re-gated. Mapped in
+     [`docs/lit-review-2026-11-harness-papers.md`](lit-review-2026-11-harness-papers.md).
    Seam: the live eval reports and the event stream.
 2. **Sandboxed shell** (G1, G2, G3) — **shipped 2026-10-08**. Strong
    models working through a
@@ -1002,6 +1020,10 @@ reproduces them.
       estimator (shipped 2026-10-06) already replaced bytes÷3, so this
       is now a residual correction, mainly for Anthropic's scaled
       estimate.
+    - **Phase-aware retention** (2026-11): stub exploration reads earlier
+      once the loop deterministically detects the writing phase (recent
+      turns carry `edit_file`/`write_file` calls) — lifecycle-aware
+      eviction per TokenPilot; selfopt-gated like every other stub class.
     - Stubs stay one line: models rarely use recovery hints (Fan et al.).
     Every addition keeps the checkpoint freeze: one cache miss per
     decision. Seam: `PruningContextCompiler`, census.
@@ -1252,6 +1274,11 @@ reproduces them.
     fan-out, provenance footers, per
     [`docs/subagents-design.md`](subagents-design.md); the economics
     trigger stays parked.
+    **Prior (2026-11, arXiv 2503.13657):** MAST's taxonomy puts 36.9% of
+    multi-agent failures on inter-agent misalignment and 21.3% on
+    superficial task verification — structural costs of delegation
+    itself, not implementation accidents. The item-19 trigger must clear
+    the coordination-failure tax, not just the token arithmetic.
 20. **Self-optimization** (G10). In order:
     1. trace export: one directory per task with transcript, events,
        census, harness version, and outcome — **phase 1 shipped**
@@ -1318,6 +1345,16 @@ reproduces them.
     the deterministic-controller principle and the never-worse
     contract. Recursion stays offline in the eval harness, where the
     maintenance bar rules.
+    5. **selfopt output shape and instance selection** (2026-11): emit
+       the Pareto-ranked overlay set as cost tiers (`--tier lite|heavy`),
+       not just the merged winner — HarnessPro (arXiv 2610.26770) beats
+       RHO (+2.0 pp pass, −26.1% cost) shipping exactly that product;
+       weight probes toward prior-failure instances (RHO's hard-task
+       coreset, arXiv 2606.05922) for more signal per probe dollar; and
+       if the ledger shows premature convergence (proposals rejected on
+       the event-count gate that later variants would pass), split
+       candidate promotion from deployment selection (ParetoSaddler,
+       arXiv 2611.02079) — the arithmetic gate stays for deployment.
 21. **Parallel orchestration.** **Shipped 2026-10-25** —
     `engine::worktrees` best-of-N rollouts, CLI `--best-of N` (2..=8,
     semaphore-bounded, opt-in): N detached git worktrees under
@@ -1388,6 +1425,98 @@ reproduces them.
     does not yet expose an interactive feed — it remains a library seam for
     future frontends (item 22).
 
+### Late 2026 — arXiv-survey items (26–31)
+
+From the 2026-11 literature sweep (74 papers, mapped in
+[`docs/lit-review-2026-11-harness-papers.md`](lit-review-2026-11-harness-papers.md));
+same rules as every item — evidence-gated, measured on the frozen subset
+before anything is default-on. Four findings frame them. Turn count
+explains 84% of log trajectory cost and 98.6% of input tokens hit the
+prefix cache — turns and invocations, not observation bytes, are the
+cost unit (TurnCost, arXiv 2610.15093). Selection, not coverage, is the
+test-time-scaling bottleneck (arXiv 2407.21787, 2502.01839, 2501.14723).
+LLM-summarized compaction damages 5–64% of continuations and retains
+≤16% of recurring details vs 79.1% for mechanical extraction — with
+DeepSeek-Flash the worst of 14 summarizer backbones, so the stub floor
+is permanent (Compact-Bench, arXiv 2610.31710). And orchestration buys
+cheap models cost cuts, not quality lifts — quality returns need the
+model tier under them (arXiv 2607.06906).
+
+26. **Dynamic turn budget** (G1, G2, G9). Replace the static
+    `max_turns` with a staged grant: initial budget (per-model P75 once
+    item 9 profiles exist), extended only on deterministic progress
+    evidence (files changed since the last check, a new green verify, a
+    new evidence class). Evidence: fixed P75 limits cut cost 24–68% at
+    ~flat solve; dynamic grants add 12–24% more (arXiv 2510.16786);
+    per-model thresholds are mandatory (Gemini collapsed under extreme
+    limits). Seam: the loop's turn gate + `EngineConfig`. Probe before
+    default-on — the paper's evidence is associational.
+
+    **Implementation shipped 2026-11, default-off.** `TurnBudget {
+    initial_turns, extension_turns, max_extensions }` on `Agent` and
+    `EngineConfig`; `max_turns` stays the hard ceiling. Evidence read
+    from `CompletionGate` state the loop already keeps — a file
+    mutation since the grant (its mutation epoch; successful commands
+    do not count), or mutations still pending against the full suite
+    (truncated inside the verify loop). Event schema v12 adds
+    `TurnBudgetExtended`; env seams `LOOM_INITIAL_TURNS` /
+    `LOOM_EXTENSION_TURNS` / `LOOM_MAX_TURN_EXTENSIONS` are registered
+    selfopt knobs. One design correction from the first test run: the
+    zero-progress counter counts any successful non-read-only call, so
+    `echo` would have counted as progress — the mutation epoch is the
+    honest signal. Default remains inert until the paired probe
+    (frozen subset, free gateway, N=5 medians) reproduces the
+    2510.16786 direction; the probe is the item's remaining open tail.
+27. **Guarded decision reuse** (G1, G2, G3). Cache the model's resolved
+    next action and skip the following reasoning call when tool
+    feedback confirms the stored decision is still valid — principle 1
+    extended from tool scheduling to decision scheduling. Evidence:
+    HarnessMM (arXiv 2610.32813) — −29.5% tokens at flat success
+    (Codex) and −87.9% with success up (DeepSeek) on HumanEval/MBPP;
+    toy single-file benches, so SWE-bench-class transfer is exactly
+    what the probe must answer. Guard primitives: continue an in-flight
+    batch-edit plan while the parse guard holds; skip re-deliberation
+    when only file ids/mtimes changed; repeat-verify after
+    non-mutating turns. Seam: a controller decision cache over the
+    existing effects/side-channel state.
+28. **Shared-prefix best-of-N fork** (G1, G2, G9). Items 21/24 run N
+    children from turn 0; fork them from a shared exploratory prefix
+    (facts compile + first K turns) instead — sessions persist and the
+    projection is byte-stable, so the shared turns are paid once and
+    hit the provider prefix cache in every child. Evidence: SWE-Replay
+    (arXiv 2601.22129): −17.4% cost, +3.8% resolve vs naive scaling.
+    Risk: correlated failures from lost diversity — re-measure on the
+    frozen subset. Seam: `engine::worktrees` + kernel session fork.
+29. **Execution-based selection filter** (G1, G9). Before item 21's
+    ranking, run the existing fixed-table `verify` in each candidate
+    worktree and drop candidates that fail the existing suite — no
+    model call, fails closed, kills the "winner breaks the suite"
+    class. Evidence: the selector, not coverage, caps best-of-N value
+    (arXiv 2501.14723, 2407.21787), and weak selectors can make
+    Best-of-3 worse than Best-of-1 (arXiv 2608.03961 — already item
+    24's caveat). Count ranking ties in the selection report;
+    model-judged tie-breaks are revisited only if ties measurably
+    dominate.
+30. **Per-task tool-menu policy** (G2, G3, G4, G5). The facts scan
+    already detects languages and build systems deterministically —
+    use them to narrow the tool menu before turn 1 (no cargo tooling in
+    an npm workspace), land the model-profile menu from item 9 on top
+    (bash-capable models do better and cheaper with leaner menus,
+    arXiv 2609.20804), and add table-driven stall-breakers: the failure
+    ledger already detects near-repeats, so N failed edits on one file
+    deterministically inject that file's `symbols_overview` next turn —
+    context, not a model call (TokenEconomizer, arXiv 2610.22732:
+    −18–31% tokens, Pass@1 up in 4/5 settings). Prune only on certain
+    facts; a wrongly pruned tool is a task loss.
+31. **Symbol-cued search output** (G1, G2, G4). Attach a one-line
+    enclosing-symbol + sibling map (tree-sitter from item 18) to each
+    `search` match group: "correct file, wrong function" causes 44–58%
+    of function-level misses, and organizing the evidence — not adding
+    tools — narrows the gap (RepoNav, arXiv 2609.08355). Lives inside
+    item 7's 2026-10-08 skip boundary: leaner results at the current
+    2.5 KB median, one line per group, output-budget marker mandatory;
+    measured on NAV1.
+
 ### Deliberately not planned
 
 Each would add surface without evidence it serves the goals (G8):
@@ -1415,6 +1544,28 @@ Each would add surface without evidence it serves the goals (G8):
   model-visible byte would bypass the text census and elision machinery.
   Revisit trigger: an eval task class that provably needs image input
   (UI screenshots, architecture diagrams) on a multimodal funded model.
+- **LLM-summarized or model-managed context.** Compact-Bench (arXiv
+  2610.31710): summaries retain ≤16% of recurring details vs 79.1%
+  mechanical, damaging 5–64% of continuations — DeepSeek-Flash is the
+  worst of 14 summarizer backbones; Source-Judged Compaction (arXiv
+  2610.20927): 83% of compaction failures trace to summary entries with
+  no source in environment output; the Complexity Trap (arXiv
+  2508.21433): masking ≈ summarization. The stub floor is permanent.
+- **Code-space harness self-modification.** ADAS (arXiv 2408.08435),
+  Darwin Gödel Machine (arXiv 2505.22954): the empirical-validation
+  loop is selfopt's; the arbitrary-code edit surface is what G10's
+  "without uncontrolled self-modification" forbids. Bounded overlays
+  and (if ever needed) declarative policy rules are the line.
+- **Activation-level harness compilation.** Latent Harness (arXiv
+  2611.01415), agentic soft tokens (arXiv 2610.41291): need
+  activation access to the served model — breaks G7 for every hosted
+  provider. Research-plugin note only if local open-weight serving ever
+  lands.
+- **Model-judged rollout selection.** Rubrics (arXiv 2601.04171) and
+  RETRACE (arXiv 2608.08950) spend invocations on judgment; prompt-based
+  reranking adds little over a deterministic gate (item 24's evidence)
+  and weak selectors make Best-of-3 worse than Best-of-1 (arXiv
+  2608.03961). Revisit only on measured ranking ties (item 29).
 
 ### Open questions
 
