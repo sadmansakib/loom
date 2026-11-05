@@ -246,9 +246,24 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     for warning in &budget_warnings {
         eprintln!("warning: {warning}");
     }
+    for name in loom_core::engine::TURN_BUDGET_ENV_VARS {
+        if let Ok(value) = std::env::var(name) {
+            eprintln!("override: {name}={value}");
+        }
+    }
     let (prune, prune_warnings) =
         loom_core::engine::prune_with_env(&args.provider, |name| std::env::var(name).ok());
     for warning in &prune_warnings {
+        eprintln!("warning: {warning}");
+    }
+    // Item 26: the staged turn budget is sweepable the same way
+    // (LOOM_INITIAL_TURNS / LOOM_EXTENSION_TURNS /
+    // LOOM_MAX_TURN_EXTENSIONS). The default stays inert.
+    let (turn_budget, turn_budget_warnings) =
+        loom_core::engine::turn_budget_with_env(Default::default(), |name| {
+            std::env::var(name).ok()
+        });
+    for warning in &turn_budget_warnings {
         eprintln!("warning: {warning}");
     }
     let config = EngineConfig {
@@ -261,6 +276,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         workspace: args.workspace.clone(),
         system_prompt,
         max_turns: args.max_turns,
+        turn_budget,
         db_path,
         persist: !args.no_save,
         catalog: None,

@@ -24,7 +24,7 @@ use crate::context::{
     AgentConfig, CompiledContext, ContextBudget, ContextCensus, ContextCompiler, ContextError,
     ContextInput, FactsSource, NoFacts, PruneCheckpoint,
 };
-use crate::event::{EventKind, EventSink};
+use crate::event::{EventKind, EventSink, TurnBudgetReason};
 use crate::id::{SessionId, TaskId};
 use crate::model::{
     Message, ModelCapabilities, ModelError, ModelErrorKind, ModelEvent, ModelProvider,
@@ -103,6 +103,50 @@ const LATE_BUDGET_DENOMINATOR: u32 = 5;
 /// at most once, while a change of approach is still affordable.
 fn late_budget_due(turn: u32, max_turns: u32, nudged: bool) -> bool {
     !nudged && turn * LATE_BUDGET_DENOMINATOR >= max_turns * LATE_BUDGET_NUMERATOR
+}
+
+/// Staged turn budget (roadmap item 26): `max_turns` stays the hard
+/// ceiling; the loop starts with `initial_turns` (0 = the full ceiling,
+/// the frozen default) and may extend by `extension_turns` when a turn
+/// boundary shows deterministic progress evidence. Grants are capped by
+/// `max_extensions`, so the policy spends *earlier*, never more than
+/// the ceiling allows.
+///
+/// Inert by default (`0, 0, 0`): the loop runs `1..=max_turns` exactly
+/// as before, byte for byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TurnBudget {
+    /// Turns granted up front; 0 = `max_turns` (the previous behavior).
+    pub initial_turns: u32,
+    /// Turns added per extension grant; 0 disables extensions.
+    pub extension_turns: u32,
+    /// Maximum extension grants per task.
+    pub max_extensions: u32,
+}
+
+/// Whether the boundary before `turn` may extend the effective budget,
+/// and on what evidence (roadmap item 26). `None` stops the run: no
+/// grant room, or no progress signal. The evidence is state the loop
+/// already keeps — a fresh mutation, or unverified work inside the
+/// completion gate — never a model call.
+fn turn_extension_reason(
+    budget: &TurnBudget,
+    extensions: u32,
+    effective: u32,
+    hard: u32,
+    completion: &CompletionGate,
+    mutations_at_grant: u64,
+) -> Option<TurnBudgetReason> {
+    if budget.extension_turns == 0 || extensions >= budget.max_extensions || effective >= hard {
+        return None;
+    }
+    if completion.mutations > mutations_at_grant {
+        Some(TurnBudgetReason::MutationAtLimit)
+    } else if completion.pending() {
+        Some(TurnBudgetReason::UnverifiedWork)
+    } else {
+        None
+    }
 }
 
 /// Default output-token reservation: the share of the context window held
@@ -590,6 +634,7 @@ pub struct Agent {
     model: String,
     retry: RetryPolicy,
     max_turns: u32,
+    turn_budget: TurnBudget,
     budget: TaskBudget,
     output_reservation: OutputReservation,
     tool_timeout: Duration,
@@ -631,6 +676,7 @@ impl Agent {
             model: model.into(),
             retry: RetryPolicy::default(),
             max_turns: DEFAULT_MAX_TURNS,
+            turn_budget: TurnBudget::default(),
             budget: TaskBudget::default(),
             output_reservation: OutputReservation::Auto,
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
@@ -655,6 +701,15 @@ impl Agent {
     #[must_use]
     pub fn with_max_turns(mut self, max_turns: u32) -> Self {
         self.max_turns = max_turns.max(1);
+        self
+    }
+
+    /// Sets the staged turn budget (roadmap item 26). The default is
+    /// inert — `max_turns` governs alone — so nothing changes until a
+    /// frontend opts in.
+    #[must_use]
+    pub fn with_turn_budget(mut self, turn_budget: TurnBudget) -> Self {
+        self.turn_budget = turn_budget;
         self
     }
 
@@ -1106,6 +1161,17 @@ impl Agent {
         let mut failed_call_turns: u32 = 0;
         let mut failure_nudged: bool = false;
 
+        // Staged turn budget (roadmap item 26): the effective limit the
+        // loop may extend on progress evidence, capped by max_turns.
+        let mut effective_turns = match self.turn_budget.initial_turns {
+            0 => self.max_turns,
+            initial => initial.min(self.max_turns).max(1),
+        };
+        let mut turn_extensions: u32 = 0;
+        // Mutation epoch when the current grant was decided: the
+        // evidence window for the next extension decision.
+        let mut mutations_at_grant: u64 = completion.mutations;
+
         for turn in 1..=self.max_turns {
             // A pause requested before the task or during the previous
             // turn's tool batch stops here: the in-flight turn has fully
@@ -1120,6 +1186,42 @@ impl Agent {
             // a ceiling was crossed still completed and stays committed.
             if let Some(limit) = self.budget.exhausted(accounting, started.elapsed()) {
                 return Err(TaskError::BudgetExhausted { limit });
+            }
+
+            // The staged-budget gate (item 26): the effective grant is
+            // spent. Extend only on deterministic progress evidence —
+            // never a model call — or stop as a turn-limit failure.
+            // With the default budget this arm is unreachable.
+            if turn > effective_turns {
+                match turn_extension_reason(
+                    &self.turn_budget,
+                    turn_extensions,
+                    effective_turns,
+                    self.max_turns,
+                    &completion,
+                    mutations_at_grant,
+                ) {
+                    Some(reason) => {
+                        turn_extensions += 1;
+                        mutations_at_grant = completion.mutations;
+                        effective_turns = effective_turns
+                            .saturating_add(self.turn_budget.extension_turns)
+                            .min(self.max_turns);
+                        sink.emit(
+                            task_id,
+                            EventKind::TurnBudgetExtended {
+                                turn,
+                                reason,
+                                new_limit: effective_turns,
+                            },
+                        );
+                    }
+                    None => {
+                        return Err(TaskError::MaxTurns {
+                            max_turns: effective_turns,
+                        });
+                    }
+                }
             }
 
             sink.emit(task_id, EventKind::TurnStarted { turn });
@@ -1196,14 +1298,13 @@ impl Agent {
             // edit resets its counter, so a run that churns through edits
             // hears nothing at all. This notice counts turns only and fires
             // at most once, while a change of approach is still affordable.
-            if !stalled && late_budget_due(turn, self.max_turns, late_nudged) {
+            if !stalled && late_budget_due(turn, effective_turns, late_nudged) {
                 late_nudged = true;
                 let notice = Item::User {
                     text: format!(
-                        "You have used {turn} of {} turns. If the same check is still failing, \
-                         stop repeating the same edit: re-read the whole failure output, say \
-                         what it proves, and change approach.",
-                        self.max_turns
+                        "You have used {turn} of {effective_turns} turns. If the same check is \
+                         still failing, stop repeating the same edit: re-read the whole failure \
+                         output, say what it proves, and change approach.",
                     ),
                 };
                 let nudge_text = match &notice {
@@ -2778,10 +2879,10 @@ fn duration_millis(duration: Duration) -> u64 {
 mod tests {
     use super::{
         COMPLETION_REFUSAL_CAP, CompletionGate, DEFAULT_RESERVED_OUTPUT_TOKENS,
-        MAX_RESERVED_OUTPUT_TOKENS, OutputReservation, ZERO_PROGRESS_TURNS,
-        acceptance_oracle_refusal, append_failure_hint, completion_refusal,
+        MAX_RESERVED_OUTPUT_TOKENS, OutputReservation, TurnBudget, TurnBudgetReason,
+        ZERO_PROGRESS_TURNS, acceptance_oracle_refusal, append_failure_hint, completion_refusal,
         derive_reserved_output_tokens, green_check, is_test_path, late_budget_due,
-        visible_call_ids, zero_progress_due,
+        turn_extension_reason, visible_call_ids, zero_progress_due,
     };
     use crate::model::{Message, ModelCapabilities, ModelRequest, StopReason};
     use crate::session::Session;
@@ -2798,6 +2899,50 @@ mod tests {
         assert!(!zero_progress_due(ZERO_PROGRESS_TURNS + 5, true));
     }
 
+    #[test]
+    fn turn_extensions_need_room_and_evidence() {
+        let full = TurnBudget {
+            initial_turns: 0,
+            extension_turns: 4,
+            max_extensions: 2,
+        };
+        let idle = CompletionGate::default();
+        // No extension configured: the default budget is inert.
+        assert!(turn_extension_reason(&TurnBudget::default(), 0, 10, 50, &idle, 0).is_none());
+        // Room checks: at the hard ceiling, or out of grants.
+        assert!(turn_extension_reason(&full, 0, 50, 50, &idle, 0).is_none());
+        assert!(turn_extension_reason(&full, 2, 10, 50, &idle, 0).is_none());
+        // Successful commands do not count — only a new file mutation
+        // since the grant is progress evidence.
+        let churned = CompletionGate::default();
+        assert!(turn_extension_reason(&full, 0, 10, 50, &churned, 0).is_none());
+        // A mutation since the grant extends.
+        let edited = CompletionGate {
+            mutations: 2,
+            ..CompletionGate::default()
+        };
+        assert_eq!(
+            turn_extension_reason(&full, 0, 10, 50, &edited, 1),
+            Some(TurnBudgetReason::MutationAtLimit)
+        );
+        // Unverified mutations extend even without a fresh edit: the
+        // run was truncated inside the verify loop.
+        let pending = CompletionGate {
+            mutations: 1,
+            ..CompletionGate::default()
+        };
+        assert_eq!(
+            turn_extension_reason(&full, 0, 10, 50, &pending, 1),
+            Some(TurnBudgetReason::UnverifiedWork)
+        );
+        // Idle with everything verified against the full suite stops.
+        let settled = CompletionGate {
+            mutations: 1,
+            suite_green_at: Some(1),
+            ..CompletionGate::default()
+        };
+        assert!(turn_extension_reason(&full, 0, 10, 50, &settled, 1).is_none());
+    }
     #[test]
     fn the_turn_budget_nudge_fires_once_at_three_fifths() {
         // A churning run never changes `turns_since_mutation`, so the

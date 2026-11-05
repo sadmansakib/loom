@@ -46,6 +46,7 @@ fn main() -> anyhow::Result<()> {
         workspace: std::env::current_dir()?,
         system_prompt: None,
         max_turns: 8,
+        turn_budget: Default::default(),
         db_path: loom_core::paths::db_path(),
         persist: false,
         catalog: None,

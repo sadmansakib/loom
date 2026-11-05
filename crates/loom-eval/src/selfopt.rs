@@ -197,6 +197,33 @@ pub const KNOBS: &[Knob] = &[
         unit: "tokens",
         doc: "recent turns the compiler never elides; larger protects live chains",
     },
+    Knob {
+        env: "LOOM_INITIAL_TURNS",
+        name: "initial_turns",
+        default: 50,
+        floor: 8,
+        ceiling: 50,
+        unit: "turns",
+        doc: "turns granted up front (engine default: the full ceiling); smaller grants cut wasted spins on hopeless tasks",
+    },
+    Knob {
+        env: "LOOM_EXTENSION_TURNS",
+        name: "extension_turns",
+        default: 8,
+        floor: 2,
+        ceiling: 16,
+        unit: "turns",
+        doc: "turns added per progress-evidence grant (engine default: off); the staged-budget lever of item 26",
+    },
+    Knob {
+        env: "LOOM_MAX_TURN_EXTENSIONS",
+        name: "max_turn_extensions",
+        default: 2,
+        floor: 1,
+        ceiling: 5,
+        unit: "grants",
+        doc: "extension grants per task (engine default: off); bounds how far initial_turns can grow toward the ceiling",
+    },
 ];
 
 /// Looks a knob up by its env var name.
@@ -859,6 +886,7 @@ mod tests {
         // the optimizer; the inverse is inert. Both are drift.
         let mut expected: Vec<&str> = loom_core::engine::BUDGET_ENV_VARS.to_vec();
         expected.extend(loom_core::engine::PRUNE_ENV_VARS);
+        expected.extend(loom_core::engine::TURN_BUDGET_ENV_VARS);
         let have: Vec<&str> = KNOBS.iter().map(|knob| knob.env).collect();
         assert_eq!(have.len(), expected.len());
         for env in expected {

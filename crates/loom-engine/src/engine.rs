@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use loom_kernel::agent::{Agent, TaskControl, TaskError, TaskSummary};
+use loom_kernel::agent::{Agent, TaskControl, TaskError, TaskSummary, TurnBudget};
 use loom_kernel::context::{
     AgentConfig, ContextCompiler, DefaultContextCompiler, PruneConfig, PruningContextCompiler,
 };
@@ -63,6 +63,10 @@ pub struct EngineConfig {
     pub system_prompt: Option<String>,
     /// Maximum number of model turns for one task.
     pub max_turns: u32,
+    /// Staged turn budget (roadmap item 26). The default is inert, so
+    /// `max_turns` governs alone and the frozen eval protocol is
+    /// unchanged until a probe opts in.
+    pub turn_budget: TurnBudget,
     /// Path to the durable-state database (`loom.db`) the frontend selected.
     ///
     /// Used for credential accounts and, when `persist` is set, sessions and
@@ -155,6 +159,7 @@ pub(crate) fn test_config() -> EngineConfig {
         workspace: base.join("workspace"),
         system_prompt: None,
         max_turns: 1,
+        turn_budget: TurnBudget::default(),
         db_path: base.join("loom.db"),
         persist: false,
         catalog: None,
@@ -580,6 +585,7 @@ impl Engine {
         }
         let mut agent = Agent::new(provider, compiler, registry, agent_config, config.model)
             .with_max_turns(config.max_turns)
+            .with_turn_budget(config.turn_budget)
             .with_loop_shaping(!overrides.bare_loop);
         if let Some(facts) = facts {
             agent = agent.with_facts_source(Box::new(facts));
@@ -1048,6 +1054,10 @@ fn compose_scout(
         workspace: workspace.to_path_buf(),
         system_prompt: None,
         max_turns: cfg.max_turns,
+        // Scout children keep a static ceiling: the staged budget is a
+        // parent-loop policy, and a bounded read-only scout never has
+        // unverified work to fund.
+        turn_budget: TurnBudget::default(),
         db_path: parent.db_path.clone(),
         persist: false,
         catalog: parent.catalog.clone(),
@@ -1220,6 +1230,39 @@ pub const BUDGET_ENV_VARS: [&str; 9] = [
     "LOOM_REPLACE_SYMBOL_HEAD_BYTES",
     "LOOM_MCP_IDLE_EVICT_TURNS",
 ];
+
+/// The `LOOM_*` staged-turn-budget knobs [`turn_budget_with_env`] reads,
+/// in struct order (roadmap item 26).
+pub const TURN_BUDGET_ENV_VARS: [&str; 3] = [
+    "LOOM_INITIAL_TURNS",
+    "LOOM_EXTENSION_TURNS",
+    "LOOM_MAX_TURN_EXTENSIONS",
+];
+
+/// Applies `LOOM_*` staged-turn-budget overrides (roadmap item 26) over
+/// the inert default. Same purity and warning contract as
+/// [`budgets_with_env`]. `LOOM_INITIAL_TURNS=0` is accepted — it means
+/// "the full ceiling" — while zero values for the other two are
+/// ignored, matching the never-disable-by-typo convention.
+pub fn turn_budget_with_env(
+    base: TurnBudget,
+    get: impl Fn(&str) -> Option<String>,
+) -> (TurnBudget, Vec<String>) {
+    let mut budget = base;
+    let mut warnings = Vec::new();
+    let mut apply = |slot: &mut u32, name: &str, allow_zero: bool| {
+        if let Some(raw) = get(name) {
+            match raw.trim().parse::<u32>() {
+                Ok(value) if allow_zero || value > 0 => *slot = value,
+                _ => warnings.push(format!("ignoring invalid {name}={raw:?}")),
+            }
+        }
+    };
+    apply(&mut budget.initial_turns, TURN_BUDGET_ENV_VARS[0], true);
+    apply(&mut budget.extension_turns, TURN_BUDGET_ENV_VARS[1], false);
+    apply(&mut budget.max_extensions, TURN_BUDGET_ENV_VARS[2], false);
+    (budget, warnings)
+}
 
 /// The `LOOM_PRUNE_*` knobs [`prune_with_env`] reads, in struct order.
 pub const PRUNE_ENV_VARS: [&str; 4] = [
@@ -1838,6 +1881,179 @@ mod tests {
             },
             usage: Usage::default(),
         }))]
+    }
+
+    /// One script: an assistant turn that writes one file — a mutating
+    /// call, the progress evidence item 26 reads.
+    fn write_file_script(path: &str, content: &str) -> Vec<Result<ModelEvent, ModelError>> {
+        use loom_kernel::transcript::{ToolArguments, ToolCall, ToolCallId};
+        let call = ToolCall {
+            id: ToolCallId::try_from(format!("call-{}", std::process::id())).unwrap(),
+            name: "write_file".to_owned(),
+            arguments: ToolArguments::try_from(serde_json::json!({
+                "path": path,
+                "content": content,
+            }))
+            .expect("arguments"),
+        };
+        vec![Ok(ModelEvent::Completed(ModelResponse {
+            message: AssistantMessage {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![call],
+                stop_reason: StopReason::ToolCalls,
+            },
+            usage: Usage::default(),
+        }))]
+    }
+
+    /// One script: a non-mutating `run_command` turn.
+    fn echo_command_script() -> Vec<Result<ModelEvent, ModelError>> {
+        use loom_kernel::transcript::{ToolArguments, ToolCall, ToolCallId};
+        let call = ToolCall {
+            id: ToolCallId::try_from(format!("call-{}", std::process::id())).unwrap(),
+            name: "run_command".to_owned(),
+            arguments: ToolArguments::try_from(serde_json::json!({
+                "program": "echo",
+                "args": ["hi"],
+            }))
+            .expect("arguments"),
+        };
+        vec![Ok(ModelEvent::Completed(ModelResponse {
+            message: AssistantMessage {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![call],
+                stop_reason: StopReason::ToolCalls,
+            },
+            usage: Usage::default(),
+        }))]
+    }
+
+    #[tokio::test]
+    async fn a_mutation_at_the_grant_limit_extends_the_turn_budget() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = rename_fixture(base.path());
+        let mut config = test_config();
+        config.workspace = workspace.clone();
+        config.db_path = base.path().join("loom.db");
+        config.max_turns = 3;
+        config.turn_budget = TurnBudget {
+            initial_turns: 1,
+            extension_turns: 2,
+            max_extensions: 1,
+        };
+        // The bare loop keeps the completion gate out of the picture:
+        // this test pins the budget gate alone.
+        let engine = Engine::open_with(
+            config,
+            EngineOverrides {
+                provider: Some(Box::new(FakeProvider::scripted(vec![
+                    write_file_script("note.txt", "hello"),
+                    FakeProvider::end_turn_script("done"),
+                ]))),
+                bare_loop: true,
+                ..EngineOverrides::default()
+            },
+        )
+        .expect("engine");
+
+        let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
+        let mut session = engine.new_session();
+        let summary = engine
+            .run_task(&mut session, "Write a note.", &sink, &Default::default())
+            .await
+            .expect("agent task");
+
+        assert_eq!(
+            summary.model_requests, 2,
+            "the grant funded the second turn"
+        );
+        let kinds = drain(&mut receiver);
+        assert!(kinds.contains(&EventKind::TurnBudgetExtended {
+            turn: 2,
+            reason: loom_kernel::event::TurnBudgetReason::MutationAtLimit,
+            new_limit: 3,
+        }));
+    }
+
+    #[tokio::test]
+    async fn an_idle_run_at_the_grant_limit_stops() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = rename_fixture(base.path());
+        let mut config = test_config();
+        config.workspace = workspace.clone();
+        config.db_path = base.path().join("loom.db");
+        config.max_turns = 3;
+        config.turn_budget = TurnBudget {
+            initial_turns: 1,
+            extension_turns: 2,
+            max_extensions: 5,
+        };
+        let engine = Engine::open_with(
+            config,
+            EngineOverrides {
+                provider: Some(Box::new(FakeProvider::scripted(
+                    vec![echo_command_script()],
+                ))),
+                bare_loop: true,
+                ..EngineOverrides::default()
+            },
+        )
+        .expect("engine");
+
+        let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
+        let mut session = engine.new_session();
+        let error = engine
+            .run_task(&mut session, "Say hi.", &sink, &Default::default())
+            .await
+            .expect_err("no evidence, no extension");
+        let TaskError::MaxTurns { max_turns } = error else {
+            panic!("expected MaxTurns, got {error:?}");
+        };
+        assert_eq!(max_turns, 1);
+        let kinds = drain(&mut receiver);
+        assert!(
+            !kinds
+                .iter()
+                .any(|kind| matches!(kind, EventKind::TurnBudgetExtended { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_turn_budget_is_inert() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = rename_fixture(base.path());
+        let mut config = test_config();
+        config.workspace = workspace.clone();
+        config.db_path = base.path().join("loom.db");
+        config.max_turns = 2;
+        let engine = Engine::open_with(
+            config,
+            EngineOverrides {
+                provider: Some(Box::new(FakeProvider::scripted(vec![
+                    echo_command_script(),
+                    FakeProvider::end_turn_script("done"),
+                ]))),
+                bare_loop: true,
+                ..EngineOverrides::default()
+            },
+        )
+        .expect("engine");
+
+        let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
+        let mut session = engine.new_session();
+        let summary = engine
+            .run_task(&mut session, "Say hi.", &sink, &Default::default())
+            .await
+            .expect("agent task");
+        assert_eq!(summary.model_requests, 2);
+        let kinds = drain(&mut receiver);
+        assert!(
+            !kinds
+                .iter()
+                .any(|kind| matches!(kind, EventKind::TurnBudgetExtended { .. }))
+        );
     }
 
     #[tokio::test]
@@ -2615,6 +2831,31 @@ mod tests {
         let content = read_file_content(&kinds).expect("read_file ran");
         assert!(content.contains("bytes omitted"), "{content}");
         assert!(content.len() < 200, "{content}");
+    }
+    #[test]
+    fn turn_budget_with_env_layers_over_the_inert_default() {
+        // Zero initial turns is the "full ceiling" default, not an error.
+        let (budget, warnings) = turn_budget_with_env(TurnBudget::default(), |name| match name {
+            "LOOM_INITIAL_TURNS" => Some("0".to_owned()),
+            "LOOM_EXTENSION_TURNS" => Some("8".to_owned()),
+            "LOOM_MAX_TURN_EXTENSIONS" => Some("2".to_owned()),
+            _ => None,
+        });
+        assert_eq!(
+            budget,
+            TurnBudget {
+                initial_turns: 0,
+                extension_turns: 8,
+                max_extensions: 2
+            }
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // A zero extension would disable the policy silently — ignored.
+        let (_, warnings) = turn_budget_with_env(TurnBudget::default(), |name| match name {
+            "LOOM_EXTENSION_TURNS" => Some("0".to_owned()),
+            _ => None,
+        });
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
 
     #[test]

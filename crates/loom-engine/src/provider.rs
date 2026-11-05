@@ -7,6 +7,7 @@
 //! adapter's configuration and its own setup-time constraints, so
 //! adapter-specific rules cannot leak into the composition root.
 
+use loom_kernel::agent::TurnBudget;
 use loom_kernel::model::{ModelCapabilities, ModelProvider};
 use loom_providers::{
     ANTHROPIC_PROVIDER_NAME, AnthropicConfig, AnthropicProvider, CUSTOM_PROVIDER_NAME,
@@ -371,6 +372,7 @@ pub fn one_shot_provider(
         workspace: std::env::temp_dir().join("loom-one-shot"),
         system_prompt: None,
         max_turns: 1,
+        turn_budget: TurnBudget::default(),
         db_path: std::env::temp_dir().join("loom-one-shot").join("loom.db"),
         persist: false,
         catalog: None,

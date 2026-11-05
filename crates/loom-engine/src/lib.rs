@@ -48,12 +48,14 @@ pub mod worktrees;
 
 pub use engine::{
     BUDGET_ENV_VARS, Continuation, Engine, EngineConfig, EngineError, EngineOverrides,
-    PRUNE_ENV_VARS, ProviderHook, budgets_with_env, default_system_prompt, prune_with_env,
+    PRUNE_ENV_VARS, ProviderHook, TURN_BUDGET_ENV_VARS, budgets_with_env, default_system_prompt,
+    prune_with_env, turn_budget_with_env,
 };
 pub use estimate::{
     ANTHROPIC_TOKEN_SCALE_PER_MILLE, AnthropicEstimator, O200kEstimator, estimator_for,
 };
 pub use loom_kernel::agent::TaskControl;
+pub use loom_kernel::agent::TurnBudget;
 pub use scout::{ANSWER_BUDGET_BYTES, ScoutConfig, ScoutEscalation, ScoutTool};
 // The provider/effort types a frontend must name to build an `EngineConfig`;
 // re-exported so a frontend never depends on the provider crate directly.

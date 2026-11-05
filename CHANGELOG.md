@@ -3,6 +3,37 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Staged turn budget (roadmap item 26); event schema v12
+
+Research-grounded (docs/lit-review-2026-11-harness-papers.md; More with
+Less arXiv 2510.16786). Ships default-off: the frozen SWE-bench
+protocol is byte-identical until a selfopt probe opts in.
+
+- `TurnBudget { initial_turns, extension_turns, max_extensions }` on
+  `Agent` (`with_turn_budget`) and `EngineConfig`. `max_turns` stays the
+  hard ceiling; the loop starts with `initial_turns` (0 = the full
+  ceiling, the previous behavior) and may extend at a spent boundary,
+  but only on deterministic progress evidence read from state the loop
+  already keeps — a file mutation since the grant
+  (`CompletionGate`'s mutation epoch; successful commands do NOT
+  count), or unverified mutations pending against the full suite (the
+  run truncated inside the completion gate's verify loop — the exact
+  interaction that motivated the item). Never a model call.
+- Event schema v12: `TurnBudgetExtended { turn, reason, new_limit }`
+  with a snake_case `TurnBudgetReason` (`mutation_at_limit` /
+  `unverified_work`). Pure marker; replay needs no state from it.
+- Sweepable env seams, same purity/warning contract as the budget
+  knobs: `LOOM_INITIAL_TURNS` (0 accepted = full ceiling),
+  `LOOM_EXTENSION_TURNS`, `LOOM_MAX_TURN_EXTENSIONS` (zero ignored —
+  never disable by typo). CLI echoes and warns; selfopt's knob table
+  registers all three (the coverage test enforces it).
+- The late-budget nudge now reports the *effective* limit, not the
+  ceiling, so a staged run hears honest numbers.
+- Tests: kernel evidence truth table (room caps, mutation-vs-command,
+  pending-vs-settled), engine behavior (extend on write at the limit,
+  idle stop, default inert — no event, same request count), env
+  layering, v12 serialization. Workspace green, clippy/fmt clean.
+
 ## 2026-10-25 — Eval provenance: mixed-build sweeps are refused, not merely disclosed
 
 Follow-up to the honesty audit: the 90/100 headline's real failure mode

@@ -75,8 +75,25 @@ use tokio_util::sync::CancellationToken;
 /// list changed during a turn's tool batch; replaying the events
 /// reconstructs the list, and each event marks one tail re-append).
 /// v10 adds `SteeringApplied` (item 25: queued user messages joined
+/// v10 adds `SteeringApplied` (item 25: queued user messages joined
 /// the transcript at a turn boundary).
-pub const EVENT_SCHEMA_VERSION: u16 = 11;
+/// v11 adds `LoopNudge` plus the serialized-argument and content head
+/// budgets for the tool events.
+/// v12 adds `TurnBudgetExtended` (item 26: a staged turn budget was
+/// extended at a turn boundary on deterministic progress evidence).
+pub const EVENT_SCHEMA_VERSION: u16 = 12;
+
+/// The evidence that justified a [`EventKind::TurnBudgetExtended`] grant
+/// (item 26): state the loop already tracks, never a model call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnBudgetReason {
+    /// The turn that exhausted the grant changed a file — active work.
+    MutationAtLimit,
+    /// Mutations were still unverified against the full suite — the run
+    /// was truncated inside the completion gate's verify loop.
+    UnverifiedWork,
+}
 
 /// Byte budget for a `ToolStarted` event's serialized arguments (schema
 /// 11): enough for the typical command or edit summary, never a whole
@@ -324,6 +341,19 @@ pub enum EventKind {
         turn: u32,
         /// How many queued messages were applied.
         messages: u32,
+    },
+    /// The staged turn budget was extended at this turn's boundary
+    /// (item 26): the initial grant ran out and the boundary showed
+    /// deterministic progress evidence, so the loop continues with
+    /// `new_limit` turns. Pure marker — replay needs no state from it.
+    TurnBudgetExtended {
+        /// 1-based turn whose compile runs under the extended budget.
+        turn: u32,
+        /// The evidence that justified the grant.
+        reason: TurnBudgetReason,
+        /// The effective turn limit after this grant (never past the
+        /// hard `max_turns` ceiling).
+        new_limit: u32,
     },
     /// The loop injected a shaping message into the transcript (schema
     /// 11): one of the one-shot completion refusals, the zero-progress
@@ -1610,6 +1640,28 @@ mod tests {
     }
 
     /// Roadmap item 8 phase B, replay: folding a task's `TodoUpdated`
+    /// Schema v12: `TurnBudgetExtended` serializes with the snake_case
+    /// tag and a snake_case reason, so an NDJSON consumer can count
+    /// extensions and their evidence without kernel types.
+    #[test]
+    fn turn_budget_extended_serializes_snake_case() {
+        let envelope = EventEnvelope {
+            schema_version: EVENT_SCHEMA_VERSION,
+            sequence: 3,
+            task_id: TaskId::new(),
+            kind: EventKind::TurnBudgetExtended {
+                turn: 4,
+                reason: TurnBudgetReason::UnverifiedWork,
+                new_limit: 12,
+            },
+        };
+        let value = serde_json::to_value(&envelope).expect("json");
+        assert_eq!(value["kind"]["type"], "turn_budget_extended");
+        assert_eq!(value["kind"]["turn"], 4);
+        assert_eq!(value["kind"]["reason"], "unverified_work");
+        assert_eq!(value["kind"]["new_limit"], 12);
+    }
+
     /// events in sequence order reconstructs the list — and each event
     /// corresponds to exactly one tail re-append, so a replayer renders
     /// the same byte-stable blocks the transcript carries.
