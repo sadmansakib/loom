@@ -1507,6 +1507,7 @@ model tier under them (arXiv 2607.06906).
     deterministically inject that file's `symbols_overview` next turn —
     context, not a model call (TokenEconomizer, arXiv 2610.22732:
     −18–31% tokens, Pass@1 up in 4/5 settings). Prune only on certain
+
     facts; a wrongly pruned tool is a task loss.
 31. **Symbol-cued search output** (G1, G2, G4). Attach a one-line
     enclosing-symbol + sibling map (tree-sitter from item 18) to each
@@ -1516,6 +1517,17 @@ model tier under them (arXiv 2607.06906).
     item 7's 2026-10-08 skip boundary: leaner results at the current
     2.5 KB median, one line per group, output-budget marker mandatory;
     measured on NAV1.
+    *Implementation shipped 2026-11:* deepest enclosing symbol only (the
+    sibling map was cut — more bytes, no evidence); cue is `[in
+    Class/method]`, capped at 64 bytes, absent on lines outside any
+    declaration (imports, whitespace) rather than guessed. Cues are
+    computed on the search walk's blocking worker (one capped re-read +
+    tree-sitter parse per hit file), default-on with a
+    `LOOM_SEARCH_SYMBOL_CUES=0` opt-out mirroring the syntax guard.
+    NAV1 no longer exists (2026-10-20 suite replacement); the open tail
+    is the frozen-subset sweep measuring whether cues cut
+    refine/re-search turns.
+
 
 ### Deliberately not planned
 

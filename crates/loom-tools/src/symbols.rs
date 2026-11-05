@@ -29,6 +29,7 @@ use loom_kernel::tool::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 use tree_sitter::{Node, Parser, Tree};
@@ -150,6 +151,33 @@ fn parse_symbols(lang: SymbolLanguage, source: &str) -> Result<(Tree, Vec<FlatSy
     let mut flat = Vec::with_capacity(count);
     flatten(&roots, 0, &mut flat);
     Ok((tree, flat))
+}
+
+/// Enclosing-symbol cues for search hits (roadmap item 31): maps each
+/// queried 1-based line to the name-path of the deepest symbol whose
+/// span contains it, so a match reads as `path:42: …  [in Class/method]`
+/// instead of a bare line number. `None` means the language is
+/// unsupported or the file produced no tree; a line missing from the
+/// map (imports, whitespace between declarations) carries no cue —
+/// honest absence, not a guessed parent.
+pub fn enclosing_symbol_cues(
+    path: &Path,
+    source: &str,
+    lines: &[usize],
+) -> Option<HashMap<usize, String>> {
+    let lang = SymbolLanguage::for_path(path)?;
+    let (_, symbols) = parse_symbols(lang, source).ok()?;
+    let mut cues = HashMap::new();
+    for &line in lines {
+        let deepest = symbols
+            .iter()
+            .filter(|s| s.start_line <= line && line <= s.end_line)
+            .max_by_key(|s| s.depth);
+        if let Some(deepest) = deepest {
+            cues.insert(line, deepest.path.clone());
+        }
+    }
+    Some(cues)
 }
 
 /// Walks `node`'s children: classified declarations become symbols

@@ -3,6 +3,26 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+
+## 2026-11 — Symbol-cued search output (roadmap item 31)
+
+Research-grounded (RepoNav arXiv 2609.08355): "correct file, wrong
+function" drives most function-level misses, and re-organizing existing
+output — not new tools — narrows the gap.
+
+- Every `search` hit now carries `[in Class/method]`, the name-path of
+  the deepest enclosing declaration (tree-sitter, item 18 machinery),
+  in both the raw listing and the per-file summary form. Lines outside
+  any declaration (imports, whitespace) carry no cue — honest absence,
+  not a guessed parent.
+- Cues are built on the search walk's blocking worker (one capped
+  re-read + parse per hit file, never per line), capped at 64 bytes,
+  and default-on with a `LOOM_SEARCH_SYMBOL_CUES=0` opt-out mirroring
+  the syntax guard.
+- Tool description notes the cue; the spec stays inside the output
+  budget (6.2 KB total). Sibling maps were cut: more bytes, no
+  evidence. Open tail: frozen-subset sweep on whether cues cut
+  refine/re-search turns.
 ## 2026-11 — Staged turn budget (roadmap item 26); event schema v12
 
 Research-grounded (docs/lit-review-2026-11-harness-papers.md; More with

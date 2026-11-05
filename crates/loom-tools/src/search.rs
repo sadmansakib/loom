@@ -24,12 +24,14 @@ use regex::Regex;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::confinement::resolve_within;
+use crate::symbols::enclosing_symbol_cues;
 
 /// Default cap on reported matching lines.
 const DEFAULT_MAX_RESULTS: usize = 200;
@@ -53,6 +55,11 @@ const MAX_MATCH_LINE_BYTES: usize = 256;
 const SUMMARY_THRESHOLD: usize = 100;
 /// How many matching lines to show per file in the summarized form.
 const PER_FILE_PREVIEW: usize = 5;
+
+/// Cap on each appended symbol cue (`  [in Class/method]`): deep
+/// name-paths in generated code would otherwise re-inflate the very
+/// output the summary form exists to bound (item 31).
+const CUE_MAX_BYTES: usize = 64;
 
 /// One matching line, before rendering.
 struct Match {
@@ -92,8 +99,8 @@ impl Tool for SearchTool {
             name: "search".to_owned(),
             description: "Searches file contents by regular expression across the \
                           workspace (gitignored, hidden, and binary files skipped). \
-                          Returns `path:line: text`; large sets are summarized per file \
-                          with a preview and a hint to narrow the search."
+                          Returns `path:line: text`, with a `[in symbol]` cue for the \
+                          enclosing declaration; large sets are summarized per file."
                 .to_owned(),
             parameters: crate::schema::parameters::<SearchInput>(),
         })
@@ -154,14 +161,22 @@ impl Tool for SearchTool {
             let walk_token = ctx.cancellation.child_token();
             let _walk_guard = walk_token.clone().drop_guard();
             let entries = tokio::task::spawn_blocking(move || {
-                search_tree(&regex, &scope, max_results, &rel_base, &walk_token)
+                let found = search_tree(&regex, &scope, max_results, &rel_base, &walk_token);
+                // Cue building re-reads and tree-sitter-parses each hit
+                // file: blocking work, so it stays on this worker
+                // (maintenance bar) rather than the async path.
+                let cues = match &found {
+                    Ok((matches, _)) => symbol_cues_for(matches, &rel_base),
+                    Err(_) => HashMap::new(),
+                };
+                found.map(|(matches, truncated)| (matches, truncated, cues))
             })
             .await
             .map_err(|err| ToolError::Execution(format!("search task failed: {err}")))?;
 
             match entries {
-                Ok((matches, truncated)) => {
-                    let (content, truncated) = render(&matches, truncated, max_results);
+                Ok((matches, truncated, cues)) => {
+                    let (content, truncated) = render(&matches, truncated, max_results, &cues);
                     let mut output = ToolOutput::new(content);
                     if truncated {
                         output = output.with_truncated();
@@ -307,14 +322,24 @@ fn search_tree(
 /// per-file summary (count plus a short preview each) above
 /// [`SUMMARY_THRESHOLD`]. A search stopped at `max_results` carries an
 /// explicit marker rather than silently dropping the remainder (V9).
-fn render(matches: &[Match], truncated: bool, max_results: usize) -> (String, bool) {
+fn render(
+    matches: &[Match],
+    truncated: bool,
+    max_results: usize,
+    cues: &HashMap<String, HashMap<usize, String>>,
+) -> (String, bool) {
     if matches.is_empty() {
         return (String::new(), false);
     }
     if matches.len() <= SUMMARY_THRESHOLD {
         let mut text = matches
             .iter()
-            .map(|m| format!("{}:{}: {}", m.rel, m.line, m.text))
+            .map(
+                |m| match cues.get(&m.rel).and_then(|file| file.get(&m.line)) {
+                    Some(cue) => format!("{}:{}: {}  [in {}]", m.rel, m.line, m.text, cap_cue(cue)),
+                    None => format!("{}:{}: {}", m.rel, m.line, m.text),
+                },
+            )
             .collect::<Vec<_>>()
             .join("\n");
         if truncated {
@@ -347,7 +372,15 @@ fn render(matches: &[Match], truncated: bool, max_results: usize) -> (String, bo
     for (name, group) in &files {
         lines.push(format!("{name} ({} matches)", group.len()));
         for found in group.iter().take(PER_FILE_PREVIEW) {
-            lines.push(format!("  {}: {}", found.line, found.text));
+            match cues.get(*name).and_then(|file| file.get(&found.line)) {
+                Some(cue) => lines.push(format!(
+                    "  {}: {}  [in {}]",
+                    found.line,
+                    found.text,
+                    cap_cue(cue)
+                )),
+                None => lines.push(format!("  {}: {}", found.line, found.text)),
+            }
             shown += 1;
         }
     }
@@ -358,6 +391,65 @@ fn render(matches: &[Match], truncated: bool, max_results: usize) -> (String, bo
         ));
     }
     (lines.join("\n"), hidden > 0 || truncated)
+}
+
+/// Builds per-file enclosing-symbol maps for the match set (item 31).
+/// Runs on the blocking worker: one capped re-read and one tree-sitter
+/// parse per file with hits, never per line. Empty (no cues) when the
+/// language is unsupported or [`symbol_cues_enabled`] is off.
+fn symbol_cues_for(matches: &[Match], root: &Path) -> HashMap<String, HashMap<usize, String>> {
+    if !symbol_cues_enabled() {
+        return HashMap::new();
+    }
+    let mut by_file: HashMap<&str, Vec<usize>> = HashMap::new();
+    for found in matches {
+        by_file
+            .entry(found.rel.as_str())
+            .or_default()
+            .push(found.line);
+    }
+    let mut cues = HashMap::new();
+    for (rel, lines) in by_file {
+        let Some(source) = read_capped_text(&root.join(rel)) else {
+            continue;
+        };
+        if let Some(map) = enclosing_symbol_cues(Path::new(rel), &source, &lines) {
+            cues.insert(rel.to_owned(), map);
+        }
+    }
+    cues
+}
+
+/// Truncates a symbol cue to [`CUE_MAX_BYTES`] on a UTF-8 char boundary,
+/// matching [`capped_line`]'s convention.
+fn cap_cue(cue: &str) -> String {
+    if cue.len() <= CUE_MAX_BYTES {
+        return cue.to_owned();
+    }
+    let mut cut = CUE_MAX_BYTES;
+    while !cue.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &cue[..cut])
+}
+
+/// Whether search hits carry an enclosing-symbol cue (roadmap item 31):
+/// on unless `LOOM_SEARCH_SYMBOL_CUES` is set to exactly `0`. Read per
+/// call so an operator can flip it without restarting the session.
+const ENV_DISABLE_CUES: &str = "LOOM_SEARCH_SYMBOL_CUES";
+
+#[cfg(test)]
+static TEST_CUES_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn symbol_cues_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if TEST_CUES_DISABLED.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+    }
+    std::env::var(ENV_DISABLE_CUES).ok().as_deref() != Some("0")
 }
 
 /// The marker appended when a search stops at its `max_results` cap.
@@ -481,9 +573,69 @@ mod tests {
             .expect("ok");
         assert_eq!(
             output.content,
-            "src/a.rs:1: fn alpha() {}\nsrc/a.rs:2: fn beta() {}"
+            "src/a.rs:1: fn alpha() {}  [in alpha]\nsrc/a.rs:2: fn beta() {}  [in beta]"
         );
         assert!(!output.truncated);
+    }
+
+    #[tokio::test]
+    async fn cues_name_the_deepest_enclosing_symbol() {
+        let (guard, root) = temp_root();
+        let base = guard.path();
+        std::fs::create_dir(base.join("src")).expect("mkdir");
+        std::fs::write(
+            base.join("src/a.rs"),
+            "use std::fmt;\nstruct Outer;\nimpl Outer {\n    fn method(&self) -> i32 {\n        7\n    }\n}\n",
+        )
+        .expect("write");
+
+        let output = search(&root, json!({"pattern": "7|fmt"}))
+            .await
+            .expect("ok");
+        assert!(
+            output.content.contains("src/a.rs:1: use std::fmt;"),
+            "top-level line carries no cue"
+        );
+        assert!(
+            output
+                .content
+                .contains("src/a.rs:5:         7  [in Outer/method]"),
+            "nested line names the deepest symbol: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn cues_can_be_disabled_per_call() {
+        let (guard, root) = temp_root();
+        std::fs::write(guard.path().join("a.rs"), "fn alpha() {}\n").expect("write");
+        TEST_CUES_DISABLED.store(true, std::sync::atomic::Ordering::SeqCst);
+        let output = search(&root, json!({"pattern": "alpha"}))
+            .await
+            .expect("ok");
+        TEST_CUES_DISABLED.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(output.content, "a.rs:1: fn alpha() {}");
+    }
+
+    #[tokio::test]
+    async fn summary_form_lines_carry_cues_too() {
+        let (guard, root) = temp_root();
+        let base = guard.path();
+        let mut source = String::new();
+        for i in 0..SUMMARY_THRESHOLD + 1 {
+            source.push_str(&format!("fn f{i}() {{ needle }}\n"));
+        }
+        std::fs::create_dir(base.join("src")).expect("mkdir");
+        std::fs::write(base.join("src/big.rs"), source).expect("write");
+
+        let output = search(&root, json!({"pattern": "needle"}))
+            .await
+            .expect("ok");
+        assert!(
+            output.content.contains("  1: fn f0() { needle }  [in f0]"),
+            "summary preview carries the cue: {}",
+            output.content
+        );
     }
 
     #[tokio::test]
@@ -648,7 +800,7 @@ mod tests {
             .await
             .expect("ok");
         // A file scope must still name the file, not strip to an empty path.
-        assert_eq!(output.content, "src/a.rs:1: fn alpha() {}");
+        assert_eq!(output.content, "src/a.rs:1: fn alpha() {}  [in alpha]");
     }
 
     #[tokio::test]
