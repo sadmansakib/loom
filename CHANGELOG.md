@@ -24,6 +24,29 @@ Best-of-3 worse than Best-of-1).
   `VerifyTool::suite_verdict(root, cancellation)` runs the fixed
   table once and returns `Option<bool>` (None = no verdict).
 
+## 2026-11 — Checkpoint/rewind spec note (roadmap gap 1, items 15/22)
+
+`docs/rewind-design.md` — the deferred spec for restoring code +
+conversation to a chosen turn. Findings locked in:
+
+- Premise corrected: conversation state is derivable at any boundary
+  (append-only transcript, stable `ItemIndex`); code state is not —
+  `ToolEffects` records paths, never content, and reverse-replaying
+  edits is not honest determinism. Only the git-clean session-start
+  checkpoint is exact today.
+- Design: rewind is a **fork**, never a truncate — new
+  `SessionStore::fork(source, boundary, new_id, provenance)` copies
+  items `[0..boundary)` in one transaction, indices preserved, task
+  records/events/todos not copied, fork lineage surfaced in
+  `loom sessions`. Lease guard refuses in-flight sessions.
+- Code restore tiered by what is provable: tier 0 refuses, tier 1
+  restores the session-start git checkpoint (no engine work), tier 2
+  captures per-write before-images at the ADR-012 tools seam
+  (content-addressed into the artifact store) — the engine iteration
+  that makes arbitrary-boundary rewind exact, named now so it lands
+  without redesign. Every tree mutation writes a recovery snapshot
+  first; refusal beats best-effort.
+
 ## 2026-11 — Skill telemetry in `loom stats` (roadmap gap, feeds item 20.4)
 
 Per-skill usage frequency and context cost, derived from the durable

@@ -1646,6 +1646,14 @@ Two small gaps surfaced and are recorded here so they are not lost
    shape). Deterministic today (worktree git + session DB), so it is a
    frontend+CLI feature, not engine work; spec lands with item 15's
    resume UX or item 22's frontend.
+   Spec written 2026-11-06: `docs/rewind-design.md`. It corrects the
+   premise: conversation state is derivable at any boundary (append-only
+   transcript), but code state is not — `ToolEffects` records paths,
+   not content — so the design tiers it: fork-always via a new
+   `SessionStore::fork` (never truncate), git-clean session-start
+   checkpoint for tree restore without engine work, and per-turn
+   before-images at the tools seam (ADR-012 effects) as the named
+   engine iteration that makes arbitrary-boundary code rewind exact.
 2. **Skill telemetry** (feeds item 20.4/skills lifecycle). Per-skill
    context cost and usage frequency (Claude Code `/skill-doctor` shape)
    so low-value skills retire on evidence — the lifecycle rule the
