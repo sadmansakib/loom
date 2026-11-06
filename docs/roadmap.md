@@ -1691,7 +1691,22 @@ Two small gaps surfaced and are recorded here so they are not lost
    before the fork so a refusal leaves nothing half-done; recovery
    snapshot under `<workspace>/.loom/rewind/` before any tree
    mutation, excluded from `git clean`), and tier-0 refusals that
-   quote the recorded reason. Step 3 (before-images) remains.
+   quote the recorded reason.
+    Rollout step 3 shipped 2026-11-06: tier-2 before-images.
+    `ToolEffects.before_images` (additive serde, no schema bump)
+    records, per modified path, the captured pre-image body
+    (content-addressed in the artifact store) or an explicit absent
+    marker — captured at the tools seam in `write_file`/`edit_file`/
+    `symbols` (`pre_image.rs`; no store means no entry means restore
+    refuses, never guesses), kept live by artifact GC. `loom rewind
+    SESSION --at IDX --restore-workspace` restores first-touch-wins
+    (newest pre-image at-or-before the boundary; delete-on-absent),
+    works for dirty starts and non-git workspaces, refuses paths it
+    cannot prove and restores that would touch `.loom/rewind`, gates
+    on `commands_run` unless `--accept-unrestorable`, and snapshots
+    per-file copies + manifest before mutating. Remaining: LSP-applied
+    edits (`lsp/apply.rs` absolute-path keys) — their writes refuse at
+    restore time today, per the design doc's tier-2 caveat.
 2. **Skill telemetry** (feeds item 20.4/skills lifecycle). Per-skill
    context cost and usage frequency (Claude Code `/skill-doctor` shape)
    so low-value skills retire on evidence — the lifecycle rule the

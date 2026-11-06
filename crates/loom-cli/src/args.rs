@@ -233,9 +233,11 @@ pub struct RewindArgs {
 
     /// Restore the workspace as part of the rewind, not just the
     /// conversation. Tiered by what is provable (`docs/rewind-design.md`
-    /// §4): refuses rather than guesses. Currently only
-    /// `--to-start` is supported; per-boundary restore is tier 2.
-    #[arg(long, requires = "to_start")]
+    /// §4): refuses rather than guesses. With `--at IDX`: per-boundary
+    /// restore from the pre-images tools captured as they wrote (tier
+    /// 2). With `--to-start`: reset to the commit the session started
+    /// from (tier 1).
+    #[arg(long)]
     pub restore_workspace: bool,
 
     /// With `--restore-workspace`: reset the workspace to the commit it
@@ -244,6 +246,13 @@ pub struct RewindArgs {
     /// exists.
     #[arg(long, requires = "restore_workspace")]
     pub to_start: bool,
+
+    /// With `--restore-workspace --at`: proceed even though the dropped
+    /// region ran commands Loom cannot undo (`commands_run` effects are
+    /// surfaced, never silently absorbed). The provable file changes
+    /// still restore; the command effects do not.
+    #[arg(long, requires = "restore_workspace")]
+    pub accept_unrestorable: bool,
 }
 
 /// Arguments for `loom auth`.

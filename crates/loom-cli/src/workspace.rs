@@ -1,7 +1,7 @@
 //! Workspace snapshots for the rewind surface (`docs/rewind-design.md`
-//! §4 tier 1 and §5 safety rule).
+//! §4 tiers 1–2 and §5 safety rule).
 //!
-//! Two operations, both pure process concerns (the engine never touches
+//! Three operations, all pure process concerns (the engine never touches
 //! git directly outside worktrees; this is the CLI adapter's seam):
 //!
 //! - [`snapshot_start`] runs at `loom run` start, before the task can
@@ -10,15 +10,25 @@
 //!   recorded as such, so a later restore refuses with the real reason
 //!   instead of guessing (tier 0).
 //! - [`plan_restore`] / [`apply_restore`] turn a recorded
-//!   [`StartCheckpoint`] back into tree state. Refusal beats
-//!   best-effort: every claim the restore makes is checked first, and
-//!   the mutation writes a recovery snapshot before it resets anything
-//!   (invariant 2).
+//!   [`StartCheckpoint`] back into tree state (tier 1: `git reset` to
+//!   the clean start). Refusal beats best-effort: every claim the
+//!   restore makes is checked first, and the mutation writes a recovery
+//!   snapshot before it resets anything (invariant 2).
+//! - [`plan_boundary_restore`] / [`apply_boundary_restore`] restore to
+//!   any transcript boundary from the per-turn pre-images tools capture
+//!   at execution time (tier 2). No git is involved: every claim is a
+//!   recorded effect, so the same restore works on a dirty checkout or
+//!   a workspace with no repository at all.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use loom_core::kernel::store::StartCheckpoint;
+use loom_core::kernel::artifact::ArtifactRef;
+use loom_core::kernel::session::Session;
+use loom_core::kernel::store::{ArtifactStore, StartCheckpoint};
+use loom_core::kernel::tool::{BeforeImage, CommandEffect};
+use loom_core::kernel::transcript::Item;
 
 /// Runs `git -C <root> <args>`, returning trimmed stdout.
 ///
@@ -217,6 +227,289 @@ pub fn apply_restore(plan: &RestorePlan) -> Result<PathBuf> {
     Ok(patch)
 }
 
+/// One path's restore action at a boundary: write the captured
+/// pre-image body back, or delete the file because it did not exist
+/// there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundaryEntry {
+    /// Workspace-relative, exactly as the recording effect spelled it.
+    pub path: String,
+    /// The captured pre-image, or `None` when the path did not exist
+    /// at the boundary — the restore then deletes it.
+    pub content: Option<ArtifactRef>,
+}
+
+/// A tier-2 boundary restore that passed every provability check.
+///
+/// Built read-only from recorded effects; the mutation happens only in
+/// [`apply_boundary_restore`], after a recovery snapshot. `commands`
+/// carries every command the dropped region ran — effects Loom cannot
+/// undo — for the caller to surface and gate on (invariant 6: never
+/// silently absorbed).
+#[derive(Debug, Clone)]
+pub struct BoundaryRestorePlan {
+    /// The recorded workspace (from the checkpoint, not the cwd — a
+    /// rewind may run from anywhere).
+    pub workspace: PathBuf,
+    /// One entry per path first touched after the boundary, sorted by
+    /// path so output and snapshots are stable.
+    pub entries: Vec<BoundaryEntry>,
+    /// Commands the dropped region ran; unrestorable by construction.
+    pub commands: Vec<CommandEffect>,
+}
+
+/// The dropped region's effects reduced to what a boundary restore
+/// needs: for each path, the pre-image recorded by its FIRST touch
+/// after `boundary` (first-touch-wins), plus every command run.
+///
+/// Why the first touch is the proof: nothing in `[boundary, i)` touched
+/// the path (it is the first touch), so the bytes that tool read off
+/// disk are exactly the path's content at the boundary — including
+/// content from before the session or from out-of-band edits. A
+/// pre-image from a later item would describe a newer state; one from
+/// an earlier item, an older one. Only the first touch's image is the
+/// boundary's state.
+fn dropped_region_effects(
+    session: &Session,
+    boundary: u32,
+) -> (BTreeMap<String, Option<BeforeImage>>, Vec<CommandEffect>) {
+    let mut first_touch: BTreeMap<String, Option<BeforeImage>> = BTreeMap::new();
+    let mut commands = Vec::new();
+    for item in &session.transcript[boundary as usize..] {
+        let Item::ToolResult(result) = item else {
+            continue;
+        };
+        commands.extend(result.effects.commands_run.iter().cloned());
+        for path in result
+            .effects
+            .files_written
+            .iter()
+            .chain(&result.effects.files_deleted)
+        {
+            if first_touch.contains_key(path) {
+                continue;
+            }
+            let image = result
+                .effects
+                .before_images
+                .iter()
+                .find(|image| &image.path == path)
+                .cloned();
+            first_touch.insert(path.clone(), image);
+        }
+    }
+    (first_touch, commands)
+}
+
+/// What the boundary listing shows per row: whether a tier-2 restore of
+/// that row is provable, and how many unrestorable commands the dropped
+/// region ran. Advisory only; the plan built at fork time is the
+/// authority.
+pub struct BoundaryRestoreSummary {
+    /// Every first-touched path has a recorded pre-image.
+    pub provable: bool,
+    /// `commands_run` entries in the dropped region; unrestorable.
+    pub commands: usize,
+}
+
+/// Reduces the dropped region of `session.transcript[from..]` to the
+/// advisory summary the listing prints.
+pub fn boundary_restore_summary(session: &Session, from: u32) -> BoundaryRestoreSummary {
+    let (first_touch, commands) = dropped_region_effects(session, from);
+    let provable = first_touch.values().all(|image| image.is_some());
+    BoundaryRestoreSummary {
+        provable,
+        commands: commands.len(),
+    }
+}
+
+/// A path a restore may act on: workspace-relative, no traversal, and
+/// outside the recovery-snapshot directory itself.
+fn ensure_safe_restore_path(path: &str) -> Result<()> {
+    anyhow::ensure!(!path.is_empty(), "an effect recorded an empty path");
+    anyhow::ensure!(
+        !path.starts_with('/'),
+        "an effect recorded an absolute path: {path}"
+    );
+    anyhow::ensure!(
+        !path.split('/').any(|segment| segment == ".."),
+        "an effect recorded a path that escapes the workspace: {path}"
+    );
+    anyhow::ensure!(
+        path != ".loom/rewind" && !path.starts_with(".loom/rewind/"),
+        "restoring \"{path}\" would write inside the recovery-snapshot \
+         directory"
+    );
+    Ok(())
+}
+
+/// Checks everything a tier-2 boundary restore claims, read-only, and
+/// returns the plan. Invariant 2 — refusal beats best-effort — wants
+/// refusals BEFORE the fork runs, so the caller plans first and applies
+/// only after the fork succeeded.
+///
+/// Refuses when the recorded workspace is gone; when a first-touched
+/// path has no pre-image entry (its touch predates tier-2 capture or
+/// ran without an artifact store — a missing entry is an honest "not
+/// provable", never a guess); and when a path would escape the
+/// workspace or land inside `.loom/rewind` (a restore must never
+/// destroy its own recovery snapshots).
+pub fn plan_boundary_restore(
+    session: &Session,
+    boundary: u32,
+    workspace: &Path,
+) -> Result<BoundaryRestorePlan> {
+    let tip = session.transcript.len() as u32;
+    anyhow::ensure!(
+        boundary <= tip,
+        "boundary {boundary} is past the session tip {tip}"
+    );
+    anyhow::ensure!(
+        workspace.is_dir(),
+        "recorded workspace {} no longer exists",
+        workspace.display()
+    );
+    let (first_touch, commands) = dropped_region_effects(session, boundary);
+    let mut entries = Vec::with_capacity(first_touch.len());
+    for (path, image) in &first_touch {
+        ensure_safe_restore_path(path)?;
+        let Some(image) = image else {
+            bail!(
+                "no pre-image was captured for \"{path}\" (its first touch \
+                 after the boundary predates tier-2 capture or ran without an \
+                 artifact store); restoring it is not provable"
+            );
+        };
+        entries.push(BoundaryEntry {
+            path: path.clone(),
+            content: image.content.clone(),
+        });
+    }
+    Ok(BoundaryRestorePlan {
+        workspace: workspace.to_owned(),
+        entries,
+        commands,
+    })
+}
+
+/// Applies a tier-2 boundary restore: recovery snapshot first (§5),
+/// then one mutation per entry. The snapshot is per-file copies — not a
+/// git diff — because tier-2 claims come from recorded effects, not
+/// from git, and must recover on a dirty checkout or a workspace with
+/// no repository at all. Returns the snapshot directory.
+///
+/// Every write is proven: the pre-image body comes from the artifact
+/// store, and its sha256 must match the recorded reference — a body
+/// that drifted (foreign store, bit rot) refuses rather than writes.
+pub fn apply_boundary_restore(
+    plan: &BoundaryRestorePlan,
+    artifacts: &dyn ArtifactStore,
+) -> Result<PathBuf> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or_default();
+    // `.files` directories hold per-file copies; `.patch` files (tier 1)
+    // never collide with them.
+    let snapshot_dir = plan
+        .workspace
+        .join(".loom")
+        .join("rewind")
+        .join(format!("{timestamp}.files"));
+    std::fs::create_dir_all(&snapshot_dir)
+        .with_context(|| format!("creating {}", snapshot_dir.display()))?;
+
+    // Snapshot before any mutation: copy each plan path's current bytes
+    // (if any), then a manifest recording what existed. Enough to undo
+    // the restore by hand even though the restore itself is exact.
+    let mut manifest: Vec<serde_json::Value> = Vec::new();
+    for entry in &plan.entries {
+        let target = plan.workspace.join(&entry.path);
+        if target.is_file() {
+            let copy = snapshot_dir.join(&entry.path);
+            if let Some(parent) = copy.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            std::fs::copy(&target, &copy).with_context(|| {
+                format!("snapshotting {} to {}", target.display(), copy.display())
+            })?;
+            manifest.push(serde_json::json!({
+                "path": entry.path,
+                "existed": true,
+            }));
+        } else {
+            manifest.push(serde_json::json!({
+                "path": entry.path,
+                "existed": false,
+            }));
+        }
+    }
+    let manifest_value = serde_json::json!({
+        "kind": "boundary-restore-snapshot",
+        "created_at_unix_ms": timestamp,
+        "workspace": plan.workspace,
+        "entries": manifest,
+    });
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest_value)
+        .map_err(|error| anyhow::anyhow!("encoding the snapshot manifest: {error}"))?;
+    std::fs::write(snapshot_dir.join("manifest.json"), manifest_bytes)
+        .with_context(|| "writing the snapshot manifest")?;
+
+    for entry in &plan.entries {
+        let target = plan.workspace.join(&entry.path);
+        match &entry.content {
+            // Absent at the boundary: the entry positively claims the
+            // path did not exist. Delete what is there now — the
+            // snapshot above holds its bytes.
+            None => {
+                if target.is_dir() {
+                    bail!(
+                        "\"{}\" is a directory now but was absent at the \
+                         boundary; refusing to remove it (recovery snapshot: {})",
+                        entry.path,
+                        snapshot_dir.display()
+                    );
+                }
+                if target.exists() {
+                    std::fs::remove_file(&target).with_context(|| {
+                        format!("deleting {} (absent at the boundary)", target.display())
+                    })?;
+                }
+            }
+            Some(reference) => {
+                let stored = artifacts
+                    .get(&reference.id)
+                    .with_context(|| format!("reading the pre-image for \"{}\"", entry.path))?
+                    .with_context(|| {
+                        format!(
+                            "the pre-image body for \"{}\" is missing from the \
+                             artifact store (collected, or a foreign store); \
+                             refusing to guess",
+                            entry.path
+                        )
+                    })?;
+                anyhow::ensure!(
+                    stored.sha256 == reference.sha256,
+                    "the pre-image body for \"{}\" failed its content check \
+                     (recorded {}, stored {}); refusing to write it",
+                    entry.path,
+                    reference.sha256,
+                    stored.sha256
+                );
+                if let Some(parent) = target.parent().filter(|p| !p.exists()) {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("creating {}", parent.display()))?;
+                }
+                std::fs::write(&target, &stored.body).with_context(|| {
+                    format!("restoring {} from its pre-image", target.display())
+                })?;
+            }
+        }
+    }
+    Ok(snapshot_dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,5 +648,223 @@ mod tests {
             run_git(dir.path(), &["rev-parse", "HEAD"]).expect("head"),
             head
         );
+    }
+
+    // ---- tier 2: boundary restore from pre-images ----
+
+    use loom_core::kernel::artifact::store_artifact;
+    use loom_core::kernel::id::SessionId;
+    use loom_core::kernel::store::MemoryArtifactStore;
+    use loom_core::kernel::transcript::{ToolCallId, ToolResult, ToolStatus};
+
+    /// A session whose one tool result rewrote `src/lib.rs` (pre-image
+    /// captured) and created `notes.txt` (absent at the boundary), and
+    /// which optionally ran one command. Transcript: user, assistant,
+    /// result — boundary 2 drops the whole turn.
+    fn boundary_session(
+        artifacts: &MemoryArtifactStore,
+        with_command: bool,
+    ) -> loom_core::kernel::session::Session {
+        let lib_ref =
+            store_artifact(artifacts, "pre_image", b"old lib\n").expect("store pre-image");
+        let mut result = ToolResult::new(
+            ToolCallId::try_from("call_edit_1".to_owned()).expect("call id"),
+            ToolStatus::Success,
+            "wrote",
+            false,
+        );
+        result.effects = result
+            .effects
+            .with_file_written("src/lib.rs")
+            .with_file_written("notes.txt")
+            .with_before_image(BeforeImage::captured("src/lib.rs", lib_ref))
+            .with_before_image(BeforeImage::absent("notes.txt"));
+        if with_command {
+            result.effects = result.effects.with_command(CommandEffect::new(
+                "cargo",
+                vec!["test".to_owned(), "--all".to_owned()],
+                Some(0),
+            ));
+        }
+        let session = loom_core::kernel::session::Session::new(SessionId::new());
+        let mut session = session;
+        let user = loom_core::kernel::transcript::Item::User {
+            text: "go".to_owned(),
+        };
+        session.push_item(user).expect("push user");
+        session
+            .push_item(loom_core::kernel::transcript::Item::Assistant(
+                loom_core::kernel::transcript::AssistantMessage {
+                    content: "editing".to_owned(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    stop_reason: loom_core::kernel::model::StopReason::EndTurn,
+                },
+            ))
+            .expect("push assistant");
+        session
+            .push_item(loom_core::kernel::transcript::Item::ToolResult(result))
+            .expect("push result");
+        session
+    }
+
+    #[test]
+    fn boundary_plan_refuses_paths_it_cannot_prove_or_trust() {
+        let artifacts = MemoryArtifactStore::new();
+        let session = boundary_session(&artifacts, false);
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("dirs");
+
+        // Provable: entries in path order, absent-vs-captured preserved.
+        // Artifact ids are fresh per store write even for identical
+        // bytes — the sha is the content identity, so compare that.
+        let plan = plan_boundary_restore(&session, 2, dir.path()).expect("provable plan");
+        let lib_sha = store_artifact(&artifacts, "pre_image", b"old lib\n")
+            .expect("same content, same sha")
+            .sha256;
+        assert_eq!(
+            plan.entries
+                .iter()
+                .map(|entry| (
+                    entry.path.as_str(),
+                    entry.content.as_ref().map(|r| r.sha256.as_str())
+                ))
+                .collect::<Vec<_>>(),
+            vec![("notes.txt", None), ("src/lib.rs", Some(lib_sha.as_str())),]
+        );
+        assert!(plan.commands.is_empty());
+
+        // The summary agrees with the plan.
+        let summary = boundary_restore_summary(&session, 2);
+        assert!(summary.provable);
+        assert_eq!(summary.commands, 0);
+
+        // No pre-image on the first touch: honest refusal, no guess.
+        let mut bare = boundary_session(&artifacts, false);
+        if let loom_core::kernel::transcript::Item::ToolResult(result) =
+            bare.transcript.last_mut().expect("result item")
+        {
+            result.effects.before_images.clear();
+        }
+        let error = plan_boundary_restore(&bare, 2, dir.path()).expect_err("no pre-image");
+        assert!(
+            error.to_string().contains("no pre-image was captured"),
+            "error said: {error}"
+        );
+
+        // Escaping paths and the snapshot dir are never written.
+        let mut escape = boundary_session(&artifacts, false);
+        if let loom_core::kernel::transcript::Item::ToolResult(result) =
+            escape.transcript.last_mut().expect("result item")
+        {
+            result
+                .effects
+                .files_written
+                .push("../outside.txt".to_owned());
+        }
+        let error = plan_boundary_restore(&escape, 2, dir.path()).expect_err("escape");
+        assert!(
+            error.to_string().contains("escapes the workspace"),
+            "error said: {error}"
+        );
+
+        let mut into_snapshots = boundary_session(&artifacts, false);
+        if let loom_core::kernel::transcript::Item::ToolResult(result) =
+            into_snapshots.transcript.last_mut().expect("result item")
+        {
+            result
+                .effects
+                .files_written
+                .push(".loom/rewind/evil.txt".to_owned());
+        }
+        let error =
+            plan_boundary_restore(&into_snapshots, 2, dir.path()).expect_err("snapshot dir");
+        assert!(
+            error.to_string().contains("recovery-snapshot directory"),
+            "error said: {error}"
+        );
+
+        // A gone workspace refuses, and so does a past-tip boundary.
+        let missing = dir.path().join("missing");
+        let error = plan_boundary_restore(&session, 2, &missing).expect_err("gone workspace");
+        assert!(
+            error.to_string().contains("no longer exists"),
+            "error said: {error}"
+        );
+        let error = plan_boundary_restore(&session, 99, dir.path()).expect_err("past tip");
+        assert!(
+            error.to_string().contains("past the session tip"),
+            "error said: {error}"
+        );
+    }
+
+    #[test]
+    fn boundary_apply_restores_bytes_deletes_absent_and_snapshots() {
+        let artifacts = MemoryArtifactStore::new();
+        let session = boundary_session(&artifacts, false);
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The workspace as the dropped turn left it: lib.rs rewritten,
+        // notes.txt created. No git anywhere — tier 2 never needs it.
+        std::fs::create_dir_all(dir.path().join("src")).expect("dirs");
+        std::fs::write(dir.path().join("src/lib.rs"), "new lib\n").expect("write");
+        std::fs::write(dir.path().join("notes.txt"), "late notes\n").expect("write");
+
+        let plan = plan_boundary_restore(&session, 2, dir.path()).expect("provable plan");
+        let snapshot = apply_boundary_restore(&plan, &artifacts).expect("apply");
+
+        // Exactly the boundary state: old bytes back, created file gone.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/lib.rs")).expect("read"),
+            "old lib\n"
+        );
+        assert!(!dir.path().join("notes.txt").exists());
+
+        // The recovery snapshot holds what was discarded (§5), with a
+        // manifest naming it.
+        let discarded_lib = snapshot.join("src").join("lib.rs");
+        assert_eq!(
+            std::fs::read_to_string(&discarded_lib).expect("read"),
+            "new lib\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(snapshot.join("notes.txt")).expect("read"),
+            "late notes\n"
+        );
+        let manifest = std::fs::read_to_string(snapshot.join("manifest.json")).expect("read");
+        assert!(
+            manifest.contains("\"existed\": true") && manifest.contains("notes.txt"),
+            "manifest should record what existed: {manifest}"
+        );
+    }
+
+    #[test]
+    fn boundary_apply_refuses_a_body_that_cannot_be_proven() {
+        let artifacts = MemoryArtifactStore::new();
+        let session = boundary_session(&artifacts, false);
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("dirs");
+        std::fs::write(dir.path().join("src/lib.rs"), "new lib\n").expect("write");
+
+        // A foreign store: same transcript, but the bodies never made
+        // it there. The plan still builds (effects claim an image); the
+        // apply must refuse instead of guessing.
+        let foreign = MemoryArtifactStore::new();
+        let plan = plan_boundary_restore(&session, 2, dir.path()).expect("provable plan");
+        let error = apply_boundary_restore(&plan, &foreign).expect_err("missing body");
+        assert!(
+            error
+                .to_string()
+                .contains("missing from the artifact store"),
+            "error said: {error}"
+        );
+
+        // Commands surface on the plan for the caller to gate on; the
+        // file restore itself stays provable.
+        let with_commands = boundary_session(&artifacts, true);
+        let plan = plan_boundary_restore(&with_commands, 2, dir.path()).expect("plan");
+        assert_eq!(plan.commands.len(), 1);
+        let summary = boundary_restore_summary(&with_commands, 2);
+        assert!(summary.provable);
+        assert_eq!(summary.commands, 1);
     }
 }

@@ -427,6 +427,13 @@ impl CommandEffect {
 /// and never inferred after the fact (ADR-012, Invariant 12). Read-only
 /// tools return [`ToolEffects::none`]. Paths are workspace-relative and
 /// `/`-separated so a record is stable across platforms.
+///
+/// `before_images` carries the per-path pre-image the tool captured
+/// before mutating (roadmap gap 1, tier 2): the file's content as it was
+/// immediately before this call, content-addressed into the artifact
+/// store. It is restore metadata, not a side effect of its own — like
+/// `repairs`, it never makes `is_empty` false, and pre-image bodies are
+/// part of the GC live set so rewind can trust them.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolEffects {
@@ -442,6 +449,54 @@ pub struct ToolEffects {
     /// effects — they never invalidate caches or count as writes.
     #[serde(default)]
     pub repairs: Vec<String>,
+    /// Per-path pre-images captured before the call mutated, keyed by the
+    /// same path strings the tool recorded in `files_written` /
+    /// `files_deleted`. A path with no entry was not captured (run
+    /// predates tier 2, or no artifact store was attached) — restore
+    /// refuses for that path rather than guessing.
+    #[serde(default)]
+    pub before_images: Vec<BeforeImage>,
+}
+
+/// One file's content immediately before the call that recorded it, or
+/// that the file did not exist at all (roadmap gap 1, tier 2:
+/// `docs/rewind-design.md` §4).
+///
+/// `content` is the content-addressed pre-image body, or `None` when
+/// the file was absent before the call — restoring a boundary then
+/// deletes the file rather than writing anything. Captured by the tool
+/// at execution time from the file it is about to modify, never
+/// inferred (ADR-012); reverse-replaying serialized tool arguments
+/// would silently break on whitespace repairs and out-of-band command
+/// effects, which is why this is storage, not reconstruction.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeforeImage {
+    /// The path this pre-image describes, in the same string form the
+    /// tool recorded in `files_written` / `files_deleted`.
+    pub path: String,
+    /// The pre-image body, or `None` when the file did not exist before
+    /// the matching mutation.
+    pub content: Option<ArtifactRef>,
+}
+
+impl BeforeImage {
+    /// Records a path that did not exist before the call (restoring
+    /// deletes it).
+    pub fn absent(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            content: None,
+        }
+    }
+
+    /// Records the pre-image body captured before the call mutated.
+    pub fn captured(path: impl Into<String>, content: ArtifactRef) -> Self {
+        Self {
+            path: path.into(),
+            content: Some(content),
+        }
+    }
 }
 
 impl ToolEffects {
@@ -483,6 +538,14 @@ impl ToolEffects {
     #[must_use]
     pub fn with_repair(mut self, note: impl Into<String>) -> Self {
         self.repairs.push(note.into());
+        self
+    }
+
+    /// Records one pre-image captured before this call mutated a path
+    /// (tier-2 rewind metadata, not a side effect itself).
+    #[must_use]
+    pub fn with_before_image(mut self, image: BeforeImage) -> Self {
+        self.before_images.push(image);
         self
     }
 }
@@ -937,6 +1000,8 @@ impl Tool for TodoTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifact::ArtifactRef;
+    use crate::id::ArtifactId;
     use serde_json::json;
 
     /// Minimal read-only tool that echoes its input back as JSON —
@@ -955,6 +1020,49 @@ mod tests {
                 },
             }
         }
+    }
+
+    #[test]
+    fn before_images_round_trip_and_default_for_old_transcripts() {
+        // Legacy effects JSON (recorded before tier-2 capture) has no
+        // before_images key; serde's default keeps those transcripts
+        // loadable rather than versioning the event schema.
+        let legacy = json!({
+            "files_written": ["a.rs"],
+            "files_deleted": [],
+            "commands_run": [],
+            "repairs": [],
+        });
+        let effects: ToolEffects = serde_json::from_value(legacy).expect("legacy effects parse");
+        assert!(effects.before_images.is_empty());
+
+        // A captured image and an absent-file image both survive a
+        // round trip verbatim — the absent one is a positive claim
+        // ("did not exist"), not a missing entry.
+        let reference = ArtifactRef::new(ArtifactId::new(), "pre_image", 12, "deadbeefdeadbeef");
+        let effects = ToolEffects::none()
+            .with_file_written("a.rs")
+            .with_before_image(BeforeImage::captured("a.rs", reference.clone()))
+            .with_before_image(BeforeImage::absent("b.txt"));
+        let round: ToolEffects =
+            serde_json::from_value(serde_json::to_value(&effects).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(round.before_images, effects.before_images);
+        assert_eq!(
+            round.before_images[1],
+            BeforeImage {
+                path: "b.txt".to_owned(),
+                content: None,
+            }
+        );
+
+        // Pre-images are restore metadata, not side effects: they never
+        // make is_empty false (mirrors `repairs`).
+        assert!(
+            ToolEffects::none()
+                .with_before_image(BeforeImage::absent("b.txt"))
+                .is_empty()
+        );
     }
 
     impl Tool for EchoTool {

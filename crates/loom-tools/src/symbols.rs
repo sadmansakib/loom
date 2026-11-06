@@ -25,7 +25,7 @@ use crate::budget::ToolBudgets;
 use crate::confinement::{resolve_within, workspace_relative};
 use futures::future::BoxFuture;
 use loom_kernel::tool::{
-    PathTouch, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec,
+    BeforeImage, PathTouch, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -652,11 +652,13 @@ impl Tool for ReplaceSymbolTool {
             let display = input.path.clone();
             let name_path = input.name_path.clone();
             let body = input.body;
-            let (relative, new_text, replaced, matches) = tokio::task::spawn_blocking(move || {
-                replace_symbol(&root, &display, &name_path, &body)
-            })
-            .await
-            .map_err(|err| ToolError::Execution(format!("replace task failed: {err}")))??;
+            let artifacts = ctx.artifacts.clone();
+            let (relative, new_text, replaced, matches, before_images) =
+                tokio::task::spawn_blocking(move || {
+                    replace_symbol(&root, &display, &name_path, &body, artifacts)
+                })
+                .await
+                .map_err(|err| ToolError::Execution(format!("replace task failed: {err}")))??;
 
             let content = format!(
                 "replaced {} in {relative} ({} byte body); previous \
@@ -665,22 +667,26 @@ impl Tool for ReplaceSymbolTool {
                 new_text.len(),
                 replaced_head(&replaced, self.budgets.replace_symbol_head_bytes),
             );
-            Ok(ToolOutput::new(content)
-                .with_effects(ToolEffects::none().with_file_written(relative)))
+            let mut effects = ToolEffects::none().with_file_written(relative);
+            for image in before_images {
+                effects = effects.with_before_image(image);
+            }
+            Ok(ToolOutput::new(content).with_effects(effects))
         })
     }
 }
 
 /// The whole replace pipeline, minus the write: resolves, parses,
 /// matches, splices, and guards. Returns the workspace-relative path,
-/// the candidate text, the replaced original text, and the matched
-/// symbol's display.
+/// the candidate text, the replaced original text, the matched
+/// symbol's display, and the tier-2 pre-image of the touched file.
 fn replace_symbol(
     root: &Path,
     display_path: &str,
     name_path: &str,
     body: &str,
-) -> Result<(String, String, String, Symbol), ToolError> {
+    artifacts: Option<std::sync::Arc<dyn loom_kernel::store::ArtifactStore>>,
+) -> Result<(String, String, String, Symbol, Vec<BeforeImage>), ToolError> {
     let path = resolve_within(root, display_path)?;
     let relative = workspace_relative(root, &path);
     let lang = SymbolLanguage::for_path(&path).ok_or_else(|| {
@@ -748,11 +754,27 @@ fn replace_symbol(
         ))
     })?;
 
+    // Tier-2 rewind capture (roadmap gap 1): the loaded original is
+    // exactly the pre-image of the touched file.
+    let before_images = crate::pre_image::capture_before_image(
+        artifacts.as_deref(),
+        &relative,
+        Some(source.as_bytes()),
+    )
+    .into_iter()
+    .collect();
+
     // Single atomic write (Serena's two-write version corrupted files
     // when the process died between delete and insert).
     std::fs::write(&path, &new_text)
         .map_err(|err| ToolError::Execution(format!("cannot write \"{relative}\": {err}")))?;
-    Ok((relative, new_text, replaced, symbol_from_flat(matched)))
+    Ok((
+        relative,
+        new_text,
+        replaced,
+        symbol_from_flat(matched),
+        before_images,
+    ))
 }
 
 /// Rebuilds a minimal `Symbol` for the result display.

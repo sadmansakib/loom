@@ -6,7 +6,7 @@
 
 use futures::future::BoxFuture;
 use loom_kernel::tool::{
-    PathTouch, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec,
+    BeforeImage, PathTouch, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -74,23 +74,57 @@ impl Tool for WriteFileTool {
             let written = content.len();
             let moved_path = path.clone();
             let moved_display = display.clone();
-            tokio::task::spawn_blocking(move || -> Result<(), ToolError> {
-                // Syntax guard (roadmap item 5 phase B): refuse the
-                // candidate before anything reaches the disk. A file the
-                // grammar already cannot read (no file yet, or a legacy
-                // buffer that fails to parse) must not block the write:
-                // the guard only refuses a buffer it is making worse.
-                let previous = std::fs::read_to_string(&moved_path).unwrap_or_default();
-                crate::syntax::guard_against(&previous, &content, &moved_path).map_err(|err| {
-                    ToolError::InvalidInput(format!("refusing to write \"{moved_display}\": {err}"))
-                })?;
-                write_file(&moved_path, content.as_bytes()).map_err(|err| {
-                    ToolError::Execution(format!("cannot write \"{moved_display}\": {err}"))
+            // Tier-2 rewind capture rides the blocking write below: the
+            // pre-image is read from the file the tool is about to
+            // modify, before the write, and returned to the effects.
+            let artifacts = ctx.artifacts.clone();
+            let captured_relative = relative.clone();
+            let before_images =
+                tokio::task::spawn_blocking(move || -> Result<Vec<BeforeImage>, ToolError> {
+                    // Syntax guard (roadmap item 5 phase B): refuse the
+                    // candidate before anything reaches the disk. A file the
+                    // grammar already cannot read (no file yet, or a legacy
+                    // buffer that fails to parse) must not block the write:
+                    // the guard only refuses a buffer it is making worse.
+                    // One read feeds both the guard and the tier-2
+                    // pre-image: raw bytes (UTF-8 loss degrades to the same
+                    // empty previous the guard already tolerated).
+                    let bytes = match std::fs::read(&moved_path) {
+                        Ok(bytes) => Some(bytes),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => {
+                            return Err(ToolError::Execution(format!(
+                                "cannot read \"{moved_display}\": {error}"
+                            )));
+                        }
+                    };
+                    let previous =
+                        std::str::from_utf8(bytes.as_deref().unwrap_or(b"")).unwrap_or_default();
+                    crate::syntax::guard_against(previous, &content, &moved_path).map_err(
+                        |err| {
+                            ToolError::InvalidInput(format!(
+                                "refusing to write \"{moved_display}\": {err}"
+                            ))
+                        },
+                    )?;
+                    let before_images = crate::pre_image::capture_before_image(
+                        artifacts.as_deref(),
+                        &captured_relative,
+                        bytes.as_deref(),
+                    )
+                    .into_iter()
+                    .collect();
+                    write_file(&moved_path, content.as_bytes()).map_err(|err| {
+                        ToolError::Execution(format!("cannot write \"{moved_display}\": {err}"))
+                    })?;
+                    Ok(before_images)
                 })
-            })
-            .await
-            .map_err(|err| ToolError::Execution(format!("write task failed: {err}")))??;
+                .await
+                .map_err(|err| ToolError::Execution(format!("write task failed: {err}")))??;
             let mut effects = ToolEffects::none().with_file_written(relative.clone());
+            for image in before_images {
+                effects = effects.with_before_image(image);
+            }
             let mut content = format!("wrote {written} bytes to {display}");
             let mut truncated = false;
             // Trace-level observations from the fused verify (e.g. the

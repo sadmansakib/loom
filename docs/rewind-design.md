@@ -85,35 +85,56 @@ touched) computed from the transcript alone. Non-interactive:
   meta). `--restore-workspace --to-start` then restores that snapshot.
   Boundaries mid-session restore conversation only; the picker says so
   at the affected rows.
-- **Tier 2 — per-turn before-images (engine work, named seam).** The
-  tools layer, which already records `files_written`/`files_deleted`
-  at execution time (ADR-012 invariant: recorded by the tool, never
-  inferred), additionally captures the pre-image content of each path
-  it is about to modify (or "absent"), content-addressed into the
-  existing artifact store (sha256 identity, dedupe for free). Rewind
-  to boundary `b` then restores, for every path first touched after
-  `b`, its newest pre-image at-or-before `b` — or deletes it if it did
-  not exist. `commands_run` effects are surfaced as unrestorable and
-  gate the restore unless `--accept-unrestorable` is passed. This is
-  the Claude Code file-history shape riding seams that already exist;
-  it is an iteration of its own, not a redesign.
+- **Tier 2 — per-turn before-images (engine work, named seam).
+  Shipped 2026-11-06.** The tools layer, which already records
+  `files_written`/`files_deleted` at execution time (ADR-012
+  invariant: recorded by the tool, never inferred), additionally
+  captures the pre-image content of each path it is about to modify
+  (or "absent"), content-addressed into the existing artifact store
+  (sha256 identity, dedupe for free). Rewind to boundary `b` then
+  restores, for every path first touched after `b`, its newest
+  pre-image at-or-before `b` — or deletes it if it did not exist.
+  `commands_run` effects are surfaced as unrestorable and gate the
+  restore unless `--accept-unrestorable` is passed. This is the
+  Claude Code file-history shape riding seams that already exist; it
+  is an iteration of its own, not a redesign.
+  - Captured today at the tools seam: `write_file`, `edit_file`,
+    `symbols` replace. Not yet: LSP-applied edits (`lsp/apply.rs`
+    records `files_written` with absolute-path keys; pre-images there
+    wait on a key-resolution pass), and file deletions performed via
+    LSP. A dropped region touching an uncaptured write refuses at
+    that path ("no pre-image was captured") rather than guessing.
+  - `run` records no pre-images by design: command effects are
+    surfaced through the `commands_run` gate instead.
 
 ### 5. Safety rule for every tree mutation
 
-Before any restore touches the workspace, write a recovery snapshot:
-`git add -A && git diff --cached` into
-`<workspace>/.loom/rewind/<timestamp>.patch` (kept, not garbage
-collected with run artifacts). Refusal beats best-effort: the restore
-either has proof for every affected path or it does not run.
+Before any restore touches the workspace, write a recovery snapshot
+(kept, not garbage collected with run artifacts). Refusal beats
+best-effort: the restore either has proof for every affected path or
+it does not run.
+
+- Tier 1 (git reset): `git add -A && git diff --cached` into
+  `<workspace>/.loom/rewind/<timestamp>.patch`.
+- Tier 2 (per-path): copy every affected file into
+  `<workspace>/.loom/rewind/<timestamp>.files/` with a
+  `manifest.json` naming what existed — git is not required, so the
+  snapshot cannot lean on it. A restore that would itself touch
+  `.loom/rewind` is refused.
 
 ### 6. CLI surface
 
 - `loom rewind <SESSION>` — picker; prints the forked session id and
-  the `loom run --session <new> TASK…` continuation line.
+  the `loom run --session <new> TASK…` continuation line. Each
+  boundary row carries a RESTORE column (`yes` / `no` / `cmds(n)`)
+  computed from recorded effects.
 - `loom rewind <SESSION> --at <index>` — non-interactive fork.
-- `--restore-workspace` / `--to-start` — tiered as above; default is
-  conversation-only, so the common "retry from turn N" never touches
-  the tree.
+- `--restore-workspace` — tiered: with `--to-start` it is tier 1
+  (git start checkpoint); with `--at IDX` it is tier 2 (per-boundary
+  pre-images, dirty starts and non-git workspaces included).
+  `--accept-unrestorable` proceeds past the `commands_run` gate.
+  Default is conversation-only, so the common "retry from turn N"
+  never touches the tree.
 - Item 22 frontends call the same `fork` + restore helpers through the
   facade; `AwaitingInput` marks the idle points where a rewind needs no
   lease guard.
@@ -139,8 +160,10 @@ either has proof for every affected path or it does not run.
 - CLI tests: picker rows from a seeded transcript, `--at` fork end to
   end (`loom sessions` shows the marker), tier-0 refusal text,
   recovery snapshot written before a tier-1 restore.
-- Tier 2 (later): pre-image capture round trip, first-touch-wins
-  restore, delete-on-absent, `commands_run` gating.
+- Tier 2 (shipped): pre-image capture round trip (kernel serde
+  back-compat, tools capture with/without store), first-touch-wins
+  restore, delete-on-absent, `commands_run` gating, GC keeps
+  pre-image bodies, per-file recovery snapshot with manifest.
 
 ## Rollout order
 
@@ -148,5 +171,7 @@ either has proof for every affected path or it does not run.
    store + CLI). Shipped 2026-11-06.
 2. Tier-1 start checkpoint recording + `--restore-workspace
    --to-start`. Shipped 2026-11-06.
-3. Tier-2 before-images at the tools seam (own iteration, updates this
-   note's tier table).
+3. Tier-2 before-images at the tools seam (own iteration, updates
+   this note's tier table). Shipped 2026-11-06 for `write_file`,
+   `edit_file`, and `symbols`; LSP-applied edits remain on the
+   tier-2 caveat list above.

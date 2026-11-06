@@ -106,6 +106,64 @@ fn loom(db: &std::path::Path, args: &[&str]) -> (bool, String, String) {
     )
 }
 
+/// Seeds a session whose edit turn recorded tier-2 pre-images: `lib.rs`
+/// rewritten (its old bytes content-addressed into the store) and
+/// `notes.txt` created (absent at the boundary). Optionally also ran
+/// one command. Same shape as [`seeded_store`]: tip 5, boundaries
+/// 0/1/3.
+fn seeded_store_with_pre_images(db: &std::path::Path, with_command: bool) -> SessionId {
+    use loom_core::kernel::artifact::store_artifact;
+    use loom_core::kernel::tool::{BeforeImage, CommandEffect};
+
+    let store = SqliteStore::open(db).unwrap();
+    let id = SessionId::new();
+    let mut session = Session::new(id);
+    store.ensure_session(&id).unwrap();
+    let user = Item::User {
+        text: "fix the bug".to_owned(),
+    };
+    let index = session.push_item(user.clone()).unwrap();
+    store.append_item(&id, index, &user).unwrap();
+
+    commit(
+        &store,
+        &id,
+        &mut session,
+        turn(
+            "reading",
+            vec![call("a", "read_file", json!({"path": "src/lib.rs"}))],
+        ),
+        vec![result("a", "fn main() {}")],
+    );
+    let old = store_artifact(&store, "pre_image", b"fn main() { old }\n")
+        .expect("store the pre-image body");
+    let mut edit = result("b", "applied");
+    edit.effects = edit
+        .effects
+        .with_file_written("src/lib.rs")
+        .with_file_written("notes.txt")
+        .with_before_image(BeforeImage::captured("src/lib.rs", old))
+        .with_before_image(BeforeImage::absent("notes.txt"));
+    if with_command {
+        edit.effects = edit.effects.with_command(CommandEffect::new(
+            "cargo",
+            vec!["test".to_owned()],
+            Some(0),
+        ));
+    }
+    commit(
+        &store,
+        &id,
+        &mut session,
+        turn(
+            "editing",
+            vec![call("b", "edit_file", json!({"path": "src/lib.rs"}))],
+        ),
+        vec![edit],
+    );
+    id
+}
+
 #[test]
 fn rewind_lists_boundaries_with_effects() {
     let dir = tempfile::tempdir().unwrap();
@@ -388,7 +446,9 @@ fn rewind_refuses_workspace_restore_without_provable_state() {
         "wrong refusal: {stderr}"
     );
 
-    // The flags are a pair: neither works alone.
+    // Tier 2 pairing, on a session recorded before pre-images: the
+    // file touch exists but its proof does not, so the restore refuses
+    // rather than guessing — and refuses before the fork.
     let (ok, _stdout, stderr) = loom(
         &db,
         &[
@@ -399,9 +459,185 @@ fn rewind_refuses_workspace_restore_without_provable_state() {
             "--restore-workspace",
         ],
     );
-    assert!(!ok, "--restore-workspace alone must fail");
+    assert!(!ok, "an unprovable boundary restore must fail");
     assert!(
-        stderr.contains("--to-start"),
+        stderr.contains("no pre-image was captured"),
+        "wrong refusal: {stderr}"
+    );
+
+    // The flag without a boundary (or --to-start) says how to pick one
+    // instead of being silently ignored by the listing.
+    let (ok, _stdout, stderr) = loom(&db, &["rewind", &id.to_string(), "--restore-workspace"]);
+    assert!(
+        !ok,
+        "--restore-workspace without --at or --to-start must fail"
+    );
+    assert!(
+        stderr.contains("--at IDX"),
         "pairing hint missing: {stderr}"
     );
+}
+
+#[test]
+fn rewind_restores_the_workspace_to_a_boundary_from_pre_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("loom.db");
+    let id = seeded_store_with_pre_images(&db, false);
+    // The workspace exactly as the edit turn left it — deliberately
+    // NOT a git repo: tier-2 claims come from recorded effects, so a
+    // dirty or repository-less workspace restores like any other.
+    let work = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(work.path().join("src")).unwrap();
+    std::fs::write(work.path().join("src/lib.rs"), "fn main() { new }\n").unwrap();
+    std::fs::write(work.path().join("notes.txt"), "late notes\n").unwrap();
+
+    // A dirty start has no tier-1 head; the recorded workspace is all
+    // tier 2 needs.
+    let store = SqliteStore::open(&db).unwrap();
+    store
+        .record_start_checkpoint(
+            &id,
+            &loom_core::kernel::store::StartCheckpoint {
+                workspace: std::fs::canonicalize(work.path()).unwrap(),
+                head: None,
+                reason: Some("workspace was dirty at session start".to_owned()),
+            },
+        )
+        .unwrap();
+
+    // The listing says the boundary is provably restorable before the
+    // user commits to anything.
+    let (ok, stdout, stderr) = loom(&db, &["rewind", &id.to_string()]);
+    assert!(ok, "listing failed: {stderr}");
+    assert!(stdout.contains("RESTORE"), "restore column: {stdout}");
+    assert!(stdout.contains("yes"), "row should be provable: {stdout}");
+
+    let (ok, stdout, stderr) = loom(
+        &db,
+        &[
+            "rewind",
+            &id.to_string(),
+            "--at",
+            "3",
+            "--restore-workspace",
+        ],
+    );
+    assert!(ok, "boundary restore failed: {stderr}");
+    assert!(
+        stdout.contains("restored workspace") && stdout.contains("boundary 3"),
+        "restore summary missing: {stdout}"
+    );
+
+    // Exactly the boundary state: old bytes back, the later-created
+    // file gone.
+    assert_eq!(
+        std::fs::read_to_string(work.path().join("src/lib.rs")).unwrap(),
+        "fn main() { old }\n"
+    );
+    assert!(!work.path().join("notes.txt").exists());
+
+    // The recovery snapshot kept what the restore discarded (§5),
+    // including the file that no longer exists.
+    let snapshots: Vec<_> = std::fs::read_dir(work.path().join(".loom").join("rewind"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".files"))
+        })
+        .collect();
+    assert_eq!(snapshots.len(), 1, "one recovery snapshot dir");
+    assert_eq!(
+        std::fs::read_to_string(snapshots[0].join("src").join("lib.rs")).unwrap(),
+        "fn main() { new }\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(snapshots[0].join("notes.txt")).unwrap(),
+        "late notes\n"
+    );
+    let manifest = std::fs::read_to_string(snapshots[0].join("manifest.json")).unwrap();
+    assert!(
+        manifest.contains("notes.txt") && manifest.contains("src/lib.rs"),
+        "manifest names both paths: {manifest}"
+    );
+}
+
+#[test]
+fn rewind_gates_boundary_restore_on_unrestorable_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("loom.db");
+    let id = seeded_store_with_pre_images(&db, true);
+    let work = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(work.path().join("src")).unwrap();
+    std::fs::write(work.path().join("src/lib.rs"), "fn main() { new }\n").unwrap();
+    std::fs::write(work.path().join("notes.txt"), "late notes\n").unwrap();
+
+    let store = SqliteStore::open(&db).unwrap();
+    store
+        .record_start_checkpoint(
+            &id,
+            &loom_core::kernel::store::StartCheckpoint {
+                workspace: std::fs::canonicalize(work.path()).unwrap(),
+                head: None,
+                reason: Some("workspace was dirty at session start".to_owned()),
+            },
+        )
+        .unwrap();
+
+    // The listing names the commands so the gate is not a surprise.
+    let (ok, stdout, stderr) = loom(&db, &["rewind", &id.to_string()]);
+    assert!(ok, "listing failed: {stderr}");
+    assert!(
+        stdout.contains("cmds(1)"),
+        "commands should mark the row: {stdout}"
+    );
+
+    // Without the flag: refused, naming the command — and before the
+    // fork, so nothing half-done remains (tree and session count).
+    let (ok, _stdout, stderr) = loom(
+        &db,
+        &[
+            "rewind",
+            &id.to_string(),
+            "--at",
+            "3",
+            "--restore-workspace",
+        ],
+    );
+    assert!(!ok, "unrestorable commands must gate the restore");
+    assert!(
+        stderr.contains("cargo test") && stderr.contains("--accept-unrestorable"),
+        "wrong refusal: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(work.path().join("src/lib.rs")).unwrap(),
+        "fn main() { new }\n"
+    );
+    assert!(work.path().join("notes.txt").exists());
+    assert_eq!(store.session_ids().unwrap().len(), 1, "no fork happened");
+
+    // With the flag: the provable file changes restore and the
+    // commands are surfaced as accepted, not silently absorbed.
+    let (ok, stdout, stderr) = loom(
+        &db,
+        &[
+            "rewind",
+            &id.to_string(),
+            "--at",
+            "3",
+            "--restore-workspace",
+            "--accept-unrestorable",
+        ],
+    );
+    assert!(ok, "accepted restore failed: {stderr}");
+    assert!(
+        stdout.contains("accepted as unrestorable: cargo test"),
+        "acceptance line missing: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(work.path().join("src/lib.rs")).unwrap(),
+        "fn main() { old }\n"
+    );
+    assert!(!work.path().join("notes.txt").exists());
 }

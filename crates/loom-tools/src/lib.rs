@@ -21,6 +21,7 @@ mod list_dir;
 pub mod lsp;
 pub mod mcp;
 pub mod policy;
+mod pre_image;
 pub mod read_file;
 mod reduce;
 mod run_command;

@@ -97,6 +97,17 @@ pub fn referenced_artifacts(
             if let Some(reference) = &result.artifact {
                 referenced.insert(reference.id);
             }
+            // Tier-2 pre-image bodies (rewind gap 1) are restore
+            // promises: the transcript claims "this was the path's
+            // content immediately before that call", and a rewind may
+            // act on that claim at any later date. They ride the same
+            // live set as tool-result spills so the GC can never break
+            // a future restore.
+            for image in &result.effects.before_images {
+                if let Some(reference) = &image.content {
+                    referenced.insert(reference.id);
+                }
+            }
         }
     }
     Ok(referenced)
@@ -164,6 +175,7 @@ mod tests {
     use crate::model::StopReason;
     use crate::session::Session;
     use crate::store::{MemoryArtifactStore, MemorySessionStore, StoredArtifact};
+    use crate::tool::BeforeImage;
     use crate::transcript::{
         AssistantMessage, ToolArguments, ToolCall, ToolCallId, ToolResult, ToolStatus,
     };
@@ -188,6 +200,22 @@ mod tests {
     fn referencing_session(reference: ArtifactRef) -> MemorySessionStore {
         let mut result = ToolResult::new(call_id("call_1"), ToolStatus::Success, "reduced", false);
         result.artifact = Some(reference);
+        session_with(result)
+    }
+
+    /// A session whose only artifact reference is a tier-2 pre-image
+    /// riding the tool effects (no result spill at all).
+    fn pre_image_session(reference: ArtifactRef) -> MemorySessionStore {
+        let mut result = ToolResult::new(call_id("call_1"), ToolStatus::Success, "wrote", false);
+        result.effects = result.effects.with_file_written("src/lib.rs");
+        result
+            .effects
+            .before_images
+            .push(BeforeImage::captured("src/lib.rs", reference));
+        session_with(result)
+    }
+
+    fn session_with(result: ToolResult) -> MemorySessionStore {
         let session = Session {
             id: SessionId::new(),
             transcript: vec![
@@ -346,6 +374,27 @@ mod tests {
             max_total_bytes: 1,
         };
         let report = collect(&artifacts, &referenced, now_millis(), bounds).unwrap();
+        assert!(report.deleted.is_empty());
+        assert!(artifacts.get(&id).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_pre_image_body_is_live_and_survives_any_bound() {
+        // A pre-image is a restore promise recorded in effects, not a
+        // result spill; the GC must honor it however old or large.
+        let artifacts = MemoryArtifactStore::new();
+        let id = ArtifactId::new();
+        put(&artifacts, id, &[5; 256]);
+        let sessions = pre_image_session(reference_to(id, 256));
+        let referenced = referenced_artifacts(&sessions).unwrap();
+        assert!(referenced.contains(&id), "effects must count as live");
+
+        let bounds = GcBounds {
+            max_age_millis: 1,
+            max_total_bytes: 1,
+        };
+        let now = now_millis() + bounds.max_age_millis + 1;
+        let report = collect(&artifacts, &referenced, now, bounds).unwrap();
         assert!(report.deleted.is_empty());
         assert!(artifacts.get(&id).unwrap().is_some());
     }

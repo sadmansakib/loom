@@ -8,14 +8,17 @@
 //! fork is pure conversation state: task records, todos, and events
 //! belong to the run that produced them.
 //!
-//! Code restore is tiered by what is provable (§4). Step 2 ships tier
-//! 1: `--restore-workspace --to-start` resets the tree to the commit
+//! Code restore is tiered by what is provable (§4). Tier 1
+//! (`--restore-workspace --to-start`) resets the tree to the commit
 //! recorded when the run started, which is exact only because the
-//! checkpoint was taken on a clean checkout before the task ran. Every
-//! other tree state — dirty start, non-git workspace, mid-session
-//! boundary — is refused with its reason (tier 0); per-boundary
-//! before-images are tier 2. Any restore writes a recovery snapshot
-//! first and never garbage-collects it (§5).
+//! checkpoint was taken on a clean checkout before the task ran. Tier
+//! 2 (`--restore-workspace --at IDX`) restores to any boundary from
+//! the pre-images tools captured as they wrote — git not required,
+//! dirty starts included. Anything neither can prove is refused with
+//! its reason (tier 0). Every restore writes a recovery snapshot
+//! first and never garbage-collects it (§5). `commands_run` effects
+//! are never silently absorbed: they surface and gate the restore
+//! behind `--accept-unrestorable`.
 //!
 //! Without `--at`, the command lists the boundaries where a fork is
 //! conversation-valid — before a user message or an assistant turn,
@@ -63,6 +66,16 @@ pub fn run(args: RewindArgs) -> anyhow::Result<ExitCode> {
         .start_checkpoint(&id)
         .context("reading the start checkpoint")?;
 
+    // A boundary restore needs a boundary: catch the flag before the
+    // listing path below returns, so --restore-workspace is never
+    // accepted and silently ignored.
+    if args.restore_workspace && !args.to_start && args.at.is_none() {
+        anyhow::bail!(
+            "--restore-workspace restores to a boundary: pass --at IDX, or \
+             use --to-start for the session-start reset"
+        );
+    }
+
     let Some(at) = args.at else {
         print_boundaries(&id, tip, &boundaries, &session, checkpoint.as_ref());
         return Ok(ExitCode::SUCCESS);
@@ -82,16 +95,50 @@ pub fn run(args: RewindArgs) -> anyhow::Result<ExitCode> {
     // leaves nothing half-done. The workspace comes from the
     // checkpoint, not the cwd — a rewind may run from anywhere.
     let restore = if args.restore_workspace {
-        let checkpoint = checkpoint.as_ref().with_context(|| {
-            format!(
-                "--restore-workspace refused: session {id} has no start \
-                 checkpoint (it predates the feature or was run with \
-                 --no-save); the conversation fork alone is available"
-            )
-        })?;
-        Some(crate::workspace::plan_restore(checkpoint)?)
+        if args.to_start {
+            let checkpoint = checkpoint.as_ref().with_context(|| {
+                format!(
+                    "--restore-workspace refused: session {id} has no start \
+                     checkpoint (it predates the feature or was run with \
+                     --no-save); the conversation fork alone is available"
+                )
+            })?;
+            Restore::Start(crate::workspace::plan_restore(checkpoint)?)
+        } else {
+            // Tier 2: restore to the fork boundary itself. Only the
+            // checkpoint's workspace location is needed — the claims
+            // come from recorded effects, so a dirty or non-git
+            // workspace restores exactly like a clean one.
+            let at = args.at.with_context(|| {
+                "--restore-workspace restores to a boundary: pass --at IDX \
+                 from this listing (or --to-start for the session-start \
+                 reset)"
+            })?;
+            let checkpoint = checkpoint.as_ref().with_context(|| {
+                format!(
+                    "--restore-workspace refused: session {id} has no start \
+                     checkpoint (it predates the feature or was run with \
+                     --no-save), so the workspace it ran in is unknown; the \
+                     conversation fork alone is available"
+                )
+            })?;
+            let plan =
+                crate::workspace::plan_boundary_restore(&session, at, &checkpoint.workspace)?;
+            // Commands are effects Loom cannot undo; they gate rather
+            // than silently absorb (invariant 6).
+            if !plan.commands.is_empty() && !args.accept_unrestorable {
+                anyhow::bail!(
+                    "the dropped region ran {} command(s) Loom cannot undo \
+                     ({}); pass --accept-unrestorable to restore the provable \
+                     file changes anyway",
+                    plan.commands.len(),
+                    summarize_commands(&plan.commands)
+                );
+            }
+            Restore::Boundary(plan)
+        }
     } else {
-        None
+        Restore::None
     };
     let new_id = SessionId::new();
     store
@@ -101,17 +148,74 @@ pub fn run(args: RewindArgs) -> anyhow::Result<ExitCode> {
         "forked {new_id} from {id}: kept [0, {at}), dropped {} item(s)",
         tip - at
     );
-    if let Some(plan) = &restore {
-        let patch = crate::workspace::apply_restore(plan)?;
-        println!(
-            "restored workspace {} to start {} (recovery snapshot: {})",
-            plan.workspace.display(),
-            plan.head.get(..8).unwrap_or(&plan.head),
-            patch.display()
-        );
+    match &restore {
+        Restore::None => {}
+        Restore::Start(plan) => {
+            let patch = crate::workspace::apply_restore(plan)?;
+            println!(
+                "restored workspace {} to start {} (recovery snapshot: {})",
+                plan.workspace.display(),
+                plan.head.get(..8).unwrap_or(&plan.head),
+                patch.display()
+            );
+        }
+        Restore::Boundary(plan) => {
+            let snapshot = crate::workspace::apply_boundary_restore(plan, &store)?;
+            let restored = plan
+                .entries
+                .iter()
+                .filter(|entry| entry.content.is_some())
+                .count();
+            let deleted = plan.entries.len() - restored;
+            println!(
+                "restored workspace {} to boundary {at}: {restored} file(s) \
+                 rewritten, {deleted} deleted (recovery snapshot: {})",
+                plan.workspace.display(),
+                snapshot.display()
+            );
+            if !plan.commands.is_empty() {
+                // Accepted, not absorbed: the user sees what stays.
+                println!(
+                    "accepted as unrestorable: {}",
+                    summarize_commands(&plan.commands)
+                );
+            }
+        }
     }
     println!("resume with: loom run --session {new_id} TASK");
     Ok(ExitCode::SUCCESS)
+}
+
+/// A workspace restore this rewind will apply after the fork.
+enum Restore {
+    None,
+    /// Tier 1: git reset to the session's start commit.
+    Start(crate::workspace::RestorePlan),
+    /// Tier 2: per-path pre-images at the fork boundary.
+    Boundary(crate::workspace::BoundaryRestorePlan),
+}
+
+/// Up to three commands, `program args` joined, for refusal and
+/// acceptance lines. Bounded like `files_dropped` keeps its column.
+fn summarize_commands(commands: &[loom_core::kernel::tool::CommandEffect]) -> String {
+    fn render(command: &loom_core::kernel::tool::CommandEffect) -> String {
+        if command.args.is_empty() {
+            command.program.clone()
+        } else {
+            format!("{} {}", command.program, command.args.join(" "))
+        }
+    }
+    match commands.len() {
+        0 => "none".to_owned(),
+        n if n <= 3 => {
+            let parts: Vec<String> = commands.iter().map(render).collect();
+            parts.join("; ")
+        }
+        n => {
+            let parts: Vec<String> = commands.iter().take(3).map(render).collect();
+            format!("{} (+{} more)", parts.join("; "), n - 3)
+        }
+    }
 }
 
 /// Walks the transcript, collecting the indices a fork may cut at: every
@@ -202,34 +306,54 @@ fn print_boundaries(
         None => "unavailable: no start checkpoint recorded".to_owned(),
         Some(checkpoint) => match &checkpoint.head {
             Some(head) => format!(
-                "to-start {} ({})",
+                "to-start {} ({}); to a boundary: --at IDX (pre-images)",
                 head.get(..8).unwrap_or(head),
                 checkpoint.workspace.display()
             ),
             None => format!(
-                "unavailable: {}",
+                "to-start unavailable ({}); to a boundary: --at IDX \
+                 (pre-images, git not required)",
                 checkpoint.reason.as_deref().unwrap_or("no checkpoint head")
             ),
         },
     };
     println!("workspace restore: {restore}");
     println!(
-        "{:<5} {:<7} {:<34} {:>5}  FILES DROPPED",
-        "IDX", "KIND", "HEAD", "DROPS"
+        "{:<5} {:<7} {:<34} {:>5}  {:<8}  FILES DROPPED",
+        "IDX", "KIND", "HEAD", "DROPS", "RESTORE"
     );
     for row in rows {
         println!(
-            "{:<5} {:<7} {:<34} {:>5}  {}",
+            "{:<5} {:<7} {:<34} {:>5}  {:<8}  {}",
             row.index,
             row.kind,
             row.head,
             tip - row.index,
+            restore_note(session, row.index),
             files_dropped(session, row.index),
         );
     }
     println!(
-        "{:<5} {:<7} {:<34} {:>5}",
-        tip, "tip", "(fork without dropping)", 0
+        "{:<5} {:<7} {:<34} {:>5}  {:<8}",
+        tip, "tip", "(fork without dropping)", 0, "-"
     );
     println!("fork with: loom rewind {id} --at <IDX>");
+    println!("fork + restore the tree: add --restore-workspace");
+}
+
+/// The RESTORE column: what a tier-2 restore of this boundary can
+/// prove from effects alone. `yes` means every first-touched path has
+/// a pre-image; commands are unrestorable and gate the restore (they
+/// name themselves when present, and `--accept-unrestorable` is the
+/// escape hatch).
+fn restore_note(session: &Session, from: u32) -> String {
+    let summary = crate::workspace::boundary_restore_summary(session, from);
+    if summary.commands > 0 {
+        return format!("cmds({})", summary.commands);
+    }
+    if summary.provable {
+        "yes".to_owned()
+    } else {
+        "no".to_owned()
+    }
 }

@@ -13,7 +13,7 @@
 
 use futures::future::BoxFuture;
 use loom_kernel::tool::{
-    PathTouch, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec,
+    BeforeImage, PathTouch, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -144,6 +144,9 @@ fn assemble_body(outcome: &EditOutcome, budgets: &ToolBudgets) -> (ToolEffects, 
     for note in &outcome.repairs {
         effects = effects.with_repair(note.clone());
     }
+    for image in &outcome.before_images {
+        effects = effects.with_before_image(image.clone());
+    }
     let repair_note = if outcome.repairs.is_empty() {
         String::new()
     } else {
@@ -207,9 +210,11 @@ impl Tool for EditFileTool {
             let scope = input.verify;
             let edits = resolve_edits(&ctx.workspace_root, batch)?;
             let root = ctx.workspace_root.clone();
-            let outcome = tokio::task::spawn_blocking(move || apply_edits(&root, &edits))
-                .await
-                .map_err(|err| ToolError::Execution(format!("edit task failed: {err}")))??;
+            let artifacts = ctx.artifacts.clone();
+            let outcome =
+                tokio::task::spawn_blocking(move || apply_edits(&root, &edits, artifacts))
+                    .await
+                    .map_err(|err| ToolError::Execution(format!("edit task failed: {err}")))??;
             let (mut effects, mut content, truncated_echo) = assemble_body(&outcome, &self.budgets);
             let mut truncated = false;
             // Trace-level observations from the fused verify (e.g. the
@@ -253,6 +258,9 @@ struct EditOutcome {
     /// `old_string` that only matched after trimming) — surfaced in the
     /// result and recorded in the effects for the session stats.
     repairs: Vec<String>,
+    /// Tier-2 rewind pre-images, one per distinct touched file, taken
+    /// from the loaded originals before the writes landed.
+    before_images: Vec<BeforeImage>,
 }
 
 /// Loads every distinct target file once, enforcing the size cap and the
@@ -421,8 +429,13 @@ fn edit_detail(resolved: &[(String, String)], per_file_counts: &[usize]) -> Stri
 /// Reads every target file once, applies the edits in order against the
 /// evolving texts, and writes all files back only when every edit
 /// matched exactly once. `root` is the workspace root, for relative
-/// paths in the effects.
-fn apply_edits(root: &Path, edits: &[(PathBuf, String, String)]) -> Result<EditOutcome, ToolError> {
+/// paths in the effects. `artifacts` carries the tier-2 pre-image
+/// capture (already-loaded originals, no extra IO).
+fn apply_edits(
+    root: &Path,
+    edits: &[(PathBuf, String, String)],
+    artifacts: Option<std::sync::Arc<dyn loom_kernel::store::ArtifactStore>>,
+) -> Result<EditOutcome, ToolError> {
     let batch_len = edits.len();
     let prefix = |index: usize| -> String {
         if batch_len > 1 {
@@ -492,6 +505,19 @@ fn apply_edits(root: &Path, edits: &[(PathBuf, String, String)]) -> Result<EditO
             ))
         })?;
     }
+    // Tier-2 rewind capture (roadmap gap 1): the loaded originals are
+    // exactly the pre-image of every touched file — capture them before
+    // the writes below, content-addressed into the artifact store.
+    let before_images: Vec<BeforeImage> = files
+        .iter()
+        .filter_map(|(path, original, _)| {
+            crate::pre_image::capture_before_image(
+                artifacts.as_deref(),
+                &workspace_relative(root, path),
+                Some(original.as_bytes()),
+            )
+        })
+        .collect();
     // Every edit matched exactly once: write everything back.
     for (path, _, text) in &files {
         std::fs::write(path, text)
@@ -513,6 +539,7 @@ fn apply_edits(root: &Path, edits: &[(PathBuf, String, String)]) -> Result<EditO
         files: resolved,
         spans: echoes,
         repairs,
+        before_images,
     })
 }
 
