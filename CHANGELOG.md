@@ -5,6 +5,25 @@ project versions by iteration, not semver.
 
 
 
+## 2026-12 — Execution-based best-of-N selection (roadmap item 29)
+
+Research-grounded (arXiv 2501.14723, 2407.21787: the selector, not
+coverage, caps best-of-N value; 2608.03961: weak selectors can make
+Best-of-3 worse than Best-of-1).
+
+- `verify_selection` (default on; `--best-of-no-verify` to opt out):
+  after the rollouts finish, the fixed-table suite (cargo test / npm
+  test / make test ...) runs once per patched candidate worktree
+  under the rollout semaphore. Failing candidates are dropped before
+  item 21's ranking; no verdict (no ecosystem, unreadable policy)
+  never drops.
+- `RolloutReport.suite_passed` per rollout; `selection_note` on the
+  report with verdict count, drops, and rank ties (broken
+  deterministically by rollout index). Both in JSON and text output.
+- `verify`: `Ecosystem` and `detect_ecosystem` are public;
+  `VerifyTool::suite_verdict(root, cancellation)` runs the fixed
+  table once and returns `Option<bool>` (None = no verdict).
+
 ## 2026-11 — Vary-the-harness best-of-N (roadmap item 24)
 
 Research-grounded (Harness², arXiv 2610.14224: harness edits diversify

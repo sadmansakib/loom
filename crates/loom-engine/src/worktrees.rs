@@ -22,7 +22,11 @@
 //! - **Deterministic selection.** Candidates rank by completion, then
 //!   failure markers (loop nudges, failed tool calls, task failure), then
 //!   turns, then model requests, then index — the Harness² fallback made
-//!   the primary selector, auditable from the report alone.
+//! - **Execution-based pre-filter.** Before ranking, the fixed-table suite
+//!   runs once per patched candidate (item 29): suite failures are dropped
+//!   before selection, and unmeasurable candidates — no ecosystem, no
+//!   verdict — stay ranked exactly as before. Deterministic spend only,
+//!   never a model call.
 //! - **Cancellation propagates.** One `CancellationToken` fans out to every
 //!   child's `TaskControl`; in-flight turns complete per the loop's
 //!   cancellation contract, worktrees are cleaned up, and nothing partial
@@ -47,6 +51,8 @@ use loom_kernel::event::{ChannelEventSink, EventKind};
 use loom_kernel::id::SessionId;
 use loom_kernel::model::ModelProvider;
 use loom_providers::ReasoningEffort;
+use loom_tools::policy::CommandPolicy;
+use loom_tools::verify::{VerifyTool, detect_ecosystem};
 use tokio::sync::Semaphore;
 
 /// Builds one provider instance per rollout. Providers are moved into
@@ -78,6 +84,11 @@ pub struct BestOfNConfig {
     /// verbose (doubled tool budgets, wider edit echo) variants. Default
     /// off — identical children maximize prefix-cache reuse.
     pub vary_harness: bool,
+    /// Run the fixed-table suite in every candidate worktree before
+    /// ranking (item 29) and drop failing candidates. Deterministic
+    /// spend only — no model call. Default on; opt out when the suite
+    /// is too slow to run per rollout.
+    pub verify_selection: bool,
 }
 
 impl Default for BestOfNConfig {
@@ -88,6 +99,7 @@ impl Default for BestOfNConfig {
             keep_worktrees: false,
             shared_prefix_turns: None,
             vary_harness: false,
+            verify_selection: true,
         }
     }
 }
@@ -114,6 +126,11 @@ pub struct RolloutReport {
     /// Human-readable spend footer (turns, requests, tokens) so multi-rollout
     /// cost is visible at the point of use, scout-footer style.
     pub cost_note: String,
+    /// Fixed-table suite verdict from the item 29 selection pass:
+    /// `Some(false)` = the suite failed and the candidate is dropped
+    /// from selection; `None` = not measured (no patch, filter off, or
+    /// no verdict — never a drop).
+    pub suite_passed: Option<bool>,
 }
 
 /// The whole orchestration result: per-rollout reports, the selected
@@ -138,6 +155,9 @@ pub struct BestOfNReport {
     /// Set when `vary_harness` diversified the fleet's configs (item 24):
     /// describes the child cycle, else `None`.
     pub harness_note: Option<String>,
+    /// The item 29 execution-filter note (verdicts, drops, rank ties)
+    /// when the selection suite ran, else `None`.
+    pub selection_note: Option<String>,
 }
 
 /// Errors that abort the orchestration before or between rollouts. Child
@@ -257,49 +277,88 @@ async fn clean_worktrees(repo_root: &Path, root: &Path, count: usize) {
     let _ = tokio::fs::remove_dir_all(root).await;
 }
 
-/// Picks the winner: candidates need a non-empty patch; ranking is
-/// completion first, then fewest markers, then fewest turns, then fewest
-/// model requests, then lowest index — a total order, so selection is
-/// reproducible from the report alone.
+/// The deterministic rank key (item 21): completion first, then fewest
+/// markers, then fewest turns, then fewest model requests. The rollout
+/// index breaks any remaining tie, so selection is reproducible from the
+/// report alone.
+fn rank_key(run: &RolloutReport) -> (bool, u64, u32, u32) {
+    (
+        !matches!(
+            run.end_reason.as_deref(),
+            Some("end_turn") | Some("fast_path")
+        ),
+        run.markers,
+        run.summary.as_ref().map(|s| s.turns).unwrap_or(u32::MAX),
+        run.summary
+            .as_ref()
+            .map(|s| s.model_requests)
+            .unwrap_or(u32::MAX),
+    )
+}
+
+/// Picks the winner: candidates need a non-empty patch and must not have
+/// failed the item 29 selection suite; ranking is the [`rank_key`] order
+/// with the rollout index as the final tie-break.
 fn winner_index(runs: &[RolloutReport]) -> Option<usize> {
     runs.iter()
-        .filter(|run| !run.patch.trim().is_empty())
-        .min_by(|a, b| {
-            // Completion signal: an `end_reason` of a successful stop.
-            // `b.cmp(&a)`: done sorts first (bools order false < true).
-            let a_done = matches!(
-                a.end_reason.as_deref(),
-                Some("end_turn") | Some("fast_path")
-            );
-            let b_done = matches!(
-                b.end_reason.as_deref(),
-                Some("end_turn") | Some("fast_path")
-            );
-            b_done
-                .cmp(&a_done)
-                .then(a.markers.cmp(&b.markers))
-                .then(
-                    a.summary
-                        .as_ref()
-                        .map(|s| s.turns)
-                        .unwrap_or(u32::MAX)
-                        .cmp(&b.summary.as_ref().map(|s| s.turns).unwrap_or(u32::MAX)),
-                )
-                .then(
-                    a.summary
-                        .as_ref()
-                        .map(|s| s.model_requests)
-                        .unwrap_or(u32::MAX)
-                        .cmp(
-                            &b.summary
-                                .as_ref()
-                                .map(|s| s.model_requests)
-                                .unwrap_or(u32::MAX),
-                        ),
-                )
-                .then(a.index.cmp(&b.index))
-        })
+        .filter(|run| !run.patch.trim().is_empty() && run.suite_passed != Some(false))
+        .min_by_key(|run| (rank_key(run), run.index))
         .map(|run| run.index)
+}
+
+/// Item 29 selection pass: run the fixed-table suite in every candidate
+/// worktree that produced a patch, record the verdict on the report, and
+/// return the note for the selection record. `Some(false)` verdicts drop
+/// the candidate in [`winner_index`]; `None` verdicts never do. The
+/// rollout semaphore bounds suite concurrency exactly like the rollouts.
+async fn run_selection_suites(
+    runs: &mut [RolloutReport],
+    repo_root: &Path,
+    semaphore: &Arc<Semaphore>,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Option<String> {
+    // Repositories without a fixed-table suite stay on pure ranking; a
+    // `.loom/verify.toml` runner is worktree-local state the parent
+    // cannot rely on here, so detection is the parent's table alone.
+    detect_ecosystem(repo_root)?;
+    let policy = match CommandPolicy::from_manifest(repo_root) {
+        Ok(policy) => policy,
+        Err(_) => {
+            return Some("execution filter skipped: policy manifest unreadable".to_owned());
+        }
+    };
+    let mut tasks = Vec::new();
+    for run in runs.iter() {
+        if run.patch.trim().is_empty() {
+            continue;
+        }
+        let permit_source = semaphore.clone();
+        let worktree = run.worktree.clone();
+        let tool = VerifyTool::with_policy(policy.clone());
+        let token = cancellation.clone();
+        tasks.push((
+            run.index,
+            tokio::spawn(async move {
+                let _permit = permit_source.acquire_owned().await;
+                tool.suite_verdict(&worktree, &token).await
+            }),
+        ));
+    }
+    let mut measured = 0usize;
+    let mut dropped = 0usize;
+    for (index, task) in tasks {
+        // A join failure or missing verdict is "no evidence": the
+        // candidate keeps its rank.
+        let verdict = task.await.ok().flatten();
+        if let Some(run) = runs.iter_mut().find(|run| run.index == index) {
+            run.suite_passed = verdict;
+        }
+        measured += usize::from(verdict.is_some());
+        dropped += usize::from(verdict == Some(false));
+    }
+    Some(format!(
+        "execution filter: {measured} suite verdict(s), {dropped} candidate(s) dropped"
+    ))
 }
 
 /// Harness variation for child `index` under `vary_harness` (item 24):
@@ -355,6 +414,7 @@ async fn run_rollout(
         markers: 0,
         patch: String::new(),
         cost_note: String::new(),
+        suite_passed: None,
     };
     if cancellation.is_cancelled() {
         report.end_reason = Some("cancelled".to_owned());
@@ -603,12 +663,50 @@ pub async fn best_of_n(
                     markers: u64::MAX,
                     patch: String::new(),
                     cost_note: String::new(),
+                    suite_passed: None,
                 });
             }
         }
     }
     runs.sort_by_key(|run| run.index);
+    // Item 29: execution-based selection before ranking — the fixed-table
+    // suite runs once per patched candidate (deterministic spend only, no
+    // model call) and failing candidates are dropped. No verdict is no
+    // evidence: unmeasurable candidates stay in the ranking.
+    let selection_note = if cfg.verify_selection && !cancellation.is_cancelled() {
+        run_selection_suites(&mut runs, &repo_root, &semaphore, cancellation).await
+    } else {
+        None
+    };
     let winner = winner_index(&runs);
+    let selection_note = match (selection_note, winner) {
+        (Some(note), Some(won)) => {
+            // The winner comes from `runs`, so its key always exists; a
+            // missing entry would mean the report is internally wrong.
+            let key = runs
+                .iter()
+                .find(|run| run.index == won)
+                .map(rank_key)
+                .unwrap_or((true, u64::MAX, u32::MAX, u32::MAX));
+            let ties = runs
+                .iter()
+                .filter(|run| {
+                    run.index != won
+                        && !run.patch.trim().is_empty()
+                        && run.suite_passed != Some(false)
+                        && rank_key(run) == key
+                })
+                .count();
+            if ties > 0 {
+                Some(format!(
+                    "{note}; {ties} rank tie(s) broken by rollout index"
+                ))
+            } else {
+                Some(note)
+            }
+        }
+        (note, _) => note,
+    };
     let mut keep = cfg.keep_worktrees;
     let (applied, apply_note) = if cancellation.is_cancelled() {
         (false, "cancelled before merge; nothing applied".to_owned())
@@ -643,6 +741,7 @@ pub async fn best_of_n(
         harness_note: cfg.vary_harness.then(|| {
             "child 0 baseline; later children cycle terse (halved tool budgets, low reasoning effort) and verbose (doubled budgets, wider edit echo)".to_owned()
         }),
+        selection_note,
     })
 }
 
@@ -961,6 +1060,7 @@ mod tests {
                 keep_worktrees: false,
                 shared_prefix_turns: None,
                 vary_harness: false,
+                verify_selection: false,
             },
             &token,
         )
@@ -974,6 +1074,93 @@ mod tests {
         assert_eq!(answer, "best-of-n winner\n");
         assert!(!report.worktrees_root.exists(), "worktrees cleaned up");
         assert!(report.runs[0].patch.contains("answer.txt"));
+    }
+
+    #[tokio::test]
+    async fn execution_filter_drops_suite_failures_before_ranking() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let repo = git_repo(base.path()).await;
+        let token = tokio_util::sync::CancellationToken::new();
+        // The suite fails exactly when answer.txt exists. It is committed
+        // before the fleet so every candidate worktree inherits it.
+        tokio::fs::write(repo.join("Makefile"), "test:\n\t@[ ! -f answer.txt ]\n")
+            .await
+            .expect("makefile");
+        git(&repo, &["add", "-A"]).await.expect("stage makefile");
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@e",
+                "commit",
+                "-q",
+                "-m",
+                "suite",
+            ],
+        )
+        .await
+        .expect("commit makefile");
+        // Rollout 0 would rank first (done, no markers) but writes
+        // answer.txt and fails the suite; rollout 1 writes a different
+        // file and survives the filter.
+        let other_call = ToolCall {
+            id: ToolCallId::try_from(format!("call-other-{}", std::process::id())).unwrap(),
+            name: "write_file".to_owned(),
+            arguments: ToolArguments::try_from(serde_json::json!({
+                "path": "other.txt",
+                "content": "runner-up\n",
+            }))
+            .expect("arguments"),
+        };
+        let runner_up = vec![
+            vec![Ok(ModelEvent::Completed(ModelResponse {
+                message: AssistantMessage {
+                    content: String::new(),
+                    reasoning: None,
+                    tool_calls: vec![other_call],
+                    stop_reason: StopReason::ToolCalls,
+                },
+                usage: Usage::default(),
+            }))],
+            ScriptedProvider::end_turn_script("done"),
+        ];
+        let factory = factory_for(vec![write_then_end_script(), runner_up]);
+        let report = best_of_n(
+            test_config(&repo, &base.path().join("loom.db")),
+            factory,
+            "write a file",
+            BestOfNConfig {
+                n: 2,
+                concurrency: 2,
+                keep_worktrees: false,
+                shared_prefix_turns: None,
+                vary_harness: false,
+                verify_selection: true,
+            },
+            &token,
+        )
+        .await
+        .expect("orchestration");
+        assert_eq!(
+            report.runs[0].suite_passed,
+            Some(false),
+            "the suite measured rollout 0"
+        );
+        assert_eq!(report.winner, Some(1), "the suite failure drops rollout 0");
+        assert!(report.applied, "runner-up applied: {}", report.apply_note);
+        assert!(
+            report
+                .selection_note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("dropped")
+        );
+        let other = tokio::fs::read_to_string(repo.join("other.txt"))
+            .await
+            .expect("runner-up patch applied");
+        assert_eq!(other, "runner-up\n");
     }
 
     #[tokio::test]
@@ -998,6 +1185,7 @@ mod tests {
                 keep_worktrees: false,
                 shared_prefix_turns: Some(1),
                 vary_harness: false,
+                verify_selection: false,
             },
             &token,
         )
@@ -1033,6 +1221,7 @@ mod tests {
                 keep_worktrees: false,
                 shared_prefix_turns: None,
                 vary_harness: false,
+                verify_selection: false,
             },
             &token,
         )
@@ -1065,6 +1254,7 @@ mod tests {
                 keep_worktrees: false,
                 shared_prefix_turns: None,
                 vary_harness: false,
+                verify_selection: false,
             },
             &token,
         )
@@ -1087,6 +1277,7 @@ mod tests {
             markers,
             patch: patch.to_owned(),
             cost_note: String::new(),
+            suite_passed: None,
         };
         let runs = vec![
             report(0, Some("max_turns"), 4, "diff"),

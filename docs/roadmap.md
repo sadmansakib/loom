@@ -1546,6 +1546,17 @@ model tier under them (arXiv 2607.06906).
     24's caveat). Count ranking ties in the selection report;
     model-judged tie-breaks are revisited only if ties measurably
     dominate.
+    *Implementation shipped 2026-11:* `--best-of-no-verify` /
+    `BestOfNConfig.verify_selection` (default **on**) runs the
+    fixed-table suite in every patched candidate worktree under the
+    rollout semaphore, records `suite_passed` per rollout and a
+    `selection_note` (verdicts, drops, rank ties broken by rollout
+    index) on the report; `Some(false)` drops the candidate, `None`
+    (no ecosystem, no verdict, filter off) never does. Suite spend is
+    deterministic-only; `run_selection_suites` uses the parent repo's
+    marker detection so unmeasurable repos keep pure item 21 ranking.
+    Open tail: frozen-subset re-measure of correlated-suite-failure
+    rate and wall-clock cost before recommending `N > 3`.
 30. **Per-task tool-menu policy** (G2, G3, G4, G5). The facts scan
     already detects languages and build systems deterministically —
     use them to narrow the tool menu before turn 1 (no cargo tooling in
@@ -1589,6 +1600,46 @@ model tier under them (arXiv 2607.06906).
     is the frozen-subset sweep measuring whether cues cut
     refine/re-search turns.
 
+
+### 2026-12 meta-harness sweep — gap check
+
+A vendor/blog/benchmark sweep (Anthropic engineering, Claude Code docs,
+Amp, Codex CLI, tmustier harness-benchmarks, plus late-2026 arXiv:
+ACon 2510.00615, PAACE 2512.16970, GCC 2508.00031, context-folding
+2510.11967, AgentRouter 2609.22951) was mapped against the ranked
+top-15 harness features from that literature. Result: **no new backlog
+items required** — every technique with evidence either ships, has a
+numbered home, or is already declined with reason:
+
+- Compaction/tool-result clearing, cache discipline, todo state,
+  completion gate, skills with progressive disclosure, sandbox +
+  approvals, eval-driven iteration (selfopt): **shipped**. New external
+  validation recorded in the lit-review addendum (Anthropic internal:
+  tool-result clearing −84% tokens at +29% perf; +39% with a memory
+  tool — the stub floor and item 20's memory line are the right seams).
+- Model routing/cascades: item 9 routing slice zero; AgentRouter's
+  step-level routing stays hypothesis evidence (needs mid-task model
+  swap → Iteration 8 ADR first). RouteLLM/FrugalGPT numbers are
+  vendor-scale, not coding-agent evidence — same status as the LangChain
+  64% figure already cited.
+- Subagent isolation/delegation discipline/effort scaling: items
+  19/21/24 (21 and 28 shipped).
+- Bash-first menus per model tier: item 30's model-profile tail.
+
+Two small gaps surfaced and are recorded here so they are not lost
+(both ride existing items, no new ids):
+
+1. **Checkpoint + rewind surface** (feeds items 15/22). The engine has
+   frozen context checkpoints and session resume, but no restore of
+   code+conversation state to a chosen turn (Claude Code `/rewind`
+   shape). Deterministic today (worktree git + session DB), so it is a
+   frontend+CLI feature, not engine work; spec lands with item 15's
+   resume UX or item 22's frontend.
+2. **Skill telemetry** (feeds item 20.4/skills lifecycle). Per-skill
+   context cost and usage frequency (Claude Code `/skill-doctor` shape)
+   so low-value skills retire on evidence — the lifecycle rule the
+   skill-memory papers require. `loom stats` already aggregates
+   per-tool call quality; extend to skill loads, no new seam.
 
 ### Deliberately not planned
 

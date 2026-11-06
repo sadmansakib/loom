@@ -20,14 +20,7 @@
 
 use std::path::Path;
 use std::sync::OnceLock;
-
-use futures::future::BoxFuture;
-use loom_kernel::tool::{
-    CommandEffect, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec,
-};
-use schemars::JsonSchema;
-use serde::Deserialize;
-use serde_json::Value;
+use std::time::Duration;
 
 use crate::budget::{self, ToolBudgets};
 use crate::evidence::{
@@ -35,16 +28,29 @@ use crate::evidence::{
     pytest_failures, python_diagnostics,
 };
 use crate::policy::{CommandPolicy, PolicyVerdict};
+use futures::future::BoxFuture;
+use loom_kernel::tool::{
+    CommandEffect, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec,
+};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 /// The build system a verification runs for. Variant meanings live in
 /// the command table and the `ecosystem` field docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Ecosystem {
+pub enum Ecosystem {
+    /// Cargo workspace or single crate (`cargo test`).
     Cargo,
+    /// Go module (`go test ./...`).
     Go,
+    /// Python project (`python -m pytest`).
     Python,
+    /// Node project (`npm test`).
     Npm,
+    /// No recognized marker, but a `Makefile` (`make test`).
     Make,
 }
 
@@ -62,7 +68,7 @@ const MARKERS: &[(&str, Ecosystem)] = &[
 ];
 
 /// Detects the workspace's ecosystem from root marker files.
-pub(crate) fn detect_ecosystem(root: &Path) -> Option<Ecosystem> {
+pub fn detect_ecosystem(root: &Path) -> Option<Ecosystem> {
     MARKERS
         .iter()
         .find(|(marker, _)| root.join(marker).is_file())
@@ -169,6 +175,32 @@ impl VerifyTool {
     pub fn with_budgets(mut self, budgets: ToolBudgets) -> Self {
         self.budgets = budgets;
         self
+    }
+
+    /// Runs the fixed-table test suite once in `root` and reports whether
+    /// it passed (roadmap item 29: execution-based selection for
+    /// best-of-N). `None` = no verdict — no supported ecosystem, a policy
+    /// refusal, or an execution failure. Selection treats "no verdict" as
+    /// "no evidence" and never drops a candidate it could not measure.
+    ///
+    /// Uses the 600 s build budget `run_command` declares, not the
+    /// engine's 120 s default: a suite that cannot finish cannot filter.
+    pub async fn suite_verdict(
+        &self,
+        root: &Path,
+        cancellation: &CancellationToken,
+    ) -> Option<bool> {
+        detect_ecosystem(root)?;
+        let ctx = ToolContext::new(
+            root.to_path_buf(),
+            cancellation.clone(),
+            Duration::from_secs(600),
+        );
+        let output = self
+            .call(serde_json::json!({ "scope": "test" }), &ctx)
+            .await
+            .ok()?;
+        status_from_content(&output.content)
     }
 }
 
@@ -442,6 +474,19 @@ fn status_line(status: std::process::ExitStatus) -> String {
     match status.code() {
         Some(code) => format!("exit status: {code}"),
         None => String::from("exit status: terminated by signal"),
+    }
+}
+
+/// Reads the pass/fail verdict out of a rendered verify output: the
+/// status line is always the second line (`$ cmd`, then `exit status:`).
+/// A signal death or unparseable shape yields `None` — no verdict.
+fn status_from_content(content: &str) -> Option<bool> {
+    match content.lines().nth(1)?.strip_prefix("exit status: ") {
+        Some("0") => Some(true),
+        // Only a numeric code is a verdict; signal deaths and anything
+        // else unparseable are "no verdict".
+        Some(code) if code.bytes().all(|b| b.is_ascii_digit()) && !code.is_empty() => Some(false),
+        _ => None,
     }
 }
 
@@ -761,5 +806,37 @@ FAILED tests/test_math.py::TestSum::test_sum - assert 4 == 5
             .await
             .expect_err("spawn must fail");
         assert!(matches!(error, ToolError::Execution(_)));
+    }
+    #[test]
+    fn status_from_content_reads_the_verdict() {
+        assert_eq!(
+            status_from_content("$ make test\nexit status: 0\nno diagnostics"),
+            Some(true)
+        );
+        assert_eq!(
+            status_from_content("$ make test\nexit status: 7\nfailed"),
+            Some(false)
+        );
+        // A signal death is not a suite verdict.
+        assert_eq!(
+            status_from_content("$ make test\nexit status: terminated by signal\n"),
+            None
+        );
+        assert_eq!(status_from_content("no status line at all"), None);
+    }
+
+    #[tokio::test]
+    async fn suite_verdict_runs_the_fixed_table_suite() {
+        let tool = VerifyTool::new();
+        let cancel = CancellationToken::new();
+        // No ecosystem marker: no verdict, and nothing executes.
+        let bare = tempfile::tempdir().expect("tempdir");
+        assert_eq!(tool.suite_verdict(bare.path(), &cancel).await, None);
+        // Make is the one table entry whose suite a test can shape.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("Makefile"), "test:\n\t@exit 0\n").expect("makefile");
+        assert_eq!(tool.suite_verdict(dir.path(), &cancel).await, Some(true));
+        std::fs::write(dir.path().join("Makefile"), "test:\n\t@exit 7\n").expect("makefile");
+        assert_eq!(tool.suite_verdict(dir.path(), &cancel).await, Some(false));
     }
 }

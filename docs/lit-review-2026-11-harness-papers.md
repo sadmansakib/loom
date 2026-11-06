@@ -447,3 +447,38 @@ edit_file calls → writing phase). One extra stub rule, selfopt-gated.
 
 Every item ships behind the maintenance bar: live-eval comparison, medians,
 N ≥ 5, pass rate co-equal with cost.
+
+Fourth addendum (2026-12, meta-harness/vendor sweep): ACon 2510.00615,
+PAACE 2512.16970, GCC 2508.00031, context-folding 2510.11967,
+AgentRouter 2609.22951, plus Anthropic engineering blogs (context
+management, long-running harnesses), Claude Code docs (checkpointing,
+skills, commands), Amp docs, tmustier harness-benchmarks.
+
+- **Anthropic tool-result clearing (vendor, internal eval).** −84%
+  tokens at +29% agentic-eval performance; +39% with the file-based
+  memory tool. → **validated** — externally confirms loom's stub
+  strategies as the first lever; the memory-tool delta is item 20's
+  evidence shape, not a summarizer argument.
+- **ACon / PAACE / GCC / context-folding.** Learned or plan-aware
+  compressors; GCC adds git-style COMMIT/BRANCH/MERGE over context;
+  CoF folds mid-trajectory state. → **decline as mechanism** (trained
+  compressors break G7; GCC's milestone checkpoints ≈ loom's frozen
+  checkpoints + item 28's session fork, both already shipped shapes).
+- **AgentRouter (step-level routing).** Route each trajectory *step*
+  across heterogeneous models. → **hypothesis for item 9/Iteration 8**;
+  step-level routing requires relaxing the model-fixed-per-task
+  invariant — Iteration-8 ADR territory, not a near-term adopt.
+- **Harness benchmark spreads (tmustier; Claw-SWE-Bench).** Same model,
+  12.5–27.4 pt pass@1 spread across harnesses; native CLIs led 4/6
+  matched Terminal-Bench 2.1 pairs. → **validated** — consistent with
+  the roadmap's framing findings; no action.
+- **Claude Code checkpoint/rewind; Amp subagent roles (Oracle/
+  Librarian/Finder); /skill-doctor telemetry.** → **product-surface
+  notes, not papers**: rewind rides items 15/22 (see roadmap gap-check
+  note); Amp's role split is item 19's specialization question;
+  skill telemetry extends `loom stats` under item 20.4.
+- **Post-land note (2026-12):** the execution-based selection entry
+  above is now item 29 shipped — `verify_selection` filters candidates
+  by the fixed-table suite before ranking; open probe tail is the
+  frozen-subset re-measure of correlated-suite-failure rate and
+  wall-clock cost before recommending `N > 3`.

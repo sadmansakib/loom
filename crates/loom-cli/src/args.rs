@@ -195,7 +195,16 @@ pub struct RunArgs {
     /// the config while later children cycle terse/verbose tool budgets and
     /// reasoning effort — diversity without a second model. Off by default.
     #[arg(long)]
+    #[arg(long)]
     pub best_of_vary: bool,
+
+    /// Execution-based selection (roadmap item 29): with --best-of, run
+    /// the fixed-table suite (cargo test / npm test / ...) in every
+    /// candidate worktree and drop failing candidates before ranking.
+    /// Deterministic spend only — no model call. On by default; pass
+    /// this flag to opt out when the suite is too slow per rollout.
+    #[arg(long)]
+    pub best_of_no_verify: bool,
 }
 
 /// Arguments for `loom auth`.

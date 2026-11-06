@@ -325,6 +325,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 keep_worktrees: false,
                 shared_prefix_turns: args.best_of_prefix_turns,
                 vary_harness: args.best_of_vary,
+                verify_selection: !args.best_of_no_verify,
             },
             &token,
         ))?;
@@ -423,6 +424,7 @@ fn print_best_of_n(report: &loom_core::engine::worktrees::BestOfNReport, json: b
                     "markers": run.markers,
                     "patch_bytes": run.patch.len(),
                     "cost": run.cost_note,
+                    "suite_passed": run.suite_passed,
                 })
             })
             .collect();
@@ -435,6 +437,7 @@ fn print_best_of_n(report: &loom_core::engine::worktrees::BestOfNReport, json: b
                 "apply_note": report.apply_note,
                 "prefix": report.prefix_note,
                 "harness": report.harness_note,
+                "selection": report.selection_note,
             })
         );
         return;
@@ -445,13 +448,21 @@ fn print_best_of_n(report: &loom_core::engine::worktrees::BestOfNReport, json: b
     if let Some(note) = &report.harness_note {
         println!("harness variation — {note}");
     }
+    if let Some(note) = &report.selection_note {
+        println!("execution filter — {note}");
+    }
     for run in &report.runs {
         println!(
-            "rollout {}: end_reason={}, markers={}, patch {} B",
+            "rollout {}: end_reason={}, markers={}, patch {} B, suite {}",
             run.index,
             run.end_reason.as_deref().unwrap_or("-"),
             run.markers,
-            run.patch.len()
+            run.patch.len(),
+            match run.suite_passed {
+                Some(true) => "pass",
+                Some(false) => "FAIL",
+                None => "-",
+            }
         );
         if !run.cost_note.is_empty() {
             println!("  {}", run.cost_note);
