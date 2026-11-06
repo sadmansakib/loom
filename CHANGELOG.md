@@ -5,6 +5,34 @@ project versions by iteration, not semver.
 
 
 
+## 2026-11 — Deterministic failure-to-fix lesson mining (roadmap item 20.4, remaining half)
+
+The second half of item 20.4 (the skill retirement rule shipped above):
+recurring failure→fix patterns are mined from stored transcripts with
+no model authorship, so the loop closes without a funded model.
+
+- `mine_lessons` in `loom_kernel::lessons` (pure, deterministic,
+  published thresholds): a *recovery* is a same-tool success within
+  8 tool results after a failure in the same session; a pattern mines
+  at ≥3 occurrences, ≥2 recoveries, ≥2 distinct sessions, one short
+  procedural statement per (tool, failure), name-ordered, capped at 16.
+  Cancelled calls never count. `MinedLesson::is_live` re-checks the
+  thresholds for the facts seam.
+- `loom lessons [--workspace DIR] [--dry-run] [--json]`: mines the
+  stored sessions and atomically writes `.loom/lessons.json`.
+  Re-mining replaces the store, so patterns that stop clearing the
+  thresholds are evicted; an empty history writes `[]`.
+- `KnownFacts.lessons` (kernel, serde-defaulted) renders
+  `lessons (evidence-gated rules from past sessions):` with evidence
+  counts, capped at 16. `FsFactsSource::with_lessons` reads the store
+  with re-validation (known failure kind, bounded statement, still
+  live) and degrades to empty on a missing or corrupt file. Wired
+  through `EngineConfig::lessons` / `loom run --lessons`, off by
+  default, never in the bare-loop arm.
+- Model-authored lessons with paired-run contrast evidence stay open
+  (the funded authoring loop); this ships the deterministic floor the
+  roadmap's evidence rule can defend today.
+
 ## 2026-11 — Skill retirement rule (roadmap item 20.4, gap 2)
 
 The telemetry gap's handoff: `SessionStats.skills` now drives a
@@ -24,8 +52,9 @@ by opinion.
   ejects, or rewrites a skill; the operator acts on it.
 - `skill_retirement_verdicts` folds a whole `SessionStats` into the
   name-ordered verdict list.
-- Failure-to-fix lesson mining (the rest of 20.4) stays open: it
-  needs an authoring loop, which wants a funded model.
+- The deterministic failure-to-fix miner that completes 20.4 is the
+  entry above; model-authored lessons with paired-run contrast evidence
+  stay open (the funded authoring loop).
 
 ## 2026-11 — Rewind rollout step 2: tier-1 start checkpoint + `--restore-workspace` (roadmap gap 1, items 15/22)
 

@@ -17,7 +17,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ignore::WalkBuilder;
-use loom_kernel::context::{FactsSource, GitState, InstructionFile, KnownFacts, SkillIndexEntry};
+use loom_kernel::context::{
+    FactsSource, GitState, InstructionFile, KnownFacts, LessonIndexEntry, SkillIndexEntry,
+};
+use loom_kernel::lessons::{self, MinedLesson};
 use loom_tools::skills::split_frontmatter;
 
 /// How deep into the tree the walk descends. Enough to reach
@@ -45,6 +48,17 @@ const INSTRUCTIONS_MAX_BYTES: usize = 4096;
 
 /// Directory scanned for the on-demand skills index (iteration 5).
 const SKILLS_DIR: &[&str] = &[".agents", "skills"];
+
+/// The lessons store mined by `loom lessons` (roadmap item 20.4).
+const LESSONS_FILE: &[&str] = &[".loom", "lessons.json"];
+
+/// Cap on lesson entries read from the store; the render caps again at
+/// the list level (mirrors the skills index two caps).
+const LESSONS_MAX_ENTRIES: usize = 64;
+
+/// Longest lesson statement the store scan will inject — a runaway file
+/// costs one bounded line, not the context.
+const LESSON_STATEMENT_MAX_CHARS: usize = 512;
 
 /// Cap on indexed skill files; the render caps again at the list level.
 const SKILLS_MAX_FILES: usize = 64;
@@ -128,6 +142,7 @@ const LANGUAGES: &[(&str, &str)] = &[
 pub struct FsFactsSource {
     root: PathBuf,
     skills: bool,
+    lessons: bool,
     mcp_menu: Option<String>,
     lsp_menu: Option<String>,
 }
@@ -139,6 +154,7 @@ impl FsFactsSource {
         Self {
             root: root.into(),
             skills: false,
+            lessons: false,
             mcp_menu: None,
             lsp_menu: None,
         }
@@ -151,6 +167,18 @@ impl FsFactsSource {
     #[must_use]
     pub fn with_skills(mut self, enabled: bool) -> Self {
         self.skills = enabled;
+        self
+    }
+
+    /// Also reads `.loom/lessons.json` into the facts block (roadmap
+    /// item 20.4).
+    ///
+    /// Off by default: `loom run --lessons` opts in, so a default run's
+    /// facts block is unchanged. A missing or unreadable store degrades
+    /// to no lessons, like the rest of the scan.
+    #[must_use]
+    pub fn with_lessons(mut self, enabled: bool) -> Self {
+        self.lessons = enabled;
         self
     }
 
@@ -182,6 +210,9 @@ impl FactsSource for FsFactsSource {
         let mut facts = scan(&self.root);
         if self.skills {
             facts.skills = scan_skills(&self.root);
+        }
+        if self.lessons {
+            facts.lessons = scan_lessons(&self.root);
         }
         facts.mcp_menu = self.mcp_menu.clone();
         facts.lsp_menu = self.lsp_menu.clone();
@@ -339,6 +370,46 @@ pub(crate) fn scan_skills(root: &Path) -> Vec<SkillIndexEntry> {
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     skills.truncate(SKILLS_MAX_FILES);
     skills
+}
+
+/// Reads `.loom/lessons.json` (roadmap item 20.4): the evidence-gated
+/// lessons `loom lessons` mined from stored transcripts.
+///
+/// Infallible like the rest of the scan: a missing file, unreadable
+/// JSON, or an entry that no longer clears the miner's thresholds
+/// degrades to fewer lessons, never to a failed task setup. Entries are
+/// re-validated on read (known failure kind, bounded non-empty statement,
+/// `is_live()`), name-ordered, deduped by (tool, failure), and capped.
+pub(crate) fn scan_lessons(root: &Path) -> Vec<LessonIndexEntry> {
+    let path = LESSONS_FILE
+        .iter()
+        .fold(root.to_path_buf(), |p, part| p.join(part));
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(mined) = serde_json::from_str::<Vec<MinedLesson>>(&body) else {
+        return Vec::new();
+    };
+    let mut valid: Vec<MinedLesson> = mined
+        .into_iter()
+        .filter(|lesson| {
+            !lesson.tool.is_empty()
+                && lessons::is_known_failure(&lesson.failure)
+                && !lesson.statement.trim().is_empty()
+                && lesson.statement.chars().count() <= LESSON_STATEMENT_MAX_CHARS
+                && lesson.is_live()
+        })
+        .collect();
+    valid.sort_by(|a, b| a.tool.cmp(&b.tool).then_with(|| a.failure.cmp(&b.failure)));
+    valid.dedup_by(|a, b| a.tool == b.tool && a.failure == b.failure);
+    valid.truncate(LESSONS_MAX_ENTRIES);
+    valid
+        .into_iter()
+        .map(|lesson| {
+            let evidence = lesson.evidence();
+            LessonIndexEntry::new(lesson.statement, evidence)
+        })
+        .collect()
 }
 
 /// Builds one menu entry from a skill file's bounded head: frontmatter
@@ -614,6 +685,123 @@ mod tests {
 
     fn tempdir() -> tempfile::TempDir {
         tempfile::tempdir().expect("create tempdir")
+    }
+
+    #[test]
+    fn scan_lessons_reads_a_miner_store() {
+        let dir = tempdir();
+        let root = dir.path();
+        let loom = root.join(".loom");
+        fs::create_dir_all(&loom).unwrap();
+        let store = vec![loom_kernel::lessons::MinedLesson::new(
+            "edit_file",
+            "invalid_input",
+            "For edit_file invalid-input failures: correct the arguments and reissue.",
+            3,
+            3,
+            3,
+        )];
+        fs::write(
+            loom.join("lessons.json"),
+            serde_json::to_string(&store).unwrap(),
+        )
+        .unwrap();
+
+        let lessons = scan_lessons(root);
+        assert_eq!(lessons.len(), 1);
+        assert!(lessons[0].statement.contains("edit_file"));
+        assert_eq!(lessons[0].evidence, "3 failures, 3 recovered, 3 sessions");
+    }
+
+    #[test]
+    fn scan_lessons_degrades_cleanly_and_validates() {
+        let dir = tempdir();
+        let root = dir.path();
+        // Missing store: empty.
+        assert!(scan_lessons(root).is_empty());
+
+        let loom = root.join(".loom");
+        fs::create_dir_all(&loom).unwrap();
+        // Corrupt JSON: empty.
+        fs::write(loom.join("lessons.json"), "not json").unwrap();
+        assert!(scan_lessons(root).is_empty());
+
+        // Dead entry (below thresholds) and unknown failure kind are
+        // dropped; the live entry survives.
+        let store = vec![
+            loom_kernel::lessons::MinedLesson::new("edit_file", "invalid_input", "dead", 1, 0, 1),
+            loom_kernel::lessons::MinedLesson::new("edit_file", "bogus", "bogus kind", 9, 9, 9),
+            loom_kernel::lessons::MinedLesson::new("read_file", "timeout", "live", 4, 3, 3),
+        ];
+        fs::write(
+            loom.join("lessons.json"),
+            serde_json::to_string(&store).unwrap(),
+        )
+        .unwrap();
+        let lessons = scan_lessons(root);
+        assert_eq!(lessons.len(), 1);
+        assert_eq!(lessons[0].statement, "live");
+    }
+
+    #[test]
+    fn scan_lessons_name_orders_and_caps() {
+        let dir = tempdir();
+        let root = dir.path();
+        let loom = root.join(".loom");
+        fs::create_dir_all(&loom).unwrap();
+        let mut store = Vec::new();
+        for i in (0..(LESSONS_MAX_ENTRIES + 5)).rev() {
+            store.push(loom_kernel::lessons::MinedLesson::new(
+                format!("tool{i:03}"),
+                "invalid_input",
+                format!("Rule {i}."),
+                3,
+                3,
+                3,
+            ));
+        }
+        fs::write(
+            loom.join("lessons.json"),
+            serde_json::to_string(&store).unwrap(),
+        )
+        .unwrap();
+        let lessons = scan_lessons(root);
+        assert_eq!(lessons.len(), LESSONS_MAX_ENTRIES);
+        assert_eq!(lessons[0].statement, "Rule 0.");
+        assert_eq!(
+            lessons.last().map(|l| l.statement.as_str()),
+            Some("Rule 63.")
+        );
+    }
+
+    #[test]
+    fn facts_source_injects_lessons_only_when_opted_in() {
+        let dir = tempdir();
+        let root = dir.path();
+        let loom = root.join(".loom");
+        fs::create_dir_all(&loom).unwrap();
+        let store = vec![loom_kernel::lessons::MinedLesson::new(
+            "edit_file",
+            "invalid_input",
+            "rule.",
+            3,
+            3,
+            3,
+        )];
+        fs::write(
+            loom.join("lessons.json"),
+            serde_json::to_string(&store).unwrap(),
+        )
+        .unwrap();
+
+        // Default source: the frozen protocol is unchanged — no lessons.
+        let default = FsFactsSource::new(root).scan();
+        assert!(default.lessons.is_empty());
+
+        // Opted in: the store rides the block.
+        let opted = FsFactsSource::new(root).with_lessons(true).scan();
+        assert_eq!(opted.lessons.len(), 1);
+        assert!(opted.render().contains("lessons (evidence-gated rules"));
     }
 
     #[test]

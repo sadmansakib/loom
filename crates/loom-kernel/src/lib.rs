@@ -14,6 +14,7 @@ pub mod artifact_gc;
 pub mod context;
 pub mod event;
 pub mod id;
+pub mod lessons;
 pub mod model;
 pub mod session;
 pub mod store;

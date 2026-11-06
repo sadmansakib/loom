@@ -1349,9 +1349,18 @@ adds four more framing findings and backlog items 26–31 below.
        `[retire]` / `[watch]` markers beside the numbers and `verdict`
        in the JSON row. Advisory only: the rule never hides, ejects,
        or rewrites a skill; acting on a verdict is the operator's
-       step. Failure-to-fix lesson mining remains open — it needs an
-       authoring loop (a proposer that reads traces and writes rules),
-       the Harness² offline half, which wants a funded model to do
+       step. The deterministic failure-to-fix miner shipped 2026-11-06:
+       `mine_lessons` (`loom_kernel::lessons`, pure over stored
+       transcripts: recurring (tool, failure) patterns with a same-tool
+       success within 8 results in the same session count as a recovery;
+       at least 3 occurrences, 2 recoveries, and 2 sessions to mine).
+       `loom lessons` atomically writes `.loom/lessons.json`
+       (re-mining replaces the store, so dead patterns are evicted), and
+       `loom run --lessons` injects live entries through the facts block
+       (re-validated on read: known failure kind, bounded statement,
+       thresholds still cleared). Model-authored lessons with
+       before/after contrast evidence remain open — that authoring loop
+       is the Harness² offline half, which wants a funded model to do
        it honestly.
 
     **Harness² input (2026-10-20, arXiv 2610.14224).** Google's

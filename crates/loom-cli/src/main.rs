@@ -12,6 +12,7 @@ use tracing_subscriber::EnvFilter;
 mod args;
 mod auth_command;
 mod instructions;
+mod lessons_command;
 mod output;
 mod provider_command;
 mod rewind_command;
@@ -33,6 +34,7 @@ fn main() -> ExitCode {
         Command::Sessions => sessions_command::run(),
         Command::Rewind(args) => rewind_command::run(args),
         Command::Stats(args) => stats_command::run(args),
+        Command::Lessons(args) => lessons_command::run(args),
     };
 
     match outcome {

@@ -90,6 +90,32 @@ impl SkillIndexEntry {
     }
 }
 
+/// One evidence-gated lesson in the facts block (roadmap item 20.4).
+///
+/// The statement is a short procedural rule mined from recurring
+/// failure-to-fix patterns; the evidence string names the counts behind
+/// it. Lessons enter here only from the `.loom/lessons.json` store the
+/// miner wrote — the kernel renders what it is given.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LessonIndexEntry {
+    /// The procedural rule.
+    pub statement: String,
+    /// The counts behind it (e.g. `3 failures, 3 recovered, 3 sessions`).
+    pub evidence: String,
+}
+
+impl LessonIndexEntry {
+    /// Builds a lesson entry.
+    #[must_use]
+    pub fn new(statement: impl Into<String>, evidence: impl Into<String>) -> Self {
+        Self {
+            statement: statement.into(),
+            evidence: evidence.into(),
+        }
+    }
+}
+
 /// Git state observed when the facts were captured.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -162,6 +188,11 @@ pub struct KnownFacts {
     /// nothing.
     #[serde(default)]
     pub skills: Vec<SkillIndexEntry>,
+    /// Evidence-gated failure-to-fix lessons (roadmap item 20.4), scanned
+    /// from `.loom/lessons.json`. Gated by the engine's lessons flag;
+    /// empty stores render nothing.
+    #[serde(default)]
+    pub lessons: Vec<LessonIndexEntry>,
     /// Deferred MCP catalog menu (slice D2): names the attached servers'
     /// tools and the `mcp_search_tools`/`mcp_load_tools` path to them.
     /// Baked once at attach time — the snapshot is static per task, so
@@ -207,6 +238,7 @@ impl KnownFacts {
             tree,
             instructions,
             skills,
+            lessons: Vec::new(),
             git,
             mcp_menu,
             lsp_menu,
@@ -228,6 +260,7 @@ impl KnownFacts {
             && self.tree.is_empty()
             && self.instructions.is_none()
             && self.skills.is_empty()
+            && self.lessons.is_empty()
             && self.mcp_menu.is_none()
             && self.lsp_menu.is_none()
             && self.git.is_empty()
@@ -272,6 +305,7 @@ impl KnownFacts {
             render_instructions(&mut out, instructions);
         }
         render_skills(&mut out, &self.skills);
+        render_lessons(&mut out, &self.lessons);
         if !self.tree.is_empty() {
             let _ = writeln!(out, "file tree:");
             for line in &self.tree {
@@ -334,6 +368,22 @@ fn render_skills(out: &mut String, skills: &[SkillIndexEntry]) {
         }
     }
     let extra = skills.len().saturating_sub(RENDER_LIST_CAP);
+    if extra > 0 {
+        let _ = writeln!(out, "- (+{extra} more)");
+    }
+}
+
+/// Emits the evidence-gated lessons (roadmap item 20.4): one line per
+/// rule with its evidence counts, capped. Empty list renders nothing.
+fn render_lessons(out: &mut String, lessons: &[LessonIndexEntry]) {
+    if lessons.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "lessons (evidence-gated rules from past sessions):");
+    for entry in lessons.iter().take(RENDER_LIST_CAP) {
+        let _ = writeln!(out, "- {} ({})", entry.statement, entry.evidence);
+    }
+    let extra = lessons.len().saturating_sub(RENDER_LIST_CAP);
     if extra > 0 {
         let _ = writeln!(out, "- (+{extra} more)");
     }
@@ -453,6 +503,7 @@ mod tests {
                 "Run cargo test first.".into(),
             )),
             skills: Vec::new(),
+            lessons: Vec::new(),
             mcp_menu: None,
             lsp_menu: None,
             git: GitState {
@@ -487,6 +538,56 @@ mod tests {
         assert!(rendered.contains("- deploy\n"));
         // Determinism holds with skills present.
         assert_eq!(facts.render(), rendered);
+    }
+
+    #[test]
+    fn lessons_render_as_rules_with_evidence() {
+        let mut facts = facts();
+        facts.lessons = vec![LessonIndexEntry::new(
+            "For edit_file invalid-input failures: correct the arguments and reissue.",
+            "3 failures, 3 recovered, 3 sessions",
+        )];
+        let rendered = facts.render();
+        assert!(rendered.contains("lessons (evidence-gated rules from past sessions):"));
+        assert!(rendered.contains("- For edit_file invalid-input failures:"));
+        assert!(rendered.contains("(3 failures, 3 recovered, 3 sessions)"));
+        assert_eq!(facts.render(), rendered);
+    }
+
+    #[test]
+    fn lessons_index_is_capped_like_other_lists() {
+        let mut facts = facts();
+        facts.lessons = (0..20)
+            .map(|i| {
+                LessonIndexEntry::new(format!("Rule {i}."), "3 failures, 3 recovered, 3 sessions")
+            })
+            .collect();
+        let rendered = facts.render();
+        assert!(rendered.contains("- Rule 15."));
+        assert!(!rendered.contains("- Rule 16."));
+        assert!(rendered.contains("- (+4 more)"));
+    }
+
+    #[test]
+    fn facts_without_lessons_field_deserialize_from_old_json() {
+        // Schema evolution: events written before item 20.4 carry no
+        // `lessons` key; `#[serde(default)]` must accept them.
+        let old = r#"{
+            "root": "/ws",
+            "languages": [],
+            "build_systems": [],
+            "source_dirs": [],
+            "test_dirs": [],
+            "config_files": [],
+            "toolchains": [],
+            "tree": [],
+            "instructions": null,
+            "git": {"branch": null, "changed_files": []}
+        }"#;
+        let facts: KnownFacts = serde_json::from_str(old).expect("old facts must deserialize");
+        assert!(facts.lessons.is_empty());
+        assert!(facts.skills.is_empty());
+        assert!(facts.is_empty());
     }
 
     #[test]

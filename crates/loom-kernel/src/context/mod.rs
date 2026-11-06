@@ -26,7 +26,8 @@ mod pruning;
 
 pub use default::DefaultContextCompiler;
 pub use facts::{
-    FactsSource, GitState, InstructionFile, KnownFacts, NoFacts, SkillIndexEntry, StaticFacts,
+    FactsSource, GitState, InstructionFile, KnownFacts, LessonIndexEntry, NoFacts, SkillIndexEntry,
+    StaticFacts,
 };
 pub use pruning::{
     ArgElision, PruneConfig, PruneReport, PruneTrigger, PrunedCall, PruningContextCompiler,

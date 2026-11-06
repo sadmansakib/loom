@@ -200,6 +200,16 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         }
         false
     };
+    // Evidence-gated lessons (roadmap item 20.4): same gate, same
+    // bare-arm rule.
+    let lessons = if args.lessons && !bare_arm {
+        true
+    } else {
+        if args.lessons {
+            eprintln!("note: --lessons is ignored in the bare-loop arm");
+        }
+        false
+    };
     // Slice D (iteration 6): MCP servers. Same gate, same bare-arm rule.
     let mcp = if args.mcp && !bare_arm {
         true
@@ -284,6 +294,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         symbols,
         git,
         skills,
+        lessons,
         mcp,
         lsp,
         budgets,

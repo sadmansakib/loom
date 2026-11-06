@@ -37,6 +37,9 @@ pub enum Command {
     Rewind(RewindArgs),
     /// Transcript analytics over stored sessions (or exported traces).
     Stats(StatsArgs),
+    /// Mine failure-to-fix lessons from stored transcripts (roadmap
+    /// item 20.4) and write `.loom/lessons.json`.
+    Lessons(LessonsArgs),
 }
 
 /// Arguments for `loom run`.
@@ -164,6 +167,12 @@ pub struct RunArgs {
     #[arg(long)]
     pub skills: bool,
 
+    /// Enable evidence-gated lessons (roadmap item 20.4): lessons mined
+    /// by `loom lessons` from `.loom/lessons.json` appear in the facts
+    /// block. Off by default.
+    #[arg(long)]
+    pub lessons: bool,
+
     /// Enable MCP servers (iteration 6): servers declared in
     /// `.loom/mcp.toml` attach over stdio with ingestion hygiene and
     /// definition pinning into `.loom/mcp.lock` (docs/mcp-design.md).
@@ -256,6 +265,24 @@ pub struct StatsArgs {
     /// Only sessions whose id contains this substring.
     #[arg(long, short = 's')]
     pub session: Option<String>,
+
+    /// Emit machine-readable JSON instead of the human table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `loom lessons`.
+#[derive(Debug, Args)]
+pub struct LessonsArgs {
+    /// Workspace whose `.loom/lessons.json` is written (default: the
+    /// current directory). The store the facts seam reads on
+    /// `loom run --lessons`.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub workspace: std::path::PathBuf,
+
+    /// Preview without writing.
+    #[arg(long)]
+    pub dry_run: bool,
 
     /// Emit machine-readable JSON instead of the human table.
     #[arg(long)]
@@ -466,6 +493,56 @@ mod tests {
                 command: ProviderCommand::Remove { name }
             }) if name == "orcarouter"
         ));
+    }
+
+    #[test]
+    fn run_parses_lessons_flag_off_by_default() {
+        let cli = parse(&[
+            "loom",
+            "run",
+            "--provider",
+            "deepseek",
+            "--model",
+            "deepseek-flash",
+            "go",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected `run`");
+        };
+        assert!(!args.lessons);
+
+        let cli = parse(&[
+            "loom",
+            "run",
+            "--provider",
+            "deepseek",
+            "--model",
+            "deepseek-flash",
+            "--lessons",
+            "go",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected `run`");
+        };
+        assert!(args.lessons);
+    }
+
+    #[test]
+    fn lessons_subcommand_parses() {
+        let cli = parse(&[
+            "loom",
+            "lessons",
+            "--workspace",
+            "/ws",
+            "--dry-run",
+            "--json",
+        ]);
+        let Command::Lessons(args) = cli.command else {
+            panic!("expected `lessons`");
+        };
+        assert_eq!(args.workspace, std::path::PathBuf::from("/ws"));
+        assert!(args.dry_run);
+        assert!(args.json);
     }
 
     #[test]

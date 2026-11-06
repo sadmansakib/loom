@@ -380,6 +380,7 @@ pub fn one_shot_provider(
         symbols: false,
         git: false,
         skills: false,
+        lessons: false,
         mcp: false,
         lsp: false,
         budgets: loom_tools::ToolBudgets::default(),

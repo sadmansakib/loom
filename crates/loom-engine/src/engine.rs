@@ -115,6 +115,13 @@ pub struct EngineConfig {
     /// `load_skill` serves bodies on demand. The bare-loop baseline
     /// never carries it.
     pub skills: bool,
+    /// Evidence-gated failure-to-fix lessons (roadmap item 20.4): when
+    /// false (the default) the facts block carries no lessons and no
+    /// `.loom/lessons.json` is read — the frozen SWE-bench protocol and
+    /// every existing frontend are unchanged until a frontend opts in.
+    /// When set, lessons mined by `loom lessons` ride the facts block.
+    /// The bare-loop baseline never carries them.
+    pub lessons: bool,
     /// MCP servers (iteration 6, slice D): when false (the default) no
     /// manifest is read, no server spawns, and the registry is
     /// byte-identical. When set, servers declared in
@@ -167,6 +174,7 @@ pub(crate) fn test_config() -> EngineConfig {
         symbols: false,
         git: false,
         skills: false,
+        lessons: false,
         mcp: false,
         lsp: false,
         budgets: ToolBudgets::default(),
@@ -557,6 +565,7 @@ impl Engine {
         let facts = (!overrides.bare_loop).then(|| {
             crate::repo::FsFactsSource::new(workspace.clone())
                 .with_skills(config.skills && !overrides.bare_loop)
+                .with_lessons(config.lessons && !overrides.bare_loop)
                 .with_mcp_menu(mcp.menu.clone())
                 .with_lsp_menu(lsp.menu.clone())
         });
@@ -1077,6 +1086,7 @@ fn compose_scout(
         symbols: false,
         git: false,
         skills: false,
+        lessons: false,
         mcp: false,
         lsp: false,
         budgets: parent.budgets,
