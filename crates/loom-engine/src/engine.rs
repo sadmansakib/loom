@@ -149,6 +149,15 @@ pub struct EngineConfig {
     /// ([`prune_config_for`]), including the GLM/Anthropic
     /// elide-reasoning behavior.
     pub prune: Option<PruneConfig>,
+    /// Machine-applicable compiler fixes after a failing verify (roadmap
+    /// item 33, docs/autofix-design.md): when false (the default) the
+    /// registry is byte-identical and a failing verify reports exactly as
+    /// before — the frozen SWE-bench protocol and the bare-loop baseline
+    /// never set it. When set, a failing local cargo verify (standalone
+    /// or fused into `edit_file`/`write_file`) attempts one fix round:
+    /// `MachineApplicable` spans only, workspace-confined, snapshotted,
+    /// re-run, kept only if the diagnostic count does not increase.
+    pub autofix: bool,
 }
 
 /// A minimal [`EngineConfig`] for tests that need one without a real
@@ -179,6 +188,8 @@ pub(crate) fn test_config() -> EngineConfig {
         lsp: false,
         budgets: ToolBudgets::default(),
         prune: None,
+        // Tests construct the default registry; autofix stays opt-in.
+        autofix: false,
     }
 }
 
@@ -403,7 +414,7 @@ impl Engine {
         let registry = match overrides.registry {
             Some(registry) => registry,
             None => {
-                let built = build_registry(&policy, config.budgets)?;
+                let built = build_registry(&policy, config.budgets, config.autofix)?;
                 // The bare-loop arm keeps the primitive tool set only
                 // (read/list/write/edit/shell); a search index, the
                 // artifact re-fetch, the fused verify, and the
@@ -1091,6 +1102,9 @@ fn compose_scout(
         lsp: false,
         budgets: parent.budgets,
         prune: None,
+        // No autofix: the scout child is read-only (verify is filtered
+        // out), and the one-shot path never enters a workspace loop.
+        autofix: false,
     };
     // Credential resolution mirrors the parent's (§18.3) — the scout
     // may live on a different provider with its own secret.
@@ -1105,7 +1119,7 @@ fn compose_scout(
     )?;
     let provider = crate::provider::build(&child, credential.secret.expose())?.provider;
     let registry = ToolRegistry::from_arc_tools(
-        build_registry(policy, child.budgets)?
+        build_registry(policy, child.budgets, false)?
             .into_arc_tools()
             .filter(|tool| tool.is_read_only()),
     );
@@ -1134,6 +1148,7 @@ fn compose_scout(
 fn build_registry(
     policy: &CommandPolicy,
     budgets: ToolBudgets,
+    autofix: bool,
 ) -> Result<ToolRegistry, EngineError> {
     let mut registry = ToolRegistry::new();
     let mut register = |name: &'static str, tool: Box<dyn loom_kernel::tool::Tool>| {
@@ -1154,10 +1169,17 @@ fn build_registry(
         "artifact_read",
         Box::new(ArtifactReadTool::default().with_budgets(budgets)),
     )?;
-    register("write_file", Box::new(WriteFileTool))?;
+    register(
+        "write_file",
+        Box::new(WriteFileTool::default().with_autofix(autofix)),
+    )?;
     register(
         "edit_file",
-        Box::new(EditFileTool::default().with_budgets(budgets)),
+        Box::new(
+            EditFileTool::default()
+                .with_budgets(budgets)
+                .with_autofix(autofix),
+        ),
     )?;
     register(
         "run_command",
@@ -1165,7 +1187,11 @@ fn build_registry(
     )?;
     register(
         "verify",
-        Box::new(VerifyTool::with_policy(policy.clone()).with_budgets(budgets)),
+        Box::new(
+            VerifyTool::with_policy(policy.clone())
+                .with_budgets(budgets)
+                .with_autofix(autofix),
+        ),
     )?;
     register("todo", Box::new(loom_kernel::tool::TodoTool::new()))?;
     Ok(registry)
@@ -1196,7 +1222,7 @@ fn bare_registry(built: ToolRegistry) -> ToolRegistry {
 /// `ToolSpec` set (the census's `tool_specs` source). No tool is ever
 /// executed during replay.
 pub(crate) fn replay_registry() -> Result<ToolRegistry, EngineError> {
-    build_registry(&CommandPolicy::default(), ToolBudgets::default())
+    build_registry(&CommandPolicy::default(), ToolBudgets::default(), false)
 }
 
 /// The built-in instruction; overridable with `--system-prompt`.
@@ -2494,7 +2520,7 @@ mod tests {
     /// (bare = read/list/write/edit/shell).
     #[test]
     fn todo_tool_is_exposed_in_the_full_registry_and_excluded_from_bare() {
-        let built = build_registry(&CommandPolicy::default(), ToolBudgets::default())
+        let built = build_registry(&CommandPolicy::default(), ToolBudgets::default(), false)
             .expect("built-in registry");
         let full: Vec<&str> = built.specs().map(|spec| spec.name.as_str()).collect();
         assert!(

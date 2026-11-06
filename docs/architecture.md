@@ -388,8 +388,8 @@ uses to link failures to the change that likely caused them.
 | `list_dir` | read | one level, byte-sorted, symlinks not followed for typing |
 | `read_artifact` | read | paged read of a spilled artifact (§6.4) |
 | `run_command` | mutating | any bare program inside an OS sandbox (§6.8; writes confined to workspace + temp + cargo home, network off), manifest rules escalate; no shell, both pipes drained concurrently, head+tail bounded capture with explicit omission markers |
-| `verify` | mutating | `check`/`test` scope for the ecosystem detected from root markers (cargo > npm > python > go > make) or an explicit `ecosystem` argument; the command comes from a fixed per-ecosystem table, never from model input; ecosystems without a build-agnostic scope (npm `check`) refuse rather than guess; success → the pass summary line; failure → structured evidence (§6.5) |
-| `edit_file` | mutating | exact old-text match, must be unique (0 or ≥2 matches = invalid input), 8 MiB file cap; atomic `edits: [...]` batch form across files (all-or-nothing, in order); every result echoes the edited region (±3 numbered lines, 8 KiB cap) so no re-read is needed; a whitespace-trim repair fires when exactly one trimmed match exists (recorded in `effects.repairs`); optional `verify` runs the detected ecosystem's check/test inside the same call (action fusion), skipping with a note when the scope is unsupported |
+| `verify` | mutating | `check`/`test` scope for the ecosystem detected from root markers (cargo > npm > python > go > make) or an explicit `ecosystem` argument; the command comes from a fixed per-ecosystem table, never from model input; ecosystems without a build-agnostic scope (npm `check`) refuse rather than guess; success → the pass summary line; failure → structured evidence (§6.5); opt-in `--autofix` adds one machine-applicable fix round after a failing cargo verify (§6.5) |
+| `edit_file` | mutating | exact old-text match, must be unique (0 or ≥2 matches = invalid input), 8 MiB file cap; atomic `edits: [...]` batch form across files (all-or-nothing, in order); every result echoes the edited region (±3 numbered lines, 8 KiB cap) so no re-read is needed; a whitespace-trim repair fires when exactly one trimmed match exists (recorded in `effects.repairs`); optional `verify` runs the detected ecosystem's check/test inside the same call (action fusion), skipping with a note when the scope is unsupported; with `--autofix` the fused failing cargo verify also gets the §6.5 fix round |
 | `write_file` | mutating | create/overwrite, parents created; optional `verify` as above |
 
 ### 6.3 Confinement
@@ -424,6 +424,24 @@ stdout-then-stderr fallback. The renderer emits a bounded block — up to 20 dia
 recent change on an overlapping path ("relevant change: src/lib.rs").
 Unparseable failures fall back to bounded raw output. A failure is never
 hidden, only compressed.
+
+Opt-in (`loom run --autofix`, roadmap item 33, rustc only): after a
+failing local cargo verify — standalone or fused into
+`edit_file`/`write_file` — one machine-applicable fix round. The
+diagnostic JSON rustc already emitted is re-parsed for
+`MachineApplicable` suggestion spans (message and children); every span
+resolves through the §6.3 confinement walk (out-of-workspace targets are
+refused, overlapping edits in a file are skipped), each touched file is
+snapshotted as a `BeforeImage`, the byte ranges are spliced, and the
+exact same command re-runs under the same limits and sandbox. The
+never-worse gate keeps the edits only if the diagnostic count does not
+increase — a failing re-run with zero parseable diagnostics is
+unmeasurable and reverts — restoring byte-for-byte otherwise. The tool
+result gains a bounded `--- autofix ---` section telling the model what
+applied and what the re-run said, `ToolEffects` records the round, and
+the event stream carries `autofix_applied` (schema 14, additive).
+Without the flag the registry and every output are byte-identical;
+container-runner and non-Cargo ecosystems skip the round honestly.
 
 ### 6.6 Batch scheduling
 

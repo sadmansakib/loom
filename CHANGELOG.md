@@ -5,6 +5,36 @@ project versions by iteration, not semver.
 
 
 
+## 2026-11 — Machine-applicable compiler fixes (roadmap item 33)
+
+Opt-in `loom run --autofix`: after a failing local cargo verify — the
+standalone `verify` tool or the verify fused into `edit_file`/`write_file`
+— one fix round applies rustc's own `MachineApplicable` suggestions
+(message and children spans), never guesses, and keeps the edits only
+under a never-worse gate.
+
+- Workspace-confined: every suggestion span resolves through the
+  escape-proof confinement walk; out-of-workspace targets are refused
+  and overlapping edits within a file are skipped, both counted.
+- Snapshotted and reversible: `BeforeImage`s for every touched file
+  before splicing; the exact same command re-runs under the same
+  limits and sandbox; if the diagnostic count increases — or a failing
+  re-run produces nothing parseable — the files are restored
+  byte-for-byte.
+- Observable: the tool result gains a bounded `--- autofix ---` +
+  `--- re-verify ---` section, `ToolEffects` records files,
+  before-images, and the re-run command (`autofix` effect), and the
+  event stream carries `autofix_applied` (event schema 13 → 14,
+  additive with serde defaults; `kept: false` = a reverted attempt,
+  still traced).
+- Honest defaults: off unless the flag is set — the registry is
+  byte-identical without it, the frozen SWE-bench protocol and the
+  bare-loop baseline are unaffected, and container-runner and non-Cargo
+  ecosystems skip the round with a note. Evidence gate (see
+  [`docs/autofix-design.md`](docs/autofix-design.md)): real `cargo
+  check --message-format=json` over 24 agent-caused error classes →
+  9/25 diagnostics machine-applicable (36%).
+
 ## 2026-11 — Offline counterfactual context replay (roadmap item 32)
 
 Funded measurement without funded spend: the context projection is a pure

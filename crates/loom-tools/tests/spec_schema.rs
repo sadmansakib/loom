@@ -16,7 +16,7 @@ fn tools() -> Vec<(&'static str, Box<dyn Tool>)> {
         ("read_file", Box::new(loom_tools::ReadFileTool::default())),
         ("list_dir", Box::new(loom_tools::ListDirTool)),
         ("search", Box::new(loom_tools::SearchTool)),
-        ("write_file", Box::new(loom_tools::WriteFileTool)),
+        ("write_file", Box::new(loom_tools::WriteFileTool::default())),
         ("edit_file", Box::new(loom_tools::EditFileTool::default())),
         ("run_command", Box::new(loom_tools::RunCommandTool::new())),
         ("verify", Box::new(loom_tools::VerifyTool::new())),

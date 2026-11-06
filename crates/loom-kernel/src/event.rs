@@ -83,7 +83,7 @@ use tokio_util::sync::CancellationToken;
 /// extended at a turn boundary on deterministic progress evidence).
 /// v13 adds the `WritingPhase` stub reason (item 10: phase-aware
 /// retention masked exploration reads during the writing phase).
-pub const EVENT_SCHEMA_VERSION: u16 = 13;
+pub const EVENT_SCHEMA_VERSION: u16 = 14;
 
 /// The evidence that justified a [`EventKind::TurnBudgetExtended`] grant
 /// (item 26): state the loop already tracks, never a model call.
@@ -316,6 +316,24 @@ pub enum EventKind {
         /// enough to see the command line and its exit status without
         /// reproducing whole tool outputs (schema 11).
         content_head: String,
+    },
+    /// A verify-call autofix finished (roadmap item 33): after a failing
+    /// verify, the tools layer applied rustc `MachineApplicable`
+    /// suggestions and re-ran the same command under a never-worse gate.
+    /// Emitted after `ToolCompleted` for the call that carried the
+    /// effect; `kept: false` means the gate reverted every edit (schema
+    /// 14, additive).
+    AutofixApplied {
+        /// Machine-applicable edits applied to disk before the gate.
+        edits: u32,
+        /// Distinct workspace files those edits touched.
+        files: u32,
+        /// Error+warning diagnostic count of the failing run.
+        diagnostics_before: u32,
+        /// Diagnostic count after the re-run (`<= before` when kept).
+        diagnostics_after: u32,
+        /// Whether the edits survived the never-worse gate.
+        kept: bool,
     },
     /// The kernel-owned todo list changed during the turn's tool batch
     /// (roadmap item 8 phase B): a `todo` create/add/mark bumped its

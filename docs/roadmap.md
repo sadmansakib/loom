@@ -1664,6 +1664,38 @@ model tier under them (arXiv 2607.06906).
    before any docker spend — same gate constant, tighten-only. Design:
    [`docs/replay-context-design.md`](replay-context-design.md).
 
+33. **Machine-applicable compiler fixes after a failing verify** (G2, G7,
+   G8; rustc only — structure seam per ecosystem). *Evidence first:*
+   stored sessions showed 15 sessions / 14 verifies with the only
+   failures being cargo-test assertion failures (no compiler
+   diagnostics at all), so the session corpus was too thin to decide;
+   the sanctioned fixture fallback ran real `cargo check
+   --message-format=json` over 24 common agent-caused error/warning
+   classes: 25 diagnostics, 9 machine-applicable (36%), including
+   E0384, E0596, and the stray-semicolon E0308 family (~22% of pure
+   errors), plus `unused_mut`/`unused_imports` warnings that ride
+   along in failing runs — non-negligible, so it shipped.
+   *Shipped 2026-11:* `loom run --autofix` (opt-in, default off — the
+   frozen SWE-bench protocol and bare-loop baseline never set it, and
+   the registry is byte-identical without it). After a failing local
+   Cargo verify — standalone `verify` or the verify fused into
+   `edit_file`/`write_file` — one fix round: parse only
+   `MachineApplicable` spans (message + children), confine every span
+   to the workspace (escape-proof resolve), skip overlapping edits in
+   a file, snapshot `BeforeImage`s, splice byte ranges, re-run the
+   exact same command under the same limits and sandbox, and keep the
+   edits only if the diagnostic count does not increase (a failing
+   re-run with zero parseable diagnostics is unmeasurable ⇒ revert);
+   otherwise restore byte-for-byte. The tool result gains a bounded
+   `--- autofix ---` section and `autofix.applied`/`autofix.reverted`
+   notices, `ToolEffects` records the round (files, before-images,
+   re-run command), and the event stream carries `autofix_applied`
+   (schema 13 → 14, additive with serde defaults; kept:false = a
+   reverted attempt, still traced). In-house applier (~200 lines, G8:
+   rustfix targets Cargo's own test-suite); container-runner and
+   non-Cargo ecosystems skip honestly. Design:
+   [`docs/autofix-design.md`](autofix-design.md).
+
 
 ### 2026-12 meta-harness sweep — gap check
 

@@ -456,6 +456,54 @@ pub struct ToolEffects {
     /// refuses for that path rather than guessing.
     #[serde(default)]
     pub before_images: Vec<BeforeImage>,
+    /// The verify-call autofix outcome (roadmap item 33), when this call
+    /// attempted one: MachineApplicable suggestions applied after a
+    /// failing verify, gated by a re-run. Like `repairs`, the record
+    /// never makes `is_empty` true on its own — the file writes it kept
+    /// already do. Additive (schema-era persisted effects deserialize
+    /// without it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autofix: Option<AutofixEffect>,
+}
+
+/// One autofix attempt's outcome record (roadmap item 33): what was
+/// applied, what the never-worse gate saw, and whether the edits were
+/// kept or reverted. Mirrors [`EventKind::AutofixApplied`]'s payload;
+/// the agent loop emits the event from this record.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutofixEffect {
+    /// Machine-applicable edits applied to disk before the gate.
+    pub edits: u32,
+    /// Distinct workspace files those edits touched.
+    pub files: u32,
+    /// Error+warning diagnostic count of the failing run.
+    pub diagnostics_before: u32,
+    /// Diagnostic count after the re-run (`<= before` when kept).
+    pub diagnostics_after: u32,
+    /// Whether the edits survived the never-worse gate.
+    pub kept: bool,
+}
+
+impl AutofixEffect {
+    /// Records one attempt's outcome. Mirrors [`EventKind::AutofixApplied`]'s
+    /// payload; the agent loop emits the event from this record.
+    #[must_use]
+    pub fn new(
+        edits: u32,
+        files: u32,
+        diagnostics_before: u32,
+        diagnostics_after: u32,
+        kept: bool,
+    ) -> Self {
+        Self {
+            edits,
+            files,
+            diagnostics_before,
+            diagnostics_after,
+            kept,
+        }
+    }
 }
 
 /// One file's content immediately before the call that recorded it, or
@@ -546,6 +594,30 @@ impl ToolEffects {
     #[must_use]
     pub fn with_before_image(mut self, image: BeforeImage) -> Self {
         self.before_images.push(image);
+        self
+    }
+
+    /// Records an autofix attempt's outcome (roadmap item 33). The last
+    /// record wins when a call somehow attempts more than one.
+    #[must_use]
+    pub fn with_autofix(mut self, autofix: AutofixEffect) -> Self {
+        self.autofix = Some(autofix);
+        self
+    }
+
+    /// Folds `other`'s records into `self` (order-preserving appends;
+    /// `other`'s autofix record wins when set). The fused-verify path
+    /// composes its own effects with the host tool's through this.
+    #[must_use]
+    pub fn merge(mut self, other: Self) -> Self {
+        self.files_written.extend(other.files_written);
+        self.files_deleted.extend(other.files_deleted);
+        self.commands_run.extend(other.commands_run);
+        self.repairs.extend(other.repairs);
+        self.before_images.extend(other.before_images);
+        if other.autofix.is_some() {
+            self.autofix = other.autofix;
+        }
         self
     }
 }

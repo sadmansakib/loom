@@ -110,6 +110,10 @@ pub struct VerifyTool {
     policy: CommandPolicy,
     /// Output budgets (item 20.2); `Default` keeps the constants.
     budgets: ToolBudgets,
+    /// Whether a failing Cargo verify attempts one machine-applicable
+    /// fix round under a never-worse gate (roadmap item 33). Opt-in:
+    /// the shipped default and every eval arm leave it off.
+    autofix: bool,
 }
 
 /// How much verification to run.
@@ -156,6 +160,7 @@ impl VerifyTool {
         Self {
             policy: CommandPolicy::cargo_only(),
             budgets: ToolBudgets::default(),
+            autofix: false,
         }
     }
 
@@ -167,6 +172,7 @@ impl VerifyTool {
         Self {
             policy,
             budgets: ToolBudgets::default(),
+            autofix: false,
         }
     }
 
@@ -174,6 +180,15 @@ impl VerifyTool {
     #[must_use]
     pub fn with_budgets(mut self, budgets: ToolBudgets) -> Self {
         self.budgets = budgets;
+        self
+    }
+
+    /// Enables the post-failure machine-applicable fix round (roadmap
+    /// item 33). Off by default; the engine only sets it from the
+    /// opt-in `EngineConfig::autofix`.
+    #[must_use]
+    pub fn with_autofix(mut self, autofix: bool) -> Self {
+        self.autofix = autofix;
         self
     }
 
@@ -333,6 +348,32 @@ impl Tool for VerifyTool {
                     "stream.truncated",
                     format!("\"{program}\" (verify) output truncated: a descendant held the pipes after exit"),
                 ));
+            }
+            // Roadmap item 33: after a failing local Cargo verify, one
+            // opt-in machine-applicable fix round — plan, snapshot,
+            // apply, re-run, never-worse gate. Container-runner and
+            // non-Cargo paths skip honestly (they returned above / the
+            // suggestion vocabulary is rustc's).
+            let fix = if self.autofix
+                && matches!(ecosystem, Ecosystem::Cargo)
+                && !output.status.success()
+            {
+                crate::autofix::attempt(
+                    ctx,
+                    program,
+                    &args,
+                    &output,
+                    &limits,
+                    &sandbox,
+                    &recent_changes,
+                    &self.budgets,
+                )
+                .await?
+            } else {
+                None
+            };
+            if let Some(outcome) = fix {
+                rendered = outcome.merge(rendered);
             }
             Ok(rendered)
         })

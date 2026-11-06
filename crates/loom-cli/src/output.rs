@@ -85,6 +85,20 @@ impl Renderer {
                 self.close_all();
                 self.notice(&format!("tool: {name} done"));
             }
+            EventKind::AutofixApplied {
+                edits,
+                files,
+                diagnostics_before,
+                diagnostics_after,
+                kept,
+            } => {
+                self.close_all();
+                let fate = if *kept { "kept" } else { "reverted" };
+                self.notice(&format!(
+                    "autofix: {edits} edit(s) across {files} file(s) {fate} \
+                     ({diagnostics_before} → {diagnostics_after} diagnostics)"
+                ));
+            }
             EventKind::ContextPruned { report, .. } => {
                 self.close_all();
                 self.notice(&format!(

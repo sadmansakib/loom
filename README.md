@@ -88,7 +88,7 @@ about, or denied via the `[policy]` verdict layer.
 | Area | State |
 |---|---|
 | Turn loop | completion gate, one-shot refusals, zero-progress + late-budget nudges, malformed tool-call recovery |
-| Tools | read/write/edit/list/search, sandboxed `run_command`, `verify` (local, or containerized/remote via `.loom/verify.toml`), `git_status`/`git_diff`/`git_log` (opt-in `--git`), symbol tools (`--symbols`), skills (`--skills`), read-only scout (`--scout`), MCP servers (opt-in `--mcp`: stdio, allowlisted, hash-pinned, deferred loading), LSP semantic tools (opt-in `--lsp`: definition/references/symbols/hover/diagnostics/rename/format/call-hierarchy via known servers) |
+| Tools | read/write/edit/list/search, sandboxed `run_command`, `verify` (local, or containerized/remote via `.loom/verify.toml`; opt-in `--autofix` applies rustc's `MachineApplicable` suggestions after a failing cargo verify under a never-worse gate), `git_status`/`git_diff`/`git_log` (opt-in `--git`), symbol tools (`--symbols`), skills (`--skills`), read-only scout (`--scout`), MCP servers (opt-in `--mcp`: stdio, allowlisted, hash-pinned, deferred loading), LSP semantic tools (opt-in `--lsp`: definition/references/symbols/hover/diagnostics/rename/format/call-hierarchy via known servers) |
 | Safety | Seatbelt/bubblewrap, network off default, manifest escalation, allow/ask/deny verdicts, credential scrubbing, process-group kill |
 | Context | repo facts, AGENTS.md instructions, pruning + turn-age masking, per-tool output budgets (env-sweepable), offline counterfactual replay (`loom replay-context`, self-validating against the recorded census) |
 | Providers | DeepSeek, OpenRouter, GLM, NVIDIA, Groq, Anthropic + any OpenAI-compatible custom gateway |

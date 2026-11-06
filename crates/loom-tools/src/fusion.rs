@@ -9,7 +9,7 @@
 //! fixed table in [`crate::verify`], so this path needs no allow-list
 //! decision either.
 
-use loom_kernel::tool::{CommandEffect, ToolContext, ToolError, ToolOutput};
+use loom_kernel::tool::{CommandEffect, ToolContext, ToolEffects, ToolError, ToolOutput};
 
 use crate::budget::ToolBudgets;
 use crate::verify::{Ecosystem, Scope};
@@ -24,18 +24,25 @@ use crate::verify::{Ecosystem, Scope};
 /// `check`), the host call still succeeds: the write happened, so the
 /// fused verify degrades to an explanatory note and no command effect is
 /// recorded.
+///
+/// `autofix` mirrors the standalone tool's opt-in (roadmap item 33):
+/// after a failing local cargo run, one machine-applicable fix round
+/// under a never-worse gate. Its effects — re-run command, kept writes,
+/// pre-images, repair note, `AutofixEffect` — arrive in the returned
+/// [`ToolEffects`] for the host call to merge into its own.
 pub(crate) async fn run_fused(
     scope: Scope,
     ctx: &ToolContext,
     changed: &str,
-) -> Result<(ToolOutput, Option<CommandEffect>), ToolError> {
+    autofix: bool,
+) -> Result<(ToolOutput, ToolEffects), ToolError> {
     let ecosystem =
         crate::verify::detect_ecosystem(&ctx.workspace_root).unwrap_or(Ecosystem::Cargo);
     let (program, args) = match ecosystem.command(scope) {
         Ok(plan) => plan,
         Err(err) => {
             let note = ToolOutput::new(format!("verify skipped: {err}"));
-            return Ok((note, None));
+            return Ok((note, ToolEffects::none()));
         }
     };
     // A declared container/remote runner (item 23) executes the fused
@@ -71,25 +78,22 @@ pub(crate) async fn run_fused(
                 ),
             ));
         }
-        return Ok((rendered, Some(effect)));
+        // No autofix on the runner substrate (item 33 scope: local
+        // sandbox runs) — the run reports exactly what the runner saw.
+        let effects = ToolEffects::none().with_command(effect);
+        return Ok((rendered, effects));
     }
     let sandbox = crate::sandbox::Sandbox::resolve(
         &ctx.workspace_root,
         crate::sandbox::SandboxGrants::from_rule(None),
     );
-    let outcome = crate::exec::run_bounded(
-        program,
-        &args,
-        ctx,
-        &crate::exec::ExecLimits::default(),
-        &sandbox,
-    )
-    .await?;
+    let limits = crate::exec::ExecLimits::default();
+    let outcome = crate::exec::run_bounded(program, &args, ctx, &limits, &sandbox).await?;
     let output = outcome.output;
     let effect = CommandEffect::new(program, args.clone(), output.status.code());
     let mut recent = ctx.recent_changes();
     recent.push(changed.to_owned());
-    let rendered = crate::verify::render(
+    let mut rendered = crate::verify::render(
         ecosystem,
         program,
         &args,
@@ -97,5 +101,32 @@ pub(crate) async fn run_fused(
         &recent,
         &ToolBudgets::default(),
     );
-    Ok((rendered, Some(effect)))
+    let mut effects = ToolEffects::none().with_command(effect);
+    // Opt-in fix round (roadmap item 33), same contract as the
+    // standalone tool: failing cargo run, machine-applicable spans
+    // only, never-worse gate on the re-run.
+    let fix = if autofix && matches!(ecosystem, Ecosystem::Cargo) && !output.status.success() {
+        crate::autofix::attempt(
+            ctx,
+            program,
+            &args,
+            &output,
+            &limits,
+            &sandbox,
+            &recent,
+            &ToolBudgets::default(),
+        )
+        .await?
+    } else {
+        None
+    };
+    if let Some(fix) = fix {
+        rendered = fix.merge(rendered);
+        // The merged output's effects already carry the re-run
+        // command and any fix effects; fold them under the first
+        // run's command.
+        effects = effects.merge(rendered.effects.clone());
+    }
+    rendered = rendered.with_effects(effects.clone());
+    Ok((rendered, effects))
 }

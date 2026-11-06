@@ -2177,6 +2177,22 @@ impl Agent {
                         content_head,
                     },
                 );
+                // A verify-call autofix reports as its own decision event
+                // (schema 14), emitted right after the call it belongs to
+                // — `kept: false` is a reverted attempt, still worth a
+                // trace line.
+                if let Some(autofix) = &result.effects.autofix {
+                    sink.emit(
+                        task_id,
+                        EventKind::AutofixApplied {
+                            edits: autofix.edits,
+                            files: autofix.files,
+                            diagnostics_before: autofix.diagnostics_before,
+                            diagnostics_after: autofix.diagnostics_after,
+                            kept: autofix.kept,
+                        },
+                    );
+                }
                 // Harness observations ride the result into the trace:
                 // one event per distinct notice in this batch (a healthy
                 // default run attaches none).

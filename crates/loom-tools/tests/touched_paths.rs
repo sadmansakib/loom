@@ -52,7 +52,7 @@ fn read_only_tools_declare_their_read_path() {
 fn mutating_tools_declare_their_write_path() {
     assert_eq!(
         touches(
-            &loom_tools::WriteFileTool,
+            &loom_tools::WriteFileTool::default(),
             json!({"path": "src/a.rs", "content": "x"})
         ),
         Some(vec![write("src/a.rs")])
@@ -102,7 +102,7 @@ fn unparseable_arguments_declare_nothing() {
         Some(Vec::new())
     );
     assert_eq!(
-        touches(&loom_tools::WriteFileTool, json!({"path": "a"})),
+        touches(&loom_tools::WriteFileTool::default(), json!({"path": "a"})),
         Some(Vec::new())
     );
 }

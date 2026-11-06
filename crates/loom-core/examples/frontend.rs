@@ -59,6 +59,7 @@ fn main() -> anyhow::Result<()> {
         lsp: false,
         budgets: loom_tools::ToolBudgets::default(),
         prune: None,
+        autofix: false,
     }))?;
 
     // Observation: one unbounded channel, one printing consumer. A TUI or

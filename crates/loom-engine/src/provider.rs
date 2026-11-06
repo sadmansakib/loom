@@ -385,6 +385,8 @@ pub fn one_shot_provider(
         lsp: false,
         budgets: loom_tools::ToolBudgets::default(),
         prune: None,
+        // No autofix: the one-shot path never enters a workspace loop.
+        autofix: false,
     };
     build(&config, api_key)
 }

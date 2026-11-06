@@ -42,11 +42,12 @@ fn serialized_specs_stay_within_budget() {
     let read = ReadFileTool::default();
     let artifact = ArtifactReadTool::default();
     let edit = EditFileTool::default();
+    let write = WriteFileTool::default();
     let tools: Vec<&dyn Tool> = vec![
         &read,
         &ListDirTool,
         &SearchTool,
-        &WriteFileTool,
+        &write,
         &edit,
         &run,
         &verify,

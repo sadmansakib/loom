@@ -192,6 +192,15 @@ pub struct RunArgs {
     #[arg(long)]
     pub lsp: bool,
 
+    /// Enable machine-applicable compiler fixes (roadmap item 33):
+    /// after a failing cargo verify, apply rustc's
+    /// `MachineApplicable` suggestions (workspace-confined, snapshotted)
+    /// and re-run the same command, keeping the edits only when the
+    /// diagnostic count does not increase (docs/autofix-design.md).
+    /// Off by default.
+    #[arg(long)]
+    pub autofix: bool,
+
     /// Parallel rollouts (roadmap item 21): run the task on N isolated
     /// git worktrees concurrently, select one rollout deterministically
     /// (completion, then fewest failure markers, then fewest turns), and

@@ -19,7 +19,21 @@ use crate::confinement::{resolve_within, workspace_relative};
 /// Creates or overwrites one UTF-8 text file, confined to the workspace
 /// root, creating missing parent directories.
 #[derive(Debug, Default)]
-pub struct WriteFileTool;
+pub struct WriteFileTool {
+    /// Whether a failing fused cargo verify attempts one
+    /// machine-applicable fix round under a never-worse gate (roadmap
+    /// item 33). Off by default; set from the engine's opt-in config.
+    autofix: bool,
+}
+
+impl WriteFileTool {
+    /// Enables the fused-verify autofix round (roadmap item 33).
+    #[must_use]
+    pub fn with_autofix(mut self, autofix: bool) -> Self {
+        self.autofix = autofix;
+        self
+    }
+}
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -131,13 +145,15 @@ impl Tool for WriteFileTool {
             // unconfined-runner notice) ride the host output.
             let mut notices = Vec::new();
             if let Some(scope) = scope {
-                let (rendered, command) = crate::fusion::run_fused(scope, ctx, &relative).await?;
+                let (rendered, fused_effects) =
+                    crate::fusion::run_fused(scope, ctx, &relative, self.autofix).await?;
                 content = format!("{content}\n\n--- verify ---\n{}", rendered.content);
                 truncated = rendered.truncated;
                 notices = rendered.notices;
-                if let Some(command) = command {
-                    effects = effects.with_command(command);
-                }
+                // The fused run's command (and any kept autofix writes,
+                // pre-images, and repair notes) fold into this call's
+                // effects (roadmap item 33).
+                effects = effects.merge(fused_effects);
             }
             let mut output = ToolOutput::new(content).with_effects(effects);
             output.notices = notices;
@@ -183,7 +199,7 @@ mod tests {
     }
 
     async fn write(root: &Path, args: Value) -> Result<ToolOutput, ToolError> {
-        WriteFileTool.call(args, &ctx(root)).await
+        WriteFileTool::default().call(args, &ctx(root)).await
     }
 
     #[tokio::test]
@@ -381,7 +397,7 @@ mod tests {
         let (_guard, root) = crate_root();
         // A syntax error: the fused check must fail while still reporting
         // the write itself as done.
-        let output = WriteFileTool
+        let output = WriteFileTool::default()
             .call(
                 json!({
                     "path": "src/lib.rs",
@@ -410,7 +426,7 @@ mod tests {
     #[tokio::test]
     async fn fused_check_pass_reports_exit_zero() {
         let (_guard, root) = crate_root();
-        let output = WriteFileTool
+        let output = WriteFileTool::default()
             .call(
                 json!({
                     "path": "src/new.rs",

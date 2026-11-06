@@ -53,6 +53,10 @@ pub struct EditFileTool {
     /// byte cap) is this tool's "edit format" knob. `Default` keeps
     /// the documented constants.
     budgets: ToolBudgets,
+    /// Whether a failing fused cargo verify attempts one
+    /// machine-applicable fix round under a never-worse gate (roadmap
+    /// item 33). Off by default; set from the engine's opt-in config.
+    autofix: bool,
 }
 
 impl EditFileTool {
@@ -60,6 +64,13 @@ impl EditFileTool {
     /// entry point).
     pub fn with_budgets(mut self, budgets: ToolBudgets) -> Self {
         self.budgets = budgets;
+        self
+    }
+
+    /// Enables the fused-verify autofix round (roadmap item 33).
+    #[must_use]
+    pub fn with_autofix(mut self, autofix: bool) -> Self {
+        self.autofix = autofix;
         self
     }
 }
@@ -226,14 +237,15 @@ impl Tool for EditFileTool {
                     .first()
                     .map(|(relative, _)| relative.clone())
                     .unwrap_or_default();
-                let (rendered, command) =
-                    crate::fusion::run_fused(scope, ctx, &verify_target).await?;
+                let (rendered, fused_effects) =
+                    crate::fusion::run_fused(scope, ctx, &verify_target, self.autofix).await?;
                 content = format!("{content}\n\n--- verify ---\n{}", rendered.content);
                 truncated = rendered.truncated;
                 notices = rendered.notices;
-                if let Some(command) = command {
-                    effects = effects.with_command(command);
-                }
+                // The fused run's command (and any kept autofix writes,
+                // pre-images, and repair notes) fold into this call's
+                // effects (roadmap item 33).
+                effects = effects.merge(fused_effects);
             }
             let mut output = ToolOutput::new(content).with_effects(effects);
             output.notices = notices;

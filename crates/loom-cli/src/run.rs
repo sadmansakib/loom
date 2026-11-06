@@ -299,6 +299,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         lsp,
         budgets,
         prune: Some(prune),
+        autofix: args.autofix,
     };
 
     let input = args.task.join(" ");
