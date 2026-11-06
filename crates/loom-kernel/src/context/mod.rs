@@ -178,6 +178,41 @@ pub struct ContextInput<'a> {
     pub prune_checkpoint: Option<&'a PruneCheckpoint>,
 }
 
+impl<'a> ContextInput<'a> {
+    /// Builds a compile input from every field.
+    ///
+    /// The struct is `#[non_exhaustive]` so field lists cannot drift for
+    /// out-of-crate callers (embedders, the engine's offline replay); this
+    /// constructor is the supported way to build one outside the kernel.
+    // Nine arguments mirror the struct's nine fields — a builder here
+    // would hide which inputs a compile actually consumes.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        session: &'a Session,
+        tools: &'a ToolRegistry,
+        task: &'a TaskRecord,
+        budget: ContextBudget,
+        capabilities: &'a ModelCapabilities,
+        model: &'a str,
+        config: &'a AgentConfig,
+        facts: &'a KnownFacts,
+        prune_checkpoint: Option<&'a PruneCheckpoint>,
+    ) -> Self {
+        Self {
+            session,
+            tools,
+            task,
+            budget,
+            capabilities,
+            model,
+            config,
+            facts,
+            prune_checkpoint,
+        }
+    }
+}
+
 /// Agent configuration the context compiler reads.
 ///
 /// Kept as a separate struct (not scattered fields on [`ContextInput`])

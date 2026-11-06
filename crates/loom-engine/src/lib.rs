@@ -40,6 +40,7 @@ pub mod engine;
 mod estimate;
 mod provider;
 pub mod registry;
+pub mod replay;
 pub mod repo;
 pub mod scout;
 pub mod trace;

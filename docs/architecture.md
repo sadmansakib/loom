@@ -24,7 +24,7 @@ kernel never links a filesystem store or a CLI, the engine never prints.
 |---|---|---|
 | `loom-core` | Facade re-exporting the public surface for embedders, plus the shared data-dir policy (`paths`) | engine, kernel, providers, store, tools |
 | `loom-kernel` | The agent itself: loop, context compilation, session/transcript model, tool abstraction, tool cache, artifacts, events, budgets | no workspace crates — it defines the side-effect traits (`ModelProvider`, `SessionStore`, `ArtifactStore`, `Tool`, …) itself |
-| `loom-engine` | Composition root: builds a configured `Agent` from paths, auth, a provider factory, tool registry, and stores; repository facts scanner; owns the OpenRouter catalog policy (`engine::catalog`), the trace export format (`engine::trace`), and its aggregation (`engine::trace_stats`) | kernel, store, providers, tools |
+| `loom-engine` | Composition root: builds a configured `Agent` from paths, auth, a provider factory, tool registry, and stores; repository facts scanner; owns the OpenRouter catalog policy (`engine::catalog`), the trace export format (`engine::trace`), its aggregation (`engine::trace_stats`), and the offline counterfactual re-compiler (`engine::replay`) | kernel, store, providers, tools |
 | `loom-providers` | Model provider adapters (DeepSeek, OpenRouter, GLM, NVIDIA, Groq over one shared OpenAI-compatible wire; Custom for any user-supplied OpenAI-compatible endpoint; Anthropic on its own messages-API driver) | kernel model types |
 | `loom-store` | SQLite persistence: sessions, turns, tasks, artifacts, auth accounts | kernel store traits |
 | `loom-tools` | The shipped tool suite (read/search/edit/write/list/run/verify + artifact read) | kernel tool traits |
@@ -709,6 +709,23 @@ mechanism and estimated reclaim, so a trace consumer can attribute
 savings per mechanism by summing `reclaimed_tokens` across those events
 (deduplicating by `call_id` — turns that merely re-apply a frozen
 checkpoint emit nothing).
+
+A trace is also the input for offline counterfactual measurement:
+`engine::replay` (roadmap item 32, exposed as `loom replay-context`)
+re-compiles an exported transcript turn-by-turn through the real
+`PruningContextCompiler` — at the same pre-assistant-item compile
+points the live loop uses, carrying prune-checkpoint state forward —
+under a baseline config and a `--set` overlay of the prune seams, with
+zero model calls. It reports the same census the budget check sees,
+per-freeze reclaim, and a cache-prefix-stability ratio between
+consecutive compiled requests; its trust contract is self-validity
+(replaying a trace under its own config must reproduce the recorded
+census and prune events, with older-schema traces reported `NOT
+ASSERTABLE` rather than falsely failed), and an arm that would need
+the LLM handoff stops and says so. `selfopt --pre-probe` reuses the
+same replay to reject proposals that cannot clear the adoption gate
+before docker spend. The fixed transcript bounds what it measures —
+token and cache cost, never task success.
 
 The boundary itself is guarded, not just described: `loom-cli` reaches
 workspace code through `loom-core` alone (ADR-021), and

@@ -5,6 +5,45 @@ project versions by iteration, not semver.
 
 
 
+## 2026-11 — Offline counterfactual context replay (roadmap item 32)
+
+Funded measurement without funded spend: the context projection is a pure
+function of (session, config, estimator), so recorded sessions re-compile
+under counterfactual `LOOM_*` prune settings with zero model calls.
+
+- `loom replay-context TRACE_DIR|SESSION [--set KEY=VAL…]` — replays a
+  `loom run --trace` export (or a stored session, `--provider` required)
+  turn-by-turn through the real `PruningContextCompiler` at the exact
+  compile points the live loop uses, carrying prune-checkpoint state
+  forward like a live run. Reports per-turn input tokens with census
+  split, freezes and reclaimed tokens, and a cache-prefix-stability
+  metric (common byte prefix of consecutive compiled requests ÷
+  previous length — a drop is a cache-bust proxy), plus
+  swebench-contrast-style paired baseline-vs-overlay deltas. Overlay
+  keys: the five `LOOM_PRUNE_*` selfopt seams plus replay-only
+  `age_mask_turns`, `phase_mask_turns`, `elide_turns`, `elide_reasoning`,
+  `elide_assistant_text` (`off` disables an optional knob).
+- Self-validity is the trust contract: replaying a trace under its own
+  config must reproduce the recorded census and prune events, else the
+  tool prints `VALIDITY: FAILED`. Traces recorded under an older
+  `event_schema_version` print `NOT ASSERTABLE` for census/prunes
+  (measured generation drift: `traces/smoke`, schema 3 vs 13, 8
+  tool-result tokens); turns are still compared.
+- LLM handoff compaction is non-replayable: when an arm overruns past
+  rescue it stops and reports `handoff-required` instead of faking a
+  model call. Every invocation prints the standing limitation — the
+  transcript is fixed, so replay measures token/cache cost only, never
+  task success.
+- `selfopt --pre-probe TRACE_DIR…` (default off): rejects
+  projection-affecting proposals whose projected median input-token
+  improvement cannot clear the adoption gate before any docker probes
+  are spent — same `ADOPT_MIN_TOKEN_IMPROVEMENT_PERCENT` constant,
+  tighten-only. Budget-only overlays and trace-less runs are never
+  rejected by the pre-probe.
+- Engine seam: `loom_engine::replay` (reached through `loom-core` per
+  ADR-021); `ContextInput::new` constructor added for out-of-crate
+  callers. No event-schema change; no behavior change to any live run.
+
 ## 2026-11 — Deterministic failure-to-fix lesson mining (roadmap item 20.4, remaining half)
 
 The second half of item 20.4 (the skill retirement rule shipped above):

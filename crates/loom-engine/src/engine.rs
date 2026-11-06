@@ -1191,6 +1191,14 @@ fn bare_registry(built: ToolRegistry) -> ToolRegistry {
     )
 }
 
+/// The replay arm's tool registry: the production registry with default
+/// policy and budgets, used only so the replay compiler sees a real
+/// `ToolSpec` set (the census's `tool_specs` source). No tool is ever
+/// executed during replay.
+pub(crate) fn replay_registry() -> Result<ToolRegistry, EngineError> {
+    build_registry(&CommandPolicy::default(), ToolBudgets::default())
+}
+
 /// The built-in instruction; overridable with `--system-prompt`.
 /// The default system prompt: what a frontend that passes no
 /// `system_prompt` runs with, and the one the eval harness must measure

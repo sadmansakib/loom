@@ -1633,6 +1633,37 @@ model tier under them (arXiv 2607.06906).
     is the frozen-subset sweep measuring whether cues cut
     refine/re-search turns.
 
+32. **Offline counterfactual context replay** (G1, G8, G9; funded
+   measurement — item 1's biggest open risk). Context projection is a
+   pure function of (session, config, estimator), so a stored session
+   or exported trace re-compiles under different `LOOM_*` prune knobs
+   with **zero model calls**: token cost and cache-bust behavior are
+   measurable offline. *Shipped 2026-11:* `loom replay-context
+   TRACE_DIR|SESSION [--set KEY=VAL…]` (loom-engine `replay`, CLI via
+   loom-core per ADR-021) replays the transcript turn-by-turn through
+   the real `PruningContextCompiler` at the same compile points the
+   live loop uses, carrying checkpoint state forward; reports per-turn
+   census, freezes, reclaimed tokens, and a cache-prefix-stability
+   metric (common byte-prefix ratio between consecutive compiled
+   requests), plus swebench-contrast-style paired baseline-vs-overlay
+   deltas. Baseline arm = provider base config; overlay accepts the
+   five selfopt prune seams plus replay-only elision/mask knobs.
+   Validity is the contract: replaying a trace under its own config
+   must reproduce the recorded census totals and prune events, else
+   the tool prints `VALIDITY: FAILED` and declares itself
+   untrustworthy for that input; traces recorded under an older
+   `event_schema_version` are reported `NOT ASSERTABLE` rather than
+   falsely failing (measured: `traces/smoke`, schema 3 vs 13, drifts
+   8 tool-result tokens across compiler generations). LLM handoff
+   compaction is non-replayable by design — the arm stops and says
+   so. Every invocation prints the limitation: fixed transcript ⇒
+   token/cache cost only, **never task success**. Selfopt integration
+   (opt-in): `selfopt --pre-probe TRACE_DIR…` rejects
+   projection-affecting proposals whose projected median input-token
+   improvement cannot clear `ADOPT_MIN_TOKEN_IMPROVEMENT_PERCENT`
+   before any docker spend — same gate constant, tighten-only. Design:
+   [`docs/replay-context-design.md`](replay-context-design.md).
+
 
 ### 2026-12 meta-harness sweep — gap check
 

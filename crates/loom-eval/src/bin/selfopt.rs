@@ -55,6 +55,9 @@ struct Args {
     instances: usize,
     rules_only: bool,
     dry_run: bool,
+    pre_probe: Vec<PathBuf>,
+    pre_probe_window: u32,
+    pre_probe_reserved: u32,
     loom_bin: Option<PathBuf>,
     timeout_secs: u64,
     max_turns: usize,
@@ -81,6 +84,18 @@ fn usage() -> ! {
   --instances <n>       cap on baseline instances probed (default all)
   --rules-only          skip the model proposer
   --dry-run             print the proposal plan as JSON and exit (no probes)
+  --pre-probe <path>    trace directory (repeatable) recorded with
+                        loom run --trace; projection-affecting proposals
+                        are replayed offline first and rejected when the
+                        projected median input improvement is below the
+                        adoption gate — docker probes are never spent on
+                        them. Default off.
+  --pre-probe-window <n>
+                        context window assumed by the replay pre-probe
+                        (default 200000; set it to the sweep model's)
+  --pre-probe-reserved <n>
+                        output reservation assumed by the pre-probe
+                        (default 32768)
   --loom-bin <path>     linux loom binary (default <eval-dir>/swebench/loom-linux/loom)
   --timeout-secs <n>    wall-clock budget per probe run (default 3600)
   --max-turns <n>       --max-turns for the in-container loom run (default 100)
@@ -109,6 +124,9 @@ fn parse_args() -> Args {
         instances: usize::MAX,
         rules_only: std::env::var("LOOM_SELFOPT_RULES_ONLY").is_ok_and(|v| v == "1"),
         dry_run: false,
+        pre_probe: Vec::new(),
+        pre_probe_window: 200_000,
+        pre_probe_reserved: 32_768,
         loom_bin: None,
         timeout_secs: 3600,
         max_turns: 100,
@@ -132,6 +150,13 @@ fn parse_args() -> Args {
             "--instances" => args.instances = value().parse().unwrap_or_else(|_| usage()),
             "--rules-only" => args.rules_only = true,
             "--dry-run" => args.dry_run = true,
+            "--pre-probe" => args.pre_probe.push(PathBuf::from(value())),
+            "--pre-probe-window" => {
+                args.pre_probe_window = value().parse().unwrap_or_else(|_| usage());
+            }
+            "--pre-probe-reserved" => {
+                args.pre_probe_reserved = value().parse().unwrap_or_else(|_| usage());
+            }
             "--loom-bin" => args.loom_bin = Some(PathBuf::from(value())),
             "--timeout-secs" => args.timeout_secs = value().parse().unwrap_or_else(|_| usage()),
             "--max-turns" => args.max_turns = value().parse().unwrap_or_else(|_| usage()),
@@ -511,6 +536,39 @@ fn main() {
         println!("{}", serde_json::to_string_pretty(&plan).unwrap());
         return;
     }
+
+    // Replay pre-probe: reject projection-affecting proposals whose
+    // projected improvement cannot clear the adoption gate, before any
+    // docker probes are spent (replay-context integration).
+    let proposals: Vec<Proposal> = if args.pre_probe.is_empty() {
+        proposals
+    } else {
+        println!(
+            "pre-probe: replaying {} trace dir(s) (window {}, reserved {})",
+            args.pre_probe.len(),
+            args.pre_probe_window,
+            args.pre_probe_reserved,
+        );
+        let mut kept = Vec::new();
+        for proposal in proposals {
+            let outcome = opt::pre_probe_proposal(
+                &proposal.overlay,
+                &args.pre_probe,
+                args.pre_probe_window,
+                args.pre_probe_reserved,
+            );
+            println!(
+                "  {} → {} ({})",
+                proposal.label,
+                if outcome.kept { "keep" } else { "REJECT" },
+                outcome.note
+            );
+            if outcome.kept {
+                kept.push(proposal);
+            }
+        }
+        kept
+    };
 
     // Probe every proposal, then decide.
     let mut decisions: Vec<Decision> = Vec::new();

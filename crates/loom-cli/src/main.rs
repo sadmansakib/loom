@@ -15,6 +15,7 @@ mod instructions;
 mod lessons_command;
 mod output;
 mod provider_command;
+mod replay_command;
 mod rewind_command;
 mod run;
 mod sessions_command;
@@ -35,6 +36,7 @@ fn main() -> ExitCode {
         Command::Rewind(args) => rewind_command::run(args),
         Command::Stats(args) => stats_command::run(args),
         Command::Lessons(args) => lessons_command::run(args),
+        Command::ReplayContext(args) => replay_command::run(args),
     };
 
     match outcome {

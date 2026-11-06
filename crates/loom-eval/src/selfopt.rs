@@ -37,6 +37,14 @@
 //! Everything here is offline-testable: the docker probes live in the
 //! `selfopt` binary; this module owns the pure parts (knob table,
 //! validation, proposals, paired comparison, composition, ledger).
+//!
+//! The replay pre-probe ([`pre_probe_proposal`]) sits between propose
+//! and probe: a projection-affecting overlay is replayed offline
+//! through `loom_core::engine::replay` against locally recorded trace
+//! directories, and a proposal whose projected median input-token
+//! improvement is below the adoption gate is rejected before any
+//! docker probes are spent. Same gate constants as the real probe —
+//! the pre-probe only ever tightens, never loosens.
 
 // Harness internals: panicking on a malformed fixture is the intended
 // behavior in tests.
@@ -955,6 +963,144 @@ fn extract_json_array(text: &str) -> Option<String> {
     (start < end).then(|| source[start..=end].to_owned())
 }
 
+// ------------------------------------------------------- pre-probe ---
+
+/// The verdict of replaying one proposal offline before any docker
+/// probes are spent on it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreProbeOutcome {
+    /// `false` means the proposal is rejected without probing.
+    pub kept: bool,
+    /// The projected median input-token improvement across usable
+    /// traces, in percent — `None` when replay could not price the
+    /// overlay at all.
+    pub projected_improvement_pct: Option<f64>,
+    /// Why: always printed by the binary, kept in sweep reports.
+    pub note: String,
+}
+
+/// Offline pre-probe (replay-context integration): replays each trace
+/// directory under the provider's baseline config and under the
+/// proposal overlay, and rejects the proposal when the projected median
+/// input-token improvement stays below the adoption gate
+/// ([`ADOPT_MIN_TOKEN_IMPROVEMENT_PERCENT`]).
+///
+/// Contract:
+///
+/// - Overlays that cannot change the projection (budget-only knobs —
+///   the recorded transcript is fixed) are kept with a note; replay
+///   cannot price them, so the docker probe decides.
+/// - A trace whose baseline arm overruns past rescue is skipped and
+///   named (its overlay comparison would not be apples-to-apples).
+/// - A proposal with no usable traces is kept: the pre-probe tightens
+///   on evidence, it never overrides the loop on none.
+/// - Same gate constant as the docker probe, so a pre-probe reject can
+///   never disagree with what the probe would have required.
+#[must_use]
+pub fn pre_probe_proposal(
+    overlay: &Overlay,
+    traces: &[std::path::PathBuf],
+    window_tokens: u32,
+    reserved_output_tokens: u32,
+) -> PreProbeOutcome {
+    let pairs: Vec<String> = overlay
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    if !loom_core::engine::replay::overlay_affects_projection(&pairs) {
+        return PreProbeOutcome {
+            kept: true,
+            projected_improvement_pct: None,
+            note: "overlay does not affect the projection (budget-only \
+                   knobs); replay cannot price it, the docker probe decides"
+                .to_owned(),
+        };
+    }
+
+    let mut improvements: Vec<f64> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for trace_dir in traces {
+        let trace = match loom_core::engine::replay::TraceInput::read(trace_dir) {
+            Ok(trace) => trace,
+            Err(error) => {
+                skipped.push(format!("{} (unreadable: {error})", trace_dir.display()));
+                continue;
+            }
+        };
+        let (base_config, _) = loom_core::engine::engine::prune_with_env(&trace.provider, |_| None);
+        let mut options = loom_core::engine::replay::ReplayOptions::new(&trace.provider);
+        options.window_tokens = window_tokens;
+        options.reserved_output_tokens = reserved_output_tokens;
+        let Ok(baseline) = loom_core::engine::replay::replay_session(
+            &trace.session,
+            &trace.task,
+            &options,
+            base_config,
+        ) else {
+            skipped.push(format!("{} (baseline replay failed)", trace_dir.display()));
+            continue;
+        };
+        if baseline.handoff_stopped_at.is_some() {
+            skipped.push(format!(
+                "{} (baseline overran past rescue at turn {})",
+                trace_dir.display(),
+                baseline.handoff_stopped_at.unwrap_or_default(),
+            ));
+            continue;
+        }
+        let Ok((config, _)) = loom_core::engine::replay::overlay_config(base_config, &pairs) else {
+            skipped.push(format!("{} (overlay rejected)", trace_dir.display()));
+            continue;
+        };
+        let Ok(overlay_replay) = loom_core::engine::replay::replay_session(
+            &trace.session,
+            &trace.task,
+            &options,
+            config,
+        ) else {
+            skipped.push(format!("{} (overlay replay failed)", trace_dir.display()));
+            continue;
+        };
+        improvements.push(loom_core::engine::replay::projected_improvement_percent(
+            &baseline,
+            &overlay_replay,
+        ));
+    }
+
+    if improvements.is_empty() {
+        let reason = if skipped.is_empty() {
+            "no traces supplied".to_owned()
+        } else {
+            format!("no usable traces: {}", skipped.join("; "))
+        };
+        return PreProbeOutcome {
+            kept: true,
+            projected_improvement_pct: None,
+            note: format!("kept without pre-probe evidence ({reason})"),
+        };
+    }
+    let improvement = median(&improvements);
+    PreProbeOutcome {
+        kept: improvement >= ADOPT_MIN_TOKEN_IMPROVEMENT_PERCENT,
+        projected_improvement_pct: Some(improvement),
+        note: format!(
+            "projected median input improvement {improvement:+.1}% across {} \
+             trace(s){} (gate {ADOPT_MIN_TOKEN_IMPROVEMENT_PERCENT}%){}",
+            improvements.len(),
+            if skipped.is_empty() {
+                String::new()
+            } else {
+                format!("; skipped {}", skipped.len())
+            },
+            if improvement >= ADOPT_MIN_TOKEN_IMPROVEMENT_PERCENT {
+                ""
+            } else {
+                " — rejected before docker"
+            },
+        ),
+    }
+}
+
 // ------------------------------------------------------------ tests ---
 
 #[cfg(test)]
@@ -1326,5 +1472,147 @@ mod tests {
         assert_eq!(baseline.runs[0].events, 7);
         assert_eq!(baseline.runs[0].usage.input_tokens, 1000);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ------------------------------------------------- pre-probe ---
+
+    /// Writes a minimal `loom run --trace`-shaped directory: a user
+    /// task, `reads` rounds of a read_file call + result of roughly
+    /// `read_bytes` bytes each, and a final end turn. No summary, no
+    /// events — the pre-probe needs neither.
+    fn write_replay_trace(
+        dir: &std::path::Path,
+        reads: usize,
+        read_bytes: usize,
+    ) -> std::path::PathBuf {
+        use loom_core::kernel::id::{SessionId, TaskId};
+        use loom_core::kernel::model::StopReason;
+        use loom_core::kernel::session::TaskRecord;
+        use loom_core::kernel::transcript::{
+            AssistantMessage, Item, ToolArguments, ToolCall, ToolCallId, ToolResult, ToolStatus,
+        };
+
+        let mut items = vec![Item::User {
+            text: "read big.txt over and over".to_owned(),
+        }];
+        let body = "lorem ipsum dolor sit amet\n".repeat(read_bytes / 27);
+        for index in 0..reads {
+            let call = ToolCall {
+                id: ToolCallId::try_from(format!("c{index}")).unwrap(),
+                name: "read_file".to_owned(),
+                arguments: ToolArguments::try_from(serde_json::json!({
+                    "path": "big.txt"
+                }))
+                .unwrap(),
+            };
+            items.push(Item::Assistant(AssistantMessage {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![call.clone()],
+                stop_reason: StopReason::ToolCalls,
+            }));
+            items.push(Item::ToolResult(ToolResult::new(
+                call.id.clone(),
+                ToolStatus::Success,
+                body.clone(),
+                false,
+            )));
+        }
+        items.push(Item::Assistant(AssistantMessage {
+            content: "done".to_owned(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            stop_reason: StopReason::EndTurn,
+        }));
+        // `turns` must be non-zero or the replay treats the task as a
+        // fast-path solve and compiles nothing.
+        let mut task = TaskRecord::new(TaskId::new(), 0);
+        task.turns = (reads + 1) as u32;
+        let manifest = serde_json::json!({
+            "harness": {"provider": "deepseek", "model": "m"},
+            "task_id": task.id.to_string(),
+        });
+        let transcript = serde_json::json!({
+            "session_id": SessionId::new().to_string(),
+            "items": items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| serde_json::json!({"index": index, "item": item}))
+                .collect::<Vec<_>>(),
+            "tasks": [task],
+        });
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+        std::fs::write(dir.join("transcript.json"), transcript.to_string()).unwrap();
+        dir.to_owned()
+    }
+
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("loom-preprobe-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn pre_probe_keeps_budget_only_overlays_without_pricing() {
+        let overlay = overlay(&[("LOOM_READ_HEAD_BYTES", "8192")]);
+        let outcome = pre_probe_proposal(&overlay, &[], 16_384, 1_024);
+        assert!(outcome.kept, "{}", outcome.note);
+        assert!(outcome.note.contains("cannot price"));
+        assert_eq!(outcome.projected_improvement_pct, None);
+    }
+
+    #[test]
+    fn pre_probe_rejects_overlays_the_projection_cannot_pay_for() {
+        let root = temp_root("reject");
+        let trace = write_replay_trace(&root.join("t1"), 2, 2_000);
+        // A floor so high the trigger is unreachable: the overlay arm
+        // compiles exactly like the baseline, so the projected
+        // improvement is zero and the gate rejects it before docker.
+        let floor = overlay(&[("LOOM_PRUNE_FLOOR_TOKENS", "256000")]);
+        let outcome = pre_probe_proposal(&floor, std::slice::from_ref(&trace), 16_384, 1_024);
+        assert!(!outcome.kept, "{}", outcome.note);
+        assert_eq!(outcome.projected_improvement_pct, Some(0.0));
+        assert!(outcome.note.contains("rejected before docker"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pre_probe_keeps_an_overlay_that_stubs_more() {
+        let root = temp_root("keep");
+        // Nine reads of ~9KB under a 32K window: the baseline (provider
+        // defaults, 80% trigger) never approaches its trigger, while the
+        // aggressive overlay triggers at 30% and — as reads age out of
+        // the protected tail turns — freezes and stubs them. Enough
+        // turns run AFTER the first freeze that the median (the gate
+        // statistic) shifts, not just the totals.
+        let trace = write_replay_trace(&root.join("t1"), 9, 9_000);
+        let aggressive = overlay(&[
+            ("LOOM_PRUNE_TRIGGER_PERCENT", "30"),
+            ("LOOM_PRUNE_FLOOR_TOKENS", "100"),
+            ("LOOM_PRUNE_MIN_RECLAIM_TOKENS", "100"),
+            ("LOOM_PRUNE_TAIL_TOKENS", "200"),
+            ("LOOM_AGE_MASK_TURNS", "1"),
+        ]);
+        let outcome = pre_probe_proposal(&aggressive, std::slice::from_ref(&trace), 32_768, 512);
+        assert!(outcome.kept, "{}", outcome.note);
+        assert!(
+            outcome.projected_improvement_pct.unwrap_or(0.0) >= ADOPT_MIN_TOKEN_IMPROVEMENT_PERCENT,
+            "{}",
+            outcome.note
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pre_probe_keeps_everything_without_usable_traces() {
+        let root = temp_root("unusable");
+        let not_a_trace = root.join("empty");
+        std::fs::create_dir_all(&not_a_trace).unwrap();
+        let floor = overlay(&[("LOOM_PRUNE_FLOOR_TOKENS", "256000")]);
+        let outcome = pre_probe_proposal(&floor, std::slice::from_ref(&not_a_trace), 16_384, 1_024);
+        assert!(outcome.kept, "{}", outcome.note);
+        assert!(outcome.note.contains("without pre-probe evidence"));
+        std::fs::remove_dir_all(&root).ok();
     }
 }
