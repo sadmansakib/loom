@@ -98,12 +98,18 @@ touched) computed from the transcript alone. Non-interactive:
   restore unless `--accept-unrestorable` is passed. This is the
   Claude Code file-history shape riding seams that already exist; it
   is an iteration of its own, not a redesign.
-  - Captured today at the tools seam: `write_file`, `edit_file`,
-    `symbols` replace. Not yet: LSP-applied edits (`lsp/apply.rs`
-    records `files_written` with absolute-path keys; pre-images there
-    wait on a key-resolution pass), and file deletions performed via
-    LSP. A dropped region touching an uncaptured write refuses at
-    that path ("no pre-image was captured") rather than guessing.
+  - Captured at the tools seam: `write_file`, `edit_file`,
+    `symbols` replace, and LSP-applied edits (`lsp/apply.rs`): the
+    plan pass already reads every file it modifies for its undo
+    snapshots, so pre-image capture rides those reads. LSP effect
+    keys were normalized from absolute to workspace-relative paths in
+    the same pass (ADR-012, matching every other write tool), which
+    is what makes their pre-images resolvable at restore time. An
+    unreadable rename source yields no entry (never a false
+    "absent"), and a rolled-back batch leaves no ledger entry. A
+    dropped region touching an uncaptured write (e.g. a session run
+    with no artifact store) still refuses at that path ("no
+    pre-image was captured") rather than guessing.
   - `run` records no pre-images by design: command effects are
     surfaced through the `commands_run` gate instead.
 
@@ -173,5 +179,6 @@ it does not run.
    --to-start`. Shipped 2026-11-06.
 3. Tier-2 before-images at the tools seam (own iteration, updates
    this note's tier table). Shipped 2026-11-06 for `write_file`,
-   `edit_file`, and `symbols`; LSP-applied edits remain on the
-   tier-2 caveat list above.
+   `edit_file`, and `symbols`; LSP-applied edits (with absolute→
+   relative effect-key normalization) shipped the same day — tier 2
+   now covers every loom write path.

@@ -1704,9 +1704,11 @@ Two small gaps surfaced and are recorded here so they are not lost
     works for dirty starts and non-git workspaces, refuses paths it
     cannot prove and restores that would touch `.loom/rewind`, gates
     on `commands_run` unless `--accept-unrestorable`, and snapshots
-    per-file copies + manifest before mutating. Remaining: LSP-applied
-    edits (`lsp/apply.rs` absolute-path keys) — their writes refuse at
-    restore time today, per the design doc's tier-2 caveat.
+    per-file copies + manifest before mutating. LSP-applied edits
+    (`lsp/apply.rs`) capture pre-images on the plan pass's existing
+    undo reads, and their effect keys were normalized from absolute
+    to workspace-relative paths (ADR-012) — tier 2 now covers every
+    loom write path.
 2. **Skill telemetry** (feeds item 20.4/skills lifecycle). Per-skill
    context cost and usage frequency (Claude Code `/skill-doctor` shape)
    so low-value skills retire on evidence — the lifecycle rule the

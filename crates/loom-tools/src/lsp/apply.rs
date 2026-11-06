@@ -22,11 +22,22 @@
 //!   insert "World"@3 then "Hello"@3 yields "WorldHello").
 //! - Every text range converts from the server's negotiated position
 //!   encoding (utf-16 by default) to byte offsets before slicing.
+//! - Effect keys are workspace-relative and carry pre-images
+//!   (`docs/rewind-design.md` tier 2): the plan pass already reads
+//!   every file it is about to modify for its undo snapshots, so the
+//!   bytes for a rewind pre-image are in hand before any mutation —
+//!   capture rides the same read, never a second one. Bodies go to
+//!   the artifact store content-addressed at plan time; a batch that
+//!   rolls back leaves the body orphaned (GC-collectable) and no
+//!   ledger entry, because effects — pre-images included — are only
+//!   recorded after the whole batch commits.
 
 use async_lsp::lsp_types;
-use loom_kernel::tool::ToolEffects;
+use loom_kernel::store::ArtifactStore;
+use loom_kernel::tool::{BeforeImage, ToolEffects};
 
 use crate::lsp::client::LspServer;
+use crate::pre_image::capture_before_image;
 
 /// Converts an LSP range (zero-based line/character, utf-16 chars by
 /// default) into byte offsets against the current file text.
@@ -204,6 +215,13 @@ impl Undo {
 struct PlannedOp {
     op: PlanOp,
     undo: Undo,
+    /// Tier-2 pre-images for the paths this op touches, keyed by the
+    /// same workspace-relative string the effects ledger will record
+    /// (ADR-012). Empty when capture was impossible (no artifact
+    /// store, or a source file that could not be read): restore then
+    /// refuses those paths rather than guessing. Renames carry two —
+    /// deleted source first, written target second.
+    before_images: Vec<BeforeImage>,
 }
 
 /// Resolves a server-supplied URI to a workspace-confined path.
@@ -224,13 +242,25 @@ fn confined_path(
         .map_err(|e| format!("{op}: uri {display} escapes the workspace root: {e}"))
 }
 
+/// The workspace-relative string under which a path's effects and
+/// pre-images are recorded (ADR-012: relative so a record means the
+/// same thing on any machine; `confined_path` guarantees the strip
+/// succeeds).
+fn effect_key(server: &LspServer, path: &std::path::Path) -> String {
+    crate::confinement::workspace_relative(server.workspace_root(), path)
+}
+
 /// Builds the validated plan for a whole edit batch: every semantic
 /// error (confinement escape, non-file URI, stale version, bad range,
 /// overlap) surfaces here, before the first mutation.
 async fn plan_workspace_edit(
     server: &LspServer,
     edit: &lsp_types::WorkspaceEdit,
+    artifacts: Option<&std::sync::Arc<dyn ArtifactStore>>,
 ) -> Result<Vec<PlannedOp>, String> {
+    // One coercion for every capture site: the helper takes the trait,
+    // callers hold an Arc (or nothing, which means captures degrade).
+    let store: Option<&dyn ArtifactStore> = artifacts.map(std::sync::Arc::as_ref);
     let operations: Vec<lsp_types::DocumentChangeOperation> =
         if let Some(changes) = edit.document_changes.as_ref() {
             match changes {
@@ -266,6 +296,7 @@ async fn plan_workspace_edit(
             lsp_types::DocumentChangeOperation::Op(resource) => match resource {
                 lsp_types::ResourceOp::Create(create) => {
                     let path = confined_path(server, &create.uri, "create")?;
+                    let rel = effect_key(server, &path);
                     let overwrite = create
                         .options
                         .as_ref()
@@ -273,8 +304,9 @@ async fn plan_workspace_edit(
                     // Preflight + undo capture: an existing file under a
                     // no-overwrite create fails the whole batch here,
                     // before any IO; an overwrite keeps the original
-                    // bytes for rollback.
-                    let undo = if path.exists() {
+                    // bytes for rollback. The pre-image rides the same
+                    // read the undo already needed (absent needs none).
+                    let (undo, before_image) = if path.exists() {
                         if !overwrite {
                             return Err(format!(
                                 "create: {} already exists (server did not allow overwrite)",
@@ -284,21 +316,31 @@ async fn plan_workspace_edit(
                         let bytes = tokio::fs::read(&path)
                             .await
                             .map_err(|e| format!("create: cannot read {}: {e}", path.display()))?;
-                        Undo::WriteBytes {
-                            path: path.clone(),
-                            bytes,
-                        }
+                        let image = capture_before_image(store, &rel, Some(&bytes));
+                        (
+                            Undo::WriteBytes {
+                                path: path.clone(),
+                                bytes,
+                            },
+                            image,
+                        )
                     } else {
-                        Undo::RemoveFile(path.clone())
+                        (
+                            Undo::RemoveFile(path.clone()),
+                            capture_before_image(store, &rel, None),
+                        )
                     };
                     plan.push(PlannedOp {
                         op: PlanOp::Create { path },
                         undo,
+                        before_images: before_image.into_iter().collect(),
                     });
                 }
                 lsp_types::ResourceOp::Rename(rename) => {
                     let from = confined_path(server, &rename.old_uri, "rename")?;
                     let to = confined_path(server, &rename.new_uri, "rename")?;
+                    let from_rel = effect_key(server, &from);
+                    let to_rel = effect_key(server, &to);
                     let overwrite = rename
                         .options
                         .as_ref()
@@ -320,12 +362,27 @@ async fn plan_workspace_edit(
                         } else {
                             None
                         };
+                    // The rename itself never reads the source — but a
+                    // rewind to before this op must put those bytes
+                    // back, so the pre-image reads them best-effort. An
+                    // unreadable source yields NO entry (not "absent":
+                    // the file existed), so restore refuses instead of
+                    // deleting on rewind.
+                    let from_image = match tokio::fs::read(&from).await {
+                        Ok(bytes) => capture_before_image(store, &from_rel, Some(&bytes)),
+                        Err(_) => None,
+                    };
+                    let to_image = capture_before_image(store, &to_rel, replaced.as_deref());
+                    let mut before_images = Vec::with_capacity(2);
+                    before_images.extend(from_image);
+                    before_images.extend(to_image);
                     plan.push(PlannedOp {
                         op: PlanOp::Rename {
                             from: from.clone(),
                             to: to.clone(),
                         },
                         undo: Undo::RenameBack { from, to, replaced },
+                        before_images,
                     });
                 }
                 lsp_types::ResourceOp::Delete(delete) => {
@@ -345,6 +402,8 @@ async fn plan_workspace_edit(
                     let bytes = tokio::fs::read(&path)
                         .await
                         .map_err(|e| format!("delete: cannot read {}: {e}", path.display()))?;
+                    let rel = effect_key(server, &path);
+                    let before_image = capture_before_image(store, &rel, Some(&bytes));
                     let undo_path = path.clone();
                     plan.push(PlannedOp {
                         op: PlanOp::Delete { path },
@@ -352,6 +411,7 @@ async fn plan_workspace_edit(
                             path: undo_path,
                             bytes,
                         },
+                        before_images: before_image.into_iter().collect(),
                     });
                 }
             },
@@ -378,12 +438,15 @@ async fn plan_workspace_edit(
                 let original = text.clone().into_bytes();
                 let edits = plain_edits(&doc_edit.edits);
                 apply_text_edits(&mut text, &edits, server.uses_utf8_positions())?;
+                let rel = effect_key(server, &path);
+                let before_image = capture_before_image(store, &rel, Some(&original));
                 plan.push(PlannedOp {
                     op: PlanOp::Edit { path, text },
                     undo: Undo::WriteBytes {
                         path: std::path::PathBuf::from(path_str),
                         bytes: original,
                     },
+                    before_images: before_image.into_iter().collect(),
                 });
             }
         }
@@ -392,13 +455,17 @@ async fn plan_workspace_edit(
 }
 
 /// Performs one planned operation: pure IO plus effect recording.
-/// `notes` collects (path, final text) for open-document sync after the
-/// whole batch commits.
+/// Effect keys are workspace-relative under `root` (ADR-012), matching
+/// every other loom write tool; `notes` keep ABSOLUTE paths because
+/// open-document sync keys on them. Pre-images arrive with the op and
+/// are folded by the caller after it commits.
 async fn perform(
     op: PlanOp,
+    root: &std::path::Path,
     effects: &mut ToolEffects,
     notes: &mut Vec<(String, String)>,
 ) -> Result<(), String> {
+    let relative = |path: &std::path::Path| crate::confinement::workspace_relative(root, path);
     match op {
         PlanOp::Create { path } => {
             if let Some(parent) = path.parent() {
@@ -411,26 +478,26 @@ async fn perform(
             tokio::fs::write(&path, "")
                 .await
                 .map_err(|e| format!("create {}: {e}", path.display()))?;
-            *effects = std::mem::take(effects).with_file_written(path.to_string_lossy());
+            *effects = std::mem::take(effects).with_file_written(relative(&path));
         }
         PlanOp::Rename { from, to } => {
             tokio::fs::rename(&from, &to)
                 .await
                 .map_err(|e| format!("rename {} → {}: {e}", from.display(), to.display()))?;
-            *effects = std::mem::take(effects).with_file_deleted(from.to_string_lossy());
-            *effects = std::mem::take(effects).with_file_written(to.to_string_lossy());
+            *effects = std::mem::take(effects).with_file_deleted(relative(&from));
+            *effects = std::mem::take(effects).with_file_written(relative(&to));
         }
         PlanOp::Delete { path } => {
             tokio::fs::remove_file(&path)
                 .await
                 .map_err(|e| format!("delete {}: {e}", path.display()))?;
-            *effects = std::mem::take(effects).with_file_deleted(path.to_string_lossy());
+            *effects = std::mem::take(effects).with_file_deleted(relative(&path));
         }
         PlanOp::Edit { path, text } => {
             tokio::fs::write(&path, &text)
                 .await
                 .map_err(|e| format!("edit: cannot write {}: {e}", path.display()))?;
-            *effects = std::mem::take(effects).with_file_written(path.to_string_lossy());
+            *effects = std::mem::take(effects).with_file_written(relative(&path));
             notes.push((path.to_string_lossy().into_owned(), text));
         }
     }
@@ -455,14 +522,27 @@ async fn report_rollback(error: String, undos: Vec<Undo>) -> String {
 
 /// Executes a plan op by op. On the first IO failure the already-applied
 /// prefix is rolled back (reverse, best effort); effects and sync notes
-/// are returned only when the whole batch committed.
-async fn apply_plan(plan: Vec<PlannedOp>) -> Result<(ToolEffects, Vec<(String, String)>), String> {
+/// are returned only when the whole batch committed. Pre-image bodies
+/// were stored at plan time — a batch that rolls back leaves the body
+/// orphaned (content-addressed, GC-collectable) and no ledger entry.
+async fn apply_plan(
+    plan: Vec<PlannedOp>,
+    root: &std::path::Path,
+) -> Result<(ToolEffects, Vec<(String, String)>), String> {
     let mut effects = ToolEffects::default();
     let mut notes: Vec<(String, String)> = Vec::new();
     let mut undos: Vec<Undo> = Vec::new();
-    for PlannedOp { op, undo } in plan {
-        if let Err(error) = perform(op, &mut effects, &mut notes).await {
+    for PlannedOp {
+        op,
+        undo,
+        before_images,
+    } in plan
+    {
+        if let Err(error) = perform(op, root, &mut effects, &mut notes).await {
             return Err(report_rollback(error, undos).await);
+        }
+        for image in before_images {
+            effects = std::mem::take(&mut effects).with_before_image(image);
         }
         undos.push(undo);
     }
@@ -477,13 +557,16 @@ async fn apply_plan(plan: Vec<PlannedOp>) -> Result<(ToolEffects, Vec<(String, S
 /// disk) roll the applied prefix back in reverse; effects and
 /// open-document sync notes are recorded only after the whole batch
 /// commits, so a rolled-back run leaves neither ledger writes nor
-/// stale didChange bumps.
+/// stale didChange bumps. `artifacts` receives the pre-image bodies
+/// (tier-2 rewind); without a store, writes still happen but restores
+/// for them will refuse.
 pub(crate) async fn apply_workspace_edit(
     server: &LspServer,
     edit: &lsp_types::WorkspaceEdit,
+    artifacts: Option<&std::sync::Arc<dyn ArtifactStore>>,
 ) -> Result<ToolEffects, String> {
-    let plan = plan_workspace_edit(server, edit).await?;
-    let (effects, notes) = apply_plan(plan).await?;
+    let plan = plan_workspace_edit(server, edit, artifacts).await?;
+    let (effects, notes) = apply_plan(plan, server.workspace_root()).await?;
     // Keep the server's view of open files current — after commit only.
     for (path, text) in notes {
         server.note_local_write(&path, text).await;
@@ -606,15 +689,98 @@ mod tests {
                     path: file.clone(),
                     bytes: b"original".to_vec(),
                 },
+                before_images: Vec::new(),
             },
             PlannedOp {
                 op: PlanOp::Create { path: doomed },
                 undo: Undo::RemoveFile(barrier.join("inner.txt")),
+                before_images: Vec::new(),
             },
         ];
-        let err = apply_plan(plan).await.expect_err("second op must fail");
+        let err = apply_plan(plan, dir.path())
+            .await
+            .expect_err("second op must fail");
         assert!(err.contains("rolled back"), "{err}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "original");
+    }
+
+    #[tokio::test]
+    async fn effects_carry_relative_keys_and_before_images() {
+        // Tier-2 contract of the LSP write path (docs/rewind-design.md):
+        // effect keys are workspace-relative like every other loom
+        // write tool, and the pre-images captured at plan time ride the
+        // effects of the committed batch. Hand-built plan, because
+        // planning itself needs a live server process.
+        use loom_kernel::artifact::store_artifact;
+        use loom_kernel::store::MemoryArtifactStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("src").join("lib.rs");
+        std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+        std::fs::write(&raw, "fn old() {}\n").unwrap();
+        // Production paths arrive canonical (resolve_within output);
+        // match that here — macOS tempdirs are symlinked (/var →
+        // /private/var) and workspace_relative strips against the
+        // canonical form only.
+        let file = raw.canonicalize().unwrap();
+        let late = {
+            let raw = dir.path().join("notes.txt");
+            std::fs::write(&raw, "late").unwrap();
+            raw.canonicalize().unwrap()
+        };
+
+        let artifacts = MemoryArtifactStore::new();
+        let lib_ref = store_artifact(&artifacts, "pre_image", b"fn old() {}\n").unwrap();
+
+        let plan = vec![
+            PlannedOp {
+                op: PlanOp::Edit {
+                    path: file.clone(),
+                    text: "fn new() {}\n".to_owned(),
+                },
+                undo: Undo::WriteBytes {
+                    path: file.clone(),
+                    bytes: b"fn old() {}\n".to_vec(),
+                },
+                before_images: vec![BeforeImage::captured("src/lib.rs", lib_ref.clone())],
+            },
+            PlannedOp {
+                op: PlanOp::Delete { path: late },
+                undo: Undo::WriteBytes {
+                    path: dir.path().join("notes.txt"),
+                    bytes: b"late".to_vec(),
+                },
+                before_images: vec![BeforeImage::absent("notes.txt")],
+            },
+        ];
+        let root = dir.path().canonicalize().unwrap();
+        let (effects, notes) = apply_plan(plan, &root).await.unwrap();
+
+        // Relative keys: the transcript claims workspace paths, not
+        // machine-specific absolute ones.
+        assert_eq!(effects.files_written, vec!["src/lib.rs".to_owned()]);
+        assert_eq!(effects.files_deleted, vec!["notes.txt".to_owned()]);
+        // Pre-images keyed by the same strings, in plan order.
+        assert_eq!(effects.before_images.len(), 2);
+        assert_eq!(effects.before_images[0].path, "src/lib.rs");
+        assert_eq!(effects.before_images[1].path, "notes.txt");
+        assert!(effects.before_images[1].content.is_none());
+        // Bodies resolve: what the restore will write back is exactly
+        // the pre-edit content.
+        let stored = artifacts
+            .get(&lib_ref.id)
+            .expect("store read")
+            .expect("pre-image body stored at plan time")
+            .body;
+        assert_eq!(stored, b"fn old() {}\n");
+        // Sync notes stay absolute — they key open documents.
+        assert_eq!(
+            notes,
+            vec![(
+                file.to_string_lossy().into_owned(),
+                "fn new() {}\n".to_owned()
+            )]
+        );
     }
 
     #[tokio::test]

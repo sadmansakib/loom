@@ -916,9 +916,10 @@ impl Tool for LspRenameTool {
                 )));
             };
             let ops = edit_op_count(&edit);
-            let effects = crate::lsp::apply::apply_workspace_edit(&server, &edit)
-                .await
-                .map_err(ToolError::Execution)?;
+            let effects =
+                crate::lsp::apply::apply_workspace_edit(&server, &edit, ctx.artifacts.as_ref())
+                    .await
+                    .map_err(ToolError::Execution)?;
             Ok(ToolOutput::new(format!(
                 "[lsp:{}]\nrenamed symbol to {} across {ops} document change(s)",
                 server.name, input.new_name
@@ -1029,9 +1030,10 @@ impl Tool for LspFormatTool {
                 ])),
                 ..Default::default()
             };
-            let effects = crate::lsp::apply::apply_workspace_edit(&server, &edit)
-                .await
-                .map_err(ToolError::Execution)?;
+            let effects =
+                crate::lsp::apply::apply_workspace_edit(&server, &edit, ctx.artifacts.as_ref())
+                    .await
+                    .map_err(ToolError::Execution)?;
             Ok(
                 ToolOutput::new(format!("[lsp:{}]\nformatted {}", server.name, input.path))
                     .with_effects(effects),
