@@ -44,8 +44,8 @@ use loom_core::engine::trace_stats::{
     attribution_line, collect, fold_totals, human_task, human_totals, task_json, totals_json,
 };
 use loom_core::kernel::analytics::{
-    SessionStats, SessionsOverview, Spill, mechanisms_json, mechanisms_line, mechanisms_overview,
-    sessions_overview,
+    SessionStats, SessionsOverview, SkillVerdict, Spill, mechanisms_json, mechanisms_line,
+    mechanisms_overview, sessions_overview,
 };
 use loom_core::kernel::artifact_gc::{self, GcBounds};
 use loom_core::kernel::store::ArtifactStore;
@@ -254,6 +254,15 @@ fn skills_line(stats: &SessionStats) -> Option<String> {
                 ));
             }
             part.push_str(&format!(", {} bytes delivered", s.delivered_bytes));
+            // The item-20.4 lifecycle verdict rides the same line: the
+            // numbers already say how a skill is used; this says what
+            // the evidence argues for. `keep` stays silent — the line
+            // would double in length for no signal.
+            match s.retirement_verdict() {
+                SkillVerdict::Watch => part.push_str(" [watch]"),
+                SkillVerdict::Retire => part.push_str(" [retire]"),
+                SkillVerdict::Keep => {}
+            }
             part
         })
         .collect();
@@ -272,6 +281,7 @@ fn skills_json(stats: &SessionStats) -> serde_json::Value {
                 "resources": s.resources,
                 "failures": s.failures,
                 "delivered_bytes": s.delivered_bytes,
+                "verdict": s.retirement_verdict().to_string(),
             })
         })
         .collect::<Vec<_>>()

@@ -5,6 +5,28 @@ project versions by iteration, not semver.
 
 
 
+## 2026-11 — Skill retirement rule (roadmap item 20.4, gap 2)
+
+The telemetry gap's handoff: `SessionStats.skills` now drives a
+lifecycle verdict, so low-value skills retire on evidence instead of
+by opinion.
+
+- `SkillStats::retirement_verdict` in `loom_kernel::analytics` (pure,
+  deterministic, four published constants): **retire** on failures
+  only, failures outweighing successes on real evidence, or bytes
+  delivered with no successful use at all; **watch** when bytes
+  delivered exceed 1 KB under 8 successful calls (expensive for how
+  seldom it is used); **keep** otherwise. Malformed-argument tallies
+  under the `"?"` key retire with the only state they can have.
+- `loom stats` prints `[retire]` / `[watch]` beside the per-skill
+  numbers (`keep` stays silent — no signal) and adds `verdict` to
+  every JSON skills row. The rule is advisory: it never hides,
+  ejects, or rewrites a skill; the operator acts on it.
+- `skill_retirement_verdicts` folds a whole `SessionStats` into the
+  name-ordered verdict list.
+- Failure-to-fix lesson mining (the rest of 20.4) stays open: it
+  needs an authoring loop, which wants a funded model.
+
 ## 2026-11 — Rewind rollout step 2: tier-1 start checkpoint + `--restore-workspace` (roadmap gap 1, items 15/22)
 
 Implements step 2 of `docs/rewind-design.md`: the workspace can now

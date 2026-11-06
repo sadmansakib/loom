@@ -1340,6 +1340,19 @@ adds four more framing findings and backlog items 26–31 below.
        `memory_20260818` context edit; Claude Code's agent-written
        `MEMORY.md`) is the same pattern at the file level — plain files
        under model control, injected through a seam Loom already has.
+       The skills half shipped 2026-11-06: the retirement rule over the
+       per-skill telemetry (`SkillStats::retirement_verdict` in
+       `loom_kernel::analytics`, four published constants) — retire on
+       failures-only, failures-outweighing-successes, or bytes with no
+       successful use; watch when bytes delivered exceed 1 KB under 8
+       successful calls; keep otherwise — printed by `loom stats` as
+       `[retire]` / `[watch]` markers beside the numbers and `verdict`
+       in the JSON row. Advisory only: the rule never hides, ejects,
+       or rewrites a skill; acting on a verdict is the operator's
+       step. Failure-to-fix lesson mining remains open — it needs an
+       authoring loop (a proposer that reads traces and writes rules),
+       the Harness² offline half, which wants a funded model to do
+       it honestly.
 
     **Harness² input (2026-10-20, arXiv 2610.14224).** Google's
     recursive-harnessing framework is the same thesis with the editing
@@ -1679,8 +1692,11 @@ Two small gaps surfaced and are recorded here so they are not lost
    failures, delivered bytes per menu name, `"?"` for malformed
    arguments) derived outcome-joined from the transcript in
    `session_stats`; `loom stats` prints a `skills:` line (human) and a
-   `skills` totals array (JSON). Cancelled loads count nowhere; the
-   wire-up to item 20.4's retirement rule is that item's work.
+   `skills` totals array (JSON). Cancelled loads count nowhere.
+   The retirement wire-up shipped under item 20.4 (below):
+   `SkillStats::retirement_verdict` — retire on evidence, watch on
+   cost, keep otherwise — printed by `loom stats` as `[retire]` /
+   `[watch]` markers and `verdict` in the JSON row.
 
 ### Deliberately not planned
 

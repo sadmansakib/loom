@@ -424,11 +424,15 @@ fn stats_reports_per_skill_telemetry() {
     assert_eq!(skills[0]["name"], json!("deploy"));
     assert_eq!(skills[0]["loads"], json!(0));
     assert_eq!(skills[0]["resources"], json!(1));
+    assert_eq!(skills[0]["verdict"], json!("keep"));
     assert_eq!(skills[1]["name"], json!("ghost"));
     assert_eq!(skills[1]["failures"], json!(1));
+    // Only failures: the retirement rule (item 20.4).
+    assert_eq!(skills[1]["verdict"], json!("retire"));
     let release = &skills[2];
     assert_eq!(release["name"], json!("release"));
     assert_eq!(release["loads"], json!(2));
+    assert_eq!(release["verdict"], json!("keep"));
     let delivered = "# skill: release\none".len() + "# skill: release\ntwo".len();
     assert_eq!(release["delivered_bytes"], json!(delivered as u64));
 
@@ -451,4 +455,49 @@ fn stats_reports_per_skill_telemetry() {
     );
     assert!(stdout.contains("release 2 loads, 0 resources"), "{stdout}");
     assert!(stdout.contains("bytes delivered"), "{stdout}");
+    // The lifecycle verdict rides the line: ghost failed outright.
+    assert!(stdout.contains("[retire]"), "{stdout}");
+    assert!(!stdout.contains("[watch]"), "{stdout}");
+}
+
+#[test]
+fn stats_marks_watch_verdict_for_expensive_rare_skills() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("loom.db");
+    {
+        let store = SqliteStore::open(&db).unwrap();
+        let id = SessionId::new();
+        let mut session = Session::new(id);
+        store.ensure_session(&id).unwrap();
+        let user = Item::User {
+            text: "try the pricey one".to_owned(),
+        };
+        let index = session.push_item(user.clone()).unwrap();
+        store.append_item(&id, index, &user).unwrap();
+
+        // One small load, but of a ~5 KB skill body: expensive
+        // relative to rare use — the watch verdict (item 20.4).
+        commit(
+            &store,
+            &id,
+            &mut session,
+            turn(
+                "skilling up",
+                vec![call("a", "load_skill", json!({"name": "pricey"}))],
+            ),
+            vec![result("a", ToolStatus::Success, &"h".repeat(5_000))],
+        );
+    }
+
+    let (ok, stdout, stderr) = stats(&db, &[]);
+    assert!(ok, "human output failed: {stderr}");
+    assert!(
+        stdout.contains("pricey 1 load, 0 resources, 5000 bytes delivered [watch]"),
+        "{stdout}"
+    );
+
+    let (ok, stdout, stderr) = stats(&db, &["--json"]);
+    assert!(ok, "json failed: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["totals"]["skills"][0]["verdict"], json!("watch"));
 }
