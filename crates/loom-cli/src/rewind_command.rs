@@ -1,14 +1,21 @@
 //! `loom rewind`: fork a stored session at a chosen transcript boundary
-//! (`docs/rewind-design.md`, rollout step 1).
+//! (`docs/rewind-design.md`, rollout steps 1–2).
 //!
 //! Rewind never deletes: it copies items `[0, boundary)` into a fresh
 //! session id and leaves the original intact — the transcript is
 //! append-only and indices are stable for the session's life (ADR-004),
 //! so a fork that truncated its source would break both promises. The
 //! fork is pure conversation state: task records, todos, and events
-//! belong to the run that produced them, and the workspace is untouched
-//! (code restore is a later, tiered step that needs proof of tree
-//! state, not best-effort guessing).
+//! belong to the run that produced them.
+//!
+//! Code restore is tiered by what is provable (§4). Step 2 ships tier
+//! 1: `--restore-workspace --to-start` resets the tree to the commit
+//! recorded when the run started, which is exact only because the
+//! checkpoint was taken on a clean checkout before the task ran. Every
+//! other tree state — dirty start, non-git workspace, mid-session
+//! boundary — is refused with its reason (tier 0); per-boundary
+//! before-images are tier 2. Any restore writes a recovery snapshot
+//! first and never garbage-collects it (§5).
 //!
 //! Without `--at`, the command lists the boundaries where a fork is
 //! conversation-valid — before a user message or an assistant turn,
@@ -24,7 +31,7 @@ use std::process::ExitCode;
 use anyhow::Context;
 use loom_core::kernel::id::SessionId;
 use loom_core::kernel::session::Session;
-use loom_core::kernel::store::SessionStore;
+use loom_core::kernel::store::{SessionStore, StartCheckpoint};
 use loom_core::kernel::transcript::{Item, ItemIndex};
 
 use crate::args::RewindArgs;
@@ -52,9 +59,12 @@ pub fn run(args: RewindArgs) -> anyhow::Result<ExitCode> {
         .with_context(|| format!("unknown session {id} (see `loom sessions`)"))?;
     let boundaries = boundary_rows(&session);
     let tip = session.transcript.len() as u32;
+    let checkpoint = store
+        .start_checkpoint(&id)
+        .context("reading the start checkpoint")?;
 
     let Some(at) = args.at else {
-        print_boundaries(&id, tip, &boundaries, &session);
+        print_boundaries(&id, tip, &boundaries, &session, checkpoint.as_ref());
         return Ok(ExitCode::SUCCESS);
     };
 
@@ -67,6 +77,22 @@ pub fn run(args: RewindArgs) -> anyhow::Result<ExitCode> {
              half); choose an IDX from: loom rewind {id}"
         );
     }
+    // Refusal beats best-effort (invariant 2): every tree claim is
+    // checked read-only BEFORE the fork runs, so a refused restore
+    // leaves nothing half-done. The workspace comes from the
+    // checkpoint, not the cwd — a rewind may run from anywhere.
+    let restore = if args.restore_workspace {
+        let checkpoint = checkpoint.as_ref().with_context(|| {
+            format!(
+                "--restore-workspace refused: session {id} has no start \
+                 checkpoint (it predates the feature or was run with \
+                 --no-save); the conversation fork alone is available"
+            )
+        })?;
+        Some(crate::workspace::plan_restore(checkpoint)?)
+    } else {
+        None
+    };
     let new_id = SessionId::new();
     store
         .fork(&id, ItemIndex::from(at), &new_id)
@@ -75,6 +101,15 @@ pub fn run(args: RewindArgs) -> anyhow::Result<ExitCode> {
         "forked {new_id} from {id}: kept [0, {at}), dropped {} item(s)",
         tip - at
     );
+    if let Some(plan) = &restore {
+        let patch = crate::workspace::apply_restore(plan)?;
+        println!(
+            "restored workspace {} to start {} (recovery snapshot: {})",
+            plan.workspace.display(),
+            plan.head.get(..8).unwrap_or(&plan.head),
+            patch.display()
+        );
+    }
     println!("resume with: loom run --session {new_id} TASK");
     Ok(ExitCode::SUCCESS)
 }
@@ -152,8 +187,32 @@ fn files_dropped(session: &Session, from: u32) -> String {
     }
 }
 
-fn print_boundaries(id: &SessionId, tip: u32, rows: &[Boundary], session: &Session) {
+fn print_boundaries(
+    id: &SessionId,
+    tip: u32,
+    rows: &[Boundary],
+    session: &Session,
+    checkpoint: Option<&StartCheckpoint>,
+) {
     println!("session {id}: {tip} item(s)");
+    // The restore line says what is provable for THIS session's tree,
+    // so the user picks a boundary knowing what --restore-workspace
+    // can and cannot do (tier 0 names the reason).
+    let restore = match checkpoint {
+        None => "unavailable: no start checkpoint recorded".to_owned(),
+        Some(checkpoint) => match &checkpoint.head {
+            Some(head) => format!(
+                "to-start {} ({})",
+                head.get(..8).unwrap_or(head),
+                checkpoint.workspace.display()
+            ),
+            None => format!(
+                "unavailable: {}",
+                checkpoint.reason.as_deref().unwrap_or("no checkpoint head")
+            ),
+        },
+    };
+    println!("workspace restore: {restore}");
     println!(
         "{:<5} {:<7} {:<34} {:>5}  FILES DROPPED",
         "IDX", "KIND", "HEAD", "DROPS"

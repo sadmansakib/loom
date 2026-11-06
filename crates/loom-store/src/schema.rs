@@ -9,7 +9,7 @@ use loom_kernel::store::StoreError;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// The schema version this build writes and understands.
-pub(crate) const SCHEMA_VERSION: u32 = 3;
+pub(crate) const SCHEMA_VERSION: u32 = 4;
 
 /// `meta` holds bookkeeping, not application data (`schema_version`).
 const META: &str = "\
@@ -103,10 +103,29 @@ CREATE TABLE IF NOT EXISTS forks (
 );
 ";
 
+/// Version 4: workspace start checkpoints for the rewind surface
+/// (`docs/rewind-design.md` §4, tier 1).
+///
+/// One row per persisted session, written by the frontend at `loom
+/// run` start. `head` is the tier-1 restore point when the workspace
+/// was a clean git checkout; a NULL `head` keeps the refusal reason
+/// (dirty start, not a repo) so a later `--restore-workspace` can
+/// explain itself instead of guessing. Sessions without a row predate
+/// the feature and load exactly as before — additive, like every step.
+const V4: &str = "\
+CREATE TABLE IF NOT EXISTS start_checkpoints (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    workspace  TEXT NOT NULL,
+    head       TEXT,
+    reason     TEXT,
+    created_at INTEGER NOT NULL
+);
+";
+
 /// The ordered migration chain, oldest step first. Each step is
 /// idempotent (`IF NOT EXISTS`) so a fresh file and an upgrade run the
 /// same statements.
-const STEPS: &[&str] = &[V1, V2, V3];
+const STEPS: &[&str] = &[V1, V2, V3, V4];
 
 /// Brings `connection` to [`SCHEMA_VERSION`], refusing a newer file.
 pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {

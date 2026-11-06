@@ -195,3 +195,213 @@ fn rewind_forks_at_a_boundary_and_sessions_shows_lineage() {
     let source = store.load(&id).unwrap().expect("source intact");
     assert_eq!(source.transcript.len(), 5);
 }
+
+/// A git repo with one committed file, diverged after the fact: the
+/// tracked file rewritten and an untracked stray added. Returns the
+/// repo dir and the base commit.
+fn diverged_repo() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("base.txt"), "base\n").unwrap();
+    for args in [
+        vec!["init"],
+        vec!["config", "user.email", "t@loom.test"],
+        vec!["config", "user.name", "loom test"],
+        vec!["add", "-A"],
+        vec!["commit", "-m", "base"],
+    ] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(&args)
+            .output()
+            .expect("spawn git");
+        assert!(status.status.success(), "git {args:?} failed in fixture");
+    }
+    let head = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("spawn git")
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    std::fs::write(root.join("base.txt"), "diverged\n").unwrap();
+    std::fs::write(root.join("stray.txt"), "untracked\n").unwrap();
+    (dir, head)
+}
+
+#[test]
+fn rewind_restores_the_workspace_to_the_start_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("loom.db");
+    let id = seeded_store(&db);
+    let (repo, head) = diverged_repo();
+
+    // The run that started this session began on a clean checkout at
+    // `head` (what `loom run` records via the workspace snapshot).
+    let store = SqliteStore::open(&db).unwrap();
+    let checkpoint = loom_core::kernel::store::StartCheckpoint {
+        workspace: std::fs::canonicalize(repo.path()).unwrap(),
+        head: Some(head.clone()),
+        reason: None,
+    };
+    store.record_start_checkpoint(&id, &checkpoint).unwrap();
+
+    // The listing says what is provable before any fork is attempted.
+    let (ok, stdout, stderr) = loom(&db, &["rewind", &id.to_string()]);
+    assert!(ok, "listing failed: {stderr}");
+    assert!(
+        stdout.contains(&format!("workspace restore: to-start {}", &head[..8])),
+        "restore line missing: {stdout}"
+    );
+
+    let (ok, stdout, stderr) = loom(
+        &db,
+        &[
+            "rewind",
+            &id.to_string(),
+            "--at",
+            "3",
+            "--restore-workspace",
+            "--to-start",
+        ],
+    );
+    assert!(ok, "restore rewind failed: {stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "restored workspace {} to start {}",
+            std::fs::canonicalize(repo.path()).unwrap().display(),
+            &head[..8]
+        )),
+        "restore summary missing: {stdout}"
+    );
+
+    // The tree is exactly the base commit; the stray is gone; the
+    // recovery snapshot kept what was discarded (§5: kept, not
+    // garbage-collected) and survived `git clean` itself.
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("base.txt")).unwrap(),
+        "base\n"
+    );
+    assert!(!repo.path().join("stray.txt").exists());
+    let rewind_dir = repo.path().join(".loom").join("rewind");
+    let patches: Vec<_> = std::fs::read_dir(&rewind_dir)
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|e| e == "patch")
+        })
+        .collect();
+    assert_eq!(patches.len(), 1, "one recovery snapshot");
+    let patch = std::fs::read_to_string(patches[0].as_ref().unwrap().path()).unwrap();
+    assert!(
+        patch.contains("diverged") && patch.contains("untracked"),
+        "snapshot must hold the discarded content: {patch}"
+    );
+
+    // The fork carries the lineage's restore point, and the source is
+    // intact with its own checkpoint unchanged.
+    let fork_id: SessionId = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("forked "))
+        .and_then(|rest| rest.split(' ').next())
+        .expect("forked id")
+        .parse()
+        .unwrap();
+    assert_eq!(
+        store.start_checkpoint(&fork_id).unwrap(),
+        Some(checkpoint.clone())
+    );
+    assert_eq!(store.start_checkpoint(&id).unwrap(), Some(checkpoint));
+}
+
+#[test]
+fn rewind_refuses_workspace_restore_without_provable_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("loom.db");
+    let id = seeded_store(&db);
+    let (repo, _head) = diverged_repo();
+
+    // Tier 0: a dirty start records its reason, and the refusal quotes
+    // it — checked BEFORE the fork, so nothing half-done remains.
+    let store = SqliteStore::open(&db).unwrap();
+    store
+        .record_start_checkpoint(
+            &id,
+            &loom_core::kernel::store::StartCheckpoint {
+                workspace: std::fs::canonicalize(repo.path()).unwrap(),
+                head: None,
+                reason: Some("workspace was dirty at session start (2 changed paths)".to_owned()),
+            },
+        )
+        .unwrap();
+    let (ok, _stdout, stderr) = loom(
+        &db,
+        &[
+            "rewind",
+            &id.to_string(),
+            "--at",
+            "3",
+            "--restore-workspace",
+            "--to-start",
+        ],
+    );
+    assert!(!ok, "a dirty start must refuse");
+    assert!(
+        stderr.contains("dirty at session start"),
+        "wrong refusal: {stderr}"
+    );
+    // Refused before the fork: no fork row, tree untouched.
+    assert_eq!(store.session_ids().unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("base.txt")).unwrap(),
+        "diverged\n"
+    );
+    assert!(repo.path().join("stray.txt").exists());
+
+    // Tier 0 again: a session with no checkpoint at all (predates the
+    // feature or ran with --no-save).
+    let stranger = seeded_store(&db);
+    let (ok, _stdout, stderr) = loom(
+        &db,
+        &[
+            "rewind",
+            &stranger.to_string(),
+            "--at",
+            "3",
+            "--restore-workspace",
+            "--to-start",
+        ],
+    );
+    assert!(!ok, "a checkpointless session must refuse");
+    assert!(
+        stderr.contains("no start checkpoint"),
+        "wrong refusal: {stderr}"
+    );
+
+    // The flags are a pair: neither works alone.
+    let (ok, _stdout, stderr) = loom(
+        &db,
+        &[
+            "rewind",
+            &id.to_string(),
+            "--at",
+            "3",
+            "--restore-workspace",
+        ],
+    );
+    assert!(!ok, "--restore-workspace alone must fail");
+    assert!(
+        stderr.contains("--to-start"),
+        "pairing hint missing: {stderr}"
+    );
+}

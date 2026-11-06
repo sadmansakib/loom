@@ -221,6 +221,20 @@ pub struct RewindArgs {
     /// this command prints. Omit it to only list the boundaries.
     #[arg(long, value_name = "IDX")]
     pub at: Option<u32>,
+
+    /// Restore the workspace as part of the rewind, not just the
+    /// conversation. Tiered by what is provable (`docs/rewind-design.md`
+    /// §4): refuses rather than guesses. Currently only
+    /// `--to-start` is supported; per-boundary restore is tier 2.
+    #[arg(long, requires = "to_start")]
+    pub restore_workspace: bool,
+
+    /// With `--restore-workspace`: reset the workspace to the commit it
+    /// was at when the session started. Only possible when that start
+    /// was a clean git checkout — the listing says whether a checkpoint
+    /// exists.
+    #[arg(long, requires = "restore_workspace")]
+    pub to_start: bool,
 }
 
 /// Arguments for `loom auth`.

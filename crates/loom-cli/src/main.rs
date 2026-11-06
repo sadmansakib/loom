@@ -18,6 +18,7 @@ mod rewind_command;
 mod run;
 mod sessions_command;
 mod stats_command;
+mod workspace;
 
 use args::{Cli, Command};
 

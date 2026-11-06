@@ -145,8 +145,8 @@ either has proof for every affected path or it does not run.
 ## Rollout order
 
 1. `SessionStore::fork` + `loom rewind` conversation-only (pure
-   store + CLI).
+   store + CLI). Shipped 2026-11-06.
 2. Tier-1 start checkpoint recording + `--restore-workspace
-   --to-start`.
+   --to-start`. Shipped 2026-11-06.
 3. Tier-2 before-images at the tools seam (own iteration, updates this
    note's tier table).

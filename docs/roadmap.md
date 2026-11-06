@@ -1660,8 +1660,16 @@ Two small gaps surfaced and are recorded here so they are not lost
    preserved, task records stay with the source, live-lease refusal)
    and `loom rewind SESSION [--at IDX]` — boundary listing with
    dropped-region effects, conversation-only fork, `loom sessions`
-   shows `[fork of SRC @ IDX]`. Steps 2 (start checkpoint) and 3
-   (before-images) remain.
+   shows `[fork of SRC @ IDX]`.
+   Rollout step 2 shipped 2026-11-06: `StartCheckpoint` recorded by
+   `loom run` at session start (schema v4 `start_checkpoints` table;
+   clean checkout stores the HEAD, dirty/non-git stores the refusal
+   reason — honesty over guessing, and the checkpoint travels with
+   forks), `loom rewind --restore-workspace --to-start` (planned
+   before the fork so a refusal leaves nothing half-done; recovery
+   snapshot under `<workspace>/.loom/rewind/` before any tree
+   mutation, excluded from `git clean`), and tier-0 refusals that
+   quote the recorded reason. Step 3 (before-images) remains.
 2. **Skill telemetry** (feeds item 20.4/skills lifecycle). Per-skill
    context cost and usage frequency (Claude Code `/skill-doctor` shape)
    so low-value skills retire on evidence — the lifecycle rule the

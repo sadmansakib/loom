@@ -367,6 +367,38 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         }
         None => {
             let mut session = engine.new_session();
+            // Tier-1 start checkpoint (`docs/rewind-design.md` §4):
+            // snapshot the workspace before the task can touch the
+            // tree, so `loom rewind --restore-workspace --to-start`
+            // has an exact restore point. Recorded only for a new
+            // session — a `--session` resume keeps the baseline of the
+            // run that actually started the lineage. Best-effort: a
+            // run whose checkpoint fails to record still runs, and a
+            // later restore refuses (no row) rather than guessing.
+            if !args.no_save {
+                use loom_core::kernel::store::SessionStore;
+                let checkpoint = crate::workspace::snapshot_start(&args.workspace);
+                if let Some(reason) = &checkpoint.reason {
+                    eprintln!("note: no workspace start checkpoint ({reason})");
+                }
+                match loom_core::store::SqliteStore::open(loom_core::paths::db_path()) {
+                    Ok(store) => {
+                        // The engine creates the session row lazily in
+                        // run_task; the checkpoint's row references it,
+                        // so ensure it first (INSERT OR IGNORE — the
+                        // engine's own ensure is idempotent).
+                        if let Err(error) = store
+                            .ensure_session(&session.id)
+                            .and_then(|()| store.record_start_checkpoint(&session.id, &checkpoint))
+                        {
+                            eprintln!("warning: recording start checkpoint: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("warning: opening store for start checkpoint: {error}")
+                    }
+                }
+            }
             let outcome = runtime.block_on(engine.run_task(&mut session, input, &sink, &control));
             (session, outcome)
         }

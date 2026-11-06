@@ -35,7 +35,9 @@ use loom_kernel::model::{
     ModelRequest, ModelResponse, ModelStream, StopReason, Usage,
 };
 use loom_kernel::session::{PlannedTurn, Session, TaskRecord, TaskStatus, TodoStatus};
-use loom_kernel::store::{ForkProvenance, MemorySessionStore, SessionStore, StoreError};
+use loom_kernel::store::{
+    ForkProvenance, MemorySessionStore, SessionStore, StartCheckpoint, StoreError,
+};
 use loom_kernel::tool::{
     CommandEffect, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolRegistry, ToolSpec,
 };
@@ -2090,6 +2092,18 @@ impl SessionStore for TestStore {
     fn fork_of(&self, session: &SessionId) -> Result<Option<ForkProvenance>, StoreError> {
         self.inner.fork_of(session)
     }
+
+    fn record_start_checkpoint(
+        &self,
+        session: &SessionId,
+        checkpoint: &StartCheckpoint,
+    ) -> Result<(), StoreError> {
+        self.inner.record_start_checkpoint(session, checkpoint)
+    }
+
+    fn start_checkpoint(&self, session: &SessionId) -> Result<Option<StartCheckpoint>, StoreError> {
+        self.inner.start_checkpoint(session)
+    }
 }
 
 /// Hands the agent a `Box<dyn SessionStore>` while the test keeps the `Arc` to
@@ -2143,6 +2157,18 @@ impl SessionStore for StoreHandle {
 
     fn fork_of(&self, session: &SessionId) -> Result<Option<ForkProvenance>, StoreError> {
         self.0.fork_of(session)
+    }
+
+    fn record_start_checkpoint(
+        &self,
+        session: &SessionId,
+        checkpoint: &StartCheckpoint,
+    ) -> Result<(), StoreError> {
+        self.0.record_start_checkpoint(session, checkpoint)
+    }
+
+    fn start_checkpoint(&self, session: &SessionId) -> Result<Option<StartCheckpoint>, StoreError> {
+        self.0.start_checkpoint(session)
     }
 }
 

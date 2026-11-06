@@ -10,7 +10,9 @@ use loom_kernel::event::{EVENT_SCHEMA_VERSION, EventEnvelope, EventKind};
 use loom_kernel::id::{ArtifactId, SessionId, TaskId};
 use loom_kernel::model::StopReason;
 use loom_kernel::session::{Session, TaskRecord, TerminalTaskStatus};
-use loom_kernel::store::{ArtifactStore, EventStore, SessionStore, StoreError, StoredArtifact};
+use loom_kernel::store::{
+    ArtifactStore, EventStore, SessionStore, StartCheckpoint, StoreError, StoredArtifact,
+};
 use loom_kernel::tool::ToolEffects;
 use loom_kernel::transcript::{
     AssistantMessage, Item, ItemIndex, ToolArguments, ToolCall, ToolCallId, ToolResult, ToolStatus,
@@ -394,6 +396,56 @@ fn fork_copies_a_prefix_keeps_indices_and_records_lineage() {
     let source = store.load(&id).unwrap().expect("source intact");
     assert_eq!(source.transcript.len(), 3);
     assert_eq!(source.tasks.len(), 1);
+}
+
+#[test]
+fn start_checkpoints_round_trip_and_travel_with_forks() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let id = SessionId::new();
+    store.ensure_session(&id).unwrap();
+    store
+        .append_item(
+            &id,
+            ItemIndex::from(0),
+            &Item::User {
+                text: "hi".to_owned(),
+            },
+        )
+        .unwrap();
+
+    // No row: a session that predates the feature is a tier-0 refusal
+    // for `--restore-workspace`, never a guess.
+    assert_eq!(store.start_checkpoint(&id).unwrap(), None);
+
+    // A dirty start keeps the refusal reason instead of a head.
+    let dirty = StartCheckpoint {
+        workspace: "/tmp/repo".into(),
+        head: None,
+        reason: Some("workspace was dirty at session start (2 changed paths)".to_owned()),
+    };
+    store.record_start_checkpoint(&id, &dirty).unwrap();
+    assert_eq!(store.start_checkpoint(&id).unwrap(), Some(dirty));
+
+    // Re-recording replaces: the honest baseline is whichever run
+    // actually started the session.
+    let clean = StartCheckpoint {
+        workspace: "/tmp/repo".into(),
+        head: Some("a".repeat(40)),
+        reason: None,
+    };
+    store.record_start_checkpoint(&id, &clean).unwrap();
+    assert_eq!(store.start_checkpoint(&id).unwrap(), Some(clean.clone()));
+
+    // The fork inherits the checkpoint: it describes the workspace the
+    // lineage started in, which is the fork's restore point too.
+    let fork_id = SessionId::new();
+    store.fork(&id, ItemIndex::from(1), &fork_id).unwrap();
+    assert_eq!(store.start_checkpoint(&fork_id).unwrap(), Some(clean));
+    assert_eq!(
+        store.start_checkpoint(&SessionId::new()).unwrap(),
+        None,
+        "unknown sessions read as absent"
+    );
 }
 
 #[test]

@@ -5,6 +5,35 @@ project versions by iteration, not semver.
 
 
 
+## 2026-11 — Rewind rollout step 2: tier-1 start checkpoint + `--restore-workspace` (roadmap gap 1, items 15/22)
+
+Implements step 2 of `docs/rewind-design.md`: the workspace can now
+be restored to the state it was in when the session started.
+
+- `StartCheckpoint` + `SessionStore::record_start_checkpoint` /
+  `start_checkpoint` in the kernel trait, `MemorySessionStore`, and
+  `SqliteStore` (schema v4 `start_checkpoints` table). `loom run`
+  records it at session start via a new `workspace.rs` helper: a
+  clean checkout stores the git HEAD (the exact tier-1 restore
+  point); a dirty start, a non-git workspace, and a git-less host
+  store the refusal reason instead — honesty over guessing (tier 0).
+  The checkpoint travels with forks: it describes the lineage's
+  workspace, so a fork's restore point is the same as its source's.
+- `loom rewind SESSION --at IDX --restore-workspace --to-start`
+  resets the tree to the recorded HEAD. Every provability check
+  (HEAD exists, workspace still a work tree, the commit is still
+  available locally) runs read-only before the fork, so a refused
+  restore leaves nothing half-done. The restore writes a recovery
+  snapshot (`git add -A && git diff --cached`) to
+  `<workspace>/.loom/rewind/<timestamp>.patch` first, keeps it
+  indefinitely, and excludes `.loom` from `git clean` so the
+  snapshot survives its own restore (invariant 2/§5).
+- The boundary listing now prints the session's provable restore
+  state (`workspace restore: to-start <head>` or the recorded
+  refusal reason), so the choice of boundary is made knowing what
+  `--restore-workspace` can and cannot do.
+- Step 3 (per-write before-images at the tools seam) remains.
+
 ## 2026-11 — Rewind rollout step 1: `loom rewind` (roadmap gap 1, items 15/22)
 
 Implements step 1 of `docs/rewind-design.md`: rewind forks, never

@@ -63,6 +63,25 @@ pub struct ForkProvenance {
     pub boundary: ItemIndex,
 }
 
+/// Where a session's workspace stood when the run started — the tier-1
+/// restore point of the rewind surface (`docs/rewind-design.md` §4).
+///
+/// Recorded by the frontend at `loom run` start, before the task can
+/// touch the tree. `head` is the exact restore target when the workspace
+/// was a clean git checkout; otherwise it is `None` and `reason` says
+/// why no tree restore is provable (dirty start, not a git repo) — the
+/// tier-0 refusal the rewind surface reports rather than guessing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartCheckpoint {
+    /// The workspace the run started in (canonicalized by the caller).
+    pub workspace: std::path::PathBuf,
+    /// HEAD at run start when the tree was clean; the commit
+    /// `--restore-workspace --to-start` resets to.
+    pub head: Option<String>,
+    /// Why [`StartCheckpoint::head`] is absent, for the refusal message.
+    pub reason: Option<String>,
+}
+
 /// Persists a [`Session`]'s transcript and task records.
 ///
 /// Implementations must make [`SessionStore::append_turn`] atomic: the
@@ -117,6 +136,10 @@ pub trait SessionStore: Send + Sync {
     /// exists. Implementations with leases (ADR-008) refuse as
     /// [`StoreError::Leased`] while a live writer holds the source, so a
     /// fork can never race a moving tip.
+    ///
+    /// The source's [`StartCheckpoint`], if any, travels with the fork:
+    /// it describes the workspace the session lineage started in, which
+    /// is the tier-1 restore point for the fork as well.
     fn fork(
         &self,
         source: &SessionId,
@@ -129,6 +152,26 @@ pub trait SessionStore: Send + Sync {
     /// Listings use this to show lineage (`loom sessions`) without
     /// guessing from ids.
     fn fork_of(&self, session: &SessionId) -> Result<Option<ForkProvenance>, StoreError>;
+
+    /// Records the workspace state at the start of `session`'s first
+    /// run (`docs/rewind-design.md` §4, tier 1).
+    ///
+    /// Called by the frontend before the task runs, so the checkpoint
+    /// describes a tree the task has not touched yet. Idempotent: a
+    /// re-record replaces the row (the honest baseline is whichever run
+    /// actually started the session).
+    fn record_start_checkpoint(
+        &self,
+        session: &SessionId,
+        checkpoint: &StartCheckpoint,
+    ) -> Result<(), StoreError>;
+
+    /// Returns the recorded start checkpoint for `session`, if any.
+    ///
+    /// `None` means the session predates the checkpoint feature or was
+    /// never run through a frontend that records one — a tier-0
+    /// refusal for `--restore-workspace`, never a guess.
+    fn start_checkpoint(&self, session: &SessionId) -> Result<Option<StartCheckpoint>, StoreError>;
 }
 
 /// A stored artifact body with its metadata (§ 2D consumes this; ADR-012).
@@ -323,6 +366,7 @@ pub trait ArtifactStore: Send + Sync {
 pub struct MemorySessionStore {
     sessions: Mutex<HashMap<SessionId, Session>>,
     forks: Mutex<HashMap<SessionId, ForkProvenance>>,
+    checkpoints: Mutex<HashMap<SessionId, StartCheckpoint>>,
 }
 
 impl MemorySessionStore {
@@ -340,6 +384,7 @@ impl MemorySessionStore {
         Self {
             sessions: Mutex::new(sessions),
             forks: Mutex::new(HashMap::new()),
+            checkpoints: Mutex::new(HashMap::new()),
         }
     }
 
@@ -464,6 +509,23 @@ impl SessionStore for MemorySessionStore {
             .lock()
             .map_err(|_| StoreError::Backend("session store lock poisoned".to_owned()))?
             .insert(*new_id, provenance);
+        // The start checkpoint travels with the fork: it describes the
+        // workspace the lineage started in, which is the fork's tier-1
+        // restore point too. Bind the clone BEFORE re-locking: an `if
+        // let` scrutinee guard lives for the whole body, and locking
+        // the same mutex twice would deadlock.
+        let checkpoint = self
+            .checkpoints
+            .lock()
+            .map_err(|_| StoreError::Backend("session store lock poisoned".to_owned()))?
+            .get(source)
+            .cloned();
+        if let Some(checkpoint) = checkpoint {
+            self.checkpoints
+                .lock()
+                .map_err(|_| StoreError::Backend("session store lock poisoned".to_owned()))?
+                .insert(*new_id, checkpoint);
+        }
         Ok(provenance)
     }
 
@@ -472,6 +534,25 @@ impl SessionStore for MemorySessionStore {
             .lock()
             .map_err(|_| StoreError::Backend("session store lock poisoned".to_owned()))
             .map(|forks| forks.get(session).copied())
+    }
+
+    fn record_start_checkpoint(
+        &self,
+        session: &SessionId,
+        checkpoint: &StartCheckpoint,
+    ) -> Result<(), StoreError> {
+        self.checkpoints
+            .lock()
+            .map_err(|_| StoreError::Backend("session store lock poisoned".to_owned()))?
+            .insert(*session, checkpoint.clone());
+        Ok(())
+    }
+
+    fn start_checkpoint(&self, session: &SessionId) -> Result<Option<StartCheckpoint>, StoreError> {
+        self.checkpoints
+            .lock()
+            .map_err(|_| StoreError::Backend("session store lock poisoned".to_owned()))
+            .map(|checkpoints| checkpoints.get(session).cloned())
     }
 }
 
@@ -693,6 +774,40 @@ mod tests {
         // Lineage is store-backed and queryable both ways.
         assert_eq!(store.fork_of(&fork_id).unwrap(), Some(provenance));
         assert_eq!(store.fork_of(&id).unwrap(), None);
+    }
+
+    #[test]
+    fn start_checkpoints_round_trip_replace_and_travel_with_forks() {
+        let (id, session) = seeded_session();
+        let store = MemorySessionStore::with_session(session);
+
+        // Absent until recorded: pre-feature sessions are tier-0 refusals.
+        assert_eq!(store.start_checkpoint(&id).unwrap(), None);
+
+        let dirty = StartCheckpoint {
+            workspace: "/tmp/repo".into(),
+            head: None,
+            reason: Some("workspace was dirty at session start (2 changed paths)".into()),
+        };
+        store.record_start_checkpoint(&id, &dirty).unwrap();
+        assert_eq!(store.start_checkpoint(&id).unwrap(), Some(dirty));
+
+        let clean = StartCheckpoint {
+            workspace: "/tmp/repo".into(),
+            head: Some("b".repeat(40)),
+            reason: None,
+        };
+        store.record_start_checkpoint(&id, &clean).unwrap();
+        assert_eq!(
+            store.start_checkpoint(&id).unwrap(),
+            Some(clean.clone()),
+            "re-recording replaces the baseline"
+        );
+
+        // The fork carries the lineage's restore point.
+        let fork_id = SessionId::new();
+        store.fork(&id, ItemIndex::from(1), &fork_id).unwrap();
+        assert_eq!(store.start_checkpoint(&fork_id).unwrap(), Some(clean));
     }
 
     #[test]

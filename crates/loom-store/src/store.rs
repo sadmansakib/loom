@@ -8,8 +8,8 @@ use loom_kernel::event::EventEnvelope;
 use loom_kernel::id::{ArtifactId, SessionId};
 use loom_kernel::session::{PlannedTurn, Session, TaskRecord, TodoList};
 use loom_kernel::store::{
-    ArtifactStat, ArtifactStore, EventStore, ForkProvenance, SessionStore, StoreError,
-    StoredArtifact,
+    ArtifactStat, ArtifactStore, EventStore, ForkProvenance, SessionStore, StartCheckpoint,
+    StoreError, StoredArtifact,
 };
 use loom_kernel::transcript::{Item, ItemIndex};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -384,6 +384,18 @@ impl SessionStore for SqliteStore {
                 ],
             )
             .map_err(backend)?;
+        // The start checkpoint travels with the fork (tier-1 restore
+        // point of the lineage); same transaction, so a fork either
+        // carries its baseline or nothing at all.
+        transaction
+            .execute(
+                "INSERT INTO start_checkpoints \
+                    (session_id, workspace, head, reason, created_at) \
+                 SELECT ?1, workspace, head, reason, created_at \
+                   FROM start_checkpoints WHERE session_id = ?2",
+                params![new_id.to_string(), source.to_string()],
+            )
+            .map_err(backend)?;
         transaction.commit().map_err(backend)?;
 
         Ok(ForkProvenance {
@@ -418,6 +430,54 @@ impl SessionStore for SqliteStore {
         Ok(Some(ForkProvenance {
             forked_from,
             boundary: ItemIndex::from(boundary),
+        }))
+    }
+
+    fn record_start_checkpoint(
+        &self,
+        session: &SessionId,
+        checkpoint: &StartCheckpoint,
+    ) -> Result<(), StoreError> {
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT INTO start_checkpoints (session_id, workspace, head, reason, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(session_id) DO UPDATE SET \
+                    workspace = excluded.workspace, head = excluded.head, \
+                    reason = excluded.reason, created_at = excluded.created_at",
+                params![
+                    session.to_string(),
+                    checkpoint.workspace.to_string_lossy(),
+                    checkpoint.head,
+                    checkpoint.reason,
+                    now_millis() as i64
+                ],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn start_checkpoint(&self, session: &SessionId) -> Result<Option<StartCheckpoint>, StoreError> {
+        let connection = self.lock()?;
+        let row = connection
+            .query_row(
+                "SELECT workspace, head, reason FROM start_checkpoints WHERE session_id = ?1",
+                [session.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(backend)?;
+        Ok(row.map(|(workspace, head, reason)| StartCheckpoint {
+            workspace: workspace.into(),
+            head,
+            reason,
         }))
     }
 
