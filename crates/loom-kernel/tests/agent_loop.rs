@@ -35,7 +35,7 @@ use loom_kernel::model::{
     ModelRequest, ModelResponse, ModelStream, StopReason, Usage,
 };
 use loom_kernel::session::{PlannedTurn, Session, TaskRecord, TaskStatus, TodoStatus};
-use loom_kernel::store::{MemorySessionStore, SessionStore, StoreError};
+use loom_kernel::store::{ForkProvenance, MemorySessionStore, SessionStore, StoreError};
 use loom_kernel::tool::{
     CommandEffect, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolRegistry, ToolSpec,
 };
@@ -2077,6 +2077,19 @@ impl SessionStore for TestStore {
     fn session_ids(&self) -> Result<Vec<SessionId>, StoreError> {
         self.inner.session_ids()
     }
+
+    fn fork(
+        &self,
+        source: &SessionId,
+        boundary: ItemIndex,
+        new_id: &SessionId,
+    ) -> Result<ForkProvenance, StoreError> {
+        self.inner.fork(source, boundary, new_id)
+    }
+
+    fn fork_of(&self, session: &SessionId) -> Result<Option<ForkProvenance>, StoreError> {
+        self.inner.fork_of(session)
+    }
 }
 
 /// Hands the agent a `Box<dyn SessionStore>` while the test keeps the `Arc` to
@@ -2117,6 +2130,19 @@ impl SessionStore for StoreHandle {
 
     fn session_ids(&self) -> Result<Vec<SessionId>, StoreError> {
         self.0.session_ids()
+    }
+
+    fn fork(
+        &self,
+        source: &SessionId,
+        boundary: ItemIndex,
+        new_id: &SessionId,
+    ) -> Result<ForkProvenance, StoreError> {
+        self.0.fork(source, boundary, new_id)
+    }
+
+    fn fork_of(&self, session: &SessionId) -> Result<Option<ForkProvenance>, StoreError> {
+        self.0.fork_of(session)
     }
 }
 

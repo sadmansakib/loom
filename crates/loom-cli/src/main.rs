@@ -14,6 +14,7 @@ mod auth_command;
 mod instructions;
 mod output;
 mod provider_command;
+mod rewind_command;
 mod run;
 mod sessions_command;
 mod stats_command;
@@ -29,6 +30,7 @@ fn main() -> ExitCode {
         Command::Auth(args) => auth_command::run(args.command).map(|()| ExitCode::SUCCESS),
         Command::Provider(args) => provider_command::run(args.command).map(|()| ExitCode::SUCCESS),
         Command::Sessions => sessions_command::run(),
+        Command::Rewind(args) => rewind_command::run(args),
         Command::Stats(args) => stats_command::run(args),
     };
 

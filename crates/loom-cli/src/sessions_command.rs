@@ -2,16 +2,18 @@
 //!
 //! A resume picker's data source (roadmap item 15): one line per session
 //! with its id, transcript length, and the status of its last task —
-//! enough to choose which session to `loom run --session` into. Reads
-//! the SQLite store directly — no engine open, so no provider or
-//! credentials are needed to inspect sessions.
+//! enough to choose which session to `loom run --session` into. Sessions
+//! created by `loom rewind` carry a `[fork of SRC @ IDX]` marker so a
+//! forked lineage is never mistaken for an original. Reads the SQLite
+//! store directly — no engine open, so no provider or credentials are
+//! needed to inspect sessions.
 
 use std::process::ExitCode;
 
 use anyhow::Context;
 use loom_core::kernel::id::SessionId;
 use loom_core::kernel::session::{Session, TaskStatus};
-use loom_core::kernel::store::SessionStore;
+use loom_core::kernel::store::{ForkProvenance, SessionStore};
 
 /// Lists every persisted session. `0` sessions is success, not an error:
 /// an empty store is a valid state.
@@ -27,7 +29,18 @@ pub fn run() -> anyhow::Result<ExitCode> {
     println!("{:<38}  {:>5}  LAST TASK", "ID", "ITEMS");
     for id in ids {
         match store.load(&id) {
-            Ok(Some(session)) => print_session(&session),
+            Ok(Some(session)) => {
+                // Lineage is store-backed; a read failure is a warning,
+                // not a reason to hide the row.
+                let fork = match store.fork_of(&id) {
+                    Ok(fork) => fork,
+                    Err(error) => {
+                        eprintln!("warning: lineage for {id}: {error}");
+                        None
+                    }
+                };
+                print_session(&session, fork.as_ref());
+            }
             Ok(None) => println!("{id:<38}  (unavailable)"),
             Err(error) => eprintln!("warning: session {id}: {error}"),
         }
@@ -35,7 +48,7 @@ pub fn run() -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn print_session(session: &Session) {
+fn print_session(session: &Session, fork: Option<&ForkProvenance>) {
     let last = session.tasks.last().map_or_else(
         || "(no tasks)".to_owned(),
         |task| {
@@ -53,8 +66,11 @@ fn print_session(session: &Session) {
             }
         },
     );
+    let lineage = fork.map_or_else(String::new, |fork| {
+        format!("  [fork of {} @ {}]", fork.forked_from, fork.boundary)
+    });
     println!(
-        "{:<38}  {:>5}  {last}",
+        "{:<38}  {:>5}  {last}{lineage}",
         session.id,
         session.transcript.len()
     );

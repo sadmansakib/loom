@@ -353,6 +353,98 @@ fn a_session_without_events_still_loads_and_reads_empty() {
 }
 
 #[test]
+fn fork_copies_a_prefix_keeps_indices_and_records_lineage() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let id = SessionId::new();
+    store.ensure_session(&id).unwrap();
+    let user = Item::User {
+        text: "fix".to_owned(),
+    };
+    store.append_item(&id, ItemIndex::from(0), &user).unwrap();
+
+    // One committed turn on top: items 1 (assistant) and 2 (result).
+    let mut session = Session::new(id);
+    session.push_item(user.clone()).unwrap();
+    let planned = session
+        .plan_turn(
+            assistant("working", vec![call("call_1", "read_file")]),
+            vec![result("call_1")],
+        )
+        .unwrap();
+    session.apply_planned_turn(planned.clone());
+    store.append_turn(&id, &planned).unwrap();
+    store
+        .upsert_task(&id, &TaskRecord::new(TaskId::new(), 1_000))
+        .unwrap();
+
+    // Cut after the assistant item, before its result.
+    let fork_id = SessionId::new();
+    let provenance = store.fork(&id, ItemIndex::from(2), &fork_id).unwrap();
+    assert_eq!(provenance.forked_from, id);
+    assert_eq!(provenance.boundary, ItemIndex::from(2));
+
+    let forked = store.load(&fork_id).unwrap().expect("forked session");
+    assert_eq!(forked.transcript.len(), 2);
+    assert_eq!(forked.transcript[0], user, "indices survive the copy");
+    assert!(forked.tasks.is_empty(), "task records stay with the source");
+    assert_eq!(store.fork_of(&fork_id).unwrap(), Some(provenance));
+    assert_eq!(store.fork_of(&id).unwrap(), None);
+
+    // The source keeps its whole transcript and its tasks.
+    let source = store.load(&id).unwrap().expect("source intact");
+    assert_eq!(source.transcript.len(), 3);
+    assert_eq!(source.tasks.len(), 1);
+}
+
+#[test]
+fn fork_refuses_to_race_a_live_lease_and_refuses_bad_boundaries() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let id = SessionId::new();
+    store.ensure_session(&id).unwrap();
+    store
+        .append_item(
+            &id,
+            ItemIndex::from(0),
+            &Item::User {
+                text: "hi".to_owned(),
+            },
+        )
+        .unwrap();
+
+    // A live lease means a writer may still be moving the tip.
+    let lease = store
+        .acquire_lease(&id, "writer", 60_000)
+        .unwrap()
+        .expect("lease acquired");
+    let error = store
+        .fork(&id, ItemIndex::from(0), &SessionId::new())
+        .unwrap_err();
+    assert!(
+        matches!(error, StoreError::Leased { .. }),
+        "wrong error: {error}"
+    );
+
+    // Released: the same fork goes through.
+    store.release_lease(&id, lease.owner()).unwrap();
+    let fork_id = SessionId::new();
+    store.fork(&id, ItemIndex::from(1), &fork_id).unwrap();
+    assert_eq!(store.load(&fork_id).unwrap().unwrap().transcript.len(), 1);
+
+    // Boundary past the tip refuses, and a reused id refuses.
+    let error = store
+        .fork(&id, ItemIndex::from(5), &SessionId::new())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("past the transcript tip"),
+        "wrong error: {error}"
+    );
+    assert!(matches!(
+        store.fork(&id, ItemIndex::from(0), &fork_id),
+        Err(StoreError::Corrupt(_))
+    ));
+}
+
+#[test]
 fn a_v1_database_migrates_in_place_and_keeps_its_sessions() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("loom.db");

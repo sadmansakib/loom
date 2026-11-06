@@ -5,6 +5,28 @@ project versions by iteration, not semver.
 
 
 
+## 2026-11 — Rewind rollout step 1: `loom rewind` (roadmap gap 1, items 15/22)
+
+Implements step 1 of `docs/rewind-design.md`: rewind forks, never
+truncates, and touches no workspace state.
+
+- `SessionStore::fork(source, boundary, new_id)` + `fork_of` in the
+  kernel trait, `MemorySessionStore`, and `SqliteStore` (schema v3
+  `forks` table; the copy is one transaction, items keep their indices,
+  task records/todos/events stay with the source). New
+  `StoreError::Leased` — the SQLite fork refuses while a live
+  single-writer lease holds the source, so a fork never races a moving
+  transcript tip.
+- `loom rewind SESSION [--at IDX]`: without `--at`, lists
+  conversation-valid boundaries (user messages, assistant turns, tip)
+  with the files the dropped region touched (recorded effects only);
+  with `--at`, forks and prints the `loom run --session` continuation
+  line. Mid-turn indexes refuse. `loom sessions` marks forks with
+  `[fork of SRC @ IDX]`.
+- Steps 2 (git-clean start checkpoint + `--restore-workspace`) and 3
+  (per-write before-images at the tools seam) follow the spec's
+  rollout order.
+
 ## 2026-12 — Execution-based best-of-N selection (roadmap item 29)
 
 Research-grounded (arXiv 2501.14723, 2407.21787: the selector, not

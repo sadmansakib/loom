@@ -1654,6 +1654,14 @@ Two small gaps surfaced and are recorded here so they are not lost
    checkpoint for tree restore without engine work, and per-turn
    before-images at the tools seam (ADR-012 effects) as the named
    engine iteration that makes arbitrary-boundary code rewind exact.
+
+   Rollout step 1 shipped 2026-11-06: `SessionStore::fork`/`fork_of`
+   in both stores (schema v3 `forks` table, one transaction, indices
+   preserved, task records stay with the source, live-lease refusal)
+   and `loom rewind SESSION [--at IDX]` — boundary listing with
+   dropped-region effects, conversation-only fork, `loom sessions`
+   shows `[fork of SRC @ IDX]`. Steps 2 (start checkpoint) and 3
+   (before-images) remain.
 2. **Skill telemetry** (feeds item 20.4/skills lifecycle). Per-skill
    context cost and usage frequency (Claude Code `/skill-doctor` shape)
    so low-value skills retire on evidence — the lifecycle rule the

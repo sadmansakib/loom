@@ -9,7 +9,7 @@ use loom_kernel::store::StoreError;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// The schema version this build writes and understands.
-pub(crate) const SCHEMA_VERSION: u32 = 2;
+pub(crate) const SCHEMA_VERSION: u32 = 3;
 
 /// `meta` holds bookkeeping, not application data (`schema_version`).
 const META: &str = "\
@@ -84,10 +84,29 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_session ON events (session_id, position);
 ";
 
+/// Version 3: fork provenance for the rewind surface
+/// (`docs/rewind-design.md`).
+///
+/// One row per session that was created by
+/// [`SessionStore::fork`](loom_kernel::store::SessionStore::fork): the
+/// source session and the transcript boundary the fork kept. The fork
+/// copies item rows directly (same `idx` values, so indices stay stable
+/// across the fork), which is why there is nothing else to record —
+/// this table is lineage, not content. A session without a row is an
+/// original, and loads exactly as before; additive, like every step.
+const V3: &str = "\
+CREATE TABLE IF NOT EXISTS forks (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    forked_from TEXT NOT NULL,
+    boundary   INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+";
+
 /// The ordered migration chain, oldest step first. Each step is
 /// idempotent (`IF NOT EXISTS`) so a fresh file and an upgrade run the
 /// same statements.
-const STEPS: &[&str] = &[V1, V2];
+const STEPS: &[&str] = &[V1, V2, V3];
 
 /// Brings `connection` to [`SCHEMA_VERSION`], refusing a newer file.
 pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {

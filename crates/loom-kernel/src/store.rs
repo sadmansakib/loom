@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::event::EventEnvelope;
 use crate::id::{ArtifactId, SessionId};
-use crate::session::{PlannedTurn, Session, TaskRecord};
+use crate::session::{PlannedTurn, Session, TaskRecord, TodoList};
 use crate::transcript::{Item, ItemIndex};
 
 /// A durable-storage failure.
@@ -36,6 +36,31 @@ pub enum StoreError {
     /// (deserialisation failure, an index gap, an unknown session).
     #[error("corrupt stored state: {0}")]
     Corrupt(String),
+    /// A live single-writer lease (ADR-008) still covers the session, so
+    /// the caller must not race the writer that holds it.
+    #[error("live lease on {session} (owner {owner}); refusing to race it")]
+    Leased {
+        /// The session the live lease covers.
+        session: SessionId,
+        /// The writer that holds the lease and must finish first.
+        owner: String,
+    },
+}
+
+/// Where a forked session came from: the source session and the first
+/// transcript index the fork did **not** copy.
+///
+/// Recorded by [`SessionStore::fork`] and read back with
+/// [`SessionStore::fork_of`], so fork lineage is store-backed rather
+/// than inferred from ids or timestamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForkProvenance {
+    /// The session the fork copied from (still intact — a fork never
+    /// truncates its source).
+    pub forked_from: SessionId,
+    /// The fork kept items `[0, boundary)`; `boundary` is the first
+    /// dropped index.
+    pub boundary: ItemIndex,
 }
 
 /// Persists a [`Session`]'s transcript and task records.
@@ -76,6 +101,34 @@ pub trait SessionStore: Send + Sync {
 
     /// Lists known session ids, ordered by id (v7, i.e. creation order).
     fn session_ids(&self) -> Result<Vec<SessionId>, StoreError>;
+
+    /// Forks `source` into `new_id`, copying transcript items
+    /// `[0, boundary)`.
+    ///
+    /// The rewind surface's store half (`docs/rewind-design.md`): a fork
+    /// never truncates the source — the transcript is append-only
+    /// (ADR-004) and the original stays queryable. Copied items keep
+    /// their indices, so references held against the source remain valid
+    /// in the fork. Task records, todos, and events belong to the run
+    /// that produced them and are not copied.
+    ///
+    /// Refuses as [`StoreError::Corrupt`] when `source` is unknown,
+    /// `boundary` is past the transcript tip, or `new_id` already
+    /// exists. Implementations with leases (ADR-008) refuse as
+    /// [`StoreError::Leased`] while a live writer holds the source, so a
+    /// fork can never race a moving tip.
+    fn fork(
+        &self,
+        source: &SessionId,
+        boundary: ItemIndex,
+        new_id: &SessionId,
+    ) -> Result<ForkProvenance, StoreError>;
+
+    /// Returns the fork provenance recorded for `session`, if any.
+    ///
+    /// Listings use this to show lineage (`loom sessions`) without
+    /// guessing from ids.
+    fn fork_of(&self, session: &SessionId) -> Result<Option<ForkProvenance>, StoreError>;
 }
 
 /// A stored artifact body with its metadata (§ 2D consumes this; ADR-012).
@@ -269,6 +322,7 @@ pub trait ArtifactStore: Send + Sync {
 #[derive(Default)]
 pub struct MemorySessionStore {
     sessions: Mutex<HashMap<SessionId, Session>>,
+    forks: Mutex<HashMap<SessionId, ForkProvenance>>,
 }
 
 impl MemorySessionStore {
@@ -285,6 +339,7 @@ impl MemorySessionStore {
         sessions.insert(session.id, session);
         Self {
             sessions: Mutex::new(sessions),
+            forks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -366,6 +421,57 @@ impl SessionStore for MemorySessionStore {
         let mut ids: Vec<SessionId> = self.lock()?.keys().copied().collect();
         ids.sort();
         Ok(ids)
+    }
+
+    fn fork(
+        &self,
+        source: &SessionId,
+        boundary: ItemIndex,
+        new_id: &SessionId,
+    ) -> Result<ForkProvenance, StoreError> {
+        let mut guard = self.lock()?;
+        let session = guard
+            .get(source)
+            .ok_or_else(|| StoreError::Corrupt(format!("unknown session {source}")))?;
+        let boundary = boundary.as_u32() as usize;
+        if boundary > session.transcript.len() {
+            return Err(StoreError::Corrupt(format!(
+                "boundary {boundary} is past the transcript tip {}",
+                session.transcript.len()
+            )));
+        }
+        if guard.contains_key(new_id) {
+            return Err(StoreError::Corrupt(format!(
+                "session {new_id} already exists"
+            )));
+        }
+        // Indices are positions, so a prefix copy preserves them; task
+        // records and todos are run state, not conversation state, and
+        // stay with the source (the fork starts a fresh task on
+        // continue, exactly like a resumed session rebuild).
+        let forked = Session {
+            id: *new_id,
+            transcript: session.transcript[..boundary].to_vec(),
+            tasks: Vec::new(),
+            todos: TodoList::default(),
+        };
+        guard.insert(*new_id, forked);
+        let provenance = ForkProvenance {
+            forked_from: *source,
+            boundary: ItemIndex::from(boundary as u32),
+        };
+        self.forks
+            .lock()
+            .map_err(|_| StoreError::Backend("session store lock poisoned".to_owned()))?
+            .insert(*new_id, provenance);
+        Ok(provenance)
+    }
+
+    fn fork_of(&self, session: &SessionId) -> Result<Option<ForkProvenance>, StoreError> {
+        self.forks
+            .lock()
+            .map_err(|_| StoreError::Backend("session store lock poisoned".to_owned()))
+            .map(|forks| forks.get(session).copied())
     }
 }
 
@@ -539,6 +645,82 @@ mod tests {
     fn loading_an_unknown_session_is_none() {
         let store = MemorySessionStore::new();
         assert!(store.load(&SessionId::new()).unwrap().is_none());
+    }
+
+    /// A seeded three-item session: user input then one committed turn.
+    fn seeded_session() -> (SessionId, Session) {
+        let id = SessionId::new();
+        let mut session = Session::new(id);
+        let user = Item::User { text: "fix".into() };
+        let index = session.push_item(user.clone()).unwrap();
+        debug_assert_eq!(index, ItemIndex::from(0));
+
+        let planned = session
+            .plan_turn(
+                assistant("working", vec![call("call_1", "read_file")]),
+                vec![result("call_1")],
+            )
+            .unwrap();
+        session.apply_planned_turn(planned);
+        (id, session)
+    }
+
+    #[test]
+    fn fork_copies_a_prefix_preserves_indices_and_records_lineage() {
+        let (id, session) = seeded_session();
+        let store = MemorySessionStore::with_session(session);
+        let fork_id = SessionId::new();
+
+        // Cut before the assistant turn: keep the user item only.
+        let provenance = store.fork(&id, ItemIndex::from(1), &fork_id).unwrap();
+        assert_eq!(provenance.forked_from, id);
+        assert_eq!(provenance.boundary, ItemIndex::from(1));
+
+        let forked = store.load(&fork_id).unwrap().expect("forked session");
+        assert_eq!(forked.transcript.len(), 1);
+        // Indices are positions, so the copy keeps them: item 0 is the
+        // user item, not a renumbered one.
+        assert_eq!(forked.transcript[0], Item::User { text: "fix".into() });
+        // Run state stays with the source; the fork is conversation only.
+        assert!(forked.tasks.is_empty());
+        assert!(forked.todos.is_empty());
+
+        // The source is intact — a fork never truncates.
+        let source = store.load(&id).unwrap().expect("source session");
+        assert_eq!(source.transcript.len(), 3);
+        assert_eq!(store.session_ids().unwrap().len(), 2);
+
+        // Lineage is store-backed and queryable both ways.
+        assert_eq!(store.fork_of(&fork_id).unwrap(), Some(provenance));
+        assert_eq!(store.fork_of(&id).unwrap(), None);
+    }
+
+    #[test]
+    fn fork_refuses_unknown_source_past_tip_and_duplicate_id() {
+        let (id, session) = seeded_session();
+        let store = MemorySessionStore::with_session(session);
+
+        let stranger = SessionId::new();
+        assert!(matches!(
+            store.fork(&stranger, ItemIndex::from(0), &SessionId::new()),
+            Err(StoreError::Corrupt(_))
+        ));
+
+        // The tip is 3; boundary 4 is past it.
+        let past_tip = SessionId::new();
+        let error = store.fork(&id, ItemIndex::from(4), &past_tip).unwrap_err();
+        assert!(
+            error.to_string().contains("past the transcript tip"),
+            "wrong error: {error}"
+        );
+
+        // A fork id that already exists would collide with live data.
+        let duplicate = SessionId::new();
+        store.ensure_session(&duplicate).unwrap();
+        assert!(matches!(
+            store.fork(&id, ItemIndex::from(0), &duplicate),
+            Err(StoreError::Corrupt(_))
+        ));
     }
 
     #[test]

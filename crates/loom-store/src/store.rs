@@ -8,7 +8,8 @@ use loom_kernel::event::EventEnvelope;
 use loom_kernel::id::{ArtifactId, SessionId};
 use loom_kernel::session::{PlannedTurn, Session, TaskRecord, TodoList};
 use loom_kernel::store::{
-    ArtifactStat, ArtifactStore, EventStore, SessionStore, StoreError, StoredArtifact,
+    ArtifactStat, ArtifactStore, EventStore, ForkProvenance, SessionStore, StoreError,
+    StoredArtifact,
 };
 use loom_kernel::transcript::{Item, ItemIndex};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -287,6 +288,137 @@ impl SessionStore for SqliteStore {
             )
             .map_err(backend)?;
         Ok(())
+    }
+
+    fn fork(
+        &self,
+        source: &SessionId,
+        boundary: ItemIndex,
+        new_id: &SessionId,
+    ) -> Result<ForkProvenance, StoreError> {
+        let now = now_millis();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction().map_err(backend)?;
+
+        // One read for the source row: existence and lease state. A live
+        // lease means a writer may still be moving the transcript tip, so
+        // the fork refuses rather than race it (ADR-008's discipline).
+        let lease = transaction
+            .query_row(
+                "SELECT lease_owner, lease_until FROM sessions WHERE id = ?1",
+                [source.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(backend)?;
+        let Some((lease_owner, lease_until)) = lease else {
+            return Err(StoreError::Corrupt(format!("unknown session {source}")));
+        };
+        if lease_until.is_some_and(|until| until > now as i64) {
+            return Err(StoreError::Leased {
+                session: *source,
+                owner: lease_owner.unwrap_or_else(|| "?".to_owned()),
+            });
+        }
+
+        // Indices are contiguous from zero, so the tip is one past the
+        // highest stored index (0 for an empty transcript).
+        let tip: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(idx) + 1, 0) FROM items WHERE session_id = ?1",
+                [source.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        let boundary_index = i64::from(boundary.as_u32());
+        if boundary_index > tip {
+            return Err(StoreError::Corrupt(format!(
+                "boundary {boundary_index} is past the transcript tip {tip}"
+            )));
+        }
+        let exists: Option<i64> = transaction
+            .query_row(
+                "SELECT 1 FROM sessions WHERE id = ?1",
+                [new_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        if exists.is_some() {
+            return Err(StoreError::Corrupt(format!(
+                "session {new_id} already exists"
+            )));
+        }
+
+        transaction
+            .execute(
+                "INSERT INTO sessions (id, created_at, lease_owner, lease_until) \
+                 VALUES (?1, ?2, NULL, NULL)",
+                params![new_id.to_string(), now as i64],
+            )
+            .map_err(backend)?;
+        // Copies keep their `idx` values: references made against the
+        // source stay valid in the fork (ADR-004's stability rule).
+        transaction
+            .execute(
+                "INSERT INTO items (session_id, idx, kind, body_json) \
+                 SELECT ?1, idx, kind, body_json FROM items \
+                  WHERE session_id = ?2 AND idx < ?3",
+                params![new_id.to_string(), source.to_string(), boundary_index],
+            )
+            .map_err(backend)?;
+        transaction
+            .execute(
+                "INSERT INTO forks (session_id, forked_from, boundary, created_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    new_id.to_string(),
+                    source.to_string(),
+                    boundary_index,
+                    now as i64
+                ],
+            )
+            .map_err(backend)?;
+        transaction.commit().map_err(backend)?;
+
+        Ok(ForkProvenance {
+            forked_from: *source,
+            boundary,
+        })
+    }
+
+    fn fork_of(&self, session: &SessionId) -> Result<Option<ForkProvenance>, StoreError> {
+        let connection = self.lock()?;
+        let row = connection
+            .query_row(
+                "SELECT forked_from, boundary FROM forks WHERE session_id = ?1",
+                [session.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(backend)?;
+        let Some((from, boundary)) = row else {
+            return Ok(None);
+        };
+        let forked_from: SessionId = from.parse().map_err(|error| {
+            StoreError::Corrupt(format!(
+                "fork row for {session} has a bad source id {from:?}: {error}"
+            ))
+        })?;
+        let boundary = u32::try_from(boundary).map_err(|_| {
+            StoreError::Corrupt(format!(
+                "fork row for {session} has a bad boundary {boundary}"
+            ))
+        })?;
+        Ok(Some(ForkProvenance {
+            forked_from,
+            boundary: ItemIndex::from(boundary),
+        }))
     }
 
     fn load(&self, session: &SessionId) -> Result<Option<Session>, StoreError> {

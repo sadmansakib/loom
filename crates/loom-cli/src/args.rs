@@ -32,6 +32,9 @@ pub enum Command {
     Provider(ProviderArgs),
     /// List persisted sessions (`loom.db`), oldest first.
     Sessions,
+    /// Fork a stored session at a chosen turn, leaving the original
+    /// intact (`docs/rewind-design.md`).
+    Rewind(RewindArgs),
     /// Transcript analytics over stored sessions (or exported traces).
     Stats(StatsArgs),
 }
@@ -205,6 +208,19 @@ pub struct RunArgs {
     /// this flag to opt out when the suite is too slow per rollout.
     #[arg(long)]
     pub best_of_no_verify: bool,
+}
+
+/// Arguments for `loom rewind`.
+#[derive(Debug, Args)]
+pub struct RewindArgs {
+    /// The session to fork: an id from `loom sessions`.
+    #[arg(value_name = "SESSION")]
+    pub session: String,
+
+    /// Fork at this transcript index — a BOUNDARY row from the listing
+    /// this command prints. Omit it to only list the boundaries.
+    #[arg(long, value_name = "IDX")]
+    pub at: Option<u32>,
 }
 
 /// Arguments for `loom auth`.
@@ -542,6 +558,22 @@ mod tests {
         };
         assert_eq!(args.target, "work");
         assert_eq!(args.provider, "glm");
+    }
+
+    #[test]
+    fn rewind_parses_session_and_boundary() {
+        let cli = parse(&["loom", "rewind", "0192e4c1-0000-7000-8000-000000000000"]);
+        let Command::Rewind(args) = cli.command else {
+            panic!("expected rewind");
+        };
+        assert_eq!(args.session, "0192e4c1-0000-7000-8000-000000000000");
+        assert!(args.at.is_none());
+
+        let cli = parse(&["loom", "rewind", "abc", "--at", "3"]);
+        let Command::Rewind(args) = cli.command else {
+            panic!("expected rewind");
+        };
+        assert_eq!(args.at, Some(3));
     }
 
     #[test]
