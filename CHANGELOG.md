@@ -24,6 +24,32 @@ Best-of-3 worse than Best-of-1).
   `VerifyTool::suite_verdict(root, cancellation)` runs the fixed
   table once and returns `Option<bool>` (None = no verdict).
 
+## 2026-11 — Skill telemetry in `loom stats` (roadmap gap, feeds item 20.4)
+
+Per-skill usage frequency and context cost, derived from the durable
+transcript alone (no new seam, no engine change) — the evidence the
+skill lifecycle rule (retire low-value skills) needs.
+
+- `SessionStats.skills: BTreeMap<String, SkillStats>` in
+  `loom-kernel/src/analytics.rs`; `SkillStats` = `loads`,
+  `resources` (bundled-file reads), `failures`, `delivered_bytes`
+  (bytes delivered into context). Keyed by the menu name the model
+  asked for; calls with no parseable name land under `"?"`.
+  Outcome-joined by call id in `session_stats`, so attempts that
+  failed never pay bytes; cancelled loads count nowhere.
+  `#[serde(default)]` keeps pre-field JSON loadable; `SessionStats::add`
+  folds per-skill maps for store-wide totals.
+- `loom stats`: human output gains a `skills:` line (one summary per
+  skill, name order, e.g. `skills: deploy 0 loads, 1 resource, 39
+  bytes delivered; release 2 loads, 0 resources, 36 bytes delivered`);
+  omitted entirely when no `load_skill` call exists, so skill-free
+  stores keep their exact old output. `--json` totals gain a `skills`
+  array (`name`, `loads`, `resources`, `failures`,
+  `delivered_bytes`); per-session rows serialize the map via
+  `SessionStats`.
+- Unknown-name misses count as `failures` under the requested name —
+  the stale-menu/retirement signal.
+
 ## 2026-11 — Frozen-subset suite audit, structural pass (roadmap item 1)
 
 Research-grounded (UTBoost, arXiv 2506.09289: amplified SWE-bench suites

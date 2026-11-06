@@ -23,6 +23,12 @@
 //! transcript cannot offer is reported directly. The aggregation is
 //! [`loom_core::engine::trace_stats`]; this module renders it.
 //!
+//! The skills section (roadmap gap: skill telemetry) extends the
+//! per-tool accounting to `load_skill`: per-skill body loads,
+//! bundled-resource reads, failures, and bytes delivered into
+//! context — the usage-frequency and context-cost evidence the skill
+//! lifecycle rule (retire low-value skills on evidence) needs.
+//!
 //! The artifacts section (roadmap 2.17) reports the body store's
 //! lifecycle state: how many bodies exist, how many the stored
 //! transcripts still reference, and how many bytes the GC's backstop
@@ -118,6 +124,9 @@ pub fn run(args: StatsArgs) -> anyhow::Result<ExitCode> {
             saved_summary(&overview.totals),
         );
         println!("mechanisms: {}", mechanisms_line(&mechanisms));
+        if let Some(line) = skills_line(&overview.totals) {
+            println!("skills: {line}");
+        }
         println!(
             "artifacts: {} bodies, {} bytes — {} referenced, {} orphaned ({} bytes, {} reclaimable by gc)",
             artifacts.bodies,
@@ -213,6 +222,62 @@ fn saved_summary(row: &SessionStats) -> String {
     format!("{saved} bytes kept out of context")
 }
 
+/// `1 load` vs `2 loads`.
+fn plural<'a>(n: u64, one: &'a str, many: &'a str) -> &'a str {
+    if n == 1 { one } else { many }
+}
+
+/// Per-skill telemetry, human form: one summary per skill in name
+/// order, semicolon-separated. Totals only — per-session detail is
+/// the JSON's job. `None` when no `load_skill` call exists anywhere,
+/// so skill-free stores keep their exact old output.
+fn skills_line(stats: &SessionStats) -> Option<String> {
+    if stats.skills.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = stats
+        .skills
+        .iter()
+        .map(|(name, s)| {
+            let mut part = format!(
+                "{name} {} {}, {} {}",
+                s.loads,
+                plural(s.loads, "load", "loads"),
+                s.resources,
+                plural(s.resources, "resource", "resources"),
+            );
+            if s.failures > 0 {
+                part.push_str(&format!(
+                    ", {} {}",
+                    s.failures,
+                    plural(s.failures, "failure", "failures")
+                ));
+            }
+            part.push_str(&format!(", {} bytes delivered", s.delivered_bytes));
+            part
+        })
+        .collect();
+    Some(parts.join("; "))
+}
+
+/// The JSON form of the skills block: one row per skill, name order.
+fn skills_json(stats: &SessionStats) -> serde_json::Value {
+    stats
+        .skills
+        .iter()
+        .map(|(name, s)| {
+            serde_json::json!({
+                "name": name,
+                "loads": s.loads,
+                "resources": s.resources,
+                "failures": s.failures,
+                "delivered_bytes": s.delivered_bytes,
+            })
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
 /// The artifact store's lifecycle numbers, as both output modes print
 /// them (roadmap 2.17).
 struct ArtifactsSection {
@@ -286,6 +351,7 @@ fn summarize(overview: &SessionsOverview) -> serde_json::Value {
         "identical_repeats": stats.identical_repeats,
         "repairs": stats.repairs,
         "edit_apply": stats.edit_apply,
+        "skills": skills_json(stats),
         "spills": stats.spills.len(),
         "spill_saved_bytes": saved,
     })

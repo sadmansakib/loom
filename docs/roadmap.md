@@ -1651,6 +1651,12 @@ Two small gaps surfaced and are recorded here so they are not lost
    so low-value skills retire on evidence — the lifecycle rule the
    skill-memory papers require. `loom stats` already aggregates
    per-tool call quality; extend to skill loads, no new seam.
+   Shipped 2026-11-06: `SessionStats.skills` (loads, resources,
+   failures, delivered bytes per menu name, `"?"` for malformed
+   arguments) derived outcome-joined from the transcript in
+   `session_stats`; `loom stats` prints a `skills:` line (human) and a
+   `skills` totals array (JSON). Cancelled loads count nowhere; the
+   wire-up to item 20.4's retirement rule is that item's work.
 
 ### Deliberately not planned
 

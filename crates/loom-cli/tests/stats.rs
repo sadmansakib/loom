@@ -360,3 +360,95 @@ fn stats_reports_mechanisms_for_sessions_without_events() {
         "only the marker mechanism fired: {stdout}"
     );
 }
+
+/// Seeds one session exercising the skill telemetry: two body loads,
+/// one bundled-resource read, one unknown-name miss.
+fn seeded_store_with_skills(db: &std::path::Path) {
+    let store = SqliteStore::open(db).unwrap();
+    let id = SessionId::new();
+    let mut session = Session::new(id);
+    store.ensure_session(&id).unwrap();
+    let user = Item::User {
+        text: "ship it".to_owned(),
+    };
+    let index = session.push_item(user.clone()).unwrap();
+    store.append_item(&id, index, &user).unwrap();
+
+    commit(
+        &store,
+        &id,
+        &mut session,
+        turn(
+            "skilling up",
+            vec![
+                call("a", "load_skill", json!({"name": "release"})),
+                call("b", "load_skill", json!({"name": "release"})),
+                call(
+                    "c",
+                    "load_skill",
+                    json!({"name": "deploy", "resource": "notes.md"}),
+                ),
+                call("d", "load_skill", json!({"name": "ghost"})),
+            ],
+        ),
+        vec![
+            result("a", ToolStatus::Success, "# skill: release\none"),
+            result("b", ToolStatus::Success, "# skill: release\ntwo"),
+            result(
+                "c",
+                ToolStatus::Success,
+                "# skill resource: deploy/notes.md\nport",
+            ),
+            result(
+                "d",
+                ToolStatus::Error(ToolFailure::InvalidInput),
+                "no skill named `ghost`",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn stats_reports_per_skill_telemetry() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("loom.db");
+    seeded_store_with_skills(&db);
+
+    let (ok, stdout, stderr) = stats(&db, &["--json"]);
+    assert!(ok, "loom stats --json failed: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    // Totals, name order: deploy, ghost, release.
+    let skills = report["totals"]["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 3);
+    assert_eq!(skills[0]["name"], json!("deploy"));
+    assert_eq!(skills[0]["loads"], json!(0));
+    assert_eq!(skills[0]["resources"], json!(1));
+    assert_eq!(skills[1]["name"], json!("ghost"));
+    assert_eq!(skills[1]["failures"], json!(1));
+    let release = &skills[2];
+    assert_eq!(release["name"], json!("release"));
+    assert_eq!(release["loads"], json!(2));
+    let delivered = "# skill: release\none".len() + "# skill: release\ntwo".len();
+    assert_eq!(release["delivered_bytes"], json!(delivered as u64));
+
+    // The session row carries the same per-skill map.
+    assert_eq!(
+        report["sessions"][0]["stats"]["skills"]["release"]["loads"],
+        json!(2)
+    );
+
+    // The human rendering says what each number is.
+    let (ok, stdout, stderr) = stats(&db, &[]);
+    assert!(ok, "human output failed: {stderr}");
+    assert!(
+        stdout.contains("skills: deploy 0 loads, 1 resource"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("ghost 0 loads, 0 resources, 1 failure"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("release 2 loads, 0 resources"), "{stdout}");
+    assert!(stdout.contains("bytes delivered"), "{stdout}");
+}

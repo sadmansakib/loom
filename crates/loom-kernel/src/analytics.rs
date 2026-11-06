@@ -25,6 +25,11 @@
 //!   arguments, but not back-to-back).
 //! * **`edit_apply`**: attempts vs applied for the edit/write family —
 //!   the model-side patch acceptance rate.
+//! * **`skills`**: per-skill `load_skill` telemetry — body loads,
+//!   bundled-resource reads, failures, and bytes delivered into
+//!   context — the usage-frequency and context-cost evidence the
+//!   skill lifecycle rule (retire low-value skills on evidence)
+//!   needs.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -119,6 +124,36 @@ pub struct EditApply {
     pub applied: u64,
 }
 
+/// Per-skill telemetry for `load_skill`, keyed by the menu name the
+/// model asked for: usage frequency plus delivered context cost, the
+/// two numbers a skill-lifecycle decision (keep, rewrite, retire)
+/// needs. Calls whose arguments carried no parseable name land under
+/// `"?"`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillStats {
+    /// Successful body loads (`name` alone).
+    pub loads: u64,
+    /// Successful bundled-resource reads (`name` + `resource`).
+    pub resources: u64,
+    /// Failed calls of any kind (unknown name, malformed arguments).
+    pub failures: u64,
+    /// Bytes delivered into context across successful loads and
+    /// resources — the per-skill context cost.
+    pub delivered_bytes: u64,
+}
+
+impl SkillStats {
+    /// Adds `other` into `self`, counter by counter (store-wide
+    /// totals).
+    pub fn add(&mut self, other: &SkillStats) {
+        self.loads += other.loads;
+        self.resources += other.resources;
+        self.failures += other.failures;
+        self.delivered_bytes += other.delivered_bytes;
+    }
+}
+
 /// One oversized result that spilled to the artifact store.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +193,11 @@ pub struct SessionStats {
     pub malformed_calls: u64,
     /// Edit-family acceptance.
     pub edit_apply: EditApply,
+    /// Per-skill `load_skill` counters, keyed by menu name (skill
+    /// telemetry). `serde(default)` keeps JSON from before this field
+    /// loadable.
+    #[serde(default)]
+    pub skills: BTreeMap<String, SkillStats>,
     /// Identical calls (same name + canonical arguments) beyond the
     /// first — includes both executed repeats and ledger refusals.
     pub identical_repeats: u64,
@@ -169,15 +209,18 @@ pub struct SessionStats {
 }
 
 impl SessionStats {
-    /// Adds `other` into `self`: counts sum, per-tool maps merge, spills
-    /// concatenate in order. The store-wide totals of a
-    /// [`sessions_overview`] are folded with this.
+    /// Adds `other` into `self`: counts sum, per-tool and per-skill
+    /// maps merge, spills concatenate in order. The store-wide totals
+    /// of a [`sessions_overview`] are folded with this.
     pub fn add(&mut self, other: &SessionStats) {
         self.turns += other.turns;
         self.identical_repeats += other.identical_repeats;
         self.repairs += other.repairs;
         self.edit_apply.attempts += other.edit_apply.attempts;
         self.edit_apply.applied += other.edit_apply.applied;
+        for (name, counts) in &other.skills {
+            self.skills.entry(name.clone()).or_default().add(counts);
+        }
         self.malformed_calls += other.malformed_calls;
         for (name, counts) in &other.tools {
             self.tools.entry(name.clone()).or_default().add(counts);
@@ -196,6 +239,10 @@ impl SessionStats {
 pub fn session_stats(session: &Session) -> SessionStats {
     let mut stats = SessionStats::default();
     let mut calls: HashMap<&str, (&str, String)> = HashMap::new();
+    // `load_skill` calls only: call id → (menu name, asked for a
+    // bundled resource). Joined to results below so per-skill counters
+    // reflect outcomes, not attempts.
+    let mut skill_calls: HashMap<&str, (String, bool)> = HashMap::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
 
     for item in &session.transcript {
@@ -213,6 +260,16 @@ pub fn session_stats(session: &Session) -> SessionStats {
                         stats.identical_repeats += 1;
                     }
                     calls.insert(call.id.as_str(), (&call.name, canonical));
+                    if call.name == "load_skill" {
+                        let args = Value::from(call.arguments.clone());
+                        let name = args
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?")
+                            .to_owned();
+                        let resource = args.get("resource").is_some();
+                        skill_calls.insert(call.id.as_str(), (name, resource));
+                    }
                 }
             }
             Item::ToolResult(result) => {
@@ -229,6 +286,29 @@ pub fn session_stats(session: &Session) -> SessionStats {
                     stats.edit_apply.attempts += 1;
                     if matches!(result.status, ToolStatus::Success) {
                         stats.edit_apply.applied += 1;
+                    }
+                }
+
+                // Skill telemetry: outcome-joined per skill (roadmap
+                // gap — skill lifecycle). Success pays its delivered
+                // bytes into the skill's context cost; any error is a
+                // failure for the name the model asked for. Cancelled
+                // loads delivered and judged nothing.
+                if name == "load_skill"
+                    && let Some((skill, resource)) = skill_calls.get(result.call_id.as_str())
+                {
+                    let counts = stats.skills.entry(skill.clone()).or_default();
+                    match &result.status {
+                        ToolStatus::Success => {
+                            if *resource {
+                                counts.resources += 1;
+                            } else {
+                                counts.loads += 1;
+                            }
+                            counts.delivered_bytes += result.content.len() as u64;
+                        }
+                        ToolStatus::Error(_) => counts.failures += 1,
+                        ToolStatus::Cancelled { .. } => {}
                     }
                 }
 
@@ -725,6 +805,60 @@ mod tests {
     /// The stub length the test above planted, for the savings assert.
     fn spilled_content_len(spill: &Spill) -> u64 {
         spill.delivered_bytes
+    }
+
+    #[test]
+    fn skill_telemetry_counts_loads_resources_and_cost_per_skill() {
+        let items = vec![
+            Item::Assistant(assistant(
+                "go",
+                vec![
+                    call("a", "load_skill", json!({"name": "release"})),
+                    call("b", "load_skill", json!({"name": "release"})),
+                    call(
+                        "c",
+                        "load_skill",
+                        json!({"name": "deploy", "resource": "notes.md"}),
+                    ),
+                    call("d", "load_skill", json!({"name": "ghost"})),
+                    call("e", "load_skill", json!({"resource": "no name"})),
+                ],
+            )),
+            Item::ToolResult(ok_result("a", "# skill: release\none")),
+            Item::ToolResult(ok_result("b", "# skill: release\ntwo")),
+            Item::ToolResult(ok_result("c", "# skill resource: deploy/notes.md\nport")),
+            Item::ToolResult(failed_result("d", ToolFailure::InvalidInput)),
+            Item::ToolResult(failed_result("e", ToolFailure::InvalidInput)),
+        ];
+        let stats = session_stats(&session(items));
+
+        let release = &stats.skills["release"];
+        assert_eq!(
+            (release.loads, release.resources, release.failures),
+            (2, 0, 0)
+        );
+        assert_eq!(
+            release.delivered_bytes,
+            ("# skill: release\none".len() + "# skill: release\ntwo".len()) as u64
+        );
+        let deploy = &stats.skills["deploy"];
+        assert_eq!((deploy.loads, deploy.resources, deploy.failures), (0, 1, 0));
+        assert_eq!(
+            deploy.delivered_bytes,
+            "# skill resource: deploy/notes.md\nport".len() as u64
+        );
+        // An unknown name is a failure for the name the model asked
+        // for — the retirement signal for stale menu entries.
+        let ghost = &stats.skills["ghost"];
+        assert_eq!((ghost.loads, ghost.failures), (0, 1));
+        // Malformed arguments still reconcile, under the "?" key.
+        assert_eq!(stats.skills["?"].failures, 1);
+
+        // Folding merges per-skill counters like per-tool ones.
+        let mut folded = stats.clone();
+        folded.add(&stats);
+        assert_eq!(folded.skills["release"].loads, 4);
+        assert_eq!(folded.skills["ghost"].failures, 2);
     }
 
     #[test]
