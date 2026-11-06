@@ -162,6 +162,47 @@ the official scorer counts it unresolved. The `resolved` verdict comes
 only from `swebench eval` — Loom never grades its own work locally, so
 no local gate can be tuned to flatter the number.
 
+## Suite audit (UTBoost-style weak-suite flags)
+
+UTBoost (arXiv 2506.09289) amplified SWE-bench's own suites and found
+345 erroneously-passing patches — 24.4% of Verified leaderboard entries
+affected — so the frozen subset's official P2P/F2P verdicts are
+hypotheses, not ground truth. The audit is a one-off deterministic
+re-grade of the frozen 100 with amplified suites
+(`docs/lit-review-2026-11-harness-papers.md` maps the paper):
+
+```
+cargo run -p loom-eval --bin suite_audit -- \
+  --dataset <eval-dir>/swebench/verified.jsonl \
+  --out <eval-dir>/suite-audit-v3-100 \
+  --repos astropy/astropy,django/django,sympy/sympy,scikit-learn/scikit-learn,sphinx-doc/sphinx \
+  --per-repo 20
+```
+
+Selection mirrors `swebench-run` (same `select_instances`), so the
+audit covers exactly the frozen subset. Two passes, no model and no
+network in the binary:
+
+1. **Structural (offline)** — `suite_audit.json` rows flag instances
+   whose suite shape is weak: `suite_small` (`f2p + p2p <= 2`) or
+   `no_new_tests` (the test patch adds no test-looking lines); either
+   firing sets the `weak_ids` hypothesis flag. The artifact's
+   `provenance` block (method version, dataset sha256, selection rule,
+   runner version) makes every verdict attributable, same rule as sweep
+   reports.
+2. **Mutant re-grade (docker, one-off)** — `mutants/mutant-<k>/`
+   predictions files hold every instance's hunk-`k`-dropped gold patch;
+   scoring each with the official harness (commands in the emitted
+   `README.md`) and intersecting the resolved sets per instance applies
+   the weak-confirm rule: an instance whose every mutant still resolves
+   has a suite that cannot catch a partial fix. Single-hunk gold
+   patches (`unmutable_ids`) get no verdict either way.
+
+Re-gate rule: any headline derived from the frozen subset that flips
+when weak-confirmed instances are excluded (or re-scored against
+amplified suites) is re-gated — recorded as a new measurement with its
+own provenance, never silently restated.
+
 ## Honesty rules
 
 - The headline is the official `resolved` rate over the sweep — nothing

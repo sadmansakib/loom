@@ -22,4 +22,5 @@
 //! network edges (dataset fetch, docker), which the binary owns.
 
 pub mod selfopt;
+pub mod suite_audit;
 pub mod swebench;

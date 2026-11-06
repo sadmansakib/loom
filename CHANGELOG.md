@@ -24,6 +24,41 @@ Best-of-3 worse than Best-of-1).
   `VerifyTool::suite_verdict(root, cancellation)` runs the fixed
   table once and returns `Option<bool>` (None = no verdict).
 
+## 2026-11 — Frozen-subset suite audit, structural pass (roadmap item 1)
+
+Research-grounded (UTBoost, arXiv 2506.09289: amplified SWE-bench suites
+caught 345 erroneously-passing patches; 24.4% of Verified leaderboard
+entries affected — so the frozen 100's official P2P/F2P verdicts are
+hypotheses, not ground truth).
+
+- `loom_eval::suite_audit` + `suite-audit` bin: two deterministic
+  passes, no model, no network. Structural — per-instance suite shape
+  (`f2p`/`p2p` counts, gold hunks, added test lines) with weak flags
+  (`suite_small`: f2p+p2p ≤ 2; `no_new_tests`: test patch adds nothing
+  test-looking). Mutant — every single-hunk-dropped gold patch staged
+  as `mutants/mutant-<k>/predictions.jsonl` for the official scorer;
+  weak-confirm rule: an instance whose every mutant still resolves has
+  a suite that cannot catch a partial fix.
+- `--repos`/`--per-repo` selection mirrors `swebench-run`
+  (`select_instances`), so the audit covers exactly the frozen subset;
+  `audit_dataset` stays pure while the bin stamps the artifact's
+  provenance block (method version, dataset sha256, selection rule,
+  runner version — same attributable-measurement rule as sweep
+  reports).
+- Ran on the frozen 100 (dataset sha256 774efa6c…, method v1):
+  **36/100 weak by suite shape** (sympy 10, sphinx 10, django 7,
+  astropy 5, scikit-learn 4), **49/100 unmutable** (single-hunk gold),
+  **259 mutants staged as 45 predictions files** under
+  `target/eval/suite-audit-v3-100/`. Artifacts: `suite_audit.json`
+  (rows + provenance), per-mutant predictions, README with the scorer
+  loop.
+- Remaining (deliberately not run here): the docker mutant re-grade
+  (~259 scorer runs, linux box) to confirm/refute the 36 hypotheses;
+  any headline that flips is re-gated (docs/eval.md § suite audit);
+  then weak flags wire into live sweep reports' provenance.
+- docs: eval.md gains the suite-audit section (usage, artifact,
+  weak-confirm + re-gate rules); roadmap item 1 records status.
+
 ## 2026-11 — Vary-the-harness best-of-N (roadmap item 24)
 
 Research-grounded (Harness², arXiv 2610.14224: harness edits diversify

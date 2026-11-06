@@ -811,6 +811,17 @@ adds four more framing findings and backlog items 26–31 below.
      amplified suites; weak-suite instances flagged in the provenance
      block; any headline that flips gets re-gated. Mapped in
      [`docs/lit-review-2026-11-harness-papers.md`](lit-review-2026-11-harness-papers.md).
+     Status 2026-11-06: structural pass shipped (`suite-audit` bin +
+     `loom_eval::suite_audit`, docs/eval.md § suite audit) and ran on
+     the frozen 100 — 36/100 weak by suite shape (small or testless),
+     49/100 unmutable (single-hunk gold), 259 single-hunk-dropped
+     mutants staged as 45 predictions files under
+     `target/eval/suite-audit-v3-100/` (artifact provenance: dataset
+     sha256 + selection rule + method v1). Remaining: the docker
+     mutant re-grade (~259 scorer runs, one-off, linux box) to
+     confirm/refute the 36 hypotheses; then any flipped headline is
+     re-gated and the weak flags get wired into live sweep reports'
+     provenance.
    Seam: the live eval reports and the event stream.
 2. **Sandboxed shell** (G1, G2, G3) — **shipped 2026-10-08**. Strong
    models working through a
