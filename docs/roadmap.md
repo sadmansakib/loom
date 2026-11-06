@@ -127,7 +127,7 @@ iterations may start early where a backlog item is cheap and measured.
 | 3 | Intelligent subagent scheduling | Not started | 19, 21, 24 |
 | 4 | Execution safety & richer tools | **Largely shipped early** | 2✓, 13⏸, 23 |
 | 5 | Skills & contextual knowledge | **Largely shipped 2026-10-23** (skills index + `load_skill`) | 4✓ (instructions), skills✓, 20.4 |
-| 6 | MCP & LSP integration | Started 2026-10-23 (item 18 symbol tools shipped) | 18✓ |
+| 6 | MCP & LSP integration | Started 2026-10-23 (item 18 symbol tools shipped) | 18✓, 34⏸ |
 | 7 | Plugin system | Future scope | — |
 | 8 | Intelligent model routing | Not started; prerequisites in place | 9⏸, 14✓ |
 | 9 | Learning & self-optimization | Not started; data path partial | 1, 20 (20.2 sweepable set shipped) |
@@ -1695,6 +1695,36 @@ model tier under them (arXiv 2607.06906).
    rustfix targets Cargo's own test-suite); container-runner and
    non-Cargo ecosystems skip honestly. Design:
    [`docs/autofix-design.md`](autofix-design.md).
+34. **LSP-backed semantic rename as a fast-path fallback** (G1, G2, G9).
+   The fast-path rename declines whenever the target name exists
+   anywhere in the workspace (whole-word, comments included); slice
+   E2's LSP rename resolves one declared symbol semantically and
+   would address exactly those declines.
+
+     **Evidence-based deferral (2026-11-06).** Demand: the stored
+     corpus — 15 sessions, 16 tasks, 3,255 events — holds 13
+     `fast_path_declined` events, every one `no-intent-match`, and
+     not a single rename-grammar ask among all 22 user inputs: the
+     fallback's trigger population is zero-observed; ambiguity
+     declines are not merely rare, they have never happened. A
+     fixture battery (probe, real `try_fast_path` matcher over a
+     realistic crate) shows the conditional door is real — 8 asks:
+     3 clean solves, 4 target-name-collision declines (the
+     LSP-addressable class), 1 zero-occurrence decline — but that
+     mix is authored, not demand. Cost if it ever fires:
+     rust-analyzer on this repo (9 crates) measured initialize at
+     0.04 s, first semantic reply ~2 s, indexing complete 4.1 s —
+     affordable per task. Revisit when rename asks show up in
+     daily-driver or stored traces and the solver declines on the
+     target-name guard. Two facts make a revisit cheap:
+     `FastPathDeclined`'s reason is coarse (`intent-rename-unsolved`
+     covers collision, zero-occurrence, and the >500-occurrence
+     cap) — widen it additively first so the trigger is measurable —
+     and the engine-facing seam is known: `LspAttachment` exposes
+     tools+menu but not the `LspServer` handles, while
+     `apply_workspace_edit` already gives confined, before-imaged,
+     rollback-able application and `record_fast_path` books
+     zero-request solves with no event schema change.
 
 
 ### 2026-12 meta-harness sweep — gap check

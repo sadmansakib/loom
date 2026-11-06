@@ -3,7 +3,19 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — LSP rename fallback: evidence-based deferral (roadmap item 34)
 
+The planned `--lsp` fast-path fallback — text-path rename declines on a
+target-name collision, resolve the one declared symbol via tree-sitter,
+`prepareRename`/`rename` through the E2 write path — was measured before
+building. The stored corpus (15 sessions, 16 tasks, 3,255 events) holds
+zero rename-grammar asks: all 13 `fast_path_declined` events are
+`no-intent-match`, so the trigger never fires today. A probe fixture
+battery against the real matcher (8 asks: 3 clean solves, 4 collision
+declines, 1 zero-occurrence) confirms the fallback is conditionally
+useful but the mix is authored; rust-analyzer on this repo measured
+0.04 s initialize / ~2 s first semantic reply / 4.1 s full index if it
+ever runs. Deferred with a recorded revisit trigger; no code changed.
 
 ## 2026-11 — Machine-applicable compiler fixes (roadmap item 33)
 
