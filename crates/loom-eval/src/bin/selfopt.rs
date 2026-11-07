@@ -286,6 +286,7 @@ fn probe_run(
     for attempt in 1..=MAX_ATTEMPTS {
         let spec = ContainerSpec {
             agent: AgentKind::Loom,
+            script_override: None,
             image: &testbed_image(instance),
             loom_binary: Some(loom_bin),
             prompt_file: &prompt_path,

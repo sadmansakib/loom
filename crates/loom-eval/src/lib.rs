@@ -18,9 +18,17 @@
 //! plus the in-container `loom run --json` report, and writes one
 //! predictions JSONL per run — the file the official scorer consumes.
 //!
+//! [`multilingual`] is the parallel Rust-slice path over
+//! SWE-bench Multilingual (43 Rust tasks, 7 repos): same prompt
+//! contract, same container isolation, a Rust-toolchain variant of the
+//! frozen container script, and the row's own prebuilt image name —
+//! driven by the `multilingual-run` binary and scored by
+//! `swebench eval multilingual`.
+//!
 //! Everything in the library is offline-testable except the two
 //! network edges (dataset fetch, docker), which the binary owns.
 
+pub mod multilingual;
 pub mod selfopt;
 pub mod suite_audit;
 pub mod swebench;

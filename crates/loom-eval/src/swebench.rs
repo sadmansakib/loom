@@ -59,8 +59,9 @@ pub struct SweInstance {
 }
 
 /// `FAIL_TO_PASS` / `PASS_TO_PASS` arrive as `"[\"a\",\"b\"]"` or as
-/// `["a","b"]`; an empty string is the empty list.
-fn string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+/// `["a","b"]`; an empty string is the empty list. Shared with the
+/// Multilingual module, whose rows use the same two test-list shapes.
+pub(crate) fn string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -253,6 +254,18 @@ pub fn select_instances<'a>(
 /// after sphinx-9281 died to __qualname__ on a test-local enum the model's
 /// simplified repro (module-level class) could never expose.
 pub fn build_prompt(instance: &SweInstance) -> String {
+    prompt_text(
+        &instance.repo,
+        &instance.problem_statement,
+        &instance.hints_text,
+    )
+}
+
+/// The prompt body shared by every dataset (Verified today, the
+/// Multilingual Rust slice tomorrow): the frozen v5 text needs only the
+/// repo, the issue, and the hints, so sibling datasets reuse it
+/// byte-identical instead of forking the contract.
+pub(crate) fn prompt_text(repo: &str, problem_statement: &str, hints_text: &str) -> String {
     let mut prompt = format!(
         "You are an autonomous software engineer fixing a real issue in a GitHub repository.\n\n\
          Repository: {repo}\n\
@@ -288,14 +301,11 @@ pub fn build_prompt(instance: &SweInstance) -> String {
          - Do not modify or delete the .git directory.\n\n\
          The issue follows.\n\n\
          <problem_statement>\n{problem}\n</problem_statement>\n",
-        repo = instance.repo,
-        problem = instance.problem_statement,
+        repo = repo,
+        problem = problem_statement,
     );
-    if !instance.hints_text.trim().is_empty() {
-        prompt.push_str(&format!(
-            "\n<hints>\n{}\n</hints>\n",
-            instance.hints_text.trim()
-        ));
+    if !hints_text.trim().is_empty() {
+        prompt.push_str(&format!("\n<hints>\n{}\n</hints>\n", hints_text.trim()));
     }
     prompt.push_str(
         "\nWhen the fix is complete, reply with a short summary of what you changed and why, and finish — do not wait for further input.\n",
@@ -479,6 +489,12 @@ pub struct ContainerSpec<'a> {
     /// script `docker_run_argv` executes; the loom binary mount stays
     /// for both arms — provenance hashes it either way.
     pub agent: AgentKind,
+    /// Frozen script override: when set, `docker_run_argv` runs this
+    /// script instead of `container_script(agent)`. The Multilingual
+    /// Rust slice uses it to inject [`crate::multilingual::RUST_CONTAINER_SCRIPT`]
+    /// while reusing everything else about the loom arm; `None` keeps
+    /// the Verified behavior byte-identical.
+    pub script_override: Option<&'a str>,
     /// Wall-clock budget for the whole loom run, in seconds.
     pub timeout_secs: u64,
     /// `--max-turns` budget for the in-container loom run.
@@ -578,7 +594,9 @@ pub fn docker_run_argv(spec: &ContainerSpec<'_>) -> Vec<String> {
         spec.image.into(),
         "sh".into(),
         "-c".into(),
-        container_script(spec.agent).into(),
+        spec.script_override
+            .unwrap_or(container_script(spec.agent))
+            .into(),
     ]);
     argv
 }
@@ -1121,6 +1139,7 @@ fn api_key_envs_mirror_the_engine_auth_table() {
 fn docker_argv_mounts_and_env_without_a_shell() {
     let spec = ContainerSpec {
         agent: AgentKind::Loom,
+        script_override: None,
         image: "sweb.eval.x86_64.org__one-1:latest",
         loom_binary: Some(Path::new("/eval/loom-linux/loom")),
         prompt_file: Path::new("/eval/swebench/instances/org-one-1/prompt-run1.txt"),
@@ -1179,6 +1198,7 @@ fn docker_argv_mounts_and_env_without_a_shell() {
 
     let gateway = ContainerSpec {
         agent: AgentKind::Loom,
+        script_override: None,
         base_url: Some("https://free.empexaura.com/v1"),
         provider: "custom",
         model: "nano-model",
@@ -1212,6 +1232,7 @@ fn docker_argv_mounts_and_env_without_a_shell() {
     ];
     let overlaid = ContainerSpec {
         agent: AgentKind::Loom,
+        script_override: None,
         extra_env: &overlay,
         container_name: "loom-org-one-1-selfopt-p1",
         ..bare_arm
@@ -1521,6 +1542,7 @@ fn mini_agent_arm_selects_its_script_and_opens_the_openai_dialect() {
     // (litellm reads nothing else).
     let spec = ContainerSpec {
         agent: AgentKind::Mini,
+        script_override: None,
         image: "sweb.eval.x86_64.org__one-1:latest",
         loom_binary: None,
         prompt_file: Path::new("/eval/swebench/instances/org-one-1/prompt-run1.txt"),

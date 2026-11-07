@@ -3,6 +3,31 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — SWE-bench Multilingual Rust slice (roadmap item 35)
+
+A second benchmark surface: the 43 Rust tasks (7 repos: tokio, bat,
+axum, ruff, nushell, coreutils, ripgrep) of the 300-task multilingual
+set, run by the new `multilingual-run` orchestrator with the Verified
+sweep's isolation model — one container per (instance, run), the frozen
+v5 prompt shared byte-identical (pinned by a test against the Verified
+builder), and the row's own prebuilt image name straight from the
+dataset (pulled images are scoring-ready, no retag). The container
+script gains the Rust toolchain (`cargo`/`cargo-fmt`/`rustc`/`rustup`)
+as a separately frozen, sha256-pinned constant whose post-heredoc bytes
+are pinned equal to the Python script's. Slice integrity gates (300
+rows, 43 tasks, `parse_log_cargo` everywhere, well-formed image names)
+abort before any spend; provenance records the dataset sha256, the
+`rust-repos-v1` selection rule, and both script hashes; scoring stays
+official-scorer-only via `swebench eval multilingual`. The Verified
+runner's frozen bytes are untouched (`script_override: None` keeps its
+docker argv byte-identical). Facts were verified against the live
+dataset and registry before building (300/41 repos — the website's
+"42" overcounts; 7/7 Rust prebuilts spot-checked). No live sweep was
+run: the runbook (pilot go/no-go gates, gold validation, measured-cost
+anchors, the item-1 frozen-subset audit remainder, and a plan-only
+full-Verified doc) is in `docs/eval.md`; design in
+`docs/rust-bench-design.md`.
+
 ## 2026-11 — LSP rename fallback: evidence-based deferral (roadmap item 34)
 
 The planned `--lsp` fast-path fallback — text-path rename declines on a

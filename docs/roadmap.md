@@ -1727,6 +1727,38 @@ model tier under them (arXiv 2607.06906).
      zero-request solves with no event schema change.
 
 
+35. **SWE-bench Multilingual: the Rust slice as a parallel eval path** (G3, G6, G8).
+   Goal: a second, harder benchmark surface — 43 Rust tasks across 7
+   repos (tokio, bat, axum, ruff, nushell, coreutils, ripgrep) of the
+   300-task multilingual set — with the Verified sweep's isolation
+   model and honesty rules, and a runbook that makes a live sweep a
+   decision instead of an improvisation.
+   Measured first (2026-11-06, datasets-server + Docker Hub registry):
+   300 rows/41 repos (the website's "42" overcounts by one); no
+   language column, but every row carries its own prebuilt `image`
+   name (shape-uniform, 7/7 Rust repos spot-checked 200 on the
+   registry) — so the runner pulls exactly what the row says, no name
+   derivation, no retag; all 43 Rust rows `parse_log_cargo`; official
+   anchor SWE-agent+Claude-3.7: Rust 58.14% at a $2.50/task cap.
+   Shipped 2026-11: `loom_eval::multilingual` + `multilingual-run`
+   (loom-only arm; mini installs via pip and only ruff's testbed is
+   known to carry Python, so a mini arm would measure infrastructure).
+   The frozen v5 prompt is shared byte-identical via `prompt_text`
+   (pinned by a test against the Verified builder); `RUST_CONTAINER_SCRIPT`
+   is the Python script plus cargo/cargo-fmt/rustc/rustup manifest
+   entries, frozen explicit bytes, sha256-pinned together with the
+   Python script; slice integrity gates (300/43/parse_log_cargo/image
+   shape) abort before any spend; provenance records dataset sha256,
+   selection rule `rust-repos-v1`, script and prompt hashes; scoring
+   is official-scorer-only (`swebench eval multilingual`). The
+   Verified runner's frozen bytes are untouched (a `script_override:
+   None` default keeps its argv byte-identical). Runbook — pilot
+   gates, gold validation, measured-cost anchors, the item-1
+   frozen-subset audit remainder, and the plan-only full-Verified doc
+   — in docs/eval.md §Multilingual Rust slice. No live sweep was run.
+   Design: [docs/rust-bench-design.md](rust-bench-design.md).
+
+
 ### 2026-12 meta-harness sweep — gap check
 
 A vendor/blog/benchmark sweep (Anthropic engineering, Claude Code docs,

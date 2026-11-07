@@ -531,6 +531,7 @@ fn main() {
             for attempt in 1..=MAX_ATTEMPTS {
                 let spec = ContainerSpec {
                     agent,
+                    script_override: None,
                     image: &image,
                     loom_binary: loom_bin.as_deref(),
                     prompt_file: &prompt_path,

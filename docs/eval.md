@@ -203,6 +203,85 @@ when weak-confirmed instances are excluded (or re-scored against
 amplified suites) is re-gated — recorded as a new measurement with its
 own provenance, never silently restated.
 
+## Multilingual Rust slice (item 35)
+
+A second benchmark surface: the 43 Rust tasks of SWE-bench Multilingual
+(300 tasks, 9 languages; Rust across 7 repos — tokio 9, bat 8, axum 7,
+ruff 7, nushell 5, coreutils 5, ripgrep 2), run by `multilingual-run`
+with the same isolation model as the Verified sweep: one container per
+(instance, run), the frozen v5 prompt byte-identical, the row's own
+prebuilt image (the dataset's `image` field names it — pulled images
+are scoring-ready with no retag), and a Rust-toolchain variant of the
+frozen container script (`program = "cargo"|"cargo-fmt"|"rustc"|"rustup"`
+added to the seeded manifest; everything after the heredoc is
+byte-identical to the Python script and both are pinned by sha256 in
+tests). The dataset has no language column, so the slice is the
+seven-repo constant plus integrity gates (300 rows, 43 tasks,
+`parse_log_cargo`, well-formed image names) that abort before any
+spend. Design and measured facts: `docs/rust-bench-design.md`.
+
+```bash
+# 0. (offline) everything the scorer needs is offline-testable:
+cargo test -p loom-eval   # selection, integrity gates, script pinning
+
+# 1. validate the scoring pipeline on gold patches first (as with Verified)
+swebench eval multilingual --gold -i tokio-rs__tokio-4384 --run-id validate-ml-gold
+
+# 2. pilot: ONE instance, one run — the go/no-go gate before any spend
+cargo run -p loom-eval --bin multilingual-run -- \
+  --instances tokio-rs__tokio-4384 --jobs 1 --runs 1
+
+# 3. grade the pilot with the official harness (command printed by the sweep)
+swebench eval multilingual -p target/eval/swebench/predictions-ml-<model>-1.jsonl \
+  --run-id loom-ml-<model>-1 -j 4
+
+# 4. only after the pilot passes its gates: the full 43-task slice
+cargo run -p loom-eval --bin multilingual-run -- --max 43 --jobs 2
+```
+
+Wall time and cost — measured anchors, not estimates:
+
+- Image pulls: one-time, ~2–5 GB total for the slice; minutes each.
+- Agent wall clock: budget 30–60 min/instance (`--timeout-secs 3600`,
+  `--max-turns 100`); the pilot's actual `run.json` duration is the
+  number to plan with.
+- API cost: no local DeepSeek sweep history exists to extrapolate
+  from, so the pilot's measured token usage × list price is the cost
+  datum. Upper anchor: the official SWE-agent + Claude-3.7-Sonnet
+  baseline resolved Rust at 58.14% under a $2.50/task cap
+  (`docs/benchmarks/published-anchors.md`) — and Rust compile-verify
+  loops mean more tool-turns per fix than the Python tasks, so budget
+  per task generously and let cache hits (reported by the sweep) pull
+  it down.
+
+Go/no-go gates before widening beyond the pilot: (a) the gold-patch
+validation resolves; (b) the pilot container ran the agent loop and
+produced a patch file (empty patch is an honest result, an infra
+failure is not); (c) `cargo` runs inside the testbed without registry
+network access — if the first `cargo test` inside the container needs
+to download crates, the image set is insufficient and the sweep stops
+there (the images were validated by the dataset authors, so this is
+expected to pass); (d) the scorer accepts the predictions file and
+reports per-instance verdicts. Any gate failing = no sweep, diagnose
+first.
+
+Scoring is official-scorer-only, same rule as Verified: the headline
+is the `resolved` rate from `swebench eval multilingual`, subset
+composition (43 tasks, 7 repos, dataset sha256, script hash) travels
+with the number in `multilingual-sweep-<model>.json`.
+
+Related open tails, recorded here so they stop living in prose:
+
+- **Item 1 remainder (frozen-subset audit):** 259 single-hunk-dropped
+  mutants are staged under `target/eval/suite-audit-v3-100/` (45
+  predictions files); the outstanding step is the docker re-grade —
+  ~259 scorer runs, a one-off on a linux box — to confirm or refute
+  the 36 weak-suite hypotheses, then re-gate any flipped headline.
+- **Verified 500:** a plan-only doc (no live sweep) describing what a
+  full-set run would take — wall time, image storage, cost at the
+  pilot-measured rate — so the step from subset to full set is a
+  decision, not an improvisation.
+
 ## Honesty rules
 
 - The headline is the official `resolved` rate over the sweep — nothing

@@ -1,7 +1,7 @@
 # Loom
 
 [![Status: Early release](https://img.shields.io/badge/status-early%20release-blue)]()
-[![Tests: 977](https://img.shields.io/badge/tests-977-brightgreen)]()
+[![Tests: 1254](https://img.shields.io/badge/tests-1254-brightgreen)]()
 [![SWE-bench Verified: 90/100](https://img.shields.io/badge/SWE--bench%20Verified-90%2F100-blue)]()
 
 > **Early release.** The headless agent core is usable today: the `loom`
@@ -110,7 +110,7 @@ N>1 remain a measurement question (roadmap item 19 trigger).
 | `loom-tools` | Built-in deterministic tools: file read/write/edit, search, listing, sandboxed command execution, git porcelain, symbols, skills. |
 | `loom-engine` | The deterministic turn loop: context compilation, token estimation, pruning, repo intelligence, completion gate, scout. |
 | `loom-core` | Facade re-exporting the public API for embedders. |
-| `loom-eval` | SWE-bench Verified sweep orchestration + official-scorer reporting. |
+| `loom-eval` | SWE-bench Verified sweep orchestration + official-scorer reporting; SWE-bench Multilingual Rust-slice runner (`multilingual-run`). |
 | `loom-cli` | `loom` binary: auth, run, sessions, stats, tracing, signals. |
 
 Dependency direction is enforced: `loom-kernel` depends on no workspace
