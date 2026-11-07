@@ -20,7 +20,6 @@ use std::time::Duration;
 
 use loom_providers::{self, CustomCatalog, OpenRouterCatalog};
 
-use crate::auth::Auth;
 use crate::engine::EngineError;
 
 /// How long a fetched catalog is considered fresh.
@@ -84,11 +83,10 @@ pub fn custom_catalog_path(db_path: &Path, provider: &str) -> PathBuf {
 /// implementation the provider uses) and the catalog is fetched. A fetch
 /// failure falls back to a stale cache when one exists.
 pub async fn load(
-    auth: &Auth,
+    db_path: &Path,
     provider: &str,
     account: Option<&str>,
     base_url: Option<&str>,
-    db_path: &Path,
 ) -> Result<OpenRouterCatalog, EngineError> {
     let path = catalog_path(db_path);
     let cached = read_cache(&path);
@@ -99,7 +97,13 @@ pub async fn load(
         return Ok(cached.clone());
     }
 
-    let credential = auth.resolve(provider, account)?;
+    // The auth handle wraps a sqlite connection (`!Sync`); resolving in
+    // a scope that ends before the fetch keeps this future `Send` for
+    // embedders that spawn it (loom-acp).
+    let credential = {
+        let auth = crate::auth::Auth::open(db_path)?;
+        auth.resolve(provider, account)?
+    };
     let base = base_url.unwrap_or(loom_providers::OPENROUTER_DEFAULT_BASE_URL);
 
     match fetch_with_retries(
@@ -142,12 +146,17 @@ fn is_fresh(catalog: &OpenRouterCatalog, now: u64) -> bool {
 /// serving gateway A's model list to gateway B would turn a
 /// configuration change into a wrong-capabilities run. Both the fresh
 /// short-circuit and the stale fallback require the URL to match.
+///
+/// Takes the database path (and opens the auth store itself) rather
+/// than an [`Auth`](crate::auth::Auth) handle so the returned future
+/// stays `Send`: the store wraps a sqlite connection that is not
+/// `Sync`, and an async fn captures its parameters for the whole
+/// body.
 pub async fn load_custom(
-    auth: &Auth,
+    db_path: &Path,
     provider: &str,
     account: Option<&str>,
     models_url: &str,
-    db_path: &Path,
 ) -> Result<CustomCatalog, EngineError> {
     let path = custom_catalog_path(db_path, provider);
     let cached = read_custom_cache(&path);
@@ -158,7 +167,12 @@ pub async fn load_custom(
         return Ok(cached.clone());
     }
 
-    let credential = auth.resolve(provider, account)?;
+    // Same Send discipline as [`load`]: the auth handle is scoped to
+    // end before the fetch.
+    let credential = {
+        let auth = crate::auth::Auth::open(db_path)?;
+        auth.resolve(provider, account)?
+    };
 
     match fetch_with_retries(
         || {

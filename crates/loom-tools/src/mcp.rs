@@ -881,27 +881,85 @@ pub async fn attach_mcp(workspace: &Path, budgets: crate::budget::ToolBudgets) -
             return McpAttachment::default();
         }
     };
-    let server_names: Vec<String> = manifest.servers.keys().cloned().collect();
     let mut lock_dirty = false;
+    let attachment = attach_declared(
+        &manifest.servers,
+        workspace,
+        budgets,
+        &mut lock,
+        &mut lock_dirty,
+        false,
+    )
+    .await;
+    if lock_dirty {
+        write_lock(workspace, &lock);
+    }
+    attachment
+}
+
+/// Attaches editor-forwarded servers (roadmap item 37 tail; see
+/// `docs/acp-tails-design.md`).
+///
+/// Same spawn and hygiene pipeline as the manifest path — the OS
+/// sandbox, scrubbed environment, and per-server caps all apply — with
+/// two deliberate differences. Every surviving tool loads eagerly: the
+/// editor is the tool picker, so there is no deferred catalog or menu.
+/// And pins live in an ephemeral in-memory lock: nothing is written to
+/// the workspace lockfile and no cross-run verification happens,
+/// because the trust anchor is the operator flag that let the caller
+/// forward these servers at all, not a pinned workspace state.
+pub async fn attach_forwarded(
+    servers: &BTreeMap<String, McpServerDecl>,
+    workspace: &Path,
+    budgets: crate::budget::ToolBudgets,
+) -> McpAttachment {
+    let mut ephemeral = McpLock::default();
+    let mut lock_dirty = false;
+    attach_declared(
+        servers,
+        workspace,
+        budgets,
+        &mut ephemeral,
+        &mut lock_dirty,
+        true,
+    )
+    .await
+}
+
+/// The shared attach pipeline: concurrent fetch (spawn, handshake,
+/// `tools/list`), serial ingestion with hygiene and pinning, then
+/// name-collision dedup and the eager/deferred split. `eager_all`
+/// loads every surviving tool eagerly (forwarded servers); otherwise
+/// only `always_load` pins load and the rest defer behind the catalog
+/// meta-tools.
+#[allow(clippy::too_many_arguments)]
+async fn attach_declared(
+    servers: &BTreeMap<String, McpServerDecl>,
+    workspace: &Path,
+    budgets: crate::budget::ToolBudgets,
+    lock: &mut McpLock,
+    lock_dirty: &mut bool,
+    eager_all: bool,
+) -> McpAttachment {
+    let server_names: Vec<String> = servers.keys().cloned().collect();
     let mut eager: Vec<Surviving> = Vec::new();
     let mut deferred: Vec<McpCatalogEntry> = Vec::new();
 
     // Fetch phase (spawn, handshake, tools/list) runs concurrently so one
     // slow server cannot serialize attach behind its full handshake
-    // timeout. Hygiene and pinning stay serial in manifest order so
+    // timeout. Hygiene and pinning stay serial in server order so
     // lockfile writes stay deterministic.
-    let fetched =
-        futures::future::join_all(manifest.servers.iter().map(|(name, decl)| async move {
-            let pair = match fetch_server(name, decl, workspace).await {
-                Ok(pair) => Some(pair),
-                Err(error) => {
-                    tracing::warn!(%error, "MCP server failed to attach");
-                    None
-                }
-            };
-            (name, decl, pair)
-        }))
-        .await;
+    let fetched = futures::future::join_all(servers.iter().map(|(name, decl)| async move {
+        let pair = match fetch_server(name, decl, workspace).await {
+            Ok(pair) => Some(pair),
+            Err(error) => {
+                tracing::warn!(%error, "MCP server failed to attach");
+                None
+            }
+        };
+        (name, decl, pair)
+    }))
+    .await;
 
     for (name, decl, pair) in fetched {
         let Some((process, raw_tools)) = pair else {
@@ -911,12 +969,13 @@ pub async fn attach_mcp(workspace: &Path, budgets: crate::budget::ToolBudgets) -
             name,
             decl,
             &server_names,
-            &mut lock,
-            &mut lock_dirty,
+            lock,
+            lock_dirty,
             &mut eager,
             &mut deferred,
             process,
             raw_tools,
+            eager_all,
         )
         .await
         {
@@ -924,11 +983,7 @@ pub async fn attach_mcp(workspace: &Path, budgets: crate::budget::ToolBudgets) -
         }
     }
 
-    if lock_dirty {
-        write_lock(workspace, &lock);
-    }
-
-    // Name-collision dedup across servers in manifest order: later
+    // Name-collision dedup across servers in declaration order: later
     // sanitization collisions drop. Eager pins win over catalog entries.
     let mut taken: std::collections::BTreeSet<String> =
         eager.iter().map(|s| s.model_name.clone()).collect();
@@ -976,8 +1031,8 @@ async fn fetch_server(
 }
 
 /// Ingests one server's advertisement. Errors abort that server's tools
-/// only; admitted tools split into `eager` (`always_load` pins) and
-/// `deferred` (catalog).
+/// only; admitted tools split into `eager` (`always_load` pins, or every
+/// tool when `eager_all`) and `deferred` (catalog).
 #[allow(clippy::too_many_arguments)]
 async fn ingest_server(
     name: &str,
@@ -989,6 +1044,7 @@ async fn ingest_server(
     deferred: &mut Vec<McpCatalogEntry>,
     process: Arc<McpServerProcess>,
     raw_tools: Vec<RawTool>,
+    eager_all: bool,
 ) -> Result<(), McpError> {
     let deny: Vec<regex::Regex> = decl
         .policy
@@ -1096,10 +1152,14 @@ async fn ingest_server(
     for entry in admitted {
         // `always_load` pins match either the remote name or the
         // sanitized model-facing name; everything else defers.
-        let pinned = decl
-            .always_load
-            .iter()
-            .any(|pin| *pin == entry.tool.remote_name || *pin == entry.model_name);
+        // Forwarded servers (`eager_all`) load everything: the editor
+        // already picked these tools, so there is no catalog to defer
+        // behind.
+        let pinned = eager_all
+            || decl
+                .always_load
+                .iter()
+                .any(|pin| *pin == entry.tool.remote_name || *pin == entry.model_name);
         if pinned {
             eager.push(entry);
         } else {

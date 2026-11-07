@@ -382,7 +382,12 @@ impl Engine {
     /// register after every built-in opt-in surface; the deferred
     /// surface and facts menus ride along. Same failure semantics as
     /// any other registration.
-    fn open_with_extra_tools(
+    ///
+    /// Public for embedders that own server discovery and lifecycle —
+    /// loom-acp's editor-forwarded servers (roadmap item 37 tail)
+    /// attach here after running them through the same hygiene
+    /// pipeline (`loom_tools::mcp::attach_forwarded`).
+    pub fn open_with_extra_tools(
         config: EngineConfig,
         overrides: EngineOverrides,
         mcp: loom_tools::mcp::McpAttachment,
@@ -756,13 +761,11 @@ impl Engine {
                     .clone()
                     .or_else(|| named.as_ref().and_then(|entry| entry.models_url.clone()))
                     .unwrap_or_else(|| format!("{}/models", base_url.trim_end_matches('/')));
-                let auth = crate::auth::Auth::open(&config.db_path)?;
                 let catalog = crate::catalog::load_custom(
-                    &auth,
+                    &config.db_path,
                     &config.provider,
                     config.account.as_deref(),
                     &models_url,
-                    &config.db_path,
                 )
                 .await?;
                 EngineConfig {
@@ -788,15 +791,13 @@ impl Engine {
         // carried its own catalog past this branch.
         let config = if config.catalog.is_none() {
             let is_openrouter = config.provider == OPENROUTER_PROVIDER_NAME;
-            let auth = crate::auth::Auth::open(&config.db_path)?;
             let account = is_openrouter.then(|| config.account.clone()).flatten();
             let base_url = is_openrouter.then(|| config.base_url.clone()).flatten();
             match crate::catalog::load(
-                &auth,
+                &config.db_path,
                 OPENROUTER_PROVIDER_NAME,
                 account.as_deref(),
                 base_url.as_deref(),
-                &config.db_path,
             )
             .await
             {
@@ -854,6 +855,52 @@ impl Engine {
         } else {
             loom_tools::mcp::McpAttachment::default()
         };
+        // Slice E1: LSP attach. Same async-open reasoning as MCP; a
+        // missing binary skips that server, an invalid manifest fails
+        // all of LSP closed, and the frozen default registry is
+        // untouched while the flag is off.
+        let lsp = if config.lsp && !overrides.bare_loop {
+            let workspace = std::fs::canonicalize(&config.workspace)
+                .unwrap_or_else(|_| config.workspace.clone());
+            loom_tools::lsp::attach_lsp(&workspace, config.budgets).await
+        } else {
+            loom_tools::lsp::LspAttachment::default()
+        };
+        Engine::open_with_extra_tools(config, overrides, mcp, lsp)
+    }
+
+    /// [`Engine::open_async_with`] plus operator-forwarded MCP servers
+    /// (roadmap item 37 tail; see `docs/acp-tails-design.md`).
+    ///
+    /// The forwarded servers run through the same spawn/hygiene
+    /// pipeline as the manifest (`attach_forwarded`) with every
+    /// surviving tool loaded eagerly — the editor is the tool picker,
+    /// so there is no deferred catalog for them. They compose with,
+    /// never replace, the manifest attachment. A caller is expected to
+    /// gate this on an explicit operator choice; the engine does not
+    /// second-guess the list it is handed.
+    pub async fn open_async_with_forwarded_mcp(
+        config: EngineConfig,
+        overrides: EngineOverrides,
+        forwarded: std::collections::BTreeMap<String, loom_tools::mcp::McpServerDecl>,
+    ) -> Result<Self, EngineError> {
+        let config = Self::resolve_catalog(config).await?;
+        let mut mcp = if config.mcp && !overrides.bare_loop {
+            let workspace = std::fs::canonicalize(&config.workspace)
+                .unwrap_or_else(|_| config.workspace.clone());
+            loom_tools::mcp::attach_mcp(&workspace, config.budgets).await
+        } else {
+            loom_tools::mcp::McpAttachment::default()
+        };
+        if !forwarded.is_empty() {
+            let workspace = std::fs::canonicalize(&config.workspace)
+                .unwrap_or_else(|_| config.workspace.clone());
+            let extra =
+                loom_tools::mcp::attach_forwarded(&forwarded, &workspace, config.budgets).await;
+            // Forwarded servers are eager-only: no menu or surface of
+            // their own to merge, just the tools.
+            mcp.tools.extend(extra.tools);
+        }
         // Slice E1: LSP attach. Same async-open reasoning as MCP; a
         // missing binary skips that server, an invalid manifest fails
         // all of LSP closed, and the frozen default registry is

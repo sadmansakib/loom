@@ -45,6 +45,14 @@ struct Args {
     /// Maximum model turns per prompt.
     #[arg(long, default_value_t = loom_core::kernel::agent::DEFAULT_MAX_TURNS)]
     max_turns: u32,
+
+    /// Admit editor-forwarded MCP servers (`mcp_servers` in
+    /// `session/new`): stdio servers only, every tool loaded eagerly,
+    /// no workspace lockfile writes. Off by default — attaching a
+    /// server the operator did not configure grants it process spawn
+    /// (and tool-driven network) inside the sandbox.
+    #[arg(long)]
+    allow_client_mcp: bool,
 }
 
 fn main() -> anyhow::Result<ExitCode> {
@@ -61,7 +69,8 @@ fn main() -> anyhow::Result<ExitCode> {
         .enable_all()
         .build()?;
     let options = ServerOptions::new(args.provider, args.model, loom_core::paths::db_path())
-        .with_base_url(args.base_url);
+        .with_base_url(args.base_url)
+        .with_allow_client_mcp(args.allow_client_mcp);
     let options = if args.max_turns != loom_core::kernel::agent::DEFAULT_MAX_TURNS {
         ServerOptions {
             max_turns: args.max_turns,

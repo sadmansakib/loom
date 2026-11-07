@@ -459,6 +459,89 @@ fn clean_server_pins_loads_eager_and_defers() {
 }
 
 #[test]
+fn forwarded_servers_attach_eagerly_without_a_manifest_or_lockfile() {
+    let dir = workspace("forwarded");
+    // No `.loom/mcp.toml` is written: the decls come from the caller
+    // (loom-acp's `--allow-client-mcp` path), not the workspace.
+    let exe = std::env::current_exe().unwrap();
+    let decl = mcp::McpServerDecl {
+        command: vec![
+            exe.to_string_lossy().into_owned(),
+            "--exact".into(),
+            "mcp_mock_server".into(),
+            "--test-threads=1".into(),
+            "--nocapture".into(),
+        ],
+        env: [("LOOM_MCP_MOCK_MODE".to_string(), "clean".to_string())]
+            .into_iter()
+            .collect(),
+        network: true,
+        always_load: Vec::new(),
+        policy: mcp::McpToolPolicy::default(),
+    };
+    let servers = [("mock".to_string(), decl)].into_iter().collect();
+
+    let rt = build_runtime();
+    let attachment = rt.block_on(mcp::attach_forwarded(
+        &servers,
+        &dir,
+        ToolBudgets::default(),
+    ));
+
+    // Editor-forwarded servers load everything eagerly: the editor is
+    // the tool picker, so there is no deferred catalog or menu.
+    let names: Vec<String> = attachment
+        .tools
+        .iter()
+        .map(|t| t.spec().name.clone())
+        .collect();
+    assert_eq!(names, ["mcp_mock_greet", "mcp_mock_add"]);
+    assert!(attachment.menu.is_none());
+    assert!(attachment.surface.is_none());
+
+    let greet = find_tool(&attachment.tools, "mcp_mock_greet");
+    let output = rt
+        .block_on(greet.call(json!({"name": "loom"}), &context(&dir)))
+        .unwrap();
+    assert!(output.content.contains("Hello, loom!"));
+
+    // The ephemeral lock never touches the workspace.
+    assert!(!dir.join(".loom/mcp.lock").exists());
+}
+
+#[test]
+fn forwarded_attach_leaves_no_state_between_runs() {
+    let dir = workspace("forwarded-twice");
+    let exe = std::env::current_exe().unwrap();
+    let decl = mcp::McpServerDecl {
+        command: vec![
+            exe.to_string_lossy().into_owned(),
+            "--exact".into(),
+            "mcp_mock_server".into(),
+            "--test-threads=1".into(),
+            "--nocapture".into(),
+        ],
+        env: [("LOOM_MCP_MOCK_MODE".to_string(), "clean".to_string())]
+            .into_iter()
+            .collect(),
+        network: true,
+        always_load: Vec::new(),
+        policy: mcp::McpToolPolicy::default(),
+    };
+    let servers = [("mock".to_string(), decl)].into_iter().collect();
+    let rt = build_runtime();
+    for _ in 0..2 {
+        let attachment = rt.block_on(mcp::attach_forwarded(
+            &servers,
+            &dir,
+            ToolBudgets::default(),
+        ));
+        assert_eq!(attachment.tools.len(), 2, "no pins persist between runs");
+    }
+    assert!(!dir.join(".loom/mcp.lock").exists());
+}
+
+#[test]
 fn always_loading_everything_disables_the_meta_tools() {
     let dir = workspace("eager-all");
     manifest(&dir, "clean", "always_load = [\"greet\", \"add\"]\n");

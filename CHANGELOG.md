@@ -3,6 +3,26 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — ACP tails: session/load and operator-gated client MCP (roadmap item 37)
+
+`loom-acp` now serves `session/load` (advertised as
+`load_session: true`): the ACP session id *is* the kernel session id
+in string form (UUIDv7), and loading rehydrates the durable transcript
+from the shared database, so the same id resumes across connections
+and process restarts. Unknown or non-v7 ids answer `invalid_request`.
+The client's forwarded `mcp_servers` attach only under the new
+`--allow-client-mcp` operator gate (default off — ignored with one
+warning, byte-for-byte the old behavior): stdio servers only, every
+tool loaded eagerly (the editor is the tool picker), ephemeral
+in-memory pins with no `.loom/mcp.lock` writes, same sandbox and
+hygiene pipeline as manifest servers (`attach_forwarded` shares
+`attach_declared`); http/sse is a hard `session/new` error.
+Engine-level: `session/new` opens through the async catalog path like
+`loom run`; that surfaced a latent `!Send` in `resolve_catalog`'s
+future (an auth-store handle alive across the fetch await) — the
+catalog loaders now scope the handle so embedders can spawn engine
+opens. Design: `docs/acp-tails-design.md`.
+
 ## 2026-11 — Server-side context editing hint (roadmap item 12, Anthropic slice, default-off)
 
 `ModelRequest` carries an optional provider-agnostic

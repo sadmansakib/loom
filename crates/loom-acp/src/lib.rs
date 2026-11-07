@@ -25,12 +25,16 @@
 //!   closed (deny) — which is exactly the engine's own behavior with
 //!   no ask resolver attached.
 //!
-//! Deliberately absent: `session/load` (not advertised in
-//! capabilities, so clients must not send it), `set_model` /
+//! `session/load` is served: the ACP session id *is* the kernel
+//! session id in string form (UUIDv7), and loading rehydrates the
+//! durable transcript from the shared database — the same id resumes
+//! across connections and process restarts. The client's forwarded
+//! `mcp_servers` in `session/new` attach only under the explicit
+//! operator flag `--allow-client-mcp` (stdio servers, eager tools,
+//! no lockfile writes; without the flag they are ignored with one
+//! warning). Still deliberately absent: `set_model` /
 //! `set_session_mode` (the default router answers with
-//! method-not-found), and the client's forwarded `mcp_servers` in
-//! `session/new` (loom brings its own manifest-driven MCP attachment;
-//! attaching editor-forwarded servers is a recorded open tail).
+//! method-not-found).
 //!
 //! The engine is reached through `loom-core` only (ADR-021). The
 //! tests drive this whole server in-process over an
@@ -79,6 +83,15 @@ pub struct ServerOptions {
     /// overrides own state (a scripted provider), so every engine
     /// open must get its own.
     pub overrides_factory: Arc<dyn Fn() -> EngineOverrides + Send + Sync>,
+    /// Whether editor-forwarded `mcp_servers` in `session/new` are
+    /// attached (roadmap item 37 tail). Off by default: attaching a
+    /// server the operator did not configure would grant it process
+    /// spawn (and, for the tools it offers, network) inside the
+    /// workspace sandbox. With the flag on, stdio servers run through
+    /// the same hygiene pipeline as manifest servers, all tools load
+    /// eagerly, and nothing is written to the workspace lockfile
+    /// (see `docs/acp-tails-design.md`).
+    pub allow_client_mcp: bool,
 }
 
 impl ServerOptions {
@@ -93,6 +106,7 @@ impl ServerOptions {
             db_path,
             max_turns: DEFAULT_MAX_TURNS,
             overrides_factory: Arc::new(EngineOverrides::default),
+            allow_client_mcp: false,
         }
     }
 
@@ -110,6 +124,14 @@ impl ServerOptions {
         factory: Arc<dyn Fn() -> EngineOverrides + Send + Sync>,
     ) -> Self {
         self.overrides_factory = factory;
+        self
+    }
+
+    /// Admits editor-forwarded `mcp_servers` in `session/new`
+    /// (operator opt-in; see the field docs).
+    #[must_use]
+    pub fn with_allow_client_mcp(mut self, allow: bool) -> Self {
+        self.allow_client_mcp = allow;
         self
     }
 }
@@ -195,6 +217,7 @@ where
     Transport: ConnectTo<Agent> + 'static,
 {
     let new_state = state.clone();
+    let load_state = state.clone();
     let prompt_state = state.clone();
     let cancel_state = state.clone();
     Agent
@@ -204,9 +227,25 @@ where
                   responder: agent_client_protocol::v1::Responder<acp::InitializeResponse>,
                   _cx: agent_client_protocol::v1::ConnectionTo<Client>| {
                 let response = acp::InitializeResponse::new(request.protocol_version)
-                    .agent_capabilities(acp::AgentCapabilities::new())
+                    .agent_capabilities(acp::AgentCapabilities::new().load_session(true))
                     .agent_info(acp::Implementation::new("loom", env!("CARGO_PKG_VERSION")));
                 async move { responder.respond(response) }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            move |request: acp::LoadSessionRequest,
+                  responder: agent_client_protocol::v1::Responder<acp::LoadSessionResponse>,
+                  cx: agent_client_protocol::v1::ConnectionTo<Client>| {
+                // Engine open (and, with forwarded servers, process
+                // spawn) is heavyweight; keep it off the dispatch loop.
+                let state = load_state.clone();
+                let task_cx = cx.clone();
+                async move {
+                    cx.spawn(async move {
+                        handle_load_session(state, request, responder, task_cx).await
+                    })
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -295,12 +334,17 @@ async fn handle_new_session(
         prune: None,
         autofix: false,
     };
+    // The ACP session id *is* the kernel session id in string form, so
+    // a later connection's `session/load` names the same durable
+    // transcript. Kernel ids are UUIDv7; editors treat them as opaque
+    // strings either way.
+    let kernel = KernelSessionId::new();
+    let acp_session_id = acp::SessionId::new(kernel.as_uuid().to_string());
     // The ask bridge: a policy `Ask` becomes the client's
     // `session/request_permission`. Fails closed on any transport
     // failure or non-allow outcome, matching the engine's no-resolver
     // default. Built before the engine opens so the resolver rides in
     // the overrides.
-    let acp_session_id = acp::SessionId::new(uuid::Uuid::now_v7().to_string());
     let ask_cx = cx.clone();
     let ask_session = acp_session_id.clone();
     let mut overrides = (options.overrides_factory)();
@@ -310,13 +354,23 @@ async fn handle_new_session(
         let permission = ask_permission(cx, session, program.to_string());
         Box::pin(permission)
     }));
-    let engine = match Engine::open_with(config, overrides) {
+    // Editor-forwarded servers (item 37 tail): stdio-only, admitted
+    // only under the operator flag; without it they are warned about
+    // and ignored, byte-for-byte the pre-flag behavior. A non-stdio
+    // entry under the flag is a hard `session/new` error — silently
+    // attaching half the request would hide the refusal.
+    let forwarded = match forwarded_set(&state, &request) {
+        Ok(decls) => decls,
+        Err(message) => {
+            return responder.respond_with_error(Error::invalid_request().data(message));
+        }
+    };
+    let engine = match Engine::open_async_with_forwarded_mcp(config, overrides, forwarded).await {
         Ok(engine) => engine,
         Err(error) => {
             return responder.respond_with_internal_error(format!("opening the engine: {error}"));
         }
     };
-    let kernel = KernelSessionId::new();
     let control = TaskControl::new();
     let core = Arc::new(AsyncMutex::new(SessionCore {
         engine: Arc::new(engine),
@@ -326,6 +380,176 @@ async fn handle_new_session(
     lock_or_recover(&state.sessions)
         .insert(acp_session_id.clone(), SessionHandle { core, control });
     responder.respond(acp::NewSessionResponse::new(acp_session_id))
+}
+
+/// Resolves the `mcp_servers` a client forwarded in `session/new` into
+/// the decl map the engine attaches, honoring the operator gate.
+///
+/// Off (the default): every forwarded server is ignored with one
+/// warning — attaching a server the operator did not configure would
+/// grant it process spawn and tool-driven network inside the sandbox.
+/// On: stdio servers map to decls with the network grant implied by
+/// admission (ACP carries no per-server field) and eager-only loading;
+/// anything else is a hard `session/new` error rather than a silent
+/// partial attach.
+fn forwarded_set(
+    state: &AcpState,
+    request: &acp::NewSessionRequest,
+) -> Result<std::collections::BTreeMap<String, loom_core::tools::mcp::McpServerDecl>, String> {
+    if request.mcp_servers.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    if !state.options.allow_client_mcp {
+        tracing::warn!(
+            servers = request.mcp_servers.len(),
+            "ignoring editor-forwarded mcp_servers; start loom-acp with --allow-client-mcp to attach them"
+        );
+        return Ok(std::collections::BTreeMap::new());
+    }
+    forwarded_decls(&request.mcp_servers)
+}
+
+/// Maps ACP `McpServer`s to loom decls. Stdio only: the http/sse
+/// transports need an outbound connection the operator never granted.
+fn forwarded_decls(
+    servers: &[acp::McpServer],
+) -> Result<std::collections::BTreeMap<String, loom_core::tools::mcp::McpServerDecl>, String> {
+    let mut decls = std::collections::BTreeMap::new();
+    for server in servers {
+        let (name, command, env) = match server {
+            acp::McpServer::Stdio(stdio) => {
+                let mut command = vec![stdio.command.to_string_lossy().into_owned()];
+                command.extend(stdio.args.iter().cloned());
+                let env = stdio
+                    .env
+                    .iter()
+                    .map(|variable| (variable.name.clone(), variable.value.clone()))
+                    .collect();
+                (stdio.name.clone(), command, env)
+            }
+            acp::McpServer::Http(http) => {
+                return Err(format!(
+                    "forwarded MCP server `{}` uses the http transport; only stdio is supported",
+                    http.name
+                ));
+            }
+            acp::McpServer::Sse(sse) => {
+                return Err(format!(
+                    "forwarded MCP server `{}` uses the sse transport; only stdio is supported",
+                    sse.name
+                ));
+            }
+            // The schema enum is non-exhaustive: a future transport is
+            // refused the same way, not silently dropped.
+            _ => {
+                return Err(
+                    "forwarded MCP server uses an unsupported transport; only stdio is supported"
+                        .to_string(),
+                );
+            }
+        };
+        decls.insert(
+            name,
+            loom_core::tools::mcp::McpServerDecl {
+                command,
+                env,
+                // Admission is the grant: ACP carries no per-server
+                // network field, so an admitted server gets network.
+                network: true,
+                // Eager-only attach (`attach_forwarded`): no pins.
+                always_load: Vec::new(),
+                policy: Default::default(),
+            },
+        );
+    }
+    Ok(decls)
+}
+
+/// Parses an ACP session id back into the kernel id it was minted
+/// from: a UUIDv7 string. Everything else never named a loom session.
+fn kernel_session_id(acp_id: &acp::SessionId) -> Result<KernelSessionId, String> {
+    uuid::Uuid::parse_str(&acp_id.0)
+        .ok()
+        .filter(|uuid| uuid.get_version_num() == 7)
+        .and_then(|uuid| KernelSessionId::try_from(uuid).ok())
+        .ok_or_else(|| "session ids are UUIDv7 values minted by session/new".to_string())
+}
+
+/// `session/load`: resume a persisted kernel session under the ACP id
+/// that created it. Opens a fresh engine (the connection may be a new
+/// process) and rehydrates the durable transcript from the shared
+/// database; a later `session/prompt` on the same id continues it.
+async fn handle_load_session(
+    state: AcpState,
+    request: acp::LoadSessionRequest,
+    responder: agent_client_protocol::v1::Responder<acp::LoadSessionResponse>,
+    _cx: agent_client_protocol::v1::ConnectionTo<Client>,
+) -> Result<(), Error> {
+    // The ACP id is the kernel id's string form: a UUIDv7. Anything
+    // else never named a loom session.
+    let kernel = match kernel_session_id(&request.session_id) {
+        Ok(kernel) => kernel,
+        Err(message) => {
+            return responder.respond_with_error(Error::invalid_request().data(message));
+        }
+    };
+    if lock_or_recover(&state.sessions).contains_key(&request.session_id) {
+        return responder.respond_with_error(
+            Error::invalid_request().data("session already active on this connection"),
+        );
+    }
+    let options = state.options.clone();
+    let config = EngineConfig {
+        provider: options.provider.clone(),
+        model: options.model.clone(),
+        base_url: options.base_url.clone(),
+        models_url: None,
+        reasoning_effort: ReasoningEffort::default(),
+        account: None,
+        workspace: request.cwd.clone(),
+        system_prompt: None,
+        max_turns: options.max_turns,
+        turn_budget: Default::default(),
+        context_editing: None,
+        db_path: options.db_path.clone(),
+        persist: true,
+        catalog: None,
+        scout: None,
+        symbols: false,
+        git: false,
+        skills: false,
+        lessons: false,
+        mcp: false,
+        lsp: false,
+        budgets: Default::default(),
+        prune: None,
+        autofix: false,
+    };
+    let engine = match Engine::open_async_with(config, (options.overrides_factory)()).await {
+        Ok(engine) => engine,
+        Err(error) => {
+            return responder.respond_with_internal_error(format!("opening the engine: {error}"));
+        }
+    };
+    // `None` covers both "persistence off" and "no such id" — same
+    // answer either way: the client named something we cannot resume.
+    let session = match engine.load_session(&kernel) {
+        Ok(Some(session)) => session,
+        _ => {
+            return responder.respond_with_error(Error::invalid_request().data("unknown session"));
+        }
+    };
+    let control = TaskControl::new();
+    let core = Arc::new(AsyncMutex::new(SessionCore {
+        engine: Arc::new(engine),
+        session,
+        control: control.clone(),
+    }));
+    lock_or_recover(&state.sessions)
+        .insert(request.session_id.clone(), SessionHandle { core, control });
+    // The loaded session keeps its id: response and request agree by
+    // construction, and modes/config options stay per-connection.
+    responder.respond(acp::LoadSessionResponse::new())
 }
 
 /// Sends one `session/request_permission` for a blocked program and
@@ -761,6 +985,52 @@ mod tests {
             text_content("world"),
         ];
         assert_eq!(prompt_text(&blocks), "hello world");
+    }
+
+    #[test]
+    fn forwarded_stdio_servers_map_to_decls() {
+        let server = acp::McpServerStdio::new("mock", "/usr/bin/mock-mcp")
+            .args(vec!["--serve".into()])
+            .env(vec![acp::EnvVariable::new("KEY", "value")]);
+        let decls =
+            forwarded_decls(&[acp::McpServer::Stdio(server)]).expect("stdio servers are supported");
+        let decl = &decls["mock"];
+        assert_eq!(decl.command, ["/usr/bin/mock-mcp", "--serve"]);
+        assert_eq!(
+            decl.env.get("KEY").map(String::as_str),
+            Some("value"),
+            "the forwarded environment rides the scrubbed spawn"
+        );
+        assert!(decl.network, "the operator grant implies network");
+        assert!(decl.always_load.is_empty());
+    }
+
+    #[test]
+    fn http_and_sse_forwarded_servers_are_rejected() {
+        let http = acp::McpServer::Http(acp::McpServerHttp::new("h", "https://x"));
+        let sse = acp::McpServer::Sse(acp::McpServerSse::new("s", "https://y"));
+        for server in [http, sse] {
+            let error = forwarded_decls(&[server]).expect_err("only stdio is supported");
+            assert!(
+                error.contains("stdio"),
+                "error names the constraint: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn acp_session_ids_round_trip_with_kernel_ids() {
+        let kernel = KernelSessionId::new();
+        let parsed = kernel_session_id(&acp::SessionId::new(kernel.as_uuid().to_string()))
+            .expect("v7 ids round-trip");
+        assert_eq!(parsed, kernel);
+        assert!(
+            kernel_session_id(&acp::SessionId::new("not-a-uuid")).is_err(),
+            "garbage is rejected"
+        );
+        // A v4 id parses as a UUID but fails the v7 rule.
+        let v4 = acp::SessionId::new("00000000-0000-4000-8000-000000000000");
+        assert!(kernel_session_id(&v4).is_err(), "non-v7 ids are rejected");
     }
 
     fn text_content(text: &str) -> acp::ContentBlock {

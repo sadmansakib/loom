@@ -103,11 +103,12 @@ about, or denied via the `[policy]` verdict layer.
 | Embedding | `loom-core` facade (ADR-021), full drive loop in `crates/loom-core/examples/frontend.rs` |
 
 Not built yet: an interactive TUI/CLI surface of its own (resume and
-steering are not exposed over ACP either — `session/load` and friends
-are open tails of roadmap item 37; ask-mode has its first frontend
-path through ACP). Parallel best-of-N worktree rollouts
-ship opt-in (`--best-of N`, roadmap item 21); delegation economics at
-N>1 remain a measurement question (roadmap item 19 trigger).
+steering ship over ACP via `session/load` — roadmap item 37's tails
+closed 2026-11-07; client-forwarded MCP servers attach only under the
+explicit `--allow-client-mcp` operator gate). Parallel best-of-N
+worktree rollouts ship opt-in (`--best-of N`, roadmap item 21);
+delegation economics at N>1 remain a measurement question (roadmap
+item 19 trigger).
 
 ## Crates
 

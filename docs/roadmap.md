@@ -1880,11 +1880,49 @@ model tier under them (arXiv 2607.06906).
     keys insertion-order-sensitive (the ledger's own docs had pinned
     that feature off-limits). Canonical serialization now sorts object
     keys recursively (`loom-kernel::canonical`), byte-identical in
-    default builds and order-independent in unified ones. Open tails:
-    editor-forwarded `mcp_servers` in
-   session/new are not attached (loom brings its own manifest);
-   load/resume of persisted kernel sessions is not exposed yet.
-   Design: [docs/acp-design.md](acp-design.md).
+    default builds and order-independent in unified ones. Design:
+    [docs/acp-design.md](acp-design.md).
+
+   *Tails shipped (2026-11-07):* both open tails closed, design first
+   in [docs/acp-tails-design.md](acp-tails-design.md). (1)
+   `session/load` is served and advertised (`load_session: true`):
+   the ACP session id *is* the kernel session id in string form (UUIDv7
+   minted at `session/new`), so loading opens a fresh engine on the
+   request's `cwd` and rehydrates the durable transcript from the
+   shared database — the same id resumes across connections and
+   process restarts; unknown ids, non-v7 ids, and an id already
+   active on the connection answer `invalid_request`. (2) The
+   client's forwarded `mcp_servers` attach under an explicit operator
+   gate, `--allow-client-mcp` (default off: without it they are
+   ignored with one warning, byte-for-byte the old behavior). Under
+   the gate: stdio only (http/sse is a hard `session/new` error, not
+   a silent partial attach), every surviving tool loads eagerly — the
+   editor is the tool picker, so no deferred catalog or menu — and
+   pins live in an ephemeral in-memory lock: nothing is written to
+   `.loom/mcp.lock`, and no cross-run pin verification happens,
+   because the trust anchor is the operator flag, not workspace
+   state. The same spawn/hygiene pipeline runs (sandbox, scrubbed
+   env, per-server caps) via `loom-tools::mcp::attach_forwarded`
+   sharing `attach_declared` with the manifest path; admission
+   implies the network grant (ACP carries no per-server field). One
+   engine-level consequence: `session/new` now opens through the
+   async catalog-resolving path like `loom run`, so a table provider's
+   session may spend its catalog timeout on a network-blocked machine
+   before falling back to built-in capability rows (the fetch failure
+   is swallowed for non-catalog providers, as in the CLI). That also
+   surfaced and fixed a latent engine bug: `resolve_catalog`'s future
+   was `!Send` (an auth-store handle holding a sqlite connection
+   lived across the fetch await), invisible until an embedder spawned
+   the open; `catalog::load`/`load_custom` now scope the handle so
+   the futures are `Send`. Offline tests: id round-trip units
+   (v7 ok, garbage and v4 rejected), mapping units for forwarded
+   decls (stdio argv/env, http/sse refused), two-connection resume
+   E2E over the scripted provider (the loaded transcript rides the
+   second connection's model request), forwarded-server E2E with a
+   real spawned mock stdio server (tool advertises, executes, content
+   reaches the editor; flag-off asserts no `mcp_*` tools), and
+   loom-tools-level attach tests (eager names, no menu/surface, no
+   lockfile writes, no state between runs).
 
 
 38. **Argument-provenance gate (CaMeL adaptation)** (G1, G2, G7).
