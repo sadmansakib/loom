@@ -750,8 +750,9 @@ adds four more framing findings and backlog items 26–31 below.
      binary, official scorer, 25 runs/arm, 95% cache). **Result: medians
      identical (3/5), full costs ~1.9× requests** — the N=1 directional
      claims for items 4/5/6/8/10 do not survive on a model this strong,
-     and G4/G5 (raise a *weaker* model) remains open pending a cheap
-     weak funded model. Full record:
+     and G4/G5 (raise a *weaker* model) remains open. **Decision
+     2026-11-07: the next G4/G5 contrast reuses this same funded
+     model** — no cheap weak vehicle hunt. Full record:
      `docs/benchmarks/swebench-n5-contrast-gpt-6-luna.md`.
      Candidate alternatives, re-checked 2026-10-18: the direct Z.ai
      API is still wiremock-only (no Z.ai key on this machine);
@@ -806,8 +807,8 @@ adds four more framing findings and backlog items 26–31 below.
       requests (834 vs 445) at ~95% cache both; sympy flipped bare's
       way twice (noise). The harness neither helps nor hurts a
       strong model on this suite — the G4/G5 claim stays strictly
-      about *weaker* models and still lacks a funded cheap weak
-      vehicle. Record:
+      about *weaker* models. Decision 2026-11-07: the next contrast
+      reuses the gpt-6-luna vehicle. Record:
       `docs/benchmarks/swebench-n5-contrast-gpt-6-luna.md`. The number this
      must produce is the G4/G5 headline in `docs/benchmarks/`: the
      claim that Loom raises a weaker model's success rate, which the
