@@ -8,6 +8,7 @@ members = [
     "crates/loom-engine",
     "crates/loom-core",
     "crates/loom-eval",
+    "crates/loom-acp",
     "crates/loom-cli",
 ]
 
@@ -97,6 +98,12 @@ sha2 = "0.10.9"
 # filesystem tooling (loom-tools: gitignore-aware walk + line search)
 ignore = "0.4.33"
 regex = "1.13.1"
+
+# ACP server mode (roadmap item 37): typed protocol types + the runtime-
+# agnostic connection; `stdio` is the only transport ACP v1 defines, and
+# the spec REQUIRES stdout to carry protocol messages only. Stable v1 API;
+# v2 stays behind the SDK's unstable feature and is not enabled.
+agent-client-protocol = { version = "5.0.0", default-features = false, features = ["stdio"] }
 
 # CLI
 clap = { version = "4.6.7", features = ["derive"] }

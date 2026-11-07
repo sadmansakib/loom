@@ -8,6 +8,8 @@
 
 pub mod agent;
 
+mod canonical;
+
 pub mod analytics;
 pub mod artifact;
 pub mod artifact_gc;

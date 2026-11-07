@@ -342,11 +342,12 @@ pub fn session_stats(session: &Session) -> SessionStats {
             Item::Assistant(assistant) => {
                 stats.turns += 1;
                 for call in &assistant.tool_calls {
-                    // Canonical key: serialized arguments (BTreeMap
+                    // Canonical key: serialized arguments with object
+                    // keys byte-sorted (independent of serde_json map
                     // ordering), the same string the identical-call
                     // ledger keys on.
-                    let canonical = serde_json::to_string(&Value::from(call.arguments.clone()))
-                        .unwrap_or_default();
+                    let canonical =
+                        crate::canonical::canonical_json(&Value::from(call.arguments.clone()));
                     if !seen.insert((call.name.clone(), canonical.clone())) {
                         stats.identical_repeats += 1;
                     }

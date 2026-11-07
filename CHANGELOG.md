@@ -3,6 +3,50 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — ACP server mode (roadmap item 37)
+
+The engine is now an Agent Client Protocol server: `loom-acp` speaks
+newline-delimited JSON-RPC 2.0 on stdio, so Zed (and every other ACP
+client) can drive loom as an external agent. The stdout question this
+feature opened with is settled by the spec itself: ACP v1 defines
+stdio as the only transport and mandates that stdout carry nothing
+but valid ACP messages (stderr is sanctioned for logs) — so the
+protocol owns stdout in server mode, `tracing` stays stderr-only, and
+`loom run`'s stdout is untouched.
+
+- new `crates/loom-acp` (loom-core only, ADR-021): `initialize` /
+  `session/new` (one engine per ACP session on the session's `cwd`,
+  credentials identical to the CLI's) / `session/prompt` (one task to
+  completion; engine events forwarded as `session/update` in emission
+  order — a per-prompt forwarder drains before the response, so chunk
+  order is wire-guaranteed) / `session/cancel` (task hard stop, the
+  session survives, the prompt resolves `Cancelled` per spec)
+- event mapping: message/thought chunks, tool calls with a kind table
+  and head-bounded content, todo list to plan; internal harness
+  telemetry never reaches the editor
+- new `EngineOverrides.ask` seam: a policy `Ask` verdict bridges to
+  the client's `session/request_permission`, failing closed on deny,
+  cancel, or transport failure; `None` keeps today's fail-closed
+  default byte-identical
+- offline tests: mapping units, in-process Channel end-to-end runs
+  with a scripted provider (ordered updates + end_turn, unknown-session
+  rejection, cancel-mid-hang), and a real-binary stdio smoke asserting
+  every stdout byte parses as JSON-RPC
+- determinism fix surfaced by the new dependency: `agent-client-protocol`
+  enables serde_json's `preserve_order`, which feature unification had
+  started flipping into every workspace build — silently changing the
+  failure ledger's and the analytics' canonical call-identity keys
+  (two calls differing only in JSON key order would stop matching).
+  Canonical serialization now sorts object keys recursively
+  (`loom-kernel::canonical`), byte-identical to before in default
+  builds and order-independent in unified ones
+
+Zed wiring: `agent_servers: { "loom": { "type": "custom",
+"command": "loom-acp", "args": ["--provider", "...", "--model",
+"..."] } }`. Design and verified API facts: docs/acp-design.md;
+roadmap item 37 records the open tails (editor-forwarded MCP servers
+not attached; session load/resume not exposed).
+
 ## 2026-11 — Escalation-by-fork: evidence-based deferral (roadmap item 36)
 
 Measured before building, deferred on the kill criterion: the stall

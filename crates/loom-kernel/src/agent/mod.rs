@@ -2306,15 +2306,17 @@ impl FailureLedger {
 }
 
 /// Identity of a call for the failure ledger: tool name plus canonical
-/// argument JSON. `Value` object keys are ordered, so equality is
-/// deterministic — this relies on `serde_json`'s map ordering. The
-/// `preserve_order` feature must stay off anywhere in the workspace, or two
-/// calls differing only in key order would key differently and evade the
+/// argument JSON. Object keys are byte-sorted by
+/// [`crate::canonical::canonical_json`], so equality does not depend on
+/// serde_json's map iteration order — which the build graph can flip to
+/// insertion order when any package (agent-client-protocol does)
+/// enables the `preserve_order` feature. Without this, two calls
+/// differing only in key order would key differently and evade the
 /// refusal.
 fn ledger_key(call: &ToolCall) -> (String, String) {
     (
         call.name.clone(),
-        serde_json::to_string(&*call.arguments).unwrap_or_default(),
+        crate::canonical::canonical_json(&call.arguments),
     )
 }
 

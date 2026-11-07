@@ -1799,6 +1799,62 @@ model tier under them (arXiv 2607.06906).
    called mid-turn code state non-derivable.
 
 
+37. **ACP server mode (`loom-acp`)** (G1, G6, G8, ADR-021). Goal: the
+   engine as an Agent Client Protocol server so editors (Zed and every
+   other ACP client) drive loom as an external agent — the
+   cross-process frontend architecture.md always said its event seam
+   anticipated. Measured before building (2026-11-07): ACP v1 defines
+   exactly one transport — newline-delimited JSON-RPC 2.0 over stdio —
+   and REQUIRES stdout protocol-only ("MUST NOT write anything to its
+   stdout that is not a valid ACP message"; stderr is sanctioned for
+   logs), so dedicating stdout to the protocol is the spec, not a
+   trade-off; the official `agent-client-protocol` crate is 5.0.0
+   (2026-11-02, Apache-2.0, ~6M downloads, semver-stable v1 API, no
+   default features, `stdio` feature for the agent side; dependencies
+   all already in loom's graph besides the crate's own derive+schema
+   pins).
+
+   *Shipped 2026-11:* new `crates/loom-acp` (depends on `loom-core`
+   only; the ADR-021 facade test stays green) — `serve()` wires
+   `initialize` / `session/new` (one engine per ACP session, opened on
+   the session's `cwd`, credentials resolved exactly like the CLI's) /
+   `session/prompt` (runs one task to completion, forwarding engine
+   events as `session/update` notifications in emission order via a
+   per-prompt forwarder the response joins, so chunk order is
+   wire-guaranteed) / `session/cancel` (TaskControl hard stop; the
+   kernel session survives; the prompt resolves Cancelled as the spec
+   requires). Event mapping: TextDelta -> agent_message_chunk,
+   ReasoningDelta -> agent_thought_chunk, ToolStarted/ToolCompleted ->
+   tool_call/tool_call_update (kind table, head-bounded content,
+   error->failed), TodoUpdated -> plan; internal telemetry (turn
+   lifecycle, model accounting, fast-path facts, nudges) deliberately
+   never reaches the editor. Stop reasons: end_turn / cancelled /
+   max_turn_requests / max_tokens; hard model/protocol failures surface
+   as JSON-RPC errors. A policy `Ask` bridges to the client's
+   `session/request_permission` through a new `EngineOverrides.ask`
+   seam (the engine threads it into run_command; `None` keeps the
+   fail-closed default byte-identical), failing closed on deny, cancel,
+   or transport failure. `set_model` / `set_session_mode` /
+   `session/load` are not implemented and the capabilities say so.
+   Stdout discipline is asserted at the binary level: spawn `loom-acp`,
+   speak JSON-RPC over real pipes, parse every stdout byte. Offline
+   tests: mapping units, in-process Channel E2E with a scripted
+   provider (initialize -> new_session -> prompt -> ordered updates ->
+   end_turn; unknown-session rejected; cancel-mid-hang -> cancelled),
+   and the stdio smoke. The dependency surfaced a latent determinism
+    bug: `agent-client-protocol` enables serde_json's `preserve_order`,
+    which feature unification flipped into every workspace build —
+    making the failure ledger's and analytics' canonical call-identity
+    keys insertion-order-sensitive (the ledger's own docs had pinned
+    that feature off-limits). Canonical serialization now sorts object
+    keys recursively (`loom-kernel::canonical`), byte-identical in
+    default builds and order-independent in unified ones. Open tails:
+    editor-forwarded `mcp_servers` in
+   session/new are not attached (loom brings its own manifest);
+   load/resume of persisted kernel sessions is not exposed yet.
+   Design: [docs/acp-design.md](acp-design.md).
+
+
 ### 2026-12 meta-harness sweep — gap check
 
 A vendor/blog/benchmark sweep (Anthropic engineering, Claude Code docs,

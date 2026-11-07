@@ -30,6 +30,7 @@ kernel never links a filesystem store or a CLI, the engine never prints.
 | `loom-tools` | The shipped tool suite (read/search/edit/write/list/run/verify + artifact read) | kernel tool traits |
 | `loom-eval` | The measurement harness: SWE-bench Verified runs in container isolation (`swebench` module + `swebench-run` orchestrator) — the agent binary executes inside official per-instance testbed images, grading belongs to the official `swebench` harness; the SWE-bench Multilingual Rust slice (43 tasks, `multilingual` module + `multilingual-run`) shares the same prompt/isolation/provenance contract; plus the offline self-optimization loop (`selfopt` module + bin) over sweep artifacts | `loom-core` only (facade; ADR-021) — containers via docker + the `loom` CLI, model calls via the rolling `engine` alias |
 | `loom-cli` | Binary: argument parsing, output rendering, run/auth/stats commands | `loom-core` only (ADR-021) |
+| `loom-acp` | Agent Client Protocol server (`loom-acp` binary): the engine as an editor-driveable external agent — JSON-RPC 2.0 over stdio, one engine per ACP session, engine events mapped to `session/update` notifications, `session/cancel` to a task hard stop, policy `Ask` bridged to `session/request_permission` (roadmap item 37) | `loom-core` only (ADR-021) |
 
 The kernel defines traits for everything with side effects
 (`SessionStore`, `ArtifactStore`, `ModelProvider`, `FactsSource`,

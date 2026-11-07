@@ -23,7 +23,7 @@ use loom_providers::{
     CUSTOM_PROVIDER_NAME, OPENROUTER_PROVIDER_NAME, ProviderCatalog, ReasoningEffort,
 };
 use loom_store::SqliteStore;
-use loom_tools::policy::CommandPolicy;
+use loom_tools::policy::{AskResolver, CommandPolicy};
 use loom_tools::{
     ArtifactReadTool, EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool,
     ToolBudgets, VerifyTool, WriteFileTool,
@@ -278,6 +278,13 @@ pub struct EngineOverrides {
     /// edit green, and revert on failure, so disabling them is a
     /// measurement choice, not a correctness one.
     pub fast_paths: Option<bool>,
+    /// An approval callback for `Ask` policy verdicts (roadmap item
+    /// 37). `None` keeps today's behavior — an `Ask` verdict fails
+    /// closed as a refusal naming the missing frontend. The ACP server
+    /// supplies one that bridges the ask to the client's
+    /// `request_permission`, so an editor operator becomes the
+    /// approver.
+    pub ask: Option<AskResolver>,
 }
 
 impl EngineOverrides {
@@ -313,6 +320,14 @@ impl EngineOverrides {
     #[must_use]
     pub fn bare_loop(mut self) -> Self {
         self.bare_loop = true;
+        self
+    }
+
+    /// Sets the approval callback for `Ask` verdicts
+    /// ([`EngineOverrides::ask`]).
+    #[must_use]
+    pub fn with_ask_resolver(mut self, ask: AskResolver) -> Self {
+        self.ask = Some(ask);
         self
     }
 }
@@ -414,7 +429,12 @@ impl Engine {
         let registry = match overrides.registry {
             Some(registry) => registry,
             None => {
-                let built = build_registry(&policy, config.budgets, config.autofix)?;
+                let built = build_registry(
+                    &policy,
+                    config.budgets,
+                    config.autofix,
+                    overrides.ask.clone(),
+                )?;
                 // The bare-loop arm keeps the primitive tool set only
                 // (read/list/write/edit/shell); a search index, the
                 // artifact re-fetch, the fused verify, and the
@@ -1119,7 +1139,7 @@ fn compose_scout(
     )?;
     let provider = crate::provider::build(&child, credential.secret.expose())?.provider;
     let registry = ToolRegistry::from_arc_tools(
-        build_registry(policy, child.budgets, false)?
+        build_registry(policy, child.budgets, false, None)?
             .into_arc_tools()
             .filter(|tool| tool.is_read_only()),
     );
@@ -1149,6 +1169,7 @@ fn build_registry(
     policy: &CommandPolicy,
     budgets: ToolBudgets,
     autofix: bool,
+    ask: Option<AskResolver>,
 ) -> Result<ToolRegistry, EngineError> {
     let mut registry = ToolRegistry::new();
     let mut register = |name: &'static str, tool: Box<dyn loom_kernel::tool::Tool>| {
@@ -1181,10 +1202,11 @@ fn build_registry(
                 .with_autofix(autofix),
         ),
     )?;
-    register(
-        "run_command",
-        Box::new(RunCommandTool::with_policy(policy.clone()).with_budgets(budgets)),
-    )?;
+    let mut run_command = RunCommandTool::with_policy(policy.clone()).with_budgets(budgets);
+    if let Some(ask) = ask {
+        run_command = run_command.with_ask_resolver(ask);
+    }
+    register("run_command", Box::new(run_command))?;
     register(
         "verify",
         Box::new(
@@ -1222,7 +1244,12 @@ fn bare_registry(built: ToolRegistry) -> ToolRegistry {
 /// `ToolSpec` set (the census's `tool_specs` source). No tool is ever
 /// executed during replay.
 pub(crate) fn replay_registry() -> Result<ToolRegistry, EngineError> {
-    build_registry(&CommandPolicy::default(), ToolBudgets::default(), false)
+    build_registry(
+        &CommandPolicy::default(),
+        ToolBudgets::default(),
+        false,
+        None,
+    )
 }
 
 /// The built-in instruction; overridable with `--system-prompt`.
@@ -2520,8 +2547,13 @@ mod tests {
     /// (bare = read/list/write/edit/shell).
     #[test]
     fn todo_tool_is_exposed_in_the_full_registry_and_excluded_from_bare() {
-        let built = build_registry(&CommandPolicy::default(), ToolBudgets::default(), false)
-            .expect("built-in registry");
+        let built = build_registry(
+            &CommandPolicy::default(),
+            ToolBudgets::default(),
+            false,
+            None,
+        )
+        .expect("built-in registry");
         let full: Vec<&str> = built.specs().map(|spec| spec.name.as_str()).collect();
         assert!(
             full.contains(&"todo"),

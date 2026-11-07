@@ -1,0 +1,31 @@
+[package]
+name = "loom-acp"
+description = "`loom-acp` binary: the loom engine as an Agent Client Protocol (ACP) server for editors (Zed and other ACP clients)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "loom-acp"
+path = "src/main.rs"
+
+[dependencies]
+loom-core = { workspace = true }
+agent-client-protocol = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+# The server owns a runtime like the CLI does: multi-thread for the
+# provider's time driver, macros for async main, sync for the session map.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "io-util"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+futures = { workspace = true }
+
+[lints]
+workspace = true
