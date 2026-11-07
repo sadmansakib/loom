@@ -233,6 +233,58 @@ async fn chat_request_is_the_plain_openai_shape() {
 }
 
 #[tokio::test]
+async fn config_headers_ride_on_the_wire() {
+    let server = MockServer::start().await;
+    let catalog = parse_custom_catalog(CATALOG_BODY, &format!("{}/models", server.uri()), 1)
+        .expect("catalog parses");
+    let provider = CustomProvider::new(
+        CustomConfig::new(server.uri(), "test-key")
+            .with_timeouts(TimeoutConfig::default())
+            .with_headers(vec![
+                ("X-Title".to_owned(), "loom eval".to_owned()),
+                (
+                    "X-Loom-Run-Id".to_owned(),
+                    "django__django-11239".to_owned(),
+                ),
+            ]),
+        catalog,
+    )
+    .expect("provider builds");
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(
+                sse(&[
+                    data_event(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
+                    done(),
+                ])
+                .into_bytes(),
+                "text/event-stream",
+            ),
+        )
+        .mount(&server)
+        .await;
+
+    let events = drain(&provider, &request_for(MODEL)).await;
+    expect_completed(&events);
+
+    // Attribution and correlation headers reach the gateway verbatim,
+    // next to the honest client identity.
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1);
+    let headers = &requests[0].headers;
+    let get = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_else(|| panic!("{name} header missing"))
+    };
+    assert_eq!(get("x-title"), "loom eval");
+    assert_eq!(get("x-loom-run-id"), "django__django-11239");
+    assert!(get("user-agent").starts_with("loom/"));
+}
+
+#[tokio::test]
 async fn error_status_bodies_classify_and_excerpt() {
     let server = MockServer::start().await;
     let provider = provider_with_catalog(&server.uri(), CATALOG_BODY);

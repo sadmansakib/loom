@@ -62,7 +62,8 @@ loom run --provider custom --base-url https://gateway.example/v1 \
     --model provider/model-name "your task"
 
 # several gateways, each under its own name (URLs remembered)
-loom provider add orcarouter --base-url https://api.orcarouter.ai/v1
+loom provider add orcarouter --base-url https://api.orcarouter.ai/v1 \
+    --header 'X-Title=loom' # attribution headers ride on every request
 loom run --provider orcarouter --model deepseek/deepseek-v4.1-flash-free "your task"
 
 # structured events for tooling (NDJSON, event schema 15)

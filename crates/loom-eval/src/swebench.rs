@@ -533,6 +533,18 @@ pub const RESERVED_CONTAINER_ENV: [&str; 7] = [
     "LOOM_MAX_TURNS",
 ];
 
+/// Encodes header pairs as the `LOOM_HEADERS` value: comma-separated
+/// `K=V` pairs, re-parsed by the in-container CLI's `--header` (which
+/// splits on the same delimiter). Pair values must therefore be
+/// comma-free — the eval runner's are (instance ids, attempt numbers).
+pub fn headers_env_value(pairs: &[(String, String)]) -> String {
+    pairs
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Assembles the `docker run` argv for one container run. Pure argv —
 /// no host shell — so paths and values survive verbatim.
 pub fn docker_run_argv(spec: &ContainerSpec<'_>) -> Vec<String> {
@@ -1072,6 +1084,26 @@ fn selection_stratified_takes_n_per_repo_in_repo_order() {
 fn stratified_selection_requires_repos() {
     let instances = parse_dataset(&fixture_jsonl());
     select_instances(&instances, &[], &[], 5, Some(1));
+}
+
+#[test]
+fn headers_env_value_encodes_comma_pairs() {
+    // The container path: `LOOM_HEADERS` is re-parsed by the CLI's
+    // `--header` (comma-delimited), so the encoding stays the exact
+    // inverse of that split.
+    let value = headers_env_value(&[
+        ("X-Title".to_owned(), "loom eval".to_owned()),
+        (
+            "X-Loom-Run-Id".to_owned(),
+            "django__django-11239".to_owned(),
+        ),
+        ("X-Loom-Attempt".to_owned(), "2".to_owned()),
+    ]);
+    assert_eq!(
+        value,
+        "X-Title=loom eval,X-Loom-Run-Id=django__django-11239,X-Loom-Attempt=2"
+    );
+    assert_eq!(headers_env_value(&[]), "");
 }
 
 #[test]

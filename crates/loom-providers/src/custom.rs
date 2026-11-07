@@ -60,6 +60,12 @@ pub struct CustomConfig {
     pub api_key: SecretString,
     /// Liveness timeouts; see [`TimeoutConfig`].
     pub timeouts: TimeoutConfig,
+    /// Extra HTTP headers (attribution, correlation) sent verbatim on
+    /// every chat request; empty by default. Names and values are
+    /// validated where user input enters (the CLI's `--header`, `loom
+    /// provider add`); a hand-edited registry entry that HTTP cannot
+    /// carry is dropped with a warning, never a failed request.
+    pub headers: Vec<(String, String)>,
 }
 
 impl CustomConfig {
@@ -69,6 +75,7 @@ impl CustomConfig {
             base_url: base_url.into(),
             api_key: SecretString::new(api_key),
             timeouts: TimeoutConfig::default(),
+            headers: Vec::new(),
         }
     }
 
@@ -76,6 +83,14 @@ impl CustomConfig {
     #[must_use]
     pub fn with_timeouts(mut self, timeouts: TimeoutConfig) -> Self {
         self.timeouts = timeouts;
+        self
+    }
+
+    /// Sets extra HTTP headers (builder style), replacing any prior
+    /// ones.
+    #[must_use]
+    pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.headers = headers;
         self
     }
 }
@@ -440,7 +455,25 @@ impl WireEndpoint for CustomProvider {
     }
 
     fn extra_headers(&self) -> Vec<(reqwest::header::HeaderName, String)> {
-        Vec::new()
+        // Pairs arrived validated from the CLI or `provider add`, but
+        // the registry file is user-editable: drop (with a warning)
+        // anything HTTP rejects rather than failing the request over
+        // identity metadata.
+        self.config
+            .headers
+            .iter()
+            .filter_map(|(name, value)| {
+                let Ok(parsed) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
+                    tracing::warn!(name, "dropping a header whose name HTTP rejects");
+                    return None;
+                };
+                if reqwest::header::HeaderValue::from_str(value).is_err() {
+                    tracing::warn!(name, "dropping a header whose value HTTP rejects");
+                    return None;
+                }
+                Some((parsed, value.clone()))
+            })
+            .collect()
     }
 
     fn timeouts(&self) -> TimeoutConfig {

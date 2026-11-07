@@ -12,17 +12,24 @@ pub fn run(command: ProviderCommand) -> Result<()> {
             name,
             base_url,
             models_url,
-        } => add(&name, &base_url, models_url),
+            headers,
+        } => add(&name, &base_url, models_url, &headers),
         ProviderCommand::List => list(),
         ProviderCommand::Remove { name } => remove(&name),
     }
 }
 
-fn add(name: &str, base_url: &str, models_url: Option<String>) -> Result<()> {
+fn add(
+    name: &str,
+    base_url: &str,
+    models_url: Option<String>,
+    header_args: &[String],
+) -> Result<()> {
     validate_name(name).map_err(anyhow::Error::msg)?;
     if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
         anyhow::bail!("--base-url must be an http(s) URL, got `{base_url}`");
     }
+    let headers = crate::args::parse_header_pairs(header_args).map_err(anyhow::Error::msg)?;
     let db_path = loom_core::paths::db_path();
     let mut registry = ProviderRegistry::load(&db_path);
     registry.upsert(
@@ -30,6 +37,7 @@ fn add(name: &str, base_url: &str, models_url: Option<String>) -> Result<()> {
         RegistryEntry {
             base_url: base_url.to_owned(),
             models_url,
+            headers: headers.into_iter().collect(),
         },
     );
     registry
@@ -52,9 +60,14 @@ fn list() -> Result<()> {
         return Ok(());
     }
     for (name, entry) in entries {
+        let headers = if entry.headers.is_empty() {
+            String::new()
+        } else {
+            format!("  (+{} headers)", entry.headers.len())
+        };
         match &entry.models_url {
-            Some(url) => println!("{name}  {}  {url}", entry.base_url),
-            None => println!("{name}  {}", entry.base_url),
+            Some(url) => println!("{name}  {}  {url}{headers}", entry.base_url),
+            None => println!("{name}  {}{headers}", entry.base_url),
         }
     }
     Ok(())

@@ -90,6 +90,21 @@ pub struct RunArgs {
     #[arg(long, value_name = "URL")]
     pub models_url: Option<String>,
 
+    /// Extra HTTP header on every chat request to `custom` and named
+    /// gateways — attribution (`--header 'X-Title=loom-eval'`) or
+    /// correlation. Repeatable; a value may also carry several
+    /// comma-separated `K=V` pairs, which is the `LOOM_HEADERS` format
+    /// the eval containers forward. Explicit pairs override same-name
+    /// headers from the provider's registry entry; other providers
+    /// ignore them.
+    #[arg(
+        long = "header",
+        value_name = "K=V",
+        env = "LOOM_HEADERS",
+        value_delimiter = ','
+    )]
+    pub headers: Vec<String>,
+
     /// Reasoning effort, sent explicitly on every request by providers
     /// that accept one (DeepSeek); ignored elsewhere.
     #[arg(long, default_value = "high")]
@@ -444,6 +459,11 @@ pub enum ProviderCommand {
         /// Model-catalog URL; defaults to `{--base-url}/models`.
         #[arg(long, value_name = "URL")]
         models_url: Option<String>,
+        /// Extra HTTP header for chat requests to this gateway
+        /// (attribution, correlation), `K=V`; repeatable, and a value
+        /// may carry several comma-separated pairs.
+        #[arg(long = "header", value_name = "K=V", value_delimiter = ',')]
+        headers: Vec<String>,
     },
     /// List registered providers.
     List,
@@ -452,6 +472,40 @@ pub enum ProviderCommand {
         /// Provider name.
         name: String,
     },
+}
+
+/// Parses `--header` values into validated `(name, value)` pairs.
+///
+/// Validation lives at this single entry point for CLI input so the
+/// engine and adapters can carry pairs verbatim: a name must be an
+/// HTTP token, a value visible ASCII — so a pair can never smuggle a
+/// second header (or a newline) onto the wire.
+pub(crate) fn parse_header_pairs(raw: &[String]) -> Result<Vec<(String, String)>, String> {
+    let mut pairs = Vec::with_capacity(raw.len());
+    for item in raw {
+        let Some((name, value)) = item.split_once('=') else {
+            return Err(format!("`{item}`: headers are NAME=VALUE"));
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(format!("`{item}`: empty header name"));
+        }
+        let token = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
+        if !name.chars().all(token) {
+            return Err(format!(
+                "`{item}`: header names are HTTP tokens (letters, digits, and !#$%&'*+-.^_`|~)"
+            ));
+        }
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(format!("`{item}`: empty header value"));
+        }
+        if !value.chars().all(|c| (' '..='~').contains(&c)) {
+            return Err(format!("`{item}`: header values are visible ASCII"));
+        }
+        pairs.push((name.to_owned(), value.to_owned()));
+    }
+    Ok(pairs)
 }
 #[cfg(test)]
 mod tests {
@@ -518,6 +572,63 @@ mod tests {
     }
 
     #[test]
+    fn run_collects_repeatable_and_delimited_headers() {
+        let cli = parse(&[
+            "loom",
+            "run",
+            "--provider",
+            "custom",
+            "--model",
+            "gateway-model",
+            "--header",
+            "X-Title=loom eval",
+            "--header",
+            "X-A=1,X-B=2",
+            "do",
+            "the",
+            "thing",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected `run`");
+        };
+        assert_eq!(
+            args.headers,
+            vec![
+                "X-Title=loom eval".to_owned(),
+                "X-A=1".to_owned(),
+                "X-B=2".to_owned()
+            ]
+        );
+        let pairs = parse_header_pairs(&args.headers).expect("valid pairs");
+        assert_eq!(
+            pairs,
+            vec![
+                ("X-Title".to_owned(), "loom eval".to_owned()),
+                ("X-A".to_owned(), "1".to_owned()),
+                ("X-B".to_owned(), "2".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn header_pairs_reject_malformed_input() {
+        for bad in [
+            "X-Title",
+            "=value",
+            "X Title=value",
+            "X\u{7f}=value",
+            "X-Title=col\u{1}lar",
+            "X-Title=line\nbreak",
+            "X-Title=",
+        ] {
+            assert!(
+                parse_header_pairs(&[bad.to_owned()]).is_err(),
+                "`{bad}` should be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn provider_subcommands_parse() {
         let cli = parse(&[
             "loom",
@@ -535,10 +646,12 @@ mod tests {
                 name,
                 base_url,
                 models_url,
+                headers,
             } => {
                 assert_eq!(name, "orcarouter");
                 assert_eq!(base_url, "https://api.orcarouter.ai/v1");
                 assert_eq!(models_url, None);
+                assert!(headers.is_empty());
             }
             _ => panic!("expected `add`"),
         }

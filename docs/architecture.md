@@ -857,7 +857,14 @@ Five adapters ship:
   plus a key. Named gateways (`loom provider add <name> --base-url …`,
   persisted in `providers.json` beside the database) ride the same
   adapter under their own name, credential env `{NAME}_API_KEY`, and
-  one catalog cache per name (`<name>-models.json`). There is no
+  one catalog cache per name (`<name>-models.json`). `--header K=V`
+  (repeatable) records attribution headers — the `HTTP-Referer` /
+  `X-Title` convention OpenRouter popularized — replayed on every
+  request to that gateway; a `--header` on `loom run` overrides or
+  extends them per invocation. Eval harnesses add correlation
+  headers the same way: `swebench-run` stamps `X-Loom-Run-Id` and
+  `X-Loom-Attempt` so gateway-side logs are greppable per instance.
+  There is no
   default base URL; missing one fails the open
   with a pointed error. The catalog reader is schema-tolerant across
   the shapes seen in the wild — `{data: [...]}` (OpenAI, OpenRouter,

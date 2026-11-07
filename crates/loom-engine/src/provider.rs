@@ -94,6 +94,26 @@ impl std::fmt::Debug for ProviderHandle {
     }
 }
 
+/// Overlays explicit header pairs onto a registry entry's: a
+/// same-name explicit pair wins (the precedence `--base-url` applies
+/// to the endpoint), new names append, order preserved.
+fn merge_headers(
+    registry: &std::collections::BTreeMap<String, String>,
+    explicit: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut headers: Vec<(String, String)> = registry
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    for (name, value) in explicit {
+        match headers.iter_mut().find(|(existing, _)| existing == name) {
+            Some(slot) => slot.1 = value.clone(),
+            None => headers.push((name.clone(), value.clone())),
+        }
+    }
+    headers
+}
+
 /// Builds the adapter named by `config.provider`.
 ///
 /// `api_key` is the resolved credential; the provider wraps it
@@ -121,6 +141,11 @@ pub fn build(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, Eng
                     if config.base_url.is_none() {
                         config.base_url = Some(entry.base_url);
                     }
+                    // Registry headers ride along, with an explicit
+                    // same-name pair overriding — the precedence
+                    // `--base-url` applies to the endpoint, applied to
+                    // the header set.
+                    config.headers = merge_headers(&entry.headers, &config.headers);
                     build_custom(&config, api_key)
                 }
                 // No registry entry, but an explicit `--base-url` (the
@@ -320,7 +345,7 @@ fn build_custom(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, 
             provider: config.provider.clone(),
         });
     };
-    let provider_config = CustomConfig::new(base_url, api_key);
+    let provider_config = CustomConfig::new(base_url, api_key).with_headers(config.headers.clone());
     let provider = CustomProvider::new(provider_config, catalog)
         .map_err(|error| EngineError::Provider(Box::new(error)))?;
     let capabilities = provider
@@ -367,6 +392,7 @@ pub fn one_shot_provider(
         model: model.to_owned(),
         base_url: base_url.map(str::to_owned),
         models_url: None,
+        headers: Vec::new(),
         reasoning_effort: loom_providers::ReasoningEffort::default(),
         account: None,
         workspace: std::env::temp_dir().join("loom-one-shot"),
@@ -579,6 +605,36 @@ mod tests {
         assert!(matches!(error, EngineError::UnknownModel { .. }));
     }
     #[test]
+    fn explicit_headers_override_registry_pairs_by_name() {
+        let registry = std::collections::BTreeMap::from([
+            ("X-Title".to_owned(), "registry".to_owned()),
+            ("X-Org".to_owned(), "acme".to_owned()),
+        ]);
+        let explicit = vec![
+            ("X-Title".to_owned(), "cli-wins".to_owned()),
+            (
+                "X-Loom-Run-Id".to_owned(),
+                "django__django-11239".to_owned(),
+            ),
+        ];
+        // Registry order is preserved (BTreeMap: alphabetical by name);
+        // an explicit pair with the same name overrides in place,
+        // brand-new names are appended.
+        assert_eq!(
+            merge_headers(&registry, &explicit),
+            vec![
+                ("X-Org".to_owned(), "acme".to_owned()),
+                ("X-Title".to_owned(), "cli-wins".to_owned()),
+                (
+                    "X-Loom-Run-Id".to_owned(),
+                    "django__django-11239".to_owned()
+                ),
+            ]
+        );
+        assert!(merge_headers(&std::collections::BTreeMap::new(), &[]).is_empty());
+    }
+
+    #[test]
     fn named_custom_provider_builds_from_the_registry() {
         let dir = std::env::temp_dir().join("loom-engine-named-provider-test");
         let _ = std::fs::remove_dir_all(&dir);
@@ -589,6 +645,7 @@ mod tests {
             crate::registry::RegistryEntry {
                 base_url: "http://gateway.test/v1".to_owned(),
                 models_url: None,
+                headers: std::collections::BTreeMap::new(),
             },
         );
         registry.save(&dir.join("loom.db")).expect("saves");

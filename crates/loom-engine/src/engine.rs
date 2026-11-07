@@ -53,6 +53,14 @@ pub struct EngineConfig {
     /// ignore it: only `custom` is described entirely by user-supplied
     /// URLs.
     pub models_url: Option<String>,
+    /// Extra HTTP headers for the custom adapter's chat requests —
+    /// attribution (`X-Title`) and correlation (`X-Loom-Run-Id`) pairs
+    /// a gateway can log. Explicit pairs override same-name pairs from
+    /// the provider's registry entry, mirroring how an explicit
+    /// `--base-url` overrides the recorded endpoint; adapters other
+    /// than `custom` (and named registry gateways, which route through
+    /// it) ignore them.
+    pub headers: Vec<(String, String)>,
     /// Reasoning effort, sent explicitly on every request.
     pub reasoning_effort: ReasoningEffort,
     /// Optional saved account (label or id) instead of the active account.
@@ -181,6 +189,7 @@ pub(crate) fn test_config() -> EngineConfig {
         model: "deepseek-flash".to_owned(),
         base_url: None,
         models_url: None,
+        headers: Vec::new(),
         reasoning_effort: ReasoningEffort::default(),
         account: None,
         workspace: base.join("workspace"),
@@ -1163,6 +1172,9 @@ fn compose_scout(
         model: cfg.model.clone(),
         base_url: parent.base_url.clone(),
         models_url: None,
+        // Same inheritance as `base_url`: the child's requests keep
+        // the run's gateway identity and correlation headers.
+        headers: parent.headers.clone(),
         reasoning_effort: parent.reasoning_effort,
         account: parent.account.clone(),
         workspace: workspace.to_path_buf(),

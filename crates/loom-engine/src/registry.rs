@@ -21,6 +21,13 @@ pub struct RegistryEntry {
     pub base_url: String,
     /// Model-catalog URL; `None` means `{base_url}/models`.
     pub models_url: Option<String>,
+    /// Extra HTTP headers sent on every chat request — attribution
+    /// (`X-Title`) and correlation pairs the gateway can log, the
+    /// counterpart of the identity headers hosted adapters send for
+    /// themselves. `default` keeps entries written before this field
+    /// loadable unchanged.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
 }
 
 /// The registry file beside the database, alongside the catalog caches.
@@ -147,6 +154,7 @@ mod tests {
             RegistryEntry {
                 base_url: "https://api.orcarouter.ai/v1".to_owned(),
                 models_url: None,
+                headers: BTreeMap::from([("X-Title".to_owned(), "loom".to_owned())]),
             },
         );
         registry.save(&db_path).expect("saves");
@@ -154,7 +162,27 @@ mod tests {
         let loaded = ProviderRegistry::load(&db_path);
         let entry = loaded.get("orcarouter").expect("registered");
         assert_eq!(entry.base_url, "https://api.orcarouter.ai/v1");
+        assert_eq!(
+            entry.headers.get("X-Title").map(String::as_str),
+            Some("loom")
+        );
         assert!(loaded.get("other").is_none());
+        let _ = std::fs::remove_dir_all(db_path.parent().expect("parent"));
+    }
+
+    #[test]
+    fn entries_written_before_headers_load_with_none() {
+        let db_path = scratch("pre-headers");
+        std::fs::write(
+            registry_path(&db_path),
+            br#"{"providers":{"bkash":{"base_url":"https://gw.test/v1","models_url":null}}}"#,
+        )
+        .expect("writes");
+        let entry = ProviderRegistry::load(&db_path)
+            .get("bkash")
+            .expect("loads")
+            .clone();
+        assert!(entry.headers.is_empty());
         let _ = std::fs::remove_dir_all(db_path.parent().expect("parent"));
     }
 
@@ -182,6 +210,7 @@ mod tests {
             RegistryEntry {
                 base_url: String::new(),
                 models_url: None,
+                headers: BTreeMap::new(),
             },
         );
         assert!(registry.remove("one"));

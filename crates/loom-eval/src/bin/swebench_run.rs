@@ -121,7 +121,10 @@ or the provider's env var (e.g. DEEPSEEK_API_KEY). Named providers
     std::process::exit(2);
 }
 
-fn parse_args() -> Args {
+// Returns the parsed args plus any `loom provider add --header` pairs
+// recorded for the chosen provider: main() forwards them into every
+// eval container as `LOOM_HEADERS` alongside the correlation headers.
+fn parse_args() -> (Args, Vec<(String, String)>) {
     let mut args = Args {
         instances: env_csv("LOOM_EVAL_SWEBENCH_INSTANCES"),
         repos: env_csv("LOOM_EVAL_SWEBENCH_REPOS"),
@@ -195,17 +198,26 @@ fn parse_args() -> Args {
     }
     // A named provider (`loom provider add`) already recorded its
     // endpoint; fill --base-url from the registry so callers needn't
-    // restate it (the eval containers run registry-less).
-    if args.base_url.is_none()
-        && let Some(entry) =
-            loom_core::engine::registry::ProviderRegistry::load(&loom_core::paths::db_path())
-                .get(&args.provider)
+    // restate it (the eval containers run registry-less). Registry
+    // headers ride along even when --base-url is explicit: they are
+    // identity for the gateway's own logs, not endpoint metadata.
+    let mut registry_headers: Vec<(String, String)> = Vec::new();
+    if let Some(entry) =
+        loom_core::engine::registry::ProviderRegistry::load(&loom_core::paths::db_path())
+            .get(&args.provider)
     {
-        args.base_url = Some(entry.base_url.clone());
+        if args.base_url.is_none() {
+            args.base_url = Some(entry.base_url.clone());
+        }
+        registry_headers = entry
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
     }
     // mini-swe-agent speaks litellm's OpenAI dialect: it needs an
-    // explicit --base-url (registry providers auto-fill it just below,
-    // so this only fires for vendors with baked-in endpoints).
+    // explicit --base-url (registry providers auto-fill it above, so
+    // this only fires for vendors with baked-in endpoints).
     if args.agent == "mini" && args.base_url.is_none() {
         eprintln!(
             "--agent mini routes traffic through an OpenAI-compatible endpoint: \
@@ -213,7 +225,7 @@ fn parse_args() -> Args {
         );
         std::process::exit(2);
     }
-    args
+    (args, registry_headers)
 }
 
 fn repo_root() -> PathBuf {
@@ -346,7 +358,7 @@ fn ensure_image(
 }
 
 fn main() {
-    let args = parse_args();
+    let (args, registry_headers) = parse_args();
     let base = args.eval_dir.join("swebench");
     std::fs::create_dir_all(base.join("instances")).unwrap();
 
@@ -539,6 +551,19 @@ fn main() {
             let mut patch = String::new();
             let mut outcome = (0usize, None);
             for attempt in 1..=MAX_ATTEMPTS {
+                // Correlation headers: gateway-side logs become
+                // greppable per instance, run, and attempt — the
+                // debugging role retry counters play for hosted SDK
+                // clients. `LOOM_HEADERS` is re-parsed by the
+                // in-container CLI's `--header`, so the container
+                // script stays byte-identical.
+                let mut header_pairs = registry_headers.clone();
+                header_pairs.push(("X-Loom-Run-Id".to_owned(), instance.instance_id.clone()));
+                header_pairs.push(("X-Loom-Attempt".to_owned(), attempt.to_string()));
+                let extra_env = vec![(
+                    "LOOM_HEADERS".to_owned(),
+                    swebench::headers_env_value(&header_pairs),
+                )];
                 let spec = ContainerSpec {
                     agent,
                     script_override: None,
@@ -554,7 +579,7 @@ fn main() {
                     timeout_secs: args.timeout_secs,
                     max_turns: args.max_turns,
                     bare: args.arm == "bare",
-                    extra_env: &[],
+                    extra_env: &extra_env,
                     container_name: &container_name,
                 };
                 println!("run {slug} #{run} (attempt {attempt}) in {image}…");

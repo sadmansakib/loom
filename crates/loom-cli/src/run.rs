@@ -276,11 +276,15 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     for warning in &turn_budget_warnings {
         eprintln!("warning: {warning}");
     }
+    // Header pairs are validated once, here; the engine carries them
+    // verbatim to the custom adapter.
+    let headers = crate::args::parse_header_pairs(&args.headers).map_err(anyhow::Error::msg)?;
     let config = EngineConfig {
         provider: args.provider,
         model: args.model,
         base_url: args.base_url,
         models_url: args.models_url,
+        headers,
         reasoning_effort: args.reasoning_effort,
         account: args.account,
         workspace: args.workspace.clone(),

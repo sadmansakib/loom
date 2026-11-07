@@ -41,6 +41,7 @@ fn main() -> anyhow::Result<()> {
         model,
         base_url: None,
         models_url: None,
+        headers: Vec::new(),
         reasoning_effort: Default::default(),
         account: None,
         workspace: std::env::current_dir()?,
