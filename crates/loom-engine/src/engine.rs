@@ -158,6 +158,11 @@ pub struct EngineConfig {
     /// child [`Agent`] on the cheap model and registers `scout` in the
     /// parent registry.
     pub scout: Option<ScoutConfig>,
+    /// Routing slice zero (roadmap item 9): tier → model wiring for
+    /// task-start selection. `None` or an inactive config keeps every
+    /// task on `model`; a wired `easy` can only route down (cheaper),
+    /// and `hard` is a separate opt-in.
+    pub routing: Option<crate::routing::RoutingConfig>,
     /// Tree-sitter symbol tools (roadmap item 18): when false (the
     /// default) `symbols_overview`/`replace_symbol` stay out of the
     /// registry, so the frozen SWE-bench protocol and every existing
@@ -245,6 +250,7 @@ pub(crate) fn test_config() -> EngineConfig {
         persist: false,
         catalog: None,
         scout: None,
+        routing: None,
         symbols: false,
         git: false,
         skills: false,
@@ -264,6 +270,14 @@ pub(crate) fn test_config() -> EngineConfig {
 /// provider, the credential, or the tool registry again.
 pub struct Engine {
     agent: Agent,
+    /// Routing slice zero (roadmap item 9): the Easy-tier agent,
+    /// built at open when `EngineConfig::routing` wires one. Same
+    /// provider, registry (scout registration included), and agent
+    /// config as `agent` — only the model differs.
+    routing_easy: Option<RoutedAgent>,
+    /// The Hard-tier agent, same construction as `routing_easy`.
+    /// Opt-in: a config without `hard` never routes up.
+    routing_hard: Option<RoutedAgent>,
     /// The canonicalized workspace root, for the fast paths' file walk.
     workspace: std::path::PathBuf,
     /// The command policy the registry was built from; the fast path
@@ -286,6 +300,13 @@ pub struct Engine {
     /// savings per mechanism from a stored session. `None` when
     /// `persist` was off — the stream stays in-memory only.
     events: Option<SharedEventStore>,
+}
+
+/// A tier agent plus the model label it runs on, for the routing
+/// notice the engine attributes to each routed task.
+struct RoutedAgent {
+    agent: Arc<Agent>,
+    model: String,
 }
 
 /// A function that wraps the provider an open produced — built from
@@ -321,6 +342,11 @@ pub struct EngineOverrides {
     /// [`ScoutConfig`]-driven composition (offline tests use this; the
     /// engine never resolves credentials for it).
     pub scout: Option<Arc<Agent>>,
+    /// Tier agents handed in as an injected seam, replacing the
+    /// [`crate::routing::RoutingConfig`]-driven composition (offline
+    /// tests use this; the engine never resolves credentials for
+    /// them). The first agent per tier wins.
+    pub routed: Option<Vec<(crate::routing::Tier, Arc<Agent>)>>,
     /// A context compiler built by the embedder, replacing the default
     /// pruning chain.
     pub compiler: Option<Box<dyn ContextCompiler>>,
@@ -658,7 +684,10 @@ impl Engine {
                     message: error.to_string(),
                 })?;
         }
-        let system_prompt = config.system_prompt.unwrap_or_else(default_system_prompt);
+        let system_prompt = config
+            .system_prompt
+            .clone()
+            .unwrap_or_else(default_system_prompt);
         // Stage-1 repository facts (2E, ADR-015): the composition root owns the
         // I/O; the loop scans once per task through this source. The
         // bare-loop arm attaches no source — the empty block is the
@@ -714,6 +743,44 @@ impl Engine {
         // frozen container script (the item 20.2 seam pattern).
         agent_config.reasoning_effort = kernel_effort(config.reasoning_effort);
         agent_config.reasoning_schedule = reasoning_schedule_from_env();
+        // Routing slice zero (roadmap item 9): build the tier agents
+        // before the main agent consumes the registry. Injection wins
+        // over composition exactly like the scout seam; the bare-loop
+        // arm is a baseline and never carries routing. Production
+        // composition resolves the (same-provider) credential once and
+        // builds per-tier agents sharing this registry and agent
+        // config — the effort schedule and system prompt ride along.
+        let (routing_easy, routing_hard) = match overrides.routed {
+            Some(pairs) => {
+                let mut easy: Option<RoutedAgent> = None;
+                let mut hard: Option<RoutedAgent> = None;
+                for (tier, agent) in pairs {
+                    let label = format!("injected-{}", tier.as_str());
+                    match tier {
+                        crate::routing::Tier::Easy if easy.is_none() => {
+                            easy = Some(RoutedAgent {
+                                model: label,
+                                agent,
+                            })
+                        }
+                        crate::routing::Tier::Hard if hard.is_none() => {
+                            hard = Some(RoutedAgent {
+                                model: label,
+                                agent,
+                            })
+                        }
+                        _ => {}
+                    }
+                }
+                (easy, hard)
+            }
+            None => match config.routing.as_ref().filter(|routing| routing.active()) {
+                Some(routing) if !overrides.bare_loop => {
+                    build_tier_agents(routing, &config, &registry, &agent_config)?
+                }
+                _ => (None, None),
+            },
+        };
         let mut agent = Agent::new(provider, compiler, registry, agent_config, config.model)
             .with_max_turns(config.max_turns)
             .with_turn_budget(config.turn_budget)
@@ -762,6 +829,8 @@ impl Engine {
             agent = agent.with_artifacts(Some(Arc::new(artifacts)));
             Ok(Self {
                 agent,
+                routing_easy,
+                routing_hard,
                 workspace,
                 policy,
                 // The bare-loop arm measures a basic harness, and a basic
@@ -775,6 +844,8 @@ impl Engine {
         } else {
             Ok(Self {
                 agent,
+                routing_easy,
+                routing_hard,
                 workspace,
                 policy,
                 fast_paths: overrides.fast_paths.unwrap_or(true) && !overrides.bare_loop,
@@ -1080,7 +1151,23 @@ impl Engine {
                 None => fast_path_decline = attempt.decline,
             }
         }
-        let outcome = self.agent.run_task(session, input, sink, control).await;
+        // Routing slice zero (roadmap item 9): pick the tier agent
+        // before the loop; Medium — or a tier with no wired model —
+        // keeps the run's own agent. The choice surfaces post-hoc
+        // below, attributed to the task like the fast-path decline.
+        // (The fast-path branch above never reaches a model, so it
+        // needs no routing.)
+        let tier = crate::routing::classify(&input);
+        let routed_agent = match tier {
+            crate::routing::Tier::Easy => self.routing_easy.as_ref(),
+            crate::routing::Tier::Hard => self.routing_hard.as_ref(),
+            crate::routing::Tier::Medium => None,
+        };
+        let routed_notice = routed_agent.map(|routed| (tier, routed.model.clone()));
+        let outcome = match routed_agent {
+            Some(routed) => routed.agent.run_task(session, input, sink, control).await,
+            None => self.agent.run_task(session, input, sink, control).await,
+        };
         // v8 surfaced decisions, attributed to the task that just ran:
         // the fast-path attempt that fell through (post-hoc — the
         // attempt happens before a task record exists), then the
@@ -1091,6 +1178,15 @@ impl Engine {
                     record.id,
                     EventKind::FastPathDeclined {
                         reason: reason.to_owned(),
+                    },
+                );
+            }
+            if let Some((tier, model)) = &routed_notice {
+                sink.emit(
+                    record.id,
+                    EventKind::HarnessNotice {
+                        category: String::from("routing"),
+                        detail: format!("task routed to {model} (tier {})", tier.as_str()),
                     },
                 );
             }
@@ -1242,6 +1338,7 @@ fn compose_scout(
         persist: false,
         catalog: parent.catalog.clone(),
         scout: None,
+        routing: None,
         symbols: false,
         git: false,
         skills: false,
@@ -1291,6 +1388,93 @@ fn compose_scout(
     )
     .with_max_turns(cfg.max_turns)
     .with_loop_shaping(false))
+}
+
+/// Builds the tier agents for routing slice zero: one agent per
+/// wired tier model, on the same provider, sharing the registry (with
+/// every dynamic registration the run made — scout included), the
+/// agent config (system prompt, effort schedule), and the production
+/// compiler shape. Only the model id — and the catalog row it resolves
+/// to — differs, so capabilities validation fires at open, loudly.
+fn build_tier_agents(
+    routing: &crate::routing::RoutingConfig,
+    config: &EngineConfig,
+    registry: &ToolRegistry,
+    agent_config: &loom_kernel::context::AgentConfig,
+) -> Result<(Option<RoutedAgent>, Option<RoutedAgent>), EngineError> {
+    // Credential resolution mirrors the parent's (§18.3) once: every
+    // tier lives on the same provider, so one secret serves all.
+    let store = SqliteAuthStore::open(&config.db_path).map_err(EngineError::Store)?;
+    let secrets = KeychainBackend::default();
+    let credential = auth::resolve(
+        &store,
+        &secrets,
+        &config.provider,
+        config.account.as_deref(),
+        |name| std::env::var(name).ok(),
+    )?;
+    let mut easy: Option<RoutedAgent> = None;
+    let mut hard: Option<RoutedAgent> = None;
+    for (tier, model) in [
+        (crate::routing::Tier::Easy, routing.easy.as_ref()),
+        (crate::routing::Tier::Hard, routing.hard.as_ref()),
+    ] {
+        let Some(model) = model else { continue };
+        let child = EngineConfig {
+            model: model.clone(),
+            // Tier children inherit everything that carries the run's
+            // gateway identity; nothing below differs but the model.
+            ..config.clone()
+        };
+        let provider = crate::provider::build(&child, credential.secret.expose())?.provider;
+        let tier_registry = ToolRegistry::from_arc_tools(registry.arc_tools());
+        let estimator: Arc<dyn loom_kernel::context::TokenEstimator> =
+            crate::estimate::estimator_for(&child.provider);
+        let compiler: Box<dyn ContextCompiler> = Box::new(
+            PruningContextCompiler::new(
+                Box::new(DefaultContextCompiler::with_estimator(estimator.clone())),
+                child
+                    .prune
+                    .unwrap_or_else(|| prune_config_for(&child.provider)),
+            )
+            .with_estimator(estimator),
+        );
+        let agent = Agent::new(
+            provider,
+            compiler,
+            tier_registry,
+            agent_config.clone(),
+            model.clone(),
+        )
+        .with_max_turns(child.max_turns)
+        .with_turn_budget(child.turn_budget)
+        .with_loop_shaping(true);
+        // Tier agents persist through the same database the main
+        // agent does — a routed task must leave the same durable
+        // transcript any other task would (separate handle, same file,
+        // exactly how the engine opens its session/artifact/event
+        // stores). Without this, `--route-easy` would silently produce
+        // sessions that cannot be resumed.
+        let agent = if config.persist {
+            let store = SqliteStore::open(config.db_path.clone()).map_err(EngineError::Session)?;
+            let artifacts =
+                SqliteStore::open(config.db_path.clone()).map_err(EngineError::Session)?;
+            agent
+                .with_store(Box::new(store))
+                .with_artifacts(Some(Arc::new(artifacts)))
+        } else {
+            agent
+        };
+        let routed = RoutedAgent {
+            agent: Arc::new(agent),
+            model: model.clone(),
+        };
+        match tier {
+            crate::routing::Tier::Easy => easy = Some(routed),
+            _ => hard = Some(routed),
+        }
+    }
+    Ok((easy, hard))
 }
 
 fn build_registry(
@@ -1760,6 +1944,8 @@ mod tests {
         .with_store(Box::new(MemorySessionStore::new()));
         Engine {
             agent,
+            routing_easy: None,
+            routing_hard: None,
             workspace: PathBuf::from("."),
             policy: CommandPolicy::default(),
             fast_paths: false,
@@ -1837,6 +2023,103 @@ mod tests {
         let lib = std::fs::read_to_string(workspace.join("src/lib.rs")).expect("lib");
         assert!(lib.contains("pub fn parse_options() -> u32"));
         assert!(!lib.contains("parse_opts"));
+    }
+
+    #[tokio::test]
+    async fn routing_picks_the_tier_agent_and_surfaces_the_choice() {
+        // Storeless engine and tier agent: routing must not depend on
+        // persistence, and the injected agent cannot share the main
+        // agent's in-memory store handle.
+        let tier_agent = Agent::new(
+            Box::new(FakeProvider::scripted(vec![FakeProvider::end_turn_script(
+                "the cheap model answered",
+            )])),
+            Box::new(DefaultContextCompiler::default()),
+            loom_kernel::tool::ToolRegistry::new(),
+            AgentConfig::new(PathBuf::from("."), "test agent"),
+            "cheap-model",
+        );
+        let engine = Engine {
+            agent: Agent::new(
+                Box::new(FakeProvider::scripted(vec![FakeProvider::end_turn_script(
+                    "the run model answered",
+                )])),
+                Box::new(DefaultContextCompiler::default()),
+                loom_kernel::tool::ToolRegistry::new(),
+                AgentConfig::new(PathBuf::from("."), "test agent"),
+                "fake-model",
+            ),
+            routing_easy: Some(RoutedAgent {
+                agent: Arc::new(tier_agent),
+                model: "cheap-model".to_owned(),
+            }),
+            routing_hard: None,
+            workspace: PathBuf::from("."),
+            policy: CommandPolicy::default(),
+            fast_paths: false,
+            resolution: None,
+            notices_flushed: std::sync::OnceLock::new(),
+            events: None,
+        };
+
+        let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
+        let mut session = engine.new_session();
+
+        // Question-shaped text classifies Easy and lands on the tier
+        // agent; the decision is attributed to the task post-hoc.
+        engine
+            .run_task(
+                &mut session,
+                "what does this repo do?",
+                &sink,
+                &Default::default(),
+            )
+            .await
+            .expect("easy task");
+        // The tier agent's scripted reply proves it ran (and only it:
+        // the engine's own agent scripted a different line).
+        let last_assistant = session
+            .transcript
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                loom_kernel::transcript::Item::Assistant(message) => Some(message.content.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert_eq!(last_assistant, "the cheap model answered");
+        let kinds = drain(&mut receiver);
+        assert!(kinds.contains(&EventKind::HarnessNotice {
+            category: "routing".to_owned(),
+            detail: "task routed to cheap-model (tier easy)".to_owned(),
+        }));
+
+        // A work order classifies Medium and stays on the run's own
+        // agent — no routing notice for it.
+        engine
+            .run_task(
+                &mut session,
+                "Fix the failing timeout test in the runner",
+                &sink,
+                &Default::default(),
+            )
+            .await
+            .expect("medium task");
+        let last_assistant = session
+            .transcript
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                loom_kernel::transcript::Item::Assistant(message) => Some(message.content.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert_eq!(last_assistant, "the run model answered");
+        let kinds = drain(&mut receiver);
+        assert!(!kinds.iter().any(|kind| matches!(
+            kind,
+            EventKind::HarnessNotice { category, .. } if category == "routing"
+        )));
     }
 
     /// A minimal cargo fixture whose manifest pins one dependency the

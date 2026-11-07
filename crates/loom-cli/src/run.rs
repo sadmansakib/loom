@@ -490,12 +490,23 @@ pub(crate) fn engine_config_from(
     // Header pairs are validated once, here; the engine carries them
     // verbatim to the custom adapter.
     let headers = crate::args::parse_header_pairs(&flags.headers).map_err(anyhow::Error::msg)?;
+    // Routing slice zero (item 9): tier wiring from --route-easy /
+    // --route-hard (or their env fallbacks). Absent both, every task
+    // runs on the run's own model — the byte-off default.
+    let routing = match (&flags.route_easy, &flags.route_hard) {
+        (None, None) => None,
+        (easy, hard) => Some(loom_core::engine::routing::RoutingConfig {
+            easy: easy.clone(),
+            hard: hard.clone(),
+        }),
+    };
     let config = EngineConfig {
         provider: flags.provider.clone(),
         model: flags.model.clone(),
         base_url: flags.base_url.clone(),
         models_url: flags.models_url.clone(),
         headers,
+        routing,
         reasoning_effort: flags.reasoning_effort,
         account: flags.account.clone(),
         workspace: flags.workspace.clone(),

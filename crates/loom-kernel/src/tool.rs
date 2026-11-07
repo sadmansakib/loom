@@ -843,6 +843,14 @@ impl ToolRegistry {
         self.tools.is_empty()
     }
 
+    /// The registered tools as shared handles, in order — for
+    /// embedders that build sibling registries over the same tool
+    /// set (routing's tier agents share the one registry the run
+    /// built, scout registration included) without consuming it.
+    pub fn arc_tools(&self) -> impl Iterator<Item = Arc<dyn Tool>> + '_ {
+        self.tools.iter().cloned()
+    }
+
     /// Consumes the registry, yielding the registered tools (as shared
     /// handles) in order. For embedders that filter a built registry
     /// (the bare-loop arm keeps the primitive tools only) rather than

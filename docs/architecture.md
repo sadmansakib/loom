@@ -694,7 +694,11 @@ is the frontend's decision, passed in as `EngineConfig::db_path`.
 
 The CLI is thin: `loom run` (interactive render — text to stdout,
 reasoning to a dim stderr, NDJSON mode for machines; `--trace DIR`
-exports the task's evidence — see below), `loom chat` (the same render
+exports the task's evidence — see below; `--route-easy MODEL` /
+`--route-hard MODEL` wire task-start tier routing on the same
+provider — a deterministic classifier picks the tier per task and
+the decision lands in the footer as a `routing` HarnessNotice),
+`loom chat` (the same render
 across many tasks: one session held open at a prompt — lines typed
 while a task runs steer it at the next turn boundary, `/pause` and
 `/cancel` map to `TaskControl`, `/rewind [IDX] [--restore]` forks the

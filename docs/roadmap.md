@@ -1055,7 +1055,23 @@ adds four more framing findings and backlog items 26–31 below.
    loss, no cost blowup), so it ships default-off pending a
    larger-set contrast. Record:
    `docs/benchmarks/swebench-n5-effort-contrast-gpt-6-luna.md`.
-   **Routing slice zero (planned):** task-*start* model selection — a
+   **Routing slice zero (shipped 2026-11-08, item 1 funded):**
+   `loom run --route-easy MODEL [--route-hard MODEL]` (env
+   `LOOM_ROUTE_EASY`/`LOOM_ROUTE_HARD`) wires tier models on the same
+   provider; a deterministic classifier (`loom_engine::routing`,
+   pure function of the task text) picks the tier at task start and
+   the engine runs the prebuilt tier agent — same registry (scout
+   included), same system prompt and effort schedule, same session
+   database, only the model differs. Design constraints held:
+   default-off; a wired `easy` alone can only route *down* (routing
+   up requires the separate `--route-hard`); editing verbs veto an
+   Easy routing outright; every routing decision is surfaced as a
+   `routing` HarnessNotice attributed to the task (decision footer
+   + trace). Offline test proves tier selection, transcript
+   attribution, and persistence parity. The funded A/B (routed vs
+   unrouted, N≥5 medians per the maintenance bar) is the open tail;
+   the LangChain 64% figure stays a hypothesis until then.
+   The original plan note follows. Task-*start* model selection — a
    trivial classifier (task text → difficulty tier) that picks the model
    before `Agent` construction. Needs no Iteration-8 ADR because the
    model-fixed-per-task invariant is untouched: the invariant governs

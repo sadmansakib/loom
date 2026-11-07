@@ -404,6 +404,7 @@ pub fn one_shot_provider(
         persist: false,
         catalog: None,
         scout: None,
+        routing: None,
         symbols: false,
         git: false,
         skills: false,

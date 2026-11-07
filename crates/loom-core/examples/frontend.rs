@@ -53,6 +53,7 @@ fn main() -> anyhow::Result<()> {
         persist: false,
         catalog: None,
         scout: None,
+        routing: None,
         symbols: false,
         git: false,
         skills: false,

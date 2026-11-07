@@ -42,6 +42,7 @@ mod provider;
 pub mod registry;
 pub mod replay;
 pub mod repo;
+pub mod routing;
 pub mod scout;
 pub mod trace;
 pub mod trace_stats;

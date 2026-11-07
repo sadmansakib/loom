@@ -137,6 +137,18 @@ pub struct RunFlags {
     )]
     pub headers: Vec<String>,
 
+    /// Route unambiguous read-only questions to a cheaper model on
+    /// the same provider (routing slice zero). This flag alone can
+    /// only reduce spend — tasks never route up without
+    /// `--route-hard`.
+    #[arg(long, value_name = "MODEL", env = "LOOM_ROUTE_EASY")]
+    pub route_easy: Option<String>,
+    /// Route long build-shaped tasks to a stronger model on the same
+    /// provider. Opt-in: without it every task that is not Easy runs
+    /// on the run's own model.
+    #[arg(long, value_name = "MODEL", env = "LOOM_ROUTE_HARD")]
+    pub route_hard: Option<String>,
+
     /// Reasoning effort, sent explicitly on every request by providers
     /// that accept one (DeepSeek); ignored elsewhere.
     #[arg(long, default_value = "high")]
@@ -863,6 +875,42 @@ mod tests {
             panic!("expected `chat`");
         };
         assert_eq!(args.task, ["explain", "this", "repo"]);
+    }
+
+    #[test]
+    fn route_flags_parse_models_and_default_off() {
+        let cli = parse(&[
+            "loom",
+            "run",
+            "--provider",
+            "glm",
+            "--model",
+            "glm-5",
+            "--route-easy",
+            "glm-5-flash",
+            "work",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected `run`");
+        };
+        assert_eq!(args.flags.route_easy.as_deref(), Some("glm-5-flash"));
+        assert_eq!(args.flags.route_hard, None);
+
+        // Absent both flags, routing stays unwired (the byte-off default).
+        let cli = parse(&[
+            "loom",
+            "run",
+            "--provider",
+            "glm",
+            "--model",
+            "glm-5",
+            "work",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected `run`");
+        };
+        assert_eq!(args.flags.route_easy, None);
+        assert_eq!(args.flags.route_hard, None);
     }
 
     #[test]

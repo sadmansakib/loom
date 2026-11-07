@@ -691,7 +691,8 @@ mod tests {
         assert_eq!(messages.len(), 3);
         // The breakpoint still marks "one", not the appended message.
         assert_eq!(
-            messages[0]["content"][0]["cache_control"]["type"], "ephemeral"
+            messages[0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
         );
         assert_eq!(messages[2]["role"], "system");
     }
