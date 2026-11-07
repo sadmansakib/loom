@@ -7,3 +7,7 @@
 
 traces/
 graphify-out/
+
+# swebench scorer output (run from repo root by mistake)
+logs/
+*__*.loom-*.json
