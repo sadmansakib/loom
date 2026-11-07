@@ -6,9 +6,10 @@
 
 > **Early release.** The headless agent core is usable today: the `loom`
 > binary runs tasks end to end against real providers, and `loom-core`
-> exposes the embedding facade. There is no interactive TUI yet, `ask`
-> policy verdicts fail closed without a frontend, and APIs version by
-> iteration, not semver.
+> exposes the embedding facade. There is no interactive TUI yet; `ask`
+> policy verdicts fail closed in the CLI, but ACP clients (e.g. Zed)
+> answer them over `session/request_permission` via `loom-acp`. APIs
+> version by iteration, not semver.
 
 Loom is a headless, provider-agnostic **coding-agent core** written in Rust.
 The deterministic loop is the controller; the model is only the reasoning
@@ -64,7 +65,7 @@ loom run --provider custom --base-url https://gateway.example/v1 \
 loom provider add orcarouter --base-url https://api.orcarouter.ai/v1
 loom run --provider orcarouter --model deepseek/deepseek-v4.1-flash-free "your task"
 
-# structured events for tooling (NDJSON, event schema 11)
+# structured events for tooling (NDJSON, event schema 14)
 loom run --provider deepseek --json "your task" | jq 'select(.kind.type=="tool_completed")'
 
 # past sessions live in SQLite; list and inspect them
@@ -76,6 +77,11 @@ loom stats
 # only (never task success)
 loom run --provider deepseek --trace traces/demo "your task"
 loom replay-context traces/demo/<task-id> --set prune_trigger_percent=50
+
+# editor integration: run loom as an Agent Client Protocol server
+# (Zed: add as an ACP agent; JSON-RPC on stdio, ask prompts surface
+# in the editor)
+loom-acp
 ```
 
 Sandboxed commands run with network off by default; escalation (network,
@@ -93,10 +99,13 @@ about, or denied via the `[policy]` verdict layer.
 | Context | repo facts, AGENTS.md instructions, pruning + turn-age masking, per-tool output budgets (env-sweepable), offline counterfactual replay (`loom replay-context`, self-validating against the recorded census) |
 | Providers | DeepSeek, OpenRouter, GLM, NVIDIA, Groq, Anthropic + any OpenAI-compatible custom gateway |
 | Persistence | SQLite sessions/events, resume, steering, `loom sessions`/`loom stats` |
+| Editors | Agent Client Protocol server (`loom-acp`, roadmap item 37): Zed et al. drive loom over JSON-RPC/stdio; `ask` verdicts bridge to the client's permission prompt |
 | Embedding | `loom-core` facade (ADR-021), full drive loop in `crates/loom-core/examples/frontend.rs` |
 
-Not built yet: interactive TUI/CLI surface (resume/steering/ask-mode need a
-frontend; the engine seams exist). Parallel best-of-N worktree rollouts
+Not built yet: an interactive TUI/CLI surface of its own (resume and
+steering are not exposed over ACP either — `session/load` and friends
+are open tails of roadmap item 37; ask-mode has its first frontend
+path through ACP). Parallel best-of-N worktree rollouts
 ship opt-in (`--best-of N`, roadmap item 21); delegation economics at
 N>1 remain a measurement question (roadmap item 19 trigger).
 

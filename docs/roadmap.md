@@ -14,7 +14,7 @@ This document has three layers:
 1. **Vision** — goals, principles, and the iteration sequence (stable;
    changes need an ADR-level reason).
 2. **Status** — what is shipped and verified in the codebase today.
-3. **Backlog** — numbered, evidence-gated items (1–31), each mapped to an
+3. **Backlog** — numbered, evidence-gated items (1–39), each mapped to an
    iteration, the goals it serves, and the seam it plugs into.
 
 It is a roadmap, not a promise. The companion `architecture.md` describes
