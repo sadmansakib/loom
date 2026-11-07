@@ -49,6 +49,10 @@ struct Args {
     /// (`AgentKind`).
     agent: String,
     eval_dir: PathBuf,
+    /// Optional `suite_audit.json` artifact: its weak-suite flags ride
+    /// the sweep report's provenance (roadmap item 1's offline
+    /// remainder), digest-checked against this sweep's dataset.
+    suite_audit: Option<PathBuf>,
 }
 
 fn csv(value: &str) -> Vec<String> {
@@ -102,6 +106,10 @@ fn usage() -> ! {
                        baseline. The container script is identical in both
                        arms; run each arm in its own --eval-dir
   --eval-dir <path>    artifacts root (default $LOOM_EVAL_DIR or <cwd>/target/eval)
+  --suite-audit <path> optional suite_audit.json artifact: embeds its weak-suite
+                       flags in the sweep report's provenance, digest-checked
+                       against this sweep's dataset (the flags are structural
+                       hypotheses, labeled unconfirmed until the mutant re-grade)
 
 Knobs mirror the environment forms: LOOM_EVAL_SWEBENCH_INSTANCES,
 LOOM_EVAL_SWEBENCH_REPOS, LOOM_EVAL_PROVIDER, LOOM_EVAL_MODEL,
@@ -137,6 +145,7 @@ fn parse_args() -> Args {
         eval_dir: std::env::var("LOOM_EVAL_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("target/eval")),
+        suite_audit: None,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
@@ -159,6 +168,7 @@ fn parse_args() -> Args {
             "--arm" => args.arm = value(),
             "--agent" => args.agent = value(),
             "--eval-dir" => args.eval_dir = PathBuf::from(value()),
+            "--suite-audit" => args.suite_audit = Some(PathBuf::from(value())),
             "--help" | "-h" => usage(),
             _ => usage(),
         }
@@ -697,6 +707,60 @@ fn main() {
         println!("best-of-{} selection: {}", args.runs, path.display());
     }
 
+    // Roadmap item 1's offline remainder: when the operator points at
+    // a suite-audit artifact, its weak-suite flags ride the sweep
+    // report's provenance — digest-bound to the audit file and to the
+    // dataset this sweep actually ran, labeled unconfirmed (the mutant
+    // re-grade that would confirm them is spend-gated).
+    let suite_audit_block = args.suite_audit.as_ref().map(|path| {
+        let bytes =
+            std::fs::read(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let sweep_ids: Vec<String> = selected
+            .iter()
+            .map(|instance| instance.instance_id.clone())
+            .collect();
+        let weak = loom_eval::suite_audit::sweep_weak_suite(&bytes, &sweep_ids)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let dataset_digest = std::fs::read(dataset_cache_path(&args.eval_dir))
+            .map(|body| swebench::sha256_hex(&body))
+            .unwrap_or_default();
+        if dataset_digest != weak.dataset_sha256 {
+            eprintln!(
+                "refusing to run: {path} audited dataset {digest}, but this\n\
+                 sweep runs {actual} — the weak flags would describe another suite.",
+                path = path.display(),
+                digest = weak.dataset_sha256,
+                actual = if dataset_digest.is_empty() {
+                    "an uncached (overridden?) dataset".to_owned()
+                } else {
+                    dataset_digest
+                }
+            );
+            std::process::exit(2);
+        }
+        if weak.weak_ids.is_empty() && weak.weak_total > 0 {
+            eprintln!(
+                "warning: the audit flags {total} weak instances, none of them in\n\
+                 this sweep's {n} instance(s) — is this the right audit artifact?",
+                total = weak.weak_total,
+                n = sweep_ids.len()
+            );
+        }
+        weak
+    });
+
+    let mut provenance_json = serde_json::json!({
+        "loom_sha256": provenance.loom_sha256,
+        "loom_bytes": provenance.loom_bytes,
+        "container_script_sha256": provenance.container_script_sha256,
+        "prompt_version": provenance.prompt_version,
+        "runner_version": provenance.runner_version,
+    });
+    if let Some(weak) = &suite_audit_block {
+        provenance_json["suite_audit"] =
+            serde_json::to_value(weak).expect("weak-suite block serializes");
+    }
+
     let sweep = serde_json::json!({
         "provider": args.provider,
         "model": args.model,
@@ -705,13 +769,7 @@ fn main() {
         "base_url": args.base_url,
         "arm": args.arm,
         "dataset": swebench::DATASET_ID,
-        "provenance": {
-            "loom_sha256": provenance.loom_sha256,
-            "loom_bytes": provenance.loom_bytes,
-            "container_script_sha256": provenance.container_script_sha256,
-            "prompt_version": provenance.prompt_version,
-            "runner_version": provenance.runner_version,
-        },
+        "provenance": provenance_json,
         "instances": report,
         "predictions_files": prediction_paths
             .iter()

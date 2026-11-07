@@ -147,7 +147,10 @@ Every sweep writes under `<eval-dir>/swebench/`:
   sizes, token usage, the predictions-file inventory, and a
   `provenance` block: the sha256 of the staged linux `loom` binary
   (also kept alongside as `loom.sha256`), the digest of the frozen
-  container script, the prompt version, and the runner's version. Each row's
+  container script, the prompt version, the runner's version, and —
+  when `--suite-audit` points at a `suite_audit.json` artifact — a
+  `suite_audit` member carrying the audit's weak-suite flags for
+  exactly this sweep's instances (see the suite-audit section). Each row's
   `usage` carries `input_tokens`, `cached_input_tokens`,
   `output_tokens`, `model_requests`, and `hit_rate` summed from the
   run's `model_completed` events (the deepseek adapter parses
@@ -202,6 +205,20 @@ Re-gate rule: any headline derived from the frozen subset that flips
 when weak-confirmed instances are excluded (or re-scored against
 amplified suites) is re-gated — recorded as a new measurement with its
 own provenance, never silently restated.
+
+**Flags in live sweep provenance (item 1 remainder, shipped
+2026-11-07).** `swebench-run --suite-audit <path>` embeds the audit's
+weak flags in the sweep report's `provenance.suite_audit`: the
+artifact's sha256 and method version, the whole-dataset `weak_total`,
+the per-instance `weak_ids`/`weak_reasons` intersected with the
+sweep's own instances, and `unconfirmed: true`. The runner
+digest-checks the artifact's dataset sha256 against the cached
+dataset file this sweep actually runs and refuses on mismatch (flags
+about another suite are worse than no flags); an audit whose weak set
+misses the sweep entirely warns but proceeds. The `unconfirmed` label
+is the honesty rule: until the spend-gated mutant re-grade runs, a
+headline reading this block cites structural hypotheses, not
+verdicts. Without the flag, provenance is byte-identical to before.
 
 ## Multilingual Rust slice (item 35)
 

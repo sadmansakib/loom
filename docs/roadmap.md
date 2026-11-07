@@ -820,8 +820,13 @@ adds four more framing findings and backlog items 26–31 below.
      sha256 + selection rule + method v1). Remaining: the docker
      mutant re-grade (~259 scorer runs, one-off, linux box) to
      confirm/refute the 36 hypotheses; then any flipped headline is
-     re-gated and the weak flags get wired into live sweep reports'
-     provenance.
+     re-gated. The wiring half shipped 2026-11-07:
+     `swebench-run --suite-audit <path>` embeds the flags in the
+     sweep report's `provenance.suite_audit` — digest-bound to the
+     artifact and the dataset, intersected with the sweep's
+     instances, labeled `unconfirmed: true` until the re-grade runs
+     (`loom_eval::suite_audit::sweep_weak_suite`; docs/eval.md §
+     suite audit).
    Seam: the live eval reports and the event stream.
 2. **Sandboxed shell** (G1, G2, G3) — **shipped 2026-10-08**. Strong
    models working through a

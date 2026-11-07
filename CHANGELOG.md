@@ -3,6 +3,18 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Weak-suite flags in sweep provenance (roadmap item 1 offline remainder)
+
+`swebench-run --suite-audit <path>` embeds a suite audit's weak-suite
+flags in the sweep report's `provenance.suite_audit`: the artifact's
+sha256, method version, and dataset sha256, the whole-dataset weak
+count, and per-instance flags intersected with the sweep's own
+instances — labeled `unconfirmed: true` (the docker mutant re-grade
+that would confirm them stays spend-gated). The runner refuses an
+artifact whose dataset digest differs from the cached dataset it
+runs, and warns when the audit's weak set misses the sweep entirely.
+Without the flag, sweep provenance is byte-identical to before.
+
 ## 2026-11 — Fast-path rename decline reasons split (roadmap item 34 precondition)
 
 `FastPathDeclined`'s rename reason was one coarse string; now every

@@ -23,11 +23,11 @@
 //! one-off re-grade, not every sweep.
 
 use crate::swebench::SweInstance;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// One instance's suite shape. Counts only — deterministic and
 /// reproducible from the dataset alone.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SuiteAuditRow {
     /// The dataset's canonical id (`org__repo-number`).
     pub instance_id: String,
@@ -62,11 +62,11 @@ impl SuiteAuditRow {
 /// measurement of one dataset file under one method version, and a
 /// weak-suite verdict is only citable with both (same rule as
 /// [`crate::swebench::SweepProvenance`]).
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SuiteAuditProvenance {
     /// Method marker — bump when any flag or the mutant rule changes,
     /// invalidating recorded audit verdicts.
-    pub method_version: &'static str,
+    pub method_version: String,
     /// sha256 of the dataset file as read, hex.
     pub dataset_sha256: String,
     /// Rows in the dataset file (selection happens after parsing).
@@ -75,12 +75,12 @@ pub struct SuiteAuditProvenance {
     /// `--per-repo 20 --repos astropy/astropy,…`), verbatim.
     pub selection: String,
     /// loom-eval's own package version (the auditor's identity).
-    pub runner_version: &'static str,
+    pub runner_version: String,
 }
 
 /// The whole audit: per-instance rows plus the counts the provenance
 /// block and the re-grade README consume.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SuiteAudit {
     /// Attributable-measurement block (house rule: no report without
     /// one).
@@ -208,11 +208,11 @@ pub fn suite_audit_provenance(
     selection: &str,
 ) -> SuiteAuditProvenance {
     SuiteAuditProvenance {
-        method_version: SUITE_AUDIT_METHOD_VERSION,
+        method_version: SUITE_AUDIT_METHOD_VERSION.to_owned(),
         dataset_sha256: crate::swebench::sha256_hex(dataset_bytes),
         dataset_rows,
         selection: selection.to_owned(),
-        runner_version: env!("CARGO_PKG_VERSION"),
+        runner_version: env!("CARGO_PKG_VERSION").to_owned(),
     }
 }
 
@@ -256,6 +256,72 @@ pub fn audit_dataset(instances: &[&SweInstance], provenance: SuiteAuditProvenanc
             .collect(),
         rows,
     }
+}
+
+/// The weak-suite slice a sweep report's provenance embeds (roadmap
+/// item 1's offline remainder): the structural audit's flags for
+/// exactly the instances the sweep ran, hashed to the artifact they
+/// came from. Labeled unconfirmed — the docker mutant re-grade that
+/// would confirm or refute the flags is spend-gated, so a headline
+/// reading this block knows it cites a hypothesis, not a verdict.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct SweepWeakSuite {
+    /// sha256 of the audit artifact file, hex — the flags are citable
+    /// only against that exact artifact.
+    pub audit_sha256: String,
+    /// The audit's own method version (its citability rule).
+    pub method_version: String,
+    /// sha256 of the dataset file the audit describes — the sweep's
+    /// dataset must match it or the flags speak about another suite.
+    pub dataset_sha256: String,
+    /// Weak instances in the whole audited dataset (not just the
+    /// sweep) — the caller's warning denominator.
+    pub weak_total: usize,
+    /// Weak instances that are in this sweep, dataset order.
+    pub weak_ids: Vec<String>,
+    /// Per weak-in-sweep instance: the structural signals that fired.
+    pub weak_reasons: std::collections::BTreeMap<String, Vec<&'static str>>,
+    /// Always true today: these are structural hypotheses; the
+    /// ~259-run mutant re-grade remains spend-gated.
+    pub unconfirmed: bool,
+}
+
+/// Intersects a serialized [`SuiteAudit`] artifact (as written by the
+/// `suite-audit` bin) with a sweep's instance ids. Errors on an
+/// unreadable artifact — the operator asked for the wiring, so a
+/// silent absence would be the dishonest failure.
+pub fn sweep_weak_suite(
+    audit_bytes: &[u8],
+    sweep_ids: &[String],
+) -> Result<SweepWeakSuite, String> {
+    let audit: SuiteAudit = serde_json::from_slice(audit_bytes)
+        .map_err(|error| format!("suite audit artifact is not readable: {error}"))?;
+    let in_sweep: std::collections::BTreeSet<&str> = sweep_ids.iter().map(String::as_str).collect();
+    let mut weak_ids = Vec::new();
+    let mut weak_reasons = std::collections::BTreeMap::new();
+    for row in &audit.rows {
+        if !row.weak() || !in_sweep.contains(row.instance_id.as_str()) {
+            continue;
+        }
+        let mut reasons = Vec::new();
+        if row.suite_small {
+            reasons.push("suite_small");
+        }
+        if row.no_new_tests {
+            reasons.push("no_new_tests");
+        }
+        weak_reasons.insert(row.instance_id.clone(), reasons);
+        weak_ids.push(row.instance_id.clone());
+    }
+    Ok(SweepWeakSuite {
+        audit_sha256: crate::swebench::sha256_hex(audit_bytes),
+        method_version: audit.provenance.method_version.clone(),
+        dataset_sha256: audit.provenance.dataset_sha256.clone(),
+        weak_total: audit.weak_ids.len(),
+        weak_ids,
+        weak_reasons,
+        unconfirmed: true,
+    })
 }
 
 #[cfg(test)]
@@ -361,5 +427,84 @@ index 333..444 100644
             audit.provenance.dataset_sha256,
             crate::swebench::sha256_hex(b"dataset-bytes")
         );
+    }
+
+    /// A serialized `SuiteAudit` artifact with three rows: one weak and
+    /// in the sweep, one healthy, one weak but outside the sweep.
+    fn audit_artifact_json() -> String {
+        let row = |id: &str, suite_small: bool, no_new_tests: bool| {
+            serde_json::json!({
+                "instance_id": id,
+                "repo": "org/repo",
+                "f2p": if suite_small { 1 } else { 3 },
+                "p2p": if suite_small { 0 } else { 5 },
+                "gold_hunks": 2,
+                "added_test_lines": if no_new_tests { 0 } else { 4 },
+                "suite_small": suite_small,
+                "no_new_tests": no_new_tests,
+                "single_hunk": false,
+            })
+        };
+        serde_json::json!({
+            "provenance": {
+                "method_version": "1",
+                "dataset_sha256": "0".repeat(64),
+                "dataset_rows": 500,
+                "selection": "--per-repo 20",
+                "runner_version": "0.1.0",
+            },
+            "rows": [
+                row("org/one-1", true, true),
+                row("org/two-2", false, false),
+                row("org/three-3", false, true),
+            ],
+            "weak_ids": ["org/one-1", "org/three-3"],
+            "mutant_runs": 0,
+            "unmutable_ids": [],
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn sweep_weak_suite_intersects_reasons_and_labels() {
+        // Roadmap item 1 remainder: a sweep report's provenance carries
+        // the audit's weak flags for exactly its own instances, hashed
+        // to the artifact, labeled unconfirmed.
+        let bytes = audit_artifact_json();
+        let sweep_ids = vec!["org/one-1".to_owned(), "org/two-2".to_owned()];
+        let weak = sweep_weak_suite(bytes.as_bytes(), &sweep_ids).expect("audit artifact readable");
+        assert_eq!(weak.weak_total, 2, "the artifact's whole-dataset count");
+        assert_eq!(weak.weak_ids, vec!["org/one-1".to_owned()]);
+        assert_eq!(
+            weak.weak_reasons.get("org/one-1").map(Vec::as_slice),
+            Some(["suite_small", "no_new_tests"].as_slice()),
+        );
+        assert!(!weak.weak_reasons.contains_key("org/two-2"));
+        assert!(weak.unconfirmed, "structural hypothesis, re-grade gated");
+        assert_eq!(weak.method_version, "1");
+        assert_eq!(weak.dataset_sha256, "0".repeat(64));
+        assert_eq!(
+            weak.audit_sha256,
+            crate::swebench::sha256_hex(bytes.as_bytes())
+        );
+    }
+
+    #[test]
+    fn sweep_weak_suite_empty_intersection_still_records_the_total() {
+        // A disjoint sweep (operator pointed at the wrong audit): no
+        // intersecting flags, but the artifact counts stay honest for
+        // the caller's warning.
+        let bytes = audit_artifact_json();
+        let weak = sweep_weak_suite(bytes.as_bytes(), &["org/other-9".to_owned()])
+            .expect("audit artifact readable");
+        assert!(weak.weak_ids.is_empty());
+        assert!(weak.weak_reasons.is_empty());
+        assert_eq!(weak.weak_total, 2);
+    }
+
+    #[test]
+    fn sweep_weak_suite_rejects_unreadable_artifacts() {
+        assert!(sweep_weak_suite(b"not json", &[]).is_err());
+        assert!(sweep_weak_suite(b"{}", &[]).is_err(), "missing every field");
     }
 }
