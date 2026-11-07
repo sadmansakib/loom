@@ -3,6 +3,22 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Escalation-by-fork: evidence-based deferral (roadmap item 36)
+
+Measured before building, deferred on the kill criterion: the stall
+trigger population is empty on every measurable surface. Interactive
+corpus (15 sessions, 16 tasks, 3,255 events): zero organic zero-progress
+nudges, zero failed-call-loop nudges, zero edit-stall breakers — all 6
+recorded `loop_nudge` events are budget notices from max-turns=1 smoke
+probes (5) or a changed-files notice in a task that recovered and
+completed (1). Both task failures are `model_error` (rate limit), which
+retry backoff already owns and a fork would re-run into while paying.
+Eval-side runs are `--no-save`, and the one recorded sweep shows no
+stall. Revisit trigger recorded in roadmap item 36 (a task that stalls
+after its nudge, and tier-3 pre-image restore — both must exist); seam
+facts (`SessionStore::fork`, per-apply pre-images) recorded there for
+that build. No code changed.
+
 ## 2026-11 — SWE-bench Multilingual Rust slice (roadmap item 35)
 
 A second benchmark surface: the 43 Rust tasks (7 repos: tokio, bat,

@@ -1759,6 +1759,46 @@ model tier under them (arXiv 2607.06906).
    Design: [docs/rust-bench-design.md](rust-bench-design.md).
 
 
+36. **Escalation-by-fork for stalled tasks** (G1, G2, G7). Goal: when a
+   task stalls deterministically (a nudge fired and the stall persisted),
+   fork the session (`SessionStore::fork`, gap 1) and re-run an escalated
+   attempt instead of failing flat — the fork keeps the original
+   transcript intact, and a loser leaves the user no worse (never-worse
+   gate, opt-in flag, default off). Three workspace strategies for the
+   forked attempt were to be resolved with numbers: (a) continue in the
+   workspace as-is, (b) clean session-start baseline (`git reset --hard`
+   + clean — derivable today per the rewind note), (c) restore to the
+   last mutating turn via pre-images (tier-3 rewind).
+
+   **Evidence-based deferral (2026-11-07).** The trigger population is
+   empty on both surfaces we can measure. Interactive corpus (15
+   sessions, 16 tasks, 3,255 events): zero organic zero-progress nudges,
+   zero failed-call-loop nudges, zero edit-stall breakers. All 6
+   `loop_nudge` events decode as non-stalls: 5 are "used 1 of 1 turns"
+   budget notices from max-turns=1 smoke probes (the budget IS the ask;
+   a fork re-buys nothing), 1 is a changed-files-since-green notice in a
+   task that recovered and completed in-session. Both task failures are
+   `model_error` (rate limit/gateway) — retry.rs already owns that
+   domain, and a fork re-runs into the same wall while paying for it
+   (violates never-worse and the money rule). Eval side: container runs
+   are `--no-save`, so stall evidence lives only in sweep reports — the
+   one recorded sweep (kilo smoke, astropy__astropy-13398) shows a
+   non-empty patch, exit 0, no task failure. The stall machinery that
+   exists (items 1.3, 30, the 2026-10-31 failed-call breaker) has
+   absorbed every stall mode actually observed — nudges corrected all of
+   them without escalation. Revisit when a stored corpus or sweep report
+   shows a task that stalled AFTER its nudge (the deterministic trigger
+   this feature needs), or when tier-3 pre-image restore ships —
+   whichever comes second, since the trigger and the primitive must both
+   exist before the three workspace strategies can be resolved with
+   numbers. Seam facts for that build: `SessionStore::fork(source,
+   boundary, new_id)` + `fork_of` lineage already ship (kernel trait,
+   memory store, SQLite schema v3 forks table); pre-images are captured
+   at apply time by fastpath/autofix/LSP-apply (content-addressed), so
+   strategy (c) is closer than docs/rewind-design.md assumed when it
+   called mid-turn code state non-derivable.
+
+
 ### 2026-12 meta-harness sweep — gap check
 
 A vendor/blog/benchmark sweep (Anthropic engineering, Claude Code docs,
