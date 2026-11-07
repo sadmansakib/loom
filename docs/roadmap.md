@@ -1048,7 +1048,13 @@ adds four more framing findings and backlog items 26–31 below.
    <fixed|progressive>` (env-forwarded, recorded in sweep
    provenance). The Anthropic in-turn system-message form above is
    the follow-up for that adapter; routing slice zero below is the
-   other open half.
+   other open half. **First funded A/B (2026-11-07, N=5, frozen
+   5-instance set):** progressive vs fixed medians 4/5 vs 3/5 —
+   directional, not separable from noise at this N (the whole delta
+   is sympy 3/5 vs 2/5, p ~ 0.7); safe on this model (no quality
+   loss, no cost blowup), so it ships default-off pending a
+   larger-set contrast. Record:
+   `docs/benchmarks/swebench-n5-effort-contrast-gpt-6-luna.md`.
    **Routing slice zero (planned):** task-*start* model selection — a
    trivial classifier (task text → difficulty tier) that picks the model
    before `Agent` construction. Needs no Iteration-8 ADR because the
