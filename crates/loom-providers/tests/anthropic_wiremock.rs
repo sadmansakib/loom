@@ -126,6 +126,27 @@ async fn streamed_text_completes_with_usage() {
 }
 
 #[tokio::test]
+async fn per_turn_effort_arrives_as_a_trailing_system_turn() {
+    let server = MockServer::start().await;
+    mount_sse(&server, text_response()).await;
+
+    let mut request = plain_request("claude-sonnet-4-5");
+    request.reasoning_effort = Some(loom_kernel::model::ReasoningEffort::High);
+    let provider = provider_at(&server.uri());
+    let _ = collect(provider.stream(&request)).await;
+
+    let requests = server.received_requests().await.expect("captured request");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    let messages = body["messages"].as_array().expect("messages");
+    let last = messages.last().expect("appended turn");
+    assert_eq!(last["role"], "system");
+    assert_eq!(
+        last["content"][0]["text"],
+        "Reasoning effort for this turn: high."
+    );
+}
+
+#[tokio::test]
 async fn auth_headers_and_the_wire_shape_are_sent() {
     let server = MockServer::start().await;
     mount_sse(&server, text_response()).await;

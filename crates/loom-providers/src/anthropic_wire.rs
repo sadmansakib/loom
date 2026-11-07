@@ -216,6 +216,28 @@ pub(crate) fn build_request_body(request: &ModelRequest) -> Value {
         }
         body["context_management"] = json!({"edits": [edit]});
     }
+    // Per-turn reasoning effort (roadmap item 9's Anthropic tail):
+    // the Messages API has no request field for a level — thinking is
+    // adaptive and the adapter never sends a `thinking` parameter
+    // (module notes) — so the level rides the same in-turn
+    // system-message channel steering uses. It is appended after the
+    // cache breakpoint is placed: the stable prefix, its breakpoint,
+    // and the translated turns' indices are untouched, and the
+    // message lands at the tail, where the next assistant turn reads
+    // it. Absent effort (the kernel default) sends nothing — the
+    // request bytes are unchanged for models and schedules that never
+    // set a level.
+    if let Some(effort) = request.reasoning_effort
+        && let Some(messages) = body["messages"].as_array_mut()
+    {
+        messages.push(json!({
+            "role": "system",
+            "content": [{
+                "type": "text",
+                "text": format!("Reasoning effort for this turn: {}.", effort.as_str()),
+            }],
+        }));
+    }
     body
 }
 
@@ -605,7 +627,7 @@ fn map_stop_reason(reason: &str) -> StopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loom_kernel::model::Message;
+    use loom_kernel::model::{Message, ReasoningEffort};
     use loom_kernel::transcript::{
         ReasoningTrace, ToolArguments, ToolCall, ToolCallId, ToolResult, ToolStatus,
     };
@@ -629,6 +651,49 @@ mod tests {
             name: "read_file".into(),
             arguments: ToolArguments::try_from(json!({"path": "x.rs"})).unwrap(),
         }
+    }
+
+    #[test]
+    fn per_turn_effort_rides_a_trailing_system_message() {
+        let mut req = request(vec![Message::User { text: "hi".into() }]);
+        req.reasoning_effort = Some(ReasoningEffort::High);
+        let body = build_request_body(&req);
+        let messages = body["messages"].as_array().unwrap();
+        // The translated turn is untouched; the level lands after it.
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "system");
+        assert_eq!(
+            messages[1]["content"][0]["text"],
+            "Reasoning effort for this turn: high."
+        );
+    }
+
+    #[test]
+    fn no_effort_leaves_the_wire_bytes_unchanged() {
+        // The kernel default is "send nothing": a request without a
+        // level must not grow a synthetic message.
+        let body = build_request_body(&request(vec![Message::User { text: "hi".into() }]));
+        assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn the_effort_message_does_not_move_a_cache_breakpoint() {
+        let mut req = request(vec![
+            Message::System { text: "sys".into() },
+            Message::User { text: "one".into() },
+            Message::User { text: "two".into() },
+        ]);
+        req.stable_prefix_messages = Some(2);
+        req.reasoning_effort = Some(ReasoningEffort::Low);
+        let body = build_request_body(&req);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        // The breakpoint still marks "one", not the appended message.
+        assert_eq!(
+            messages[0]["content"][0]["cache_control"]["type"], "ephemeral"
+        );
+        assert_eq!(messages[2]["role"], "system");
     }
 
     #[test]
