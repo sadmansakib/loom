@@ -3,6 +3,30 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Repro-test tie-breaker: evidence-based deferral (roadmap item 39)
+
+Measured before building, deferred on the kill criterion: the tie
+population a repro-test tie-breaker would settle does not exist on
+any readable surface. Every artifact type that could carry
+candidate-level scores was enumerated — selfopt ledgers and reports
+(none exist on disk, in the data directory, or anywhere in git
+history; the artifact that would contain ties has never been
+produced), suite-audit v3 (patches and structural counts; scoring
+delegated to the external harness), swebench sweeps (binary
+resolved/unresolved, one candidate per run). Ties observed: zero.
+The remedy is also spend-gated (a repro re-run is paid probe
+traffic; offline replay cannot mint new outcomes), and re-run
+gating already ships at the right layer (kernel autofix keeps a fix
+only when a re-run improves diagnostics; `probe_failures` already
+counts non-reproducing runs inside a probe). Revisit trigger
+recorded in roadmap item 39: the first selfopt ledger with a
+selection where two adopted candidates tie on
+`(input_improvement_pct, probe_failures)` — the ledger's `Decision`
+rows already carry both fields, so the trigger checks with one
+script against the next real run. Design + seam facts in
+[docs/repro-tiebreak-design.md](docs/repro-tiebreak-design.md).
+No code changed.
+
 ## 2026-11 — ACP server mode (roadmap item 37)
 
 The engine is now an Agent Client Protocol server: `loom-acp` speaks

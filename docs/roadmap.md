@@ -1885,6 +1885,32 @@ model tier under them (arXiv 2607.06906).
     additive `ToolFailure` variant + event-schema bump. No code
     changed.
 
+39. **Repro-test tie-breaker for candidate selection** (G1, G2, G7).
+    Goal: when self-optimization ranks adopted candidates and two
+    tie on the selection key (`input_improvement_pct`, then
+    `probe_failures`, in the `--tier lite` `max_by`), break the tie
+    by reproducibility — re-run the probe suite for the tied pair
+    and prefer the candidate whose gains reproduce. Evidence gate
+    run first, deferred on the kill criterion
+    ([docs/repro-tiebreak-design.md](repro-tiebreak-design.md)):
+    every surface that could carry a tie was read — selfopt ledgers
+    and reports (none exist on disk, in the data directory, or in
+    git history; the artifact type that would contain ties has never
+    been produced), suite-audit v3 artifacts (patches and structural
+    counts; scoring is external), swebench sweeps (binary outcomes,
+    one candidate per run). Ties observed: zero. The remedy is also
+    spend-gated: a repro re-run is paid probe traffic and offline
+    replay cannot mint new outcomes; and re-run gating already
+    exists at the right layer (kernel autofix, `probe_failures`
+    counts). Revisit trigger (sharp): the first selfopt ledger
+    recording a selection where two adopted candidates tie on
+    `(input_improvement_pct, probe_failures)` — `Decision` rows
+    already carry both fields, so one script against the next real
+    run detects it. Seams for that build: the lite-tier `max_by`
+    (silent last-wins today, deterministic input order), explicit
+    key before repro re-run (fewer failures, then label — no spend),
+    `LedgerEntry` needs no schema change. No code changed.
+
 ### 2026-12 meta-harness sweep — gap check
 
 A vendor/blog/benchmark sweep (Anthropic engineering, Claude Code docs,
