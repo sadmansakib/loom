@@ -3,6 +3,20 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Fast-path rename decline reasons split (roadmap item 34 precondition)
+
+`FastPathDeclined`'s rename reason was one coarse string; now every
+guard that declines a mechanical rename names itself
+(`intent-rename-collision`, `intent-rename-zero-occurrences`,
+`intent-rename-too-many-occurrences`, `intent-rename-verify-failed`,
+`intent-rename-write-failed`; event schema 14 → 15, additive — the
+field stays a free string, older payloads unaffected). This is item
+34's recorded precondition: the LSP-rename fallback's revisit trigger
+(a rename ask declined on the target-name guard) is measurable from
+recorded events with one grep. The fallback itself stays deferred
+until that trigger fires. Design:
+`docs/fastpath-decline-reasons-design.md`.
+
 ## 2026-11 — Repro-test tie-breaker: evidence-based deferral (roadmap item 39)
 
 Measured before building, deferred on the kill criterion: the tie

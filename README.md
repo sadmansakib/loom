@@ -65,7 +65,7 @@ loom run --provider custom --base-url https://gateway.example/v1 \
 loom provider add orcarouter --base-url https://api.orcarouter.ai/v1
 loom run --provider orcarouter --model deepseek/deepseek-v4.1-flash-free "your task"
 
-# structured events for tooling (NDJSON, event schema 14)
+# structured events for tooling (NDJSON, event schema 15)
 loom run --provider deepseek --json "your task" | jq 'select(.kind.type=="tool_completed")'
 
 # past sessions live in SQLite; list and inspect them

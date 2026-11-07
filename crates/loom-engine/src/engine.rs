@@ -1944,7 +1944,7 @@ mod tests {
         assert_eq!(summary.model_requests, 1, "the loop took over");
         let kinds = drain(&mut receiver);
         assert!(kinds.contains(&EventKind::FastPathDeclined {
-            reason: "intent-rename-unsolved".to_owned()
+            reason: "intent-rename-zero-occurrences".to_owned()
         }));
         // The fixture is untouched — a declined fast path never edits.
         let lib = std::fs::read_to_string(workspace.join("src/lib.rs")).expect("lib");

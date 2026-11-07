@@ -66,8 +66,13 @@ pub struct FastPathOutcome {
 pub struct FastPathAttempt {
     /// The verified solve, when the fast path succeeded.
     pub outcome: Option<FastPathOutcome>,
-    /// Coarse decline reason (`"no-intent-match"` or
-    /// `"intent-{kind}-unsolved"`).
+    /// Decline reason: `"no-intent-match"`,
+    /// `"intent-{kind}-unsolved"` (matched, but a guard or the
+    /// offline verifier said no), or — for renames since schema v15
+    /// — the specific guard: `intent-rename-collision`,
+    /// `intent-rename-zero-occurrences`,
+    /// `intent-rename-too-many-occurrences`,
+    /// `intent-rename-verify-failed`, `intent-rename-write-failed`.
     pub decline: Option<&'static str>,
 }
 
@@ -130,7 +135,9 @@ enum Intent {
 
 impl Intent {
     /// The decline reason when the intent matched but its solver's
-    /// guards (or the offline verifier) said no.
+    /// guards (or the offline verifier) said no. Rename classifies
+    /// its own causes before reaching here (item 34); this arm is
+    /// the unclassified fallback.
     fn decline_reason(&self) -> &'static str {
         match self {
             Self::Rename { .. } => "intent-rename-unsolved",
@@ -611,12 +618,15 @@ async fn program_output(
 }
 
 /// Applies the rename intent: collision-checked, whole-word, verified.
+/// `Err` carries the specific guard that declined (roadmap item 34:
+/// per-cause reasons keep the LSP-rename revisit trigger measurable);
+/// `Ok(None)` is the unclassified fallback — no site reaches it today.
 async fn apply_rename(
     workspace: &Path,
     policy: &CommandPolicy,
     from: &str,
     to: &str,
-) -> Option<FastPathOutcome> {
+) -> Result<Option<FastPathOutcome>, &'static str> {
     let files = rust_files(workspace);
     let mut touched: Vec<(PathBuf, String)> = Vec::new();
     let mut occurrences = 0;
@@ -631,13 +641,16 @@ async fn apply_rename(
         if count_word(&text, to) > 0 {
             // The target name already exists in a touched file: a
             // blind replace would shadow it. Decline.
-            return None;
+            return Err("intent-rename-collision");
         }
         occurrences += count;
         touched.push((path.clone(), text));
     }
-    if occurrences == 0 || occurrences > 500 {
-        return None;
+    if occurrences == 0 {
+        return Err("intent-rename-zero-occurrences");
+    }
+    if occurrences > 500 {
+        return Err("intent-rename-too-many-occurrences");
     }
     // A pre-existing target name anywhere in the workspace is ambiguity,
     // not just in the touched files.
@@ -646,7 +659,7 @@ async fn apply_rename(
             continue;
         };
         if count_word(&text, to) > 0 {
-            return None;
+            return Err("intent-rename-collision");
         }
     }
     let snapshots: Vec<Snapshot> = touched
@@ -662,14 +675,14 @@ async fn apply_rename(
         let (rewritten, _) = replace_word(text, from, to);
         if std::fs::write(path, rewritten).is_err() {
             restore(&snapshots);
-            return None;
+            return Err("intent-rename-write-failed");
         }
     }
     if !cargo_ok(workspace, policy, &["check"]).await {
         restore(&snapshots);
-        return None;
+        return Err("intent-rename-verify-failed");
     }
-    Some(FastPathOutcome {
+    Ok(Some(FastPathOutcome {
         kind: "rename",
         files_changed: touched.len() as u32,
         note: format!(
@@ -677,7 +690,7 @@ async fn apply_rename(
              {occurrences} occurrence(s); verified with `cargo check`.",
             touched.len()
         ),
-    })
+    }))
 }
 
 /// Applies the constant intent at its unique declaration site.
@@ -1121,7 +1134,10 @@ pub async fn try_fast_path(
         Intent::FormatRust => apply_format(workspace, policy, FormatClass::Rust).await,
         Intent::FormatGo => apply_format(workspace, policy, FormatClass::Go).await,
         Intent::Format => apply_format(workspace, policy, FormatClass::Auto).await,
-        Intent::Rename { from, to } => apply_rename(workspace, policy, from, to).await,
+        Intent::Rename { from, to } => match apply_rename(workspace, policy, from, to).await {
+            Ok(outcome) => outcome,
+            Err(reason) => return FastPathAttempt::declined(reason),
+        },
         Intent::Constant { name, from, to } => {
             apply_constant(workspace, policy, name, from, to).await
         }
@@ -1201,14 +1217,15 @@ mod tests {
         assert!(attempt.outcome.is_none());
 
         // A rename of a symbol the file does not carry: the intent
-        // matched, the solver's guards said no — a different reason.
+        // matched, the solver's zero-occurrence guard said no — a
+        // specific reason, not the coarse fallback (roadmap item 34).
         let attempt = try_fast_path(
             &workspace,
             "Rename missing_symbol to renamed_symbol",
             &policy,
         )
         .await;
-        assert_eq!(attempt.decline, Some("intent-rename-unsolved"));
+        assert_eq!(attempt.decline, Some("intent-rename-zero-occurrences"));
 
         // A dependency bump for a crate the manifest does not carry.
         let attempt = try_fast_path(
@@ -1218,6 +1235,97 @@ mod tests {
         )
         .await;
         assert_eq!(attempt.decline, Some("intent-dependency-unsolved"));
+    }
+
+    #[tokio::test]
+    async fn rename_declines_classify_their_guard() {
+        // Roadmap item 34's precondition: the coarse
+        // `intent-rename-unsolved` splits into per-cause reasons so the
+        // LSP-rename revisit trigger (target-name collision declines)
+        // is measurable from recorded events.
+        let policy = CommandPolicy::cargo_only();
+
+        // Collision inside a touched file: a blind replace would
+        // shadow the existing target name.
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = base.path().join("ws");
+        std::fs::create_dir_all(workspace.join("src")).expect("dirs");
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"fp_decline_cls\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn parse_opts() -> u32 {\n    7\n}\npub fn parse_options() -> u32 {\n    8\n}\n",
+        )
+        .expect("lib");
+        let attempt =
+            try_fast_path(&workspace, "Rename parse_opts to parse_options", &policy).await;
+        assert_eq!(attempt.decline, Some("intent-rename-collision"));
+
+        // Collision only in an *untouched* workspace file: the
+        // second-pass whole-workspace guard catches it.
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = base.path().join("ws");
+        std::fs::create_dir_all(workspace.join("src")).expect("dirs");
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"fp_decline_far\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn parse_opts() -> u32 {\n    7\n}\n",
+        )
+        .expect("lib");
+        std::fs::write(
+            workspace.join("src/other.rs"),
+            "pub fn parse_options() -> u32 {\n    9\n}\n",
+        )
+        .expect("other");
+        let attempt =
+            try_fast_path(&workspace, "Rename parse_opts to parse_options", &policy).await;
+        assert_eq!(attempt.decline, Some("intent-rename-collision"));
+
+        // More than 500 occurrences: above the mechanical cap.
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = base.path().join("ws");
+        std::fs::create_dir_all(workspace.join("src")).expect("dirs");
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"fp_decline_cap\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        let mut heavy = String::from("// occurrences of the word below:\n");
+        for _ in 0..501 {
+            heavy.push_str("// aaa aaa\n");
+        }
+        std::fs::write(workspace.join("src/lib.rs"), heavy).expect("lib");
+        let attempt = try_fast_path(&workspace, "Rename aaa to bbb", &policy).await;
+        assert_eq!(attempt.decline, Some("intent-rename-too-many-occurrences"));
+
+        // A pre-existing broken crate: the rewrite itself is sound,
+        // but `cargo check` cannot go green, so the attempt reverts
+        // and names the verifier (the workspace stays byte-identical).
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = base.path().join("ws");
+        std::fs::create_dir_all(workspace.join("src")).expect("dirs");
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"fp_decline_ver\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        let broken = "pub fn parse_opts( {\n";
+        std::fs::write(workspace.join("src/lib.rs"), broken).expect("lib");
+        let attempt =
+            try_fast_path(&workspace, "Rename parse_opts to parse_options", &policy).await;
+        assert_eq!(attempt.decline, Some("intent-rename-verify-failed"));
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("src/lib.rs")).expect("lib"),
+            broken,
+            "a declined fast path restores byte-for-byte"
+        );
     }
 
     #[tokio::test]

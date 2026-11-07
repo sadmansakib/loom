@@ -1726,6 +1726,19 @@ model tier under them (arXiv 2607.06906).
      rollback-able application and `record_fast_path` books
      zero-request solves with no event schema change.
 
+     **Precondition shipped (2026-11-07).** The coarse reason is
+     split (event schema 14 → 15, additive; free-string wire): the
+     rename declines now carry `intent-rename-collision`,
+     `intent-rename-zero-occurrences`,
+     `intent-rename-too-many-occurrences`,
+     `intent-rename-verify-failed`, or `intent-rename-write-failed`
+     (`intent-rename-unsolved` remains the unclassified fallback).
+     The revisit trigger is now one grep over recorded events —
+     `fast_path_declined` with `reason == "intent-rename-collision"`
+     — with no authored fixtures needed. The fallback itself stays
+     deferred until that trigger fires. Design:
+     `docs/fastpath-decline-reasons-design.md`.
+
 
 35. **SWE-bench Multilingual: the Rust slice as a parallel eval path** (G3, G6, G8).
    Goal: a second, harder benchmark surface — 43 Rust tasks across 7

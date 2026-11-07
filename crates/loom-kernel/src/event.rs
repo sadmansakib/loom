@@ -83,7 +83,15 @@ use tokio_util::sync::CancellationToken;
 /// extended at a turn boundary on deterministic progress evidence).
 /// v13 adds the `WritingPhase` stub reason (item 10: phase-aware
 /// retention masked exploration reads during the writing phase).
-pub const EVENT_SCHEMA_VERSION: u16 = 14;
+/// v14 adds `AutofixApplied` (item 33: the self-optimization loop's
+/// autofix mechanism touched a file set during a task).
+/// v15 widens `FastPathDeclined`'s rename reason additively (item 34
+/// precondition): the coarse `intent-rename-unsolved` splits into
+/// `intent-rename-collision`, `intent-rename-zero-occurrences`,
+/// `intent-rename-too-many-occurrences`, `intent-rename-verify-failed`,
+/// and `intent-rename-write-failed`. The field stays a free string, so
+/// older payloads and readers are unaffected.
+pub const EVENT_SCHEMA_VERSION: u16 = 15;
 
 /// The evidence that justified a [`EventKind::TurnBudgetExtended`] grant
 /// (item 26): state the loop already tracks, never a model call.
@@ -200,9 +208,12 @@ pub enum EventKind {
     /// record exists, so this reads as a post-hoc annotation on the
     /// model-driven task that resulted. The workspace was untouched.
     FastPathDeclined {
-        /// Coarse decline reason: `"no-intent-match"` or
+        /// Decline reason: `"no-intent-match"`,
         /// `"intent-{kind}-unsolved"` (matched, but a guard or the
-        /// offline verifier said no).
+        /// offline verifier said no), or — for renames since schema
+        /// v15 — the specific guard (`intent-rename-collision`,
+        /// `intent-rename-zero-occurrences`, …; see
+        /// [`EVENT_SCHEMA_VERSION`]'s history).
         reason: String,
     },
     /// The authority that fixed the configured model's capabilities,
@@ -1027,6 +1038,16 @@ mod tests {
                 },
                 "fast_path_declined",
                 serde_json::json!({ "reason": "intent-rename-unsolved" }),
+            ),
+            // v15: the rename decline reasons split per cause (item
+            // 34); the wire stays a free string, so the new values
+            // round-trip beside the legacy coarse one.
+            (
+                EventKind::FastPathDeclined {
+                    reason: "intent-rename-collision".to_owned(),
+                },
+                "fast_path_declined",
+                serde_json::json!({ "reason": "intent-rename-collision" }),
             ),
             (
                 EventKind::CapabilitiesResolved {
