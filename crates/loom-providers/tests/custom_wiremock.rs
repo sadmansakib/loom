@@ -20,7 +20,7 @@
 
 use futures::StreamExt;
 use loom_kernel::model::{
-    Message, ModelError, ModelEvent, ModelProvider, ModelRequest, ModelResponse,
+    Message, ModelError, ModelEvent, ModelProvider, ModelRequest, ModelResponse, ReasoningEffort,
 };
 use loom_providers::{
     CustomConfig, CustomProvider, TimeoutConfig, fetch_custom_catalog, parse_custom_catalog,
@@ -40,6 +40,7 @@ fn request_for(model: &str) -> ModelRequest {
         temperature: None,
         stable_prefix_messages: None,
         context_editing: None,
+        reasoning_effort: None,
     }
 }
 
@@ -230,6 +231,59 @@ async fn chat_request_is_the_plain_openai_shape() {
     assert!(body.get("reasoning").is_none());
     assert!(body.get("reasoning_effort").is_none());
     assert!(body.get("thinking").is_none());
+}
+
+#[tokio::test]
+async fn reasoning_effort_rides_only_reasoning_capable_models() {
+    let server = MockServer::start().await;
+    // The live gateway's shape: `supports_reasoning: true` marks the
+    // model (roadmap item 9's catalog signal).
+    let catalog = r#"{
+        "data": [
+            {
+                "id": "gateway-model",
+                "context_window": 131072,
+                "max_output_tokens": 16384,
+                "supported_parameters": ["tools", "parallel_tool_calls"],
+                "supports_reasoning": true,
+                "pricing": { "prompt": 0.000001, "completion": 0.000002 }
+            },
+            { "id": "bare-model" }
+        ]
+    }"#;
+    let provider = provider_with_catalog(&server.uri(), catalog);
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(
+                sse(&[
+                    data_event(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
+                    done(),
+                ])
+                .into_bytes(),
+                "text/event-stream",
+            ),
+        )
+        .mount(&server)
+        .await;
+
+    // Capable model + a kernel level: forwarded verbatim.
+    let mut request = request_for(MODEL);
+    request.reasoning_effort = Some(ReasoningEffort::Low);
+    expect_completed(&drain(&provider, &request).await);
+
+    // Incapable model, same level: nothing sent — acceptance is not
+    // support.
+    let mut request = request_for("bare-model");
+    request.reasoning_effort = Some(ReasoningEffort::Low);
+    expect_completed(&drain(&provider, &request).await);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 2);
+    let capable: Value = serde_json::from_slice(&requests[0].body).expect("capable body is JSON");
+    assert_eq!(capable["reasoning_effort"], "low");
+    let bare: Value = serde_json::from_slice(&requests[1].body).expect("bare body is JSON");
+    assert!(bare.get("reasoning_effort").is_none());
 }
 
 #[tokio::test]

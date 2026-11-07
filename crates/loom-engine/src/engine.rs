@@ -12,10 +12,11 @@ use std::sync::Arc;
 use loom_kernel::agent::{Agent, TaskControl, TaskError, TaskSummary, TurnBudget};
 use loom_kernel::context::{
     AgentConfig, ContextCompiler, DefaultContextCompiler, PruneConfig, PruningContextCompiler,
+    ReasoningSchedule,
 };
 use loom_kernel::event::{EventKind, EventSink, PersistingEventSink};
 use loom_kernel::id::SessionId;
-use loom_kernel::model::ModelProvider;
+use loom_kernel::model::{ModelProvider, ReasoningEffort as KernelReasoningEffort};
 use loom_kernel::session::Session;
 use loom_kernel::store::{SharedEventStore, StoreError};
 use loom_kernel::tool::ToolRegistry;
@@ -31,6 +32,49 @@ use loom_tools::{
 
 use crate::auth::{self, KeychainBackend, SqliteAuthStore};
 use crate::scout::{ScoutConfig, ScoutTool};
+
+/// Maps the operator's provider-level effort flag onto the kernel's
+/// per-request intent (roadmap item 9). `None` sends nothing — the
+/// provider default, and the byte-off behavior.
+fn kernel_effort(effort: ReasoningEffort) -> Option<KernelReasoningEffort> {
+    match effort {
+        ReasoningEffort::None => None,
+        ReasoningEffort::Low => Some(KernelReasoningEffort::Low),
+        ReasoningEffort::High | ReasoningEffort::Max => Some(KernelReasoningEffort::High),
+    }
+}
+
+/// `LOOM_REASONING_SCHEDULE` seam (roadmap item 9 via item 20.2's
+/// sweepable-env pattern): `fixed` (the default, byte-identical) or
+/// `progressive`, with `LOOM_REASONING_OPEN_TURNS` (default 2)
+/// setting how many opening turns run at high effort. Unset keeps the
+/// default; an invalid value warns and falls back rather than failing
+/// a run over a knob.
+fn reasoning_schedule_from_env() -> ReasoningSchedule {
+    let Some(raw) = std::env::var("LOOM_REASONING_SCHEDULE")
+        .ok()
+        .filter(|raw| !raw.is_empty())
+    else {
+        return ReasoningSchedule::Fixed;
+    };
+    match raw.as_str() {
+        "fixed" => ReasoningSchedule::Fixed,
+        "progressive" => {
+            let open_turns = std::env::var("LOOM_REASONING_OPEN_TURNS")
+                .ok()
+                .and_then(|raw| raw.parse::<u16>().ok())
+                .unwrap_or(2);
+            ReasoningSchedule::Progressive { open_turns }
+        }
+        other => {
+            tracing::warn!(
+                value = other,
+                "unknown LOOM_REASONING_SCHEDULE; using fixed"
+            );
+            ReasoningSchedule::Fixed
+        }
+    }
+}
 /// Everything a frontend must decide before [`Engine::open`].
 ///
 /// `workspace` is canonicalized by the engine; the rest maps one-to-one to the
@@ -664,6 +708,12 @@ impl Engine {
         // Roadmap item 12: the operator's context-editing hint rides
         // the agent config verbatim (default None sends nothing).
         agent_config.context_editing = config.context_editing.clone();
+        // Roadmap item 9: per-turn reasoning effort. The fixed level
+        // maps from the operator's provider-level flag; the schedule
+        // is env-seamed so funded sweeps vary it without touching the
+        // frozen container script (the item 20.2 seam pattern).
+        agent_config.reasoning_effort = kernel_effort(config.reasoning_effort);
+        agent_config.reasoning_schedule = reasoning_schedule_from_env();
         let mut agent = Agent::new(provider, compiler, registry, agent_config, config.model)
             .with_max_turns(config.max_turns)
             .with_turn_budget(config.turn_budget)
@@ -1612,6 +1662,25 @@ pub enum EngineError {
 mod tests {
     use super::*;
     use futures::stream;
+
+    #[test]
+    fn kernel_effort_maps_provider_levels_onto_intent() {
+        // None is "send nothing" (byte-off); High and Max both land on
+        // the kernel's High — dialects without a max tier snap up.
+        assert_eq!(kernel_effort(ReasoningEffort::None), None);
+        assert_eq!(
+            kernel_effort(ReasoningEffort::Low),
+            Some(KernelReasoningEffort::Low)
+        );
+        assert_eq!(
+            kernel_effort(ReasoningEffort::High),
+            Some(KernelReasoningEffort::High)
+        );
+        assert_eq!(
+            kernel_effort(ReasoningEffort::Max),
+            Some(KernelReasoningEffort::High)
+        );
+    }
     use loom_kernel::context::{AgentConfig, DefaultContextCompiler, PruneConfig};
     use loom_kernel::model::{
         ModelCapabilities, ModelError, ModelErrorKind, ModelEvent, ModelProvider, ModelRequest,

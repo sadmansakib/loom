@@ -1032,6 +1032,23 @@ adds four more framing findings and backlog items 26–31 below.
     what a schedule needs to observe its own cost. The schedule itself
     (a kernel-side effort policy emitting those in-turn notes) remains
     open, gated on item 1.
+   **Schedule shipped (2026-11-07, item 1 funded):** the kernel now
+   carries per-turn effort as data — `ModelRequest.reasoning_effort`
+   (provider-agnostic intent, additive serde, byte-off default,
+   cache-blind because it never touches the message list) — and the
+   default compiler resolves it from an `AgentConfig` schedule:
+   `Fixed` (default, byte-identical) or `Progressive { open_turns }`
+   (high for the opening turns and the turn after a `verify` call,
+   low between). The custom adapter forwards the level as
+   `reasoning_effort` only when the fetched catalog marks the model
+   reasoning-capable (`supports_reasoning`, the funded gateway's
+   field — passthrough behaviorally verified: low vs high effort
+   moved a probe answer 54 -> 89 completion tokens). Sweeps select
+   the policy with `swebench-run --reasoning-schedule
+   <fixed|progressive>` (env-forwarded, recorded in sweep
+   provenance). The Anthropic in-turn system-message form above is
+   the follow-up for that adapter; routing slice zero below is the
+   other open half.
    **Routing slice zero (planned):** task-*start* model selection — a
    trivial classifier (task text → difficulty tier) that picks the model
    before `Agent` construction. Needs no Iteration-8 ADR because the

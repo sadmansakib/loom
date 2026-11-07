@@ -223,6 +223,7 @@ fn model_proposals(
             temperature: None,
             stable_prefix_messages: None,
             context_editing: None,
+            reasoning_effort: None,
         };
         let mut stream = handle.provider.stream(&request);
         let mut text = String::new();

@@ -619,6 +619,7 @@ mod tests {
             temperature: None,
             stable_prefix_messages: None,
             context_editing: None,
+            reasoning_effort: None,
         }
     }
 

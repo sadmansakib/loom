@@ -21,9 +21,9 @@
 
 use super::{
     AgentConfig, CompiledContext, ContextCensus, ContextError, ContextInput, HeuristicEstimator,
-    KnownFacts, TokenEstimator, estimate_serialized,
+    KnownFacts, ReasoningSchedule, TokenEstimator, estimate_serialized,
 };
-use crate::model::{Message, ModelCapabilities, ModelRequest};
+use crate::model::{Message, ModelCapabilities, ModelRequest, ReasoningEffort};
 use crate::tool::{ToolEffects, ToolRegistry};
 use crate::transcript::{Item, ToolResult};
 use std::sync::Arc;
@@ -59,6 +59,55 @@ impl DefaultContextCompiler {
     }
 }
 
+/// Resolves this request's reasoning-effort intent (roadmap item 9):
+/// `None` whenever the model cannot reason or no level applies.
+///
+/// [`ReasoningSchedule::Fixed`] copies the configured level (default
+/// `None` — byte-off). [`ReasoningSchedule::Progressive`] runs High for
+/// the session's first `open_turns` assistant turns and on the first
+/// request after a `verify` tool call (the post-verification
+/// accept/iterate decision), Low in between. The level rides the
+/// request, never the message list, so the stable prefix and the
+/// prompt-cache decisions stay blind to it.
+fn effort_for_turn(input: &ContextInput<'_>) -> Option<ReasoningEffort> {
+    if !input.capabilities.reasoning {
+        return None;
+    }
+    match input.config.reasoning_schedule {
+        ReasoningSchedule::Fixed => input.config.reasoning_effort,
+        ReasoningSchedule::Progressive { open_turns } => {
+            let assistant_turns = input
+                .session
+                .transcript
+                .iter()
+                .filter(|item| matches!(item, Item::Assistant(_)))
+                .count();
+            if assistant_turns < usize::from(open_turns) {
+                return Some(ReasoningEffort::High);
+            }
+            // The last assistant turn decides: if it called `verify`,
+            // this request is the post-verification decision turn.
+            let verify_pending = input.session.transcript.iter().rev().find_map(|item| {
+                if let Item::Assistant(assistant) = item {
+                    Some(
+                        assistant
+                            .tool_calls
+                            .iter()
+                            .any(|call| &*call.name == "verify"),
+                    )
+                } else {
+                    None
+                }
+            });
+            if verify_pending == Some(true) {
+                Some(ReasoningEffort::High)
+            } else {
+                Some(ReasoningEffort::Low)
+            }
+        }
+    }
+}
+
 impl super::ContextCompiler for DefaultContextCompiler {
     fn compile(&self, input: ContextInput<'_>) -> Result<CompiledContext, ContextError> {
         let (messages, facts_tokens) =
@@ -79,6 +128,7 @@ impl super::ContextCompiler for DefaultContextCompiler {
             // what the provider sends the model, not this projection —
             // the census and budget check below stay hint-blind.
             context_editing: input.config.context_editing.clone(),
+            reasoning_effort: effort_for_turn(&input),
         };
         let census = census(&request, facts_tokens, &*self.estimator);
         if census.total > input.budget.max_input_tokens {
@@ -446,6 +496,90 @@ mod tests {
             &tuned,
         ));
         assert_eq!(compiled.unwrap().request.context_editing, Some(hint));
+    }
+
+    #[test]
+    fn reasoning_effort_rides_only_when_configured() {
+        let session = session();
+
+        // Default config (Fixed, no level): byte-off — nothing rides.
+        let plain = compile(&session, &registry(), budget()).unwrap();
+        assert_eq!(plain.request.reasoning_effort, None);
+
+        // Fixed + explicit level on a reasoning-capable model: the
+        // level rides verbatim (the compiler copies, never interprets).
+        let mut tuned = config();
+        tuned.reasoning_effort = Some(ReasoningEffort::High);
+        let compiled = DefaultContextCompiler::default().compile(input(
+            &session,
+            &registry(),
+            &task_record(),
+            budget(),
+            &capabilities(),
+            &tuned,
+        ));
+        assert_eq!(
+            compiled.unwrap().request.reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+
+        // A model that cannot reason never gets a level, even when one
+        // is configured: sending it would be a silent no-op at best.
+        let fixed_caps = ModelCapabilities::new(100_000).with_tool_calls(true);
+        let compiled = DefaultContextCompiler::default().compile(input(
+            &session,
+            &registry(),
+            &task_record(),
+            budget(),
+            &fixed_caps,
+            &tuned,
+        ));
+        assert_eq!(compiled.unwrap().request.reasoning_effort, None);
+    }
+
+    #[test]
+    fn progressive_schedule_modulates_effort_by_turn() {
+        let mut tuned = config();
+        tuned.reasoning_schedule = ReasoningSchedule::Progressive { open_turns: 1 };
+        let effort_of = |session: &Session| {
+            DefaultContextCompiler::default()
+                .compile(input(
+                    session,
+                    &registry(),
+                    &task_record(),
+                    budget(),
+                    &capabilities(),
+                    &tuned,
+                ))
+                .unwrap()
+                .request
+                .reasoning_effort
+        };
+
+        // Opening turn (no assistant history yet): high effort.
+        assert_eq!(effort_of(&session()), Some(ReasoningEffort::High));
+
+        // Past the opening, nothing to verify: low.
+        let mut mid = session();
+        mid.push_item(Item::Assistant(assistant("digging", StopReason::EndTurn)))
+            .unwrap();
+        assert_eq!(effort_of(&mid), Some(ReasoningEffort::Low));
+
+        // The turn after a `verify` call: high again — the
+        // accept/iterate decision deserves opening-turn effort.
+        let mut verifying = session();
+        verifying
+            .append_turn(
+                AssistantMessage {
+                    content: "checking".into(),
+                    reasoning: None,
+                    tool_calls: vec![call("v1", "verify")],
+                    stop_reason: StopReason::ToolCalls,
+                },
+                vec![result_for("v1")],
+            )
+            .unwrap();
+        assert_eq!(effort_of(&verifying), Some(ReasoningEffort::High));
     }
 
     /// A registered tool (dummy — the compiler only reads specs).

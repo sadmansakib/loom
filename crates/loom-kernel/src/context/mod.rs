@@ -238,6 +238,34 @@ pub struct AgentConfig {
     /// set. `None` (the default) sends nothing — kernel-owned
     /// projection stays the only context authority.
     pub context_editing: Option<crate::model::ContextEditingHint>,
+    /// Fixed reasoning-effort intent (roadmap item 9): the level
+    /// [`ReasoningSchedule::Fixed`] stamps on every request, and the
+    /// baseline a modulating schedule replaces. `None` (the default)
+    /// sends nothing.
+    pub reasoning_effort: Option<crate::model::ReasoningEffort>,
+    /// Per-turn reasoning-effort policy (roadmap item 9). The default
+    /// `Fixed` keeps behavior byte-identical; `Progressive` raises
+    /// effort on the opening turns and while verification is due.
+    pub reasoning_schedule: ReasoningSchedule,
+}
+
+/// How the kernel resolves each request's reasoning effort (roadmap
+/// item 9). The level itself is an intent on
+/// [`crate::model::ModelRequest`]; this policy says which level the
+/// compiler picks per turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningSchedule {
+    /// One level for every request: `AgentConfig::reasoning_effort`
+    /// verbatim (possibly `None`). The default — nothing changes until
+    /// an operator or sweep opts in.
+    Fixed,
+    /// High effort for the first `open_turns` assistant turns of the
+    /// session and on the turn after a `verify` tool call (the
+    /// post-verification accept/iterate decision), low in between.
+    Progressive {
+        /// How many of the session's opening turns run at high effort.
+        open_turns: u16,
+    },
 }
 
 impl AgentConfig {
@@ -249,6 +277,8 @@ impl AgentConfig {
             system_prompt: system_prompt.into(),
             handoff_compaction: true,
             context_editing: None,
+            reasoning_effort: None,
+            reasoning_schedule: ReasoningSchedule::Fixed,
         }
     }
 }

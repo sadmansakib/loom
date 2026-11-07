@@ -196,6 +196,34 @@ impl Message {
     }
 }
 
+/// Provider-agnostic reasoning-effort intent for one request (roadmap
+/// item 9). The kernel resolves a level per turn (a schedule); adapters
+/// translate it into their wire dialect or ignore the whole hint — an
+/// adapter that cannot steer effort sends nothing, exactly like
+/// [`ContextEditingHint`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    /// Low effort: mid-task turns between the opening and verification.
+    Low,
+    /// Medium effort (dialects without it snap to the nearest side).
+    Medium,
+    /// High effort: opening turns and post-verification decisions.
+    High,
+}
+
+impl ReasoningEffort {
+    /// Wire string for the OpenAI-compatible `reasoning_effort` field.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        }
+    }
+}
+
 /// A single request to a model, produced by the context compiler.
 ///
 /// All fields are provider-neutral; the adapter translates them into its
@@ -236,6 +264,15 @@ pub struct ModelRequest {
     /// until a frontend opts in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_editing: Option<ContextEditingHint>,
+    /// Per-turn reasoning-effort intent (roadmap item 9): the kernel's
+    /// schedule resolved this request's level. `None` (the default)
+    /// sends nothing; adapters that cannot steer effort ignore it. The
+    /// level rides the request, never the message list, so the
+    /// stable-prefix and prompt-cache decisions are blind to it.
+    /// Additive and skipped when off, so serialized requests stay
+    /// byte-identical until a schedule opts in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// Provider-agnostic intent for server-side clearing of stale tool
@@ -656,6 +693,7 @@ mod tests {
             temperature: None,
             stable_prefix_messages: None,
             context_editing: None,
+            reasoning_effort: Some(ReasoningEffort::High),
         };
         let json = serde_json::to_string(&request).unwrap();
         let back: ModelRequest = serde_json::from_str(&json).unwrap();
@@ -673,6 +711,7 @@ mod tests {
         }"#;
         let back: ModelRequest = serde_json::from_str(legacy).unwrap();
         assert_eq!(back.stable_prefix_messages, None);
+        assert_eq!(back.reasoning_effort, None);
     }
 
     #[test]
@@ -690,6 +729,7 @@ mod tests {
                 clear_at_least_tokens: Some(5_000),
                 exclude_tools: vec![String::from("scout")],
             }),
+            reasoning_effort: Some(ReasoningEffort::Medium),
         };
         let json = serde_json::to_string(&request).unwrap();
         let back: ModelRequest = serde_json::from_str(&json).unwrap();
@@ -709,9 +749,11 @@ mod tests {
             temperature: None,
             stable_prefix_messages: Some(2),
             context_editing: None,
+            reasoning_effort: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(!json.contains("context_editing"));
+        assert!(!json.contains("reasoning_effort"));
         // Legacy bytes (pre-hint) deserialize with the hint off.
         let legacy = r#"{
             "model": "deepseek-flash",

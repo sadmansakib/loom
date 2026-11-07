@@ -88,6 +88,7 @@ fn request_buildable_and_streamable_outside_core() {
         temperature: None,
         stable_prefix_messages: None,
         context_editing: None,
+        reasoning_effort: None,
     };
 
     let stream = provider.stream(&request);

@@ -885,6 +885,10 @@ pub struct SweepProvenance {
     pub prompt_version: &'static str,
     /// loom-eval's own package version (the runner's identity).
     pub runner_version: &'static str,
+    /// Reasoning-effort schedule the sweep ran under (roadmap item 9):
+    /// `fixed` or `progressive`. Recorded so an effort A/B's arms are
+    /// identifiable from the report alone.
+    pub reasoning_schedule: String,
 }
 
 /// sha256 of `bytes` as lowercase hex.
@@ -906,6 +910,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 pub fn sweep_provenance(
     loom_bin: Option<&Path>,
     agent: AgentKind,
+    reasoning_schedule: &str,
 ) -> std::io::Result<SweepProvenance> {
     let loom_sha256 = match loom_bin {
         Some(loom_bin) => {
@@ -920,6 +925,7 @@ pub fn sweep_provenance(
         container_script_sha256: sha256_hex(container_script(agent).as_bytes()),
         prompt_version: PROMPT_VERSION,
         runner_version: env!("CARGO_PKG_VERSION"),
+        reasoning_schedule: reasoning_schedule.to_owned(),
     })
 }
 
@@ -1512,7 +1518,7 @@ fn sweep_provenance_hashes_the_staged_binary_and_script() {
     std::fs::create_dir_all(&dir).unwrap();
     let bin = dir.join("loom");
     std::fs::write(&bin, b"pretend elf").unwrap();
-    let provenance = sweep_provenance(Some(&bin), AgentKind::Loom).unwrap();
+    let provenance = sweep_provenance(Some(&bin), AgentKind::Loom, "fixed").unwrap();
     assert_eq!(
         provenance.loom_sha256.as_deref(),
         Some(sha256_hex(b"pretend elf").as_str())
@@ -1526,7 +1532,7 @@ fn sweep_provenance_hashes_the_staged_binary_and_script() {
     // A different binary must yield a different digest — the whole
     // point of the mixed-build guard.
     std::fs::write(&bin, b"pretend elf v2").unwrap();
-    let rebuilt = sweep_provenance(Some(&bin), AgentKind::Loom).unwrap();
+    let rebuilt = sweep_provenance(Some(&bin), AgentKind::Loom, "fixed").unwrap();
     assert_ne!(rebuilt.loom_sha256, provenance.loom_sha256);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1624,8 +1630,8 @@ fn provenance_hashes_the_selected_agents_script() {
     std::fs::create_dir_all(&dir).unwrap();
     let bin = dir.join("loom");
     std::fs::write(&bin, b"pretend elf").unwrap();
-    let loom = sweep_provenance(Some(&bin), AgentKind::Loom).expect("provenance");
-    let mini = sweep_provenance(Some(&bin), AgentKind::Mini).expect("provenance");
+    let loom = sweep_provenance(Some(&bin), AgentKind::Loom, "fixed").expect("provenance");
+    let mini = sweep_provenance(Some(&bin), AgentKind::Mini, "fixed").expect("provenance");
     assert_eq!(
         loom.container_script_sha256,
         sha256_hex(CONTAINER_SCRIPT.as_bytes())

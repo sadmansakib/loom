@@ -98,6 +98,7 @@ fn plain_request(model: &str, prompt: &str) -> ModelRequest {
         temperature: None,
         stable_prefix_messages: None,
         context_editing: None,
+        reasoning_effort: None,
     }
 }
 

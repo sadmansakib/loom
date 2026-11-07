@@ -448,10 +448,25 @@ impl WireEndpoint for CustomProvider {
     }
 
     fn request_body(&self, request: &ModelRequest) -> Value {
-        // Plain OpenAI wire: no dialect fields. A gateway that wants
-        // extra body parameters would need them appended here, the
-        // same way the hosted dialects do.
-        build_request_body(request, &WireOptions::default())
+        // Plain OpenAI wire plus one intent field: per-turn reasoning
+        // effort (roadmap item 9), forwarded only when the catalog
+        // marks the model reasoning-capable — a gateway that accepts
+        // any body is not evidence it steers anything — and the
+        // kernel asked for a level. It rides extra_body, never the
+        // message list, so cache breakpoints are unaffected.
+        let mut options = WireOptions::default();
+        if let Some(effort) = request.reasoning_effort
+            && self
+                .catalog
+                .capabilities(&request.model)
+                .is_some_and(|capabilities| capabilities.reasoning)
+        {
+            options.extra_body.insert(
+                String::from("reasoning_effort"),
+                Value::from(effort.as_str()),
+            );
+        }
+        build_request_body(request, &options)
     }
 
     fn extra_headers(&self) -> Vec<(reqwest::header::HeaderName, String)> {

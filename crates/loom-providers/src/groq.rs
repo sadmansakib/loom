@@ -386,6 +386,7 @@ mod tests {
             temperature: None,
             stable_prefix_messages: None,
             context_editing: None,
+            reasoning_effort: None,
         };
         let body = provider.request_body(&request);
         assert_eq!(body["reasoning_effort"], "high", "default effort");

@@ -1856,8 +1856,10 @@ impl Agent {
             temperature: None,
             stable_prefix_messages: None,
             // The handoff is a one-shot summary call — no history to
-            // clear, so no context-editing hint rides it.
+            // clear, so no context-editing hint rides it, and no
+            // schedule applies (compression, not reasoning work).
             context_editing: None,
+            reasoning_effort: None,
         };
         let response = self
             .stream_with_retry(&request, task_id, sink, cancellation, accounting)
@@ -3203,6 +3205,7 @@ mod tests {
             temperature: None,
             stable_prefix_messages: None,
             context_editing: None,
+            reasoning_effort: None,
         }
     }
 

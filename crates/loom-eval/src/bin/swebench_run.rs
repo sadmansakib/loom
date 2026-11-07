@@ -53,6 +53,14 @@ struct Args {
     /// the sweep report's provenance (roadmap item 1's offline
     /// remainder), digest-checked against this sweep's dataset.
     suite_audit: Option<PathBuf>,
+    /// Per-turn reasoning-effort policy forwarded to the in-container
+    /// loom (roadmap item 9): `fixed` (default) or `progressive`.
+    /// Recorded in sweep provenance and forwarded as
+    /// `LOOM_REASONING_SCHEDULE` — `fixed` included, so the report's
+    /// claim and the container env cannot disagree.
+    reasoning_schedule: String,
+    /// Opening turns at high effort under `progressive`.
+    reasoning_open_turns: u16,
 }
 
 fn csv(value: &str) -> Vec<String> {
@@ -110,6 +118,15 @@ fn usage() -> ! {
                        flags in the sweep report's provenance, digest-checked
                        against this sweep's dataset (the flags are structural
                        hypotheses, labeled unconfirmed until the mutant re-grade)
+  --reasoning-schedule <fixed|progressive>
+                       per-turn reasoning-effort policy for the in-container
+                       loom (default $LOOM_EVAL_REASONING_SCHEDULE or fixed):
+                       `progressive` forwards LOOM_REASONING_SCHEDULE=progressive
+                       so opening and post-verify turns run at high effort
+                       (roadmap item 9); the container script stays identical
+  --reasoning-open-turns <n>
+                       opening turns at high effort under progressive
+                       (default $LOOM_EVAL_REASONING_OPEN_TURNS or 2)
 
 Knobs mirror the environment forms: LOOM_EVAL_SWEBENCH_INSTANCES,
 LOOM_EVAL_SWEBENCH_REPOS, LOOM_EVAL_PROVIDER, LOOM_EVAL_MODEL,
@@ -149,6 +166,12 @@ fn parse_args() -> (Args, Vec<(String, String)>) {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("target/eval")),
         suite_audit: None,
+        reasoning_schedule: std::env::var("LOOM_EVAL_REASONING_SCHEDULE")
+            .unwrap_or_else(|_| "fixed".into()),
+        reasoning_open_turns: std::env::var("LOOM_EVAL_REASONING_OPEN_TURNS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(2),
     };
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
@@ -172,6 +195,10 @@ fn parse_args() -> (Args, Vec<(String, String)>) {
             "--agent" => args.agent = value(),
             "--eval-dir" => args.eval_dir = PathBuf::from(value()),
             "--suite-audit" => args.suite_audit = Some(PathBuf::from(value())),
+            "--reasoning-schedule" => args.reasoning_schedule = value(),
+            "--reasoning-open-turns" => {
+                args.reasoning_open_turns = value().parse().unwrap_or_else(|_| usage());
+            }
             "--help" | "-h" => usage(),
             _ => usage(),
         }
@@ -194,6 +221,14 @@ fn parse_args() -> (Args, Vec<(String, String)>) {
     }
     if args.agent != "loom" && args.agent != "mini" {
         eprintln!("--agent must be `loom` or `mini`");
+        std::process::exit(2);
+    }
+    if args.reasoning_schedule != "fixed" && args.reasoning_schedule != "progressive" {
+        eprintln!("--reasoning-schedule must be `fixed` or `progressive`");
+        std::process::exit(2);
+    }
+    if args.reasoning_open_turns == 0 {
+        eprintln!("--reasoning-open-turns must be positive");
         std::process::exit(2);
     }
     // A named provider (`loom provider add`) already recorded its
@@ -458,8 +493,9 @@ fn main() {
     // extend an eval dir whose recorded sweeps ran a different build —
     // silently mixing builds into one number is how the v3-100
     // headline spanned two binaries.
-    let provenance = swebench::sweep_provenance(loom_bin.as_deref(), agent)
-        .unwrap_or_else(|error| panic!("hashing the staged loom binary: {error}"));
+    let provenance =
+        swebench::sweep_provenance(loom_bin.as_deref(), agent, &args.reasoning_schedule)
+            .unwrap_or_else(|error| panic!("hashing the staged loom binary: {error}"));
     for entry in std::fs::read_dir(&base).into_iter().flatten().flatten() {
         let path = entry.path();
         if path.extension().is_some_and(|e| e == "json")
@@ -560,10 +596,24 @@ fn main() {
                 let mut header_pairs = registry_headers.clone();
                 header_pairs.push(("X-Loom-Run-Id".to_owned(), instance.instance_id.clone()));
                 header_pairs.push(("X-Loom-Attempt".to_owned(), attempt.to_string()));
-                let extra_env = vec![(
+                let mut extra_env = vec![(
                     "LOOM_HEADERS".to_owned(),
                     swebench::headers_env_value(&header_pairs),
                 )];
+                // Roadmap item 9: the effort policy rides env, not the
+                // frozen script. `fixed` is forwarded too, so the
+                // sweep report's provenance and the container's env
+                // cannot disagree.
+                extra_env.push((
+                    "LOOM_REASONING_SCHEDULE".to_owned(),
+                    args.reasoning_schedule.clone(),
+                ));
+                if args.reasoning_schedule == "progressive" {
+                    extra_env.push((
+                        "LOOM_REASONING_OPEN_TURNS".to_owned(),
+                        args.reasoning_open_turns.to_string(),
+                    ));
+                }
                 let spec = ContainerSpec {
                     agent,
                     script_override: None,
@@ -780,6 +830,7 @@ fn main() {
         "container_script_sha256": provenance.container_script_sha256,
         "prompt_version": provenance.prompt_version,
         "runner_version": provenance.runner_version,
+        "reasoning_schedule": provenance.reasoning_schedule,
     });
     if let Some(weak) = &suite_audit_block {
         provenance_json["suite_audit"] =

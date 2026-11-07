@@ -432,7 +432,7 @@ fn main() {
     // Honesty rule, same as the Verified sweep: one headline, one
     // engine build. Refuse to extend an eval dir whose recorded Rust
     // sweeps ran a different build.
-    let provenance = swebench::sweep_provenance(Some(&loom_bin), AgentKind::Loom)
+    let provenance = swebench::sweep_provenance(Some(&loom_bin), AgentKind::Loom, "fixed")
         .unwrap_or_else(|error| panic!("hashing the staged loom binary: {error}"));
     for entry in std::fs::read_dir(&base).into_iter().flatten().flatten() {
         let path = entry.path();

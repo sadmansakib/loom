@@ -835,6 +835,7 @@ mod tests {
             temperature: None,
             stable_prefix_messages: None,
             context_editing: None,
+            reasoning_effort: None,
         }
     }
 
@@ -875,6 +876,7 @@ mod tests {
                 temperature: Some(0.2),
                 stable_prefix_messages: None,
                 context_editing: None,
+                reasoning_effort: None,
                 ..request()
             },
             &wire_options(),
