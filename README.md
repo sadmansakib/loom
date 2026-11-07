@@ -60,6 +60,10 @@ loom run --provider deepseek "fix the failing test and make cargo test pass"
 # queues at the next turn boundary; /rewind, /stats, /new work on it
 loom chat --provider deepseek
 
+# add --bg-commands to detach long builds: their completion notice
+# steers back in at the next turn boundary (loom chat/run)
+loom chat --provider deepseek --bg-commands
+
 # any OpenAI-compatible gateway
 export CUSTOM_API_KEY=...
 loom run --provider custom --base-url https://gateway.example/v1 \

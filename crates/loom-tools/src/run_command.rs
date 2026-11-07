@@ -699,7 +699,7 @@ fn tee(text: &mut String, ctx: &ToolContext, body: &str) -> Option<ArtifactRef> 
 /// sitting early on `PATH` passes here, shadows a later entry that would
 /// have worked, and the failure then surfaces from the spawn as a
 /// permissions error rather than the legible "not found on PATH".
-fn resolve_in_path(program: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn resolve_in_path(program: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|dir| dir.join(program))

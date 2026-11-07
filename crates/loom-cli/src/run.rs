@@ -507,6 +507,7 @@ pub(crate) fn engine_config_from(
         models_url: flags.models_url.clone(),
         headers,
         routing,
+        background_commands: flags.bg_commands,
         reasoning_effort: flags.reasoning_effort,
         account: flags.account.clone(),
         workspace: flags.workspace.clone(),

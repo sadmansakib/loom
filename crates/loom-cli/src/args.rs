@@ -149,6 +149,14 @@ pub struct RunFlags {
     #[arg(long, value_name = "MODEL", env = "LOOM_ROUTE_HARD")]
     pub route_hard: Option<String>,
 
+    /// Background commands (item 13): register `run_background` and
+    /// `command_status`, let long commands run detached instead of
+    /// blocking a turn, and steer their completion notices in at the
+    /// next turn boundary. Interactive lever — headless eval runs keep
+    /// it off.
+    #[arg(long, env = "LOOM_BG_COMMANDS")]
+    pub bg_commands: bool,
+
     /// Reasoning effort, sent explicitly on every request by providers
     /// that accept one (DeepSeek); ignored elsewhere.
     #[arg(long, default_value = "high")]
@@ -911,6 +919,40 @@ mod tests {
         };
         assert_eq!(args.flags.route_easy, None);
         assert_eq!(args.flags.route_hard, None);
+    }
+
+    #[test]
+    fn bg_commands_is_opt_in_and_shared_by_run_and_chat() {
+        // The flag registers the detached-command tools; the byte-off
+        // default keeps headless runs (eval harnesses included) free
+        // of the poll protocol.
+        let cli = parse(&[
+            "loom",
+            "chat",
+            "--provider",
+            "glm",
+            "--model",
+            "glm-5",
+            "--bg-commands",
+        ]);
+        let Command::Chat(args) = cli.command else {
+            panic!("expected `chat`");
+        };
+        assert!(args.flags.bg_commands);
+
+        let cli = parse(&[
+            "loom",
+            "run",
+            "--provider",
+            "glm",
+            "--model",
+            "glm-5",
+            "work",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected `run`");
+        };
+        assert!(!args.flags.bg_commands);
     }
 
     #[test]

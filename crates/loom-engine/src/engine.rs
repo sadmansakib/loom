@@ -26,8 +26,8 @@ use loom_providers::{
 use loom_store::SqliteStore;
 use loom_tools::policy::{AskResolver, CommandPolicy};
 use loom_tools::{
-    ArtifactReadTool, EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool,
-    ToolBudgets, VerifyTool, WriteFileTool,
+    ArtifactReadTool, BackgroundJobs, CommandStatusTool, EditFileTool, ListDirTool, ReadFileTool,
+    RunBackgroundTool, RunCommandTool, SearchTool, ToolBudgets, VerifyTool, WriteFileTool,
 };
 
 use crate::auth::{self, KeychainBackend, SqliteAuthStore};
@@ -163,6 +163,13 @@ pub struct EngineConfig {
     /// task on `model`; a wired `easy` can only route down (cheaper),
     /// and `hard` is a separate opt-in.
     pub routing: Option<crate::routing::RoutingConfig>,
+    /// Background commands (roadmap item 13): opt-in interactive-mode
+    /// lever. When true the registry grows `run_background` and
+    /// `command_status`, long commands run detached instead of blocking
+    /// a turn, and their completions ride the steering queue at the
+    /// next turn boundary. Headless eval runs keep it off — a detached
+    /// poll adds bytes the frozen protocol does not have.
+    pub background_commands: bool,
     /// Tree-sitter symbol tools (roadmap item 18): when false (the
     /// default) `symbols_overview`/`replace_symbol` stay out of the
     /// registry, so the frozen SWE-bench protocol and every existing
@@ -251,6 +258,7 @@ pub(crate) fn test_config() -> EngineConfig {
         catalog: None,
         scout: None,
         routing: None,
+        background_commands: false,
         symbols: false,
         git: false,
         skills: false,
@@ -270,6 +278,13 @@ pub(crate) fn test_config() -> EngineConfig {
 /// provider, the credential, or the tool registry again.
 pub struct Engine {
     agent: Agent,
+    /// Background-command registry (roadmap item 13): present only
+    /// when `EngineConfig::background_commands` opted in and the
+    /// loop is not the bare baseline. Holds every detached job for
+    /// the engine's lifetime — jobs outlive single tasks; the last
+    /// registry drop kills whatever still runs (the same group
+    /// reaping a foreground timeout performs).
+    background: Option<BackgroundJobs>,
     /// Routing slice zero (roadmap item 9): the Easy-tier agent,
     /// built at open when `EngineConfig::routing` wires one. Same
     /// provider, registry (scout registration included), and agent
@@ -582,6 +597,34 @@ impl Engine {
                     message: error.to_string(),
                 })?;
         }
+        // Roadmap item 13: background commands. Opt-in via
+        // `EngineConfig::background_commands`; the bare-loop arm never
+        // carries them. The job registry is engine-owned — detached jobs
+        // outlive single tasks, and the last drop reaps whatever still
+        // runs (the same process-group kill a foreground timeout
+        // performs). Completion notices wait in the registry until a
+        // running task's watcher steers them in at a turn boundary.
+        let background_jobs = if config.background_commands && !overrides.bare_loop {
+            let jobs = BackgroundJobs::default();
+            registry
+                .register(Box::new(RunBackgroundTool::new(
+                    policy.clone(),
+                    jobs.clone(),
+                )))
+                .map_err(|error| EngineError::RegisterTool {
+                    tool: "run_background",
+                    message: error.to_string(),
+                })?;
+            registry
+                .register(Box::new(CommandStatusTool::new(jobs.clone())))
+                .map_err(|error| EngineError::RegisterTool {
+                    tool: "command_status",
+                    message: error.to_string(),
+                })?;
+            Some(jobs)
+        } else {
+            None
+        };
         // Roadmap item 18: tree-sitter symbol tools. Opt-in via
         // `EngineConfig::symbols`; the bare-loop arm never carries them.
         // Roadmap item 30: the symbol tools serve Rust, Python, and
@@ -829,6 +872,7 @@ impl Engine {
             agent = agent.with_artifacts(Some(Arc::new(artifacts)));
             Ok(Self {
                 agent,
+                background: background_jobs,
                 routing_easy,
                 routing_hard,
                 workspace,
@@ -844,6 +888,7 @@ impl Engine {
         } else {
             Ok(Self {
                 agent,
+                background: background_jobs,
                 routing_easy,
                 routing_hard,
                 workspace,
@@ -1164,10 +1209,37 @@ impl Engine {
             crate::routing::Tier::Medium => None,
         };
         let routed_notice = routed_agent.map(|routed| (tier, routed.model.clone()));
+        // Roadmap item 13: while the loop runs, a watcher polls the
+        // background-job registry and steers completion notices in —
+        // they land at the next turn boundary as user items, exactly
+        // like a human steering mid-task. Prior completions (jobs that
+        // finished between tasks) are drained up front so the first
+        // turn of this task sees them. Notices that land after the
+        // final turn stay queued for the next run_task — nothing is
+        // lost, and the frozen eval protocol never sees any of this
+        // (background_commands is off there).
+        let background_watcher = self.background.as_ref().map(|jobs| {
+            for notice in jobs.take_finished_notices() {
+                control.steer(notice);
+            }
+            let jobs = jobs.clone();
+            let control = control.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    for notice in jobs.take_finished_notices() {
+                        control.steer(notice);
+                    }
+                }
+            })
+        });
         let outcome = match routed_agent {
             Some(routed) => routed.agent.run_task(session, input, sink, control).await,
             None => self.agent.run_task(session, input, sink, control).await,
         };
+        if let Some(watcher) = background_watcher {
+            watcher.abort();
+        }
         // v8 surfaced decisions, attributed to the task that just ran:
         // the fast-path attempt that fell through (post-hoc — the
         // attempt happens before a task record exists), then the
@@ -1339,6 +1411,7 @@ fn compose_scout(
         catalog: parent.catalog.clone(),
         scout: None,
         routing: None,
+        background_commands: false,
         symbols: false,
         git: false,
         skills: false,
@@ -1945,6 +2018,7 @@ mod tests {
         Engine {
             agent,
             routing_easy: None,
+            background: None,
             routing_hard: None,
             workspace: PathBuf::from("."),
             policy: CommandPolicy::default(),
@@ -2054,6 +2128,7 @@ mod tests {
                 model: "cheap-model".to_owned(),
             }),
             routing_hard: None,
+            background: None,
             workspace: PathBuf::from("."),
             policy: CommandPolicy::default(),
             fast_paths: false,
@@ -2119,6 +2194,128 @@ mod tests {
         assert!(!kinds.iter().any(|kind| matches!(
             kind,
             EventKind::HarnessNotice { category, .. } if category == "routing"
+        )));
+    }
+
+    /// One script: an assistant turn that detaches one background job.
+    fn run_background_script() -> Vec<Result<ModelEvent, ModelError>> {
+        use loom_kernel::transcript::{ToolArguments, ToolCall, ToolCallId};
+        let call = ToolCall {
+            id: ToolCallId::try_from(format!("bg-{}", std::process::id())).unwrap(),
+            name: "run_background".to_owned(),
+            arguments: ToolArguments::try_from(serde_json::json!({
+                "program": "echo",
+                "args": ["detached hi"],
+            }))
+            .expect("arguments"),
+        };
+        vec![Ok(ModelEvent::Completed(ModelResponse {
+            message: AssistantMessage {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![call],
+                stop_reason: StopReason::ToolCalls,
+            },
+            usage: Usage::default(),
+        }))]
+    }
+
+    /// One script: an assistant turn that asks `command_status` for the
+    /// background-job list.
+    fn command_status_script() -> Vec<Result<ModelEvent, ModelError>> {
+        use loom_kernel::transcript::{ToolArguments, ToolCall, ToolCallId};
+        let call = ToolCall {
+            id: ToolCallId::try_from(format!("st-{}", std::process::id())).unwrap(),
+            name: "command_status".to_owned(),
+            arguments: ToolArguments::try_from(serde_json::json!({
+                "action": "list",
+            }))
+            .expect("arguments"),
+        };
+        vec![Ok(ModelEvent::Completed(ModelResponse {
+            message: AssistantMessage {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![call],
+                stop_reason: StopReason::ToolCalls,
+            },
+            usage: Usage::default(),
+        }))]
+    }
+
+    #[tokio::test]
+    async fn background_completions_steer_into_the_next_task() {
+        // Item 13, end-to-end offline: with the config flag on the
+        // registry grows `run_background`/`command_status`, a detached
+        // job does not block the task that spawned it, and its
+        // completion notice — still queued when that task ends — is
+        // steered into the opening turn of the next task instead of
+        // being lost.
+        let base = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config();
+        config.workspace = base.path().to_path_buf();
+        config.db_path = base.path().join("loom.db");
+        config.background_commands = true;
+        config.max_turns = 10;
+        let engine = Engine::open_with(
+            config,
+            EngineOverrides {
+                provider: Some(Box::new(FakeProvider::scripted(vec![
+                    run_background_script(),
+                    FakeProvider::end_turn_script("detached"),
+                    command_status_script(),
+                    FakeProvider::end_turn_script("observed"),
+                ]))),
+                ..EngineOverrides::default()
+            },
+        )
+        .expect("engine");
+
+        let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
+        let mut session = engine.new_session();
+
+        // Task one detaches the job and ends; the job (echo) finishes
+        // after the task, so its notice stays queued.
+        engine
+            .run_task(
+                &mut session,
+                "start something long",
+                &sink,
+                &Default::default(),
+            )
+            .await
+            .expect("detach task");
+        assert!(drain(&mut receiver).iter().any(
+            |kind| matches!(kind, EventKind::ToolCompleted { name, .. } if name == "run_background")
+        ));
+        // Give the detached echo a moment to land in the registry.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Task two opens with the pre-drained notice: the steering
+        // queue applies it before turn 1's compile, and the same
+        // registry answers `command_status`.
+        engine
+            .run_task(&mut session, "check on it", &sink, &Default::default())
+            .await
+            .expect("status task");
+        let kinds = drain(&mut receiver);
+        assert!(
+            kinds.contains(&EventKind::SteeringApplied {
+                turn: 1,
+                messages: 1
+            }),
+            "the completion notice steered into the opening turn: {kinds:?}"
+        );
+        assert!(kinds.iter().any(|kind| matches!(
+            kind,
+            EventKind::ToolCompleted { name, .. } if name == "command_status"
+        )));
+        // The steered notice is a persisted user item — the next
+        // frontend sees it in the transcript, not just the live stream.
+        assert!(session.transcript.iter().any(|item| matches!(
+            item,
+            loom_kernel::transcript::Item::User { text }
+                if text.contains("[background]") && text.contains("exit status: 0")
         )));
     }
 

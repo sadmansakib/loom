@@ -243,6 +243,11 @@ pub fn chat(args: ChatArgs) -> anyhow::Result<ExitCode> {
         shared_session_id(&session_id)
     );
     eprintln!("type a task to run it; /help lists commands; Ctrl-D exits");
+    if args.flags.bg_commands {
+        eprintln!(
+            "background commands on: `run_background` detaches, completions steer in at the next turn boundary"
+        );
+    }
 
     // The UI-side control handle for the running task, if any.
     let mut control: Option<TaskControl> = None;

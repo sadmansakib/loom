@@ -125,13 +125,13 @@ iterations may start early where a backlog item is cheap and measured.
 | 1 | Core service | **Done** | — (see Shipped) |
 | 2 | Core efficiency & repository intelligence | **Done 2026-10-23** (funded-measurement debt in item 1) | 1, 3✓, 4✓, 5✓, 6✓, 7✗, 8✓, 10✓ᴬ, 11⏸, 12✓, 16✓, 17✓ |
 | 3 | Intelligent subagent scheduling | Not started | 19, 21, 24 |
-| 4 | Execution safety & richer tools | **Largely shipped early** | 2✓, 13⏸, 23 |
+| 4 | Execution safety & richer tools | **Largely shipped early** | 2✓, 13✓, 23✓ |
 | 5 | Skills & contextual knowledge | **Largely shipped 2026-10-23** (skills index + `load_skill`) | 4✓ (instructions), skills✓, 20.4 |
 | 6 | MCP & LSP integration | Started 2026-10-23 (item 18 symbol tools shipped) | 18✓, 34⏸ |
 | 7 | Plugin system | Future scope | — |
-| 8 | Intelligent model routing | Not started; prerequisites in place | 9⏸, 14✓ |
+| 8 | Intelligent model routing | **Shipped 2026-11-08** (effort schedule + task-start tier routing; funded A/Bs open) | 9✓ᴬ, 14✓ |
 | 9 | Learning & self-optimization | Not started; data path partial | 1, 20 (20.2 sweepable set shipped) |
-| — | Product surface (cross-cutting) | Partial | 15, 22, 25 |
+| — | Product surface (cross-cutting) | **CLI shipped** (`loom run` + interactive `loom chat`); 22⏸ (TUI/frontends) | 15✓, 22⏸, 25✓ |
 
 Legend: ✓ shipped · ✓ᴬ phase A shipped, remainder open · ✗ skipped on
 evidence · ⏸ deferred on evidence (revisit trigger recorded in the item).
@@ -1253,6 +1253,16 @@ adds four more framing findings and backlog items 26–31 below.
      session open across tasks (steering via `TaskControl`, `/pause`,
      `/cancel`), so the revisit trigger is armed — the wall-time lever
      now has a surface to matter in.
+     **Shipped 2026-11-08 (same day the trigger armed):** `run_background`
+     + `command_status` tools behind `--bg-commands` (`LOOM_BG_COMMANDS`)
+     on `loom run`/`loom chat`. Jobs detach with their own process group
+     (drop = SIGKILL), ride the workspace command policy and sandbox,
+     and their completion notice is injected as a steering message at
+     the next turn boundary — `loom chat` shows it mid-conversation;
+     headless `loom run` pre-drains it into the next task's opening
+     turn. Eval byte-stability is preserved because the flag is opt-in
+     and the eval arms never set it. Cap: 4 concurrent jobs per engine,
+     engine drop kills everything.
 14. **Non-OpenAI provider** (G7). An Anthropic-messages adapter to
     pressure the `ModelProvider` boundary. The compiler emits
     **segments marked cacheable or volatile**, so cache breakpoints are

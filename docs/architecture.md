@@ -704,7 +704,11 @@ while a task runs steer it at the next turn boundary, `/pause` and
 `/cancel` map to `TaskControl`, `/rewind [IDX] [--restore]` forks the
 session in place, `/new` starts over; the loop itself is two threads
 and a channel — a worker owning the engine, the main thread owning
-stdin — so the engine stays single-owner), `loom auth`
+stdin — so the engine stays single-owner; with `--bg-commands` the
+session also gets `run_background`/`command_status`: long builds
+detach into their own process groups and their completion notice is
+steered in as a `[background]` message at the next turn boundary,
+while the model keeps working), `loom auth`
 (login/list/set-active/remove), `loom stats` (per-session analytics from
 stored transcripts: turns, per-tool call quality, edit acceptance,
 repeats, repairs, spill savings; the listing/filter/fold data step is

@@ -9,6 +9,7 @@
 
 mod artifact_read;
 mod autofix;
+mod background;
 mod budget;
 mod confinement;
 mod edit_file;
@@ -39,6 +40,7 @@ mod window;
 mod write_file;
 
 pub use artifact_read::ArtifactReadTool;
+pub use background::{BackgroundJobs, CommandStatusTool, RunBackgroundTool};
 pub use budget::ToolBudgets;
 pub use edit_file::EditFileTool;
 pub use git::{GitDiffTool, GitLogTool, GitStatusTool};
