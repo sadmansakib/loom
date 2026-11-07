@@ -47,6 +47,29 @@ Zed wiring: `agent_servers: { "loom": { "type": "custom",
 roadmap item 37 records the open tails (editor-forwarded MCP servers
 not attached; session load/resume not exposed).
 
+## 2026-11 — Argument-provenance gate: evidence-based deferral (roadmap item 38)
+
+Measured before building, deferred on the kill criterion: the
+verbatim-fragment provenance signal cannot discriminate benign from
+adversarial flows in this loop. Across all 15 recorded sessions
+(43 sensitive calls, 120 string arguments, independently
+re-verified), fragment-sharing with prior tool output at K=32 is
+the norm: every `edit_file` argument (36/36 — old/new anchors are
+copied from the file being edited; benign-derived rate 100% against
+a pre-registered 10% ceiling) and 21 `run_command` arguments, all
+workspace-root paths legitimately reused into `path`/`dir`/`workdir`
+after appearing in command output. Zero instruction-like flows into
+`run_command`, zero writes to trusted paths. Enforcing would refuse
+legitimate work; even record-only mode fires on essentially every
+command. Revisit triggers and seam facts recorded in roadmap item
+38 (adversarial corpus recorded through loom, or a semantic
+provenance signal). Shipped instead: [docs/threat-model.md](docs/threat-model.md)
+(assets, trust boundaries, attacker model, defense map — the gap
+analysis that motivated the check) and
+[docs/provenance-design.md](docs/provenance-design.md) (CaMeL
+adaptation, pre-registered decision rule, full measurements). No
+code changed.
+
 ## 2026-11 — Escalation-by-fork: evidence-based deferral (roadmap item 36)
 
 Measured before building, deferred on the kill criterion: the stall

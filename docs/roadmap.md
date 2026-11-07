@@ -1855,6 +1855,36 @@ model tier under them (arXiv 2607.06906).
    Design: [docs/acp-design.md](acp-design.md).
 
 
+38. **Argument-provenance gate (CaMeL adaptation)** (G1, G2, G7).
+    Goal: at tool-admission time, treat arguments derived from
+    untrusted tool output as grounds for an explicit operator
+    decision — the loop's answer to prompt injection by copied
+    content (arXiv 2503.18813 restated for a free-form loop; a DSL
+    interpreter with provable non-interference does not transfer).
+    Threat model shipped first ([docs/threat-model.md](threat-model.md));
+    design + pre-registered decision rule in
+    [docs/provenance-design.md](provenance-design.md). Measured
+    before building, deferred on the kill criterion: across all 15
+    recorded sessions (43 sensitive calls, 120 string arguments,
+    independently re-verified), verbatim fragment-sharing with prior
+    tool output at K=32 is the *norm*, not the anomaly — every
+    `edit_file` argument (36/36, benign-derived rate 100% against a
+    pre-registered 10% ceiling) and 21 `run_command` arguments, all
+    of which are workspace-root paths legitimately reused into
+    `path`/`dir`/`workdir` after appearing in command output. Zero
+    instruction-like flows into `run_command`, zero writes to
+    trusted paths. The heuristic cannot discriminate, so even
+    record-only `flag` mode is noise. Revisit triggers: an
+    adversarial corpus recorded through loom (AgentDojo-style
+    injected tasks saved as sessions) or a semantic provenance
+    signal — more benign sessions cannot fix a non-discriminative
+    signal. Seam facts for that build: admission beside the existing
+    refusal partition in `execute_batch`; corpus = prior
+    `Item::ToolResult` bodies in transcript order; escalation via
+    the `EngineOverrides.ask` seam (item 37); refusal needs an
+    additive `ToolFailure` variant + event-schema bump. No code
+    changed.
+
 ### 2026-12 meta-harness sweep — gap check
 
 A vendor/blog/benchmark sweep (Anthropic engineering, Claude Code docs,

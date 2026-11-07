@@ -134,6 +134,8 @@ Workspace lints: `unsafe_code` forbidden; `missing_docs`, `unwrap_used`,
 Documentation: [`docs/architecture.md`](docs/architecture.md) (design),
 [`docs/eval.md`](docs/eval.md) (eval suite protocol + honesty rules),
 [`docs/daily-driver.md`](docs/daily-driver.md) (generalization probes),
+[`docs/threat-model.md`](docs/threat-model.md) (trust boundaries,
+attacker model, defenses),
 [`docs/roadmap.md`](docs/roadmap.md) (vision, iterations, evidence
 backlog).
 
