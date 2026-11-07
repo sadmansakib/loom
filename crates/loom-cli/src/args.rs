@@ -26,6 +26,10 @@ pub struct Cli {
 pub enum Command {
     /// Run one task against the model.
     Run(Box<RunArgs>),
+    /// Interactive session: tasks at the prompt continue one session;
+    /// typed lines steer a running task; `/rewind`, `/stats`, and
+    /// `/sessions` work in place.
+    Chat(Box<ChatArgs>),
     /// Manage saved provider credentials (`loom.db` + OS keychain).
     Auth(AuthArgs),
     /// Manage named custom providers (`providers.json` beside `loom.db`).
@@ -58,6 +62,34 @@ pub struct RunArgs {
     )]
     pub task: Vec<String>,
 
+    /// Every knob a one-shot run and an interactive chat share: the
+    /// engine assembly reads these verbatim, so `loom run` and
+    /// `loom chat` configure the engine identically.
+    #[command(flatten)]
+    pub flags: RunFlags,
+}
+
+/// Arguments for `loom chat`: an optional opening task plus the shared
+/// run flags. Lines typed at the prompt continue the session; while a
+/// task runs they steer it at the next turn boundary (roadmap item 25).
+#[derive(Debug, Args)]
+pub struct ChatArgs {
+    /// Optional first task; all remaining words are joined with single
+    /// spaces. The prompt accepts further tasks afterwards.
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "TASK"
+    )]
+    pub task: Vec<String>,
+
+    #[command(flatten)]
+    pub flags: RunFlags,
+}
+
+/// The engine-configuration flags shared by `loom run` and `loom chat`.
+#[derive(Debug, Args)]
+pub struct RunFlags {
     /// Emit one NDJSON event per line instead of human-readable output.
     #[arg(long)]
     pub json: bool,
@@ -534,13 +566,13 @@ mod tests {
             panic!("expected `run`");
         };
         assert_eq!(args.task, vec!["find", "the", "turn", "loop"]);
-        assert_eq!(args.provider, "nvidia");
-        assert_eq!(args.model, "z-ai/glm-5.3-flash");
-        assert_eq!(args.reasoning_effort, ReasoningEffort::High);
-        assert_eq!(args.max_turns, DEFAULT_MAX_TURNS);
-        assert!(!args.json);
-        assert!(!args.no_save);
-        assert!(!args.no_global_instructions);
+        assert_eq!(args.flags.provider, "nvidia");
+        assert_eq!(args.flags.model, "z-ai/glm-5.3-flash");
+        assert_eq!(args.flags.reasoning_effort, ReasoningEffort::High);
+        assert_eq!(args.flags.max_turns, DEFAULT_MAX_TURNS);
+        assert!(!args.flags.json);
+        assert!(!args.flags.no_save);
+        assert!(!args.flags.no_global_instructions);
     }
 
     #[test]
@@ -563,10 +595,13 @@ mod tests {
         let Command::Run(args) = cli.command else {
             panic!("expected `run`");
         };
-        assert_eq!(args.provider, "custom");
-        assert_eq!(args.base_url.as_deref(), Some("http://localhost:4000/v1"));
+        assert_eq!(args.flags.provider, "custom");
         assert_eq!(
-            args.models_url.as_deref(),
+            args.flags.base_url.as_deref(),
+            Some("http://localhost:4000/v1")
+        );
+        assert_eq!(
+            args.flags.models_url.as_deref(),
             Some("http://localhost:4000/v1/models")
         );
     }
@@ -592,14 +627,14 @@ mod tests {
             panic!("expected `run`");
         };
         assert_eq!(
-            args.headers,
+            args.flags.headers,
             vec![
                 "X-Title=loom eval".to_owned(),
                 "X-A=1".to_owned(),
                 "X-B=2".to_owned()
             ]
         );
-        let pairs = parse_header_pairs(&args.headers).expect("valid pairs");
+        let pairs = parse_header_pairs(&args.flags.headers).expect("valid pairs");
         assert_eq!(
             pairs,
             vec![
@@ -684,7 +719,7 @@ mod tests {
         let Command::Run(args) = cli.command else {
             panic!("expected `run`");
         };
-        assert!(!args.lessons);
+        assert!(!args.flags.lessons);
 
         let cli = parse(&[
             "loom",
@@ -699,7 +734,7 @@ mod tests {
         let Command::Run(args) = cli.command else {
             panic!("expected `run`");
         };
-        assert!(args.lessons);
+        assert!(args.flags.lessons);
     }
 
     #[test]
@@ -775,14 +810,14 @@ mod tests {
         let Command::Run(args) = cli.command else {
             panic!("expected `run`");
         };
-        assert!(args.json);
-        assert_eq!(args.base_url.as_deref(), Some("https://example.test"));
-        assert_eq!(args.reasoning_effort, ReasoningEffort::Max);
-        assert_eq!(args.account.as_deref(), Some("work"));
-        assert_eq!(args.max_turns, 3);
-        assert!(args.no_save);
+        assert!(args.flags.json);
+        assert_eq!(args.flags.base_url.as_deref(), Some("https://example.test"));
+        assert_eq!(args.flags.reasoning_effort, ReasoningEffort::Max);
+        assert_eq!(args.flags.account.as_deref(), Some("work"));
+        assert_eq!(args.flags.max_turns, 3);
+        assert!(args.flags.no_save);
         assert!(
-            args.no_global_instructions,
+            args.flags.no_global_instructions,
             "--no-global-instructions opts out of the user-level file"
         );
     }
@@ -791,6 +826,43 @@ mod tests {
     fn reasoning_effort_rejects_unknown_values() {
         let error = Cli::try_parse_from(["loom", "run", "--reasoning-effort", "bogus", "x"]);
         assert!(error.is_err());
+    }
+
+    #[test]
+    fn chat_takes_an_optional_task_and_shares_the_run_flags() {
+        // No task: the prompt is the entry point.
+        let cli = parse(&[
+            "loom",
+            "chat",
+            "--provider",
+            "glm",
+            "--model",
+            "glm-5",
+            "--json",
+        ]);
+        let Command::Chat(args) = cli.command else {
+            panic!("expected `chat`");
+        };
+        assert!(args.task.is_empty());
+        assert_eq!(args.flags.provider, "glm");
+        assert!(args.flags.json);
+
+        // An opening task runs immediately, then the prompt takes over.
+        let cli = parse(&[
+            "loom",
+            "chat",
+            "--provider",
+            "glm",
+            "--model",
+            "glm-5",
+            "explain",
+            "this",
+            "repo",
+        ]);
+        let Command::Chat(args) = cli.command else {
+            panic!("expected `chat`");
+        };
+        assert_eq!(args.task, ["explain", "this", "repo"]);
     }
 
     #[test]

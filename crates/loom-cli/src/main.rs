@@ -11,6 +11,7 @@ use tracing_subscriber::EnvFilter;
 
 mod args;
 mod auth_command;
+mod chat;
 mod instructions;
 mod lessons_command;
 mod output;
@@ -30,6 +31,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let outcome = match cli.command {
         Command::Run(args) => run::run(*args),
+        Command::Chat(args) => chat::chat(*args),
         Command::Auth(args) => auth_command::run(args.command).map(|()| ExitCode::SUCCESS),
         Command::Provider(args) => provider_command::run(args.command).map(|()| ExitCode::SUCCESS),
         Command::Sessions => sessions_command::run(),

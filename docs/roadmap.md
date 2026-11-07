@@ -1233,6 +1233,10 @@ adds four more framing findings and backlog items 26–31 below.
      boundaries, breaking the byte-stable census and replay equivalence
      the eval harness is built on. Revisit when interactive sessions
      exist, or a corpus shows same-message command+work batching.
+     Interactive sessions exist since 2026-11-08: `loom chat` holds one
+     session open across tasks (steering via `TaskControl`, `/pause`,
+     `/cancel`), so the revisit trigger is armed — the wall-time lever
+     now has a surface to matter in.
 14. **Non-OpenAI provider** (G7). An Anthropic-messages adapter to
     pressure the `ModelProvider` boundary. The compiler emits
     **segments marked cacheable or volatile**, so cache breakpoints are
@@ -2073,6 +2077,10 @@ Two small gaps surfaced and are recorded here so they are not lost
    and `loom rewind SESSION [--at IDX]` — boundary listing with
    dropped-region effects, conversation-only fork, `loom sessions`
    shows `[fork of SRC @ IDX]`.
+   Interactive consumer shipped 2026-11-08: `loom chat` exposes the
+   whole surface without leaving the prompt — `/rewind` lists
+   boundaries, `/rewind IDX` forks and continues from the fork
+   in-session, `--restore` carries the tree with it.
    Rollout step 2 shipped 2026-11-06: `StartCheckpoint` recorded by
    `loom run` at session start (schema v4 `start_checkpoints` table;
    clean checkout stores the HEAD, dirty/non-git stores the refusal

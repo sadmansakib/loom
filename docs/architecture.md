@@ -694,7 +694,13 @@ is the frontend's decision, passed in as `EngineConfig::db_path`.
 
 The CLI is thin: `loom run` (interactive render — text to stdout,
 reasoning to a dim stderr, NDJSON mode for machines; `--trace DIR`
-exports the task's evidence — see below), `loom auth`
+exports the task's evidence — see below), `loom chat` (the same render
+across many tasks: one session held open at a prompt — lines typed
+while a task runs steer it at the next turn boundary, `/pause` and
+`/cancel` map to `TaskControl`, `/rewind [IDX] [--restore]` forks the
+session in place, `/new` starts over; the loop itself is two threads
+and a channel — a worker owning the engine, the main thread owning
+stdin — so the engine stays single-owner), `loom auth`
 (login/list/set-active/remove), `loom stats` (per-session analytics from
 stored transcripts: turns, per-tool call quality, edit acceptance,
 repeats, repairs, spill savings; the listing/filter/fold data step is

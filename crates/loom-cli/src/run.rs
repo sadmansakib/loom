@@ -28,7 +28,7 @@ use loom_core::kernel::id::TaskId;
 /// harness notice (sandbox passthrough, truncated streams). The
 /// renderer keeps stdout; this footer prints to stderr after the task.
 #[derive(Clone, Default)]
-struct DecisionLog {
+pub(crate) struct DecisionLog {
     lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
@@ -53,7 +53,7 @@ impl EventSink for DecisionLog {
 /// Prints the footer: first occurrence of each decision line, in
 /// emission order. Silence (no footer) is itself the signal — the
 /// defaults held.
-fn print_decisions(log: &DecisionLog) {
+pub(crate) fn print_decisions(log: &DecisionLog) {
     let lines = match log.lines.lock() {
         Ok(lines) => lines.clone(),
         Err(_) => return,
@@ -100,215 +100,13 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         .build()
         .context("building the tokio runtime")?;
 
-    let db_path = loom_core::paths::db_path();
+    let trace_provider = args.flags.provider.clone();
+    let trace_model = args.flags.model.clone();
 
-    // Global instructions (the user-level AGENTS.md) compose once, here:
-    // the CLI is the frontend that reads configuration (ADR-008) — the
-    // engine itself never consults the environment, so the eval harness
-    // and embedders are unaffected by whatever this machine's global
-    // file says. An explicit `--system-prompt` replaces the built-in
-    // instruction, and the user's standing global file still appends —
-    // it exists because the user asked for it; `--no-global-instructions`
-    // is the escape hatch. Composing before the engine opens keeps the
-    // prompt byte-stable for the whole session (§8.1.1).
-    let global_instructions_path = loom_core::paths::global_instructions_path();
-    let system_prompt = if args.no_global_instructions {
-        args.system_prompt
-    } else {
-        let global = crate::instructions::load_global(&global_instructions_path);
-        Some(crate::instructions::merge(
-            args.system_prompt
-                .unwrap_or_else(loom_core::engine::default_system_prompt),
-            global.map(|body| (body, global_instructions_path)),
-        ))
-    };
-
-    // The bare-loop arm (roadmap item 1): the eval harness sets
-    // LOOM_BARE to measure the engine's levers against the plain
-    // five-tool loop. Read here, not in the engine (ADR-008): embedders
-    // assemble their own overrides, and a stray env var on a user
-    // machine must not silently strip their harness.
+    let (config, overrides) = engine_config_from(&args.flags)?;
+    // The bare arm also gates --best-of below; recompute it here (env-
+    // derived, so the two reads cannot disagree).
     let bare_arm = std::env::var_os("LOOM_BARE").is_some();
-    if bare_arm {
-        eprintln!(
-            "bare-loop arm active (LOOM_BARE): facts, pruning, completion \
-             gate, failure ledger, and fast paths are off"
-        );
-    }
-
-    // Captured before `EngineConfig` consumes the strings: the trace
-    // manifest needs the run configuration after the task ended.
-    let trace_provider = args.provider.clone();
-    let trace_model = args.model.clone();
-
-    // `open_async` owns the catalog sequencing: fetch, cache beside the
-    // database, fall back to a stale cache — identical for every frontend.
-    let overrides = if bare_arm {
-        EngineOverrides::default().bare_loop()
-    } else {
-        EngineOverrides::default()
-    };
-    // The scout arm (roadmap item 19): off unless both flags are given;
-    // the bare arm never carries it (it measures the plain loop).
-    let escalation = match (
-        args.scout_escalation.as_deref(),
-        args.scout_escalation_model.as_deref(),
-    ) {
-        (Some(_), None) => anyhow::bail!("--scout-escalation requires --scout-escalation-model"),
-        (None, Some(_)) => anyhow::bail!("--scout-escalation-model requires --scout-escalation"),
-        (Some(provider), Some(model)) => {
-            if args.scout.is_none() || args.scout_model.is_none() {
-                anyhow::bail!("--scout-escalation requires --scout and --scout-model");
-            }
-            Some((provider.to_owned(), model.to_owned()))
-        }
-        (None, None) => None,
-    };
-    let scout = match (args.scout.as_deref(), args.scout_model.as_deref()) {
-        (Some(provider), Some(model)) => {
-            if bare_arm {
-                eprintln!("note: --scout is ignored in the bare-loop arm");
-                None
-            } else {
-                let mut config = ScoutConfig::new(provider.to_owned(), model.to_owned());
-                if let Some((esc_provider, esc_model)) = escalation {
-                    config = config.with_escalation(esc_provider, esc_model);
-                }
-                Some(config)
-            }
-        }
-        (Some(_), None) => anyhow::bail!("--scout requires --scout-model"),
-        (None, Some(_)) => anyhow::bail!("--scout-model requires --scout"),
-        (None, None) => None,
-    };
-    // The symbol tools (roadmap item 18): off unless asked; the bare
-    // arm measures the plain loop, so it never carries them.
-    let symbols = if args.symbols && !bare_arm {
-        true
-    } else {
-        if args.symbols {
-            eprintln!("note: --symbols is ignored in the bare-loop arm");
-        }
-        false
-    };
-    // The skills seam (iteration 5): same gate, same bare-arm rule.
-    let skills = if args.skills && !bare_arm {
-        true
-    } else {
-        if args.skills {
-            eprintln!("note: --skills is ignored in the bare-loop arm");
-        }
-        false
-    };
-    // Evidence-gated lessons (roadmap item 20.4): same gate, same
-    // bare-arm rule.
-    let lessons = if args.lessons && !bare_arm {
-        true
-    } else {
-        if args.lessons {
-            eprintln!("note: --lessons is ignored in the bare-loop arm");
-        }
-        false
-    };
-    // Slice D (iteration 6): MCP servers. Same gate, same bare-arm rule.
-    let mcp = if args.mcp && !bare_arm {
-        true
-    } else {
-        if args.mcp {
-            eprintln!("note: --mcp is ignored in the bare-loop arm");
-        }
-        false
-    };
-    // Slice E (iteration 6): LSP servers. Same gate, same bare-arm rule.
-    let lsp = if args.lsp && !bare_arm {
-        true
-    } else {
-        if args.lsp {
-            eprintln!("note: --lsp is ignored in the bare-loop arm");
-        }
-        false
-    };
-    // Structured git tools (iteration 4): same gate, same bare-arm rule.
-    let git = if args.git && !bare_arm {
-        true
-    } else {
-        if args.git {
-            eprintln!("note: --git is ignored in the bare-loop arm");
-        }
-        false
-    };
-    // Item 20.2: per-tool budgets and pruning policy are sweepable via
-    // env (LOOM_*_BYTES/_LINES and LOOM_PRUNE_*), layered over the
-    // defaults. Presence echoes (honesty: the run log records what
-    // varied); invalid values warn and are ignored.
-    for name in loom_core::engine::BUDGET_ENV_VARS
-        .into_iter()
-        .chain(loom_core::engine::PRUNE_ENV_VARS)
-    {
-        if let Ok(value) = std::env::var(name) {
-            eprintln!("override: {name}={value}");
-        }
-    }
-    let (budgets, budget_warnings) =
-        loom_core::engine::budgets_with_env(loom_core::tools::ToolBudgets::default(), |name| {
-            std::env::var(name).ok()
-        });
-    for warning in &budget_warnings {
-        eprintln!("warning: {warning}");
-    }
-    for name in loom_core::engine::TURN_BUDGET_ENV_VARS {
-        if let Ok(value) = std::env::var(name) {
-            eprintln!("override: {name}={value}");
-        }
-    }
-    let (prune, prune_warnings) =
-        loom_core::engine::prune_with_env(&args.provider, |name| std::env::var(name).ok());
-    for warning in &prune_warnings {
-        eprintln!("warning: {warning}");
-    }
-    // Item 26: the staged turn budget is sweepable the same way
-    // (LOOM_INITIAL_TURNS / LOOM_EXTENSION_TURNS /
-    // LOOM_MAX_TURN_EXTENSIONS). The default stays inert.
-    let (turn_budget, turn_budget_warnings) =
-        loom_core::engine::turn_budget_with_env(Default::default(), |name| {
-            std::env::var(name).ok()
-        });
-    for warning in &turn_budget_warnings {
-        eprintln!("warning: {warning}");
-    }
-    // Header pairs are validated once, here; the engine carries them
-    // verbatim to the custom adapter.
-    let headers = crate::args::parse_header_pairs(&args.headers).map_err(anyhow::Error::msg)?;
-    let config = EngineConfig {
-        provider: args.provider,
-        model: args.model,
-        base_url: args.base_url,
-        models_url: args.models_url,
-        headers,
-        reasoning_effort: args.reasoning_effort,
-        account: args.account,
-        workspace: args.workspace.clone(),
-        system_prompt,
-        max_turns: args.max_turns,
-        turn_budget,
-        // Roadmap item 12: off on every CLI surface — server-side
-        // context editing is a frontend-level opt-in, and the eval
-        // protocol stays frozen.
-        context_editing: None,
-        db_path,
-        persist: !args.no_save,
-        catalog: None,
-        scout,
-        symbols,
-        git,
-        skills,
-        lessons,
-        mcp,
-        lsp,
-        budgets,
-        prune: Some(prune),
-        autofix: args.autofix,
-    };
 
     let input = args.task.join(" ");
 
@@ -316,11 +114,11 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     // one deterministic winner, its patch applied here. The catalog
     // sequencing and credential resolution are shared with the single
     // run — one fetch, one keychain read, N cheap provider rebuilds.
-    if let Some(requested) = args.best_of {
+    if let Some(requested) = args.flags.best_of {
         if bare_arm {
             anyhow::bail!("--best-of cannot combine with the LOOM_BARE arm");
         }
-        if args.session.is_some() {
+        if args.flags.session.is_some() {
             anyhow::bail!("--best-of starts fresh parallel rollouts; --session continues one");
         }
         let n = requested.clamp(2, 8);
@@ -343,14 +141,14 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 n,
                 concurrency: 3,
                 keep_worktrees: false,
-                shared_prefix_turns: args.best_of_prefix_turns,
-                vary_harness: args.best_of_vary,
-                verify_selection: !args.best_of_no_verify,
+                shared_prefix_turns: args.flags.best_of_prefix_turns,
+                vary_harness: args.flags.best_of_vary,
+                verify_selection: !args.flags.best_of_no_verify,
             },
             &token,
         ))?;
         signal.abort();
-        print_best_of_n(&report, args.json);
+        print_best_of_n(&report, args.flags.json);
         runtime.shutdown_timeout(Duration::from_secs(5));
         return Ok(if report.applied {
             ExitCode::SUCCESS
@@ -362,8 +160,11 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let engine = runtime.block_on(Engine::open_async_with(config, overrides))?;
 
     let decision_log = DecisionLog::default();
-    let (sink, renderer_thread, tracer_thread) =
-        spawn_consumers(args.json, args.trace.clone(), decision_log.clone());
+    let (sink, renderer_thread, tracer_thread) = spawn_consumers(
+        args.flags.json,
+        args.flags.trace.clone(),
+        decision_log.clone(),
+    );
 
     // The provider's timeouts need the time driver the runtime enables.
     let control = TaskControl::new();
@@ -373,7 +174,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     // transcript, appends the input, and runs to the next stopping point;
     // `continue_session` returns the advanced session even when the task
     // failed, so the trace export still has a transcript to write.
-    let (session, outcome) = match args.session.as_deref() {
+    let (session, outcome) = match args.flags.session.as_deref() {
         Some(id) => {
             let id = id
                 .parse()
@@ -395,30 +196,11 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             // run that actually started the lineage. Best-effort: a
             // run whose checkpoint fails to record still runs, and a
             // later restore refuses (no row) rather than guessing.
-            if !args.no_save {
-                use loom_core::kernel::store::SessionStore;
-                let checkpoint = crate::workspace::snapshot_start(&args.workspace);
-                if let Some(reason) = &checkpoint.reason {
-                    eprintln!("note: no workspace start checkpoint ({reason})");
-                }
-                match loom_core::store::SqliteStore::open(loom_core::paths::db_path()) {
-                    Ok(store) => {
-                        // The engine creates the session row lazily in
-                        // run_task; the checkpoint's row references it,
-                        // so ensure it first (INSERT OR IGNORE — the
-                        // engine's own ensure is idempotent).
-                        if let Err(error) = store
-                            .ensure_session(&session.id)
-                            .and_then(|()| store.record_start_checkpoint(&session.id, &checkpoint))
-                        {
-                            eprintln!("warning: recording start checkpoint: {error}");
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("warning: opening store for start checkpoint: {error}")
-                    }
-                }
-            }
+            crate::run::record_start_checkpoint(
+                &session.id,
+                &args.flags.workspace,
+                args.flags.no_save,
+            );
             let outcome = runtime.block_on(engine.run_task(&mut session, input, &sink, &control));
             (session, outcome)
         }
@@ -436,21 +218,21 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             TraceMeta {
                 provider: &trace_provider,
                 model: &trace_model,
-                reasoning_effort: args.reasoning_effort,
-                max_turns: args.max_turns,
-                persisted: !args.no_save,
+                reasoning_effort: args.flags.reasoning_effort,
+                max_turns: args.flags.max_turns,
+                persisted: !args.flags.no_save,
             },
         );
     }
 
     match outcome {
         Ok(summary) => {
-            output::print_summary(&summary, "completed", &session.id, args.json);
+            output::print_summary(&summary, "completed", &session.id, args.flags.json);
             runtime.shutdown_timeout(Duration::from_secs(5));
             Ok(ExitCode::SUCCESS)
         }
         Err(error) => {
-            output::print_failure(&error, args.json);
+            output::print_failure(&error, args.flags.json);
             runtime.shutdown_timeout(Duration::from_secs(5));
             Ok(if error.is_cancelled() || error.is_paused() {
                 ExitCode::from(130)
@@ -526,13 +308,265 @@ fn print_best_of_n(report: &loom_core::engine::worktrees::BestOfNReport, json: b
     }
 }
 
+/// Assembles the engine configuration from the shared run flags,
+/// used verbatim by `loom run` and `loom chat` so both frontends
+/// configure the engine identically. Returns the overrides too — the
+/// bare-loop arm (`LOOM_BARE`) changes both, and callers need it for
+/// `Engine::open_async_with`.
+pub(crate) fn engine_config_from(
+    flags: &crate::args::RunFlags,
+) -> anyhow::Result<(EngineConfig, EngineOverrides)> {
+    let db_path = loom_core::paths::db_path();
+
+    // Global instructions (the user-level AGENTS.md) compose once, here:
+    // the CLI is the frontend that reads configuration (ADR-008) — the
+    // engine itself never consults the environment, so the eval harness
+    // and embedders are unaffected by whatever this machine's global
+    // file says. An explicit `--system-prompt` replaces the built-in
+    // instruction, and the user's standing global file still appends —
+    // it exists because the user asked for it; `--no-global-instructions`
+    // is the escape hatch. Composing before the engine opens keeps the
+    // prompt byte-stable for the whole session (§8.1.1).
+    let global_instructions_path = loom_core::paths::global_instructions_path();
+    let system_prompt = if flags.no_global_instructions {
+        flags.system_prompt.clone()
+    } else {
+        let global = crate::instructions::load_global(&global_instructions_path);
+        Some(crate::instructions::merge(
+            flags
+                .system_prompt
+                .clone()
+                .unwrap_or_else(loom_core::engine::default_system_prompt),
+            global.map(|body| (body, global_instructions_path)),
+        ))
+    };
+
+    // The bare-loop arm (roadmap item 1): the eval harness sets
+    // LOOM_BARE to measure the engine's levers against the plain
+    // five-tool loop. Read here, not in the engine (ADR-008): embedders
+    // assemble their own overrides, and a stray env var on a user
+    // machine must not silently strip their harness.
+    let bare_arm = std::env::var_os("LOOM_BARE").is_some();
+    if bare_arm {
+        eprintln!(
+            "bare-loop arm active (LOOM_BARE): facts, pruning, completion \
+             gate, failure ledger, and fast paths are off"
+        );
+    }
+
+    let overrides = if bare_arm {
+        EngineOverrides::default().bare_loop()
+    } else {
+        EngineOverrides::default()
+    };
+    // The scout arm (roadmap item 19): off unless both flags are given;
+    // the bare arm never carries it (it measures the plain loop).
+    let escalation = match (
+        flags.scout_escalation.as_deref(),
+        flags.scout_escalation_model.as_deref(),
+    ) {
+        (Some(_), None) => anyhow::bail!("--scout-escalation requires --scout-escalation-model"),
+        (None, Some(_)) => anyhow::bail!("--scout-escalation-model requires --scout-escalation"),
+        (Some(provider), Some(model)) => {
+            if flags.scout.is_none() || flags.scout_model.is_none() {
+                anyhow::bail!("--scout-escalation requires --scout and --scout-model");
+            }
+            Some((provider.to_owned(), model.to_owned()))
+        }
+        (None, None) => None,
+    };
+    let scout = match (flags.scout.as_deref(), flags.scout_model.as_deref()) {
+        (Some(provider), Some(model)) => {
+            if bare_arm {
+                eprintln!("note: --scout is ignored in the bare-loop arm");
+                None
+            } else {
+                let mut config = ScoutConfig::new(provider.to_owned(), model.to_owned());
+                if let Some((esc_provider, esc_model)) = escalation {
+                    config = config.with_escalation(esc_provider, esc_model);
+                }
+                Some(config)
+            }
+        }
+        (Some(_), None) => anyhow::bail!("--scout requires --scout-model"),
+        (None, Some(_)) => anyhow::bail!("--scout-model requires --scout"),
+        (None, None) => None,
+    };
+    // The symbol tools (roadmap item 18): off unless asked; the bare
+    // arm measures the plain loop, so it never carries them.
+    let symbols = if flags.symbols && !bare_arm {
+        true
+    } else {
+        if flags.symbols {
+            eprintln!("note: --symbols is ignored in the bare-loop arm");
+        }
+        false
+    };
+    // The skills seam (iteration 5): same gate, same bare-arm rule.
+    let skills = if flags.skills && !bare_arm {
+        true
+    } else {
+        if flags.skills {
+            eprintln!("note: --skills is ignored in the bare-loop arm");
+        }
+        false
+    };
+    // Evidence-gated lessons (roadmap item 20.4): same gate, same
+    // bare-arm rule.
+    let lessons = if flags.lessons && !bare_arm {
+        true
+    } else {
+        if flags.lessons {
+            eprintln!("note: --lessons is ignored in the bare-loop arm");
+        }
+        false
+    };
+    // Slice D (iteration 6): MCP servers. Same gate, same bare-arm rule.
+    let mcp = if flags.mcp && !bare_arm {
+        true
+    } else {
+        if flags.mcp {
+            eprintln!("note: --mcp is ignored in the bare-loop arm");
+        }
+        false
+    };
+    // Slice E (iteration 6): LSP servers. Same gate, same bare-arm rule.
+    let lsp = if flags.lsp && !bare_arm {
+        true
+    } else {
+        if flags.lsp {
+            eprintln!("note: --lsp is ignored in the bare-loop arm");
+        }
+        false
+    };
+    // Structured git tools (iteration 4): same gate, same bare-arm rule.
+    let git = if flags.git && !bare_arm {
+        true
+    } else {
+        if flags.git {
+            eprintln!("note: --git is ignored in the bare-loop arm");
+        }
+        false
+    };
+    // Item 20.2: per-tool budgets and pruning policy are sweepable via
+    // env (LOOM_*_BYTES/_LINES and LOOM_PRUNE_*), layered over the
+    // defaults. Presence echoes (honesty: the run log records what
+    // varied); invalid values warn and are ignored.
+    for name in loom_core::engine::BUDGET_ENV_VARS
+        .into_iter()
+        .chain(loom_core::engine::PRUNE_ENV_VARS)
+    {
+        if let Ok(value) = std::env::var(name) {
+            eprintln!("override: {name}={value}");
+        }
+    }
+    let (budgets, budget_warnings) =
+        loom_core::engine::budgets_with_env(loom_core::tools::ToolBudgets::default(), |name| {
+            std::env::var(name).ok()
+        });
+    for warning in &budget_warnings {
+        eprintln!("warning: {warning}");
+    }
+    for name in loom_core::engine::TURN_BUDGET_ENV_VARS {
+        if let Ok(value) = std::env::var(name) {
+            eprintln!("override: {name}={value}");
+        }
+    }
+    let (prune, prune_warnings) =
+        loom_core::engine::prune_with_env(&flags.provider, |name| std::env::var(name).ok());
+    for warning in &prune_warnings {
+        eprintln!("warning: {warning}");
+    }
+    // Item 26: the staged turn budget is sweepable the same way
+    // (LOOM_INITIAL_TURNS / LOOM_EXTENSION_TURNS /
+    // LOOM_MAX_TURN_EXTENSIONS). The default stays inert.
+    let (turn_budget, turn_budget_warnings) =
+        loom_core::engine::turn_budget_with_env(Default::default(), |name| {
+            std::env::var(name).ok()
+        });
+    for warning in &turn_budget_warnings {
+        eprintln!("warning: {warning}");
+    }
+    // Header pairs are validated once, here; the engine carries them
+    // verbatim to the custom adapter.
+    let headers = crate::args::parse_header_pairs(&flags.headers).map_err(anyhow::Error::msg)?;
+    let config = EngineConfig {
+        provider: flags.provider.clone(),
+        model: flags.model.clone(),
+        base_url: flags.base_url.clone(),
+        models_url: flags.models_url.clone(),
+        headers,
+        reasoning_effort: flags.reasoning_effort,
+        account: flags.account.clone(),
+        workspace: flags.workspace.clone(),
+        system_prompt,
+        max_turns: flags.max_turns,
+        turn_budget,
+        // Roadmap item 12: off on every CLI surface — server-side
+        // context editing is a frontend-level opt-in, and the eval
+        // protocol stays frozen.
+        context_editing: None,
+        db_path,
+        persist: !flags.no_save,
+        catalog: None,
+        scout,
+        symbols,
+        git,
+        skills,
+        lessons,
+        mcp,
+        lsp,
+        budgets,
+        prune: Some(prune),
+        autofix: flags.autofix,
+    };
+    Ok((config, overrides))
+}
+
+/// Records the tier-1 start checkpoint (`docs/rewind-design.md` §4) for
+/// a fresh session: snapshots the workspace before the task can touch
+/// the tree, so `loom rewind --restore-workspace --to-start` has an
+/// exact restore point. Shared by `loom run` and `loom chat`. Best
+/// effort: a run whose checkpoint fails to record still runs, and a
+/// later restore refuses (no row) rather than guessing.
+pub(crate) fn record_start_checkpoint(
+    session_id: &loom_core::kernel::id::SessionId,
+    workspace: &std::path::Path,
+    no_save: bool,
+) {
+    if no_save {
+        return;
+    }
+    use loom_core::kernel::store::SessionStore;
+    let checkpoint = crate::workspace::snapshot_start(workspace);
+    if let Some(reason) = &checkpoint.reason {
+        eprintln!("note: no workspace start checkpoint ({reason})");
+    }
+    match loom_core::store::SqliteStore::open(loom_core::paths::db_path()) {
+        Ok(store) => {
+            // The engine creates the session row lazily in run_task;
+            // the checkpoint's row references it, so ensure it first
+            // (INSERT OR IGNORE — the engine's own ensure is idempotent).
+            if let Err(error) = store
+                .ensure_session(session_id)
+                .and_then(|()| store.record_start_checkpoint(session_id, &checkpoint))
+            {
+                eprintln!("warning: recording start checkpoint: {error}");
+            }
+        }
+        Err(error) => {
+            eprintln!("warning: opening store for start checkpoint: {error}")
+        }
+    }
+}
+
 /// Spawns the run's event consumers (§11): the renderer always owns
 /// stdout; with `--trace` a second consumer appends every envelope to
 /// the task's `events.ndjson` and hands the writer back so the main
 /// thread can finish the export once the outcome is known. A stalled
 /// disk can delay the trace without ever delaying the terminal, and
 /// vice versa.
-fn spawn_consumers(
+pub(crate) fn spawn_consumers(
     json: bool,
     trace: Option<std::path::PathBuf>,
     decision_log: DecisionLog,
@@ -577,7 +611,7 @@ fn spawn_consumers(
 /// The two-stage Ctrl-C ladder: the first press pauses — the in-flight
 /// turn finishes and commits, then the loop stops — and a second press
 /// aborts mid-flight. Either way the session survives to be resumed.
-async fn ctrl_c_ladder(control: TaskControl) {
+pub(crate) async fn ctrl_c_ladder(control: TaskControl) {
     if tokio::signal::ctrl_c().await.is_ok() {
         eprintln!("stopping after the current turn (Ctrl-C again to abort)…");
         control.pause();
@@ -592,7 +626,7 @@ async fn ctrl_c_ladder(control: TaskControl) {
 /// the fan-out (and with it both channel senders) ends the
 /// `blocking_recv` loops, and the trace writer — when one ran — comes
 /// back for the export below.
-fn join_consumers(
+pub(crate) fn join_consumers(
     sink: FanoutSink,
     signal: tokio::task::JoinHandle<()>,
     renderer_thread: std::thread::JoinHandle<()>,

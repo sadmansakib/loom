@@ -56,6 +56,10 @@ loom auth login deepseek
 # run a task in the current directory (one-shot, headless)
 loom run --provider deepseek "fix the failing test and make cargo test pass"
 
+# or keep one session open and steer it: text while a task runs
+# queues at the next turn boundary; /rewind, /stats, /new work on it
+loom chat --provider deepseek
+
 # any OpenAI-compatible gateway
 export CUSTOM_API_KEY=...
 loom run --provider custom --base-url https://gateway.example/v1 \

@@ -48,6 +48,14 @@ struct Boundary {
 
 /// Lists rewind boundaries for `args.session`, or forks it at `--at`.
 pub fn run(args: RewindArgs) -> anyhow::Result<ExitCode> {
+    rewind(&args)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The body of [`run`], shared with `loom chat`'s `/rewind`: returns the
+/// fork's new session id when a fork happened (`--at` given), `None`
+/// when the call only listed boundaries.
+pub(crate) fn rewind(args: &RewindArgs) -> anyhow::Result<Option<SessionId>> {
     let id: SessionId = args.session.parse().with_context(|| {
         format!(
             "parsing SESSION {:?} (expected an id from `loom sessions`)",
@@ -78,7 +86,7 @@ pub fn run(args: RewindArgs) -> anyhow::Result<ExitCode> {
 
     let Some(at) = args.at else {
         print_boundaries(&id, tip, &boundaries, &session, checkpoint.as_ref());
-        return Ok(ExitCode::SUCCESS);
+        return Ok(None);
     };
 
     // A mid-turn cut would strand tool calls without results; the store
@@ -183,7 +191,7 @@ pub fn run(args: RewindArgs) -> anyhow::Result<ExitCode> {
         }
     }
     println!("resume with: loom run --session {new_id} TASK");
-    Ok(ExitCode::SUCCESS)
+    Ok(Some(new_id))
 }
 
 /// A workspace restore this rewind will apply after the fork.
