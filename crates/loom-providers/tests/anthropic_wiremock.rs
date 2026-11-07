@@ -7,7 +7,7 @@
 
 use futures::StreamExt;
 use loom_kernel::model::{
-    Message, ModelEvent, ModelProvider, ModelRequest, ModelStream, StopReason,
+    ContextEditingHint, Message, ModelEvent, ModelProvider, ModelRequest, ModelStream, StopReason,
 };
 use loom_kernel::transcript::{ToolArguments, ToolCall, ToolCallId};
 use wiremock::matchers::{method, path};
@@ -32,6 +32,7 @@ fn plain_request(model: &str) -> ModelRequest {
         max_tokens: None,
         temperature: None,
         stable_prefix_messages: None,
+        context_editing: None,
     }
 }
 
@@ -429,6 +430,72 @@ async fn a_truncated_stream_reports_length_without_calls() {
     assert_eq!(response.message.stop_reason, StopReason::MaxTokens);
     assert!(response.message.tool_calls.is_empty());
     assert_eq!(response.usage.output_tokens, 8);
+}
+
+#[tokio::test]
+async fn context_editing_hint_maps_to_clear_tool_uses_and_the_beta_header() {
+    let server = MockServer::start().await;
+    mount_sse(&server, text_response()).await;
+
+    let mut request = plain_request("claude-sonnet-4-5");
+    request.context_editing = Some(ContextEditingHint {
+        trigger_tokens: 30_000,
+        keep_tool_uses: 3,
+        clear_at_least_tokens: Some(5_000),
+        exclude_tools: vec![String::from("scout")],
+    });
+
+    let provider = provider_at(&server.uri());
+    let _ = collect(provider.stream(&request)).await;
+
+    let requests = server.received_requests().await.expect("captured request");
+    let request = &requests[0];
+    let beta = request
+        .headers
+        .get("anthropic-beta")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(beta, "context-management-2025-06-27");
+    let body: serde_json::Value = serde_json::from_slice(&request.body).expect("json body");
+    // Every knob explicit: replaying these bytes reconstructs the
+    // behavior without unstated provider defaults.
+    assert_eq!(
+        body["context_management"],
+        serde_json::json!({
+            "edits": [{
+                "type": "clear_tool_uses_20250919",
+                "trigger": {"type": "input_tokens", "value": 30000},
+                "keep": {"type": "tool_uses", "value": 3},
+                "clear_at_least": {"type": "input_tokens", "value": 5000},
+                "exclude_tools": ["scout"]
+            }]
+        })
+    );
+}
+
+#[tokio::test]
+async fn no_context_editing_sends_no_context_management_and_no_beta_header() {
+    let server = MockServer::start().await;
+    mount_sse(&server, text_response()).await;
+
+    let provider = provider_at(&server.uri());
+    let _ = collect(provider.stream(&plain_request("claude-sonnet-4-5"))).await;
+
+    let requests = server.received_requests().await.expect("captured request");
+    let request = &requests[0];
+    let beta = request
+        .headers
+        .get("anthropic-beta")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(beta, "", "default-off must not send the beta header");
+    let body: serde_json::Value = serde_json::from_slice(&request.body).expect("json body");
+    assert!(
+        body.get("context_management").is_none(),
+        "default-off must not send context_management"
+    );
 }
 
 #[tokio::test]

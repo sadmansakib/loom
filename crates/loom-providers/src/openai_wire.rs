@@ -834,6 +834,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             stable_prefix_messages: None,
+            context_editing: None,
         }
     }
 
@@ -873,6 +874,7 @@ mod tests {
                 max_tokens: Some(1024),
                 temperature: Some(0.2),
                 stable_prefix_messages: None,
+                context_editing: None,
                 ..request()
             },
             &wire_options(),

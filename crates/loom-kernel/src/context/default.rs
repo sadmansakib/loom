@@ -75,6 +75,10 @@ impl super::ContextCompiler for DefaultContextCompiler {
                 .map(|tokens| tokens.min(input.budget.reserved_output_tokens)),
             temperature: None,
             stable_prefix_messages,
+            // Copied, never interpreted: server-side editing changes
+            // what the provider sends the model, not this projection —
+            // the census and budget check below stay hint-blind.
+            context_editing: input.config.context_editing.clone(),
         };
         let census = census(&request, facts_tokens, &*self.estimator);
         if census.total > input.budget.max_input_tokens {
@@ -267,6 +271,7 @@ mod tests {
     use super::*;
     use crate::context::{ContextBudget, ContextCompiler};
     use crate::id::TaskId;
+    use crate::model::ContextEditingHint;
     use crate::model::StopReason;
     use crate::session::{Session, TaskRecord};
     use crate::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
@@ -412,6 +417,35 @@ mod tests {
                 facts,
             ))
         }
+    }
+
+    #[test]
+    fn context_editing_rides_the_request_only_when_configured() {
+        let session = session();
+
+        // Default config: no hint on the wire (byte-off default).
+        let plain = compile(&session, &registry(), budget()).unwrap();
+        assert_eq!(plain.request.context_editing, None);
+
+        // Opt-in: the hint rides verbatim — the compiler copies, it
+        // never interprets (the kernel stays provider-blind).
+        let hint = ContextEditingHint {
+            trigger_tokens: 30_000,
+            keep_tool_uses: 3,
+            clear_at_least_tokens: Some(5_000),
+            exclude_tools: vec![String::from("scout")],
+        };
+        let mut tuned = config();
+        tuned.context_editing = Some(hint.clone());
+        let compiled = DefaultContextCompiler::default().compile(input(
+            &session,
+            &registry(),
+            &task_record(),
+            budget(),
+            &capabilities(),
+            &tuned,
+        ));
+        assert_eq!(compiled.unwrap().request.context_editing, Some(hint));
     }
 
     /// A registered tool (dummy — the compiler only reads specs).

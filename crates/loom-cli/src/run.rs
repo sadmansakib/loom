@@ -287,6 +287,10 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         system_prompt,
         max_turns: args.max_turns,
         turn_budget,
+        // Roadmap item 12: off on every CLI surface — server-side
+        // context editing is a frontend-level opt-in, and the eval
+        // protocol stays frozen.
+        context_editing: None,
         db_path,
         persist: !args.no_save,
         catalog: None,

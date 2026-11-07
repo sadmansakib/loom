@@ -385,6 +385,7 @@ mod tests {
             max_tokens: Some(64),
             temperature: None,
             stable_prefix_messages: None,
+            context_editing: None,
         };
         let body = provider.request_body(&request);
         assert_eq!(body["reasoning_effort"], "high", "default effort");

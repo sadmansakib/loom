@@ -1157,6 +1157,20 @@ adds four more framing findings and backlog items 26–31 below.
      `/responses/compact` endpoint on the OpenAI-compatible side (free
      reach for four of five adapters) — the in-house path above is the
      default everywhere today.
+     **`clear_tool_uses_20250919` shipped (2026-11-07), default-off.**
+     A provider-agnostic `ContextEditingHint` (trigger tokens, keep-N
+     tool uses, clear-at-least, exclude list) rides `ModelRequest`
+     when `EngineConfig::context_editing` is set; the Anthropic
+     adapter maps it to the `context_management` edit — every knob
+     explicit, so the request bytes replay behavior — plus the
+     `context-management-2025-06-27` beta header (attached by
+     detecting the body key, so header and body cannot drift).
+     Wiremock-verified on and off; serialized requests are
+     byte-identical while off, and no CLI/eval surface sets it
+     (`docs/context-editing-design.md`). Still out: `compact_20260112`
+     (overlaps the kernel's own compaction authority) and the
+     OpenAI-compatible side — both wait for a gateway that proves the
+     need.
 13. **Background commands** (G1, G2). Long builds and tests run
     detached; the runtime injects a completion notice at the next turn
     boundary instead of blocking a turn on them (Sema Code, Crush). Seam:

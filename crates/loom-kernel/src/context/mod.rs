@@ -233,6 +233,11 @@ pub struct AgentConfig {
     /// last resort). Requires a checkpoint-honoring compiler — the
     /// engine's bare arm turns both off together.
     pub handoff_compaction: bool,
+    /// Server-side context editing hint (roadmap item 12): copied
+    /// verbatim onto every compiled [`crate::model::ModelRequest`] when
+    /// set. `None` (the default) sends nothing — kernel-owned
+    /// projection stays the only context authority.
+    pub context_editing: Option<crate::model::ContextEditingHint>,
 }
 
 impl AgentConfig {
@@ -243,6 +248,7 @@ impl AgentConfig {
             workspace_root,
             system_prompt: system_prompt.into(),
             handoff_compaction: true,
+            context_editing: None,
         }
     }
 }

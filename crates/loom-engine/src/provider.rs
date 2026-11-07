@@ -373,6 +373,7 @@ pub fn one_shot_provider(
         system_prompt: None,
         max_turns: 1,
         turn_budget: TurnBudget::default(),
+        context_editing: None,
         db_path: std::env::temp_dir().join("loom-one-shot").join("loom.db"),
         persist: false,
         catalog: None,

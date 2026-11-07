@@ -1855,6 +1855,9 @@ impl Agent {
             max_tokens: Some(HANDOFF_MAX_OUTPUT_TOKENS),
             temperature: None,
             stable_prefix_messages: None,
+            // The handoff is a one-shot summary call — no history to
+            // clear, so no context-editing hint rides it.
+            context_editing: None,
         };
         let response = self
             .stream_with_retry(&request, task_id, sink, cancellation, accounting)
@@ -3199,6 +3202,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             stable_prefix_messages: None,
+            context_editing: None,
         }
     }
 

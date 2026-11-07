@@ -62,6 +62,7 @@ fn request_for(model: &str) -> ModelRequest {
         max_tokens: None,
         temperature: None,
         stable_prefix_messages: None,
+        context_editing: None,
     }
 }
 
@@ -352,6 +353,7 @@ async fn tool_results_round_trip_through_the_wire_body() {
         max_tokens: None,
         temperature: None,
         stable_prefix_messages: None,
+        context_editing: None,
     };
     let provider = provider_at(&server.uri());
     let _events: Vec<Result<ModelEvent, ModelError>> = provider.stream(&request).collect().await;

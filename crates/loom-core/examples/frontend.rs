@@ -47,6 +47,7 @@ fn main() -> anyhow::Result<()> {
         system_prompt: None,
         max_turns: 8,
         turn_budget: Default::default(),
+        context_editing: None,
         db_path: loom_core::paths::db_path(),
         persist: false,
         catalog: None,

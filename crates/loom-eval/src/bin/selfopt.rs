@@ -222,6 +222,7 @@ fn model_proposals(
             max_tokens: Some(8192),
             temperature: None,
             stable_prefix_messages: None,
+            context_editing: None,
         };
         let mut stream = handle.provider.stream(&request);
         let mut text = String::new();

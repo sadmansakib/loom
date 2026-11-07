@@ -61,6 +61,12 @@ use serde_json::{Value, json};
 /// Header value for the required `anthropic-version` header.
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+/// Beta header required by server-side context editing. Sent only
+/// when the request body carries `context_management` — a dated
+/// constant; if Anthropic renames the strategy, this and the edit
+/// type in `anthropic_wire` are the only places to touch.
+pub(crate) const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
+
 /// `max_tokens` fallback when the request carries none. Anthropic
 /// requires the parameter; the kernel's compiler normally derives it
 /// from capabilities, so this covers direct adapter use only.
@@ -185,6 +191,30 @@ pub(crate) fn build_request_body(request: &ModelRequest) -> Value {
                 })
                 .collect(),
         );
+    }
+    // Server-side context editing (roadmap item 12): the
+    // provider-agnostic hint becomes Anthropic's
+    // `clear_tool_uses_20250919` strategy. `trigger` and `keep` are
+    // always explicit — replaying the request bytes must reconstruct
+    // behavior without unstated provider defaults. The matching beta
+    // header is attached in `anthropic.rs` by detecting this key, so
+    // the header cannot drift from the body.
+    if let Some(hint) = &request.context_editing {
+        let mut edit = json!({
+            "type": "clear_tool_uses_20250919",
+            "trigger": {"type": "input_tokens", "value": hint.trigger_tokens},
+            "keep": {"type": "tool_uses", "value": hint.keep_tool_uses},
+        });
+        if let Some(clear_at_least) = hint.clear_at_least_tokens {
+            edit["clear_at_least"] = json!({
+                "type": "input_tokens",
+                "value": clear_at_least,
+            });
+        }
+        if !hint.exclude_tools.is_empty() {
+            edit["exclude_tools"] = json!(hint.exclude_tools);
+        }
+        body["context_management"] = json!({"edits": [edit]});
     }
     body
 }
@@ -588,6 +618,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             stable_prefix_messages: None,
+            context_editing: None,
         }
     }
 

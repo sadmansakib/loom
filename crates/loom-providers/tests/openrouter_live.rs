@@ -130,6 +130,7 @@ fn plain_request(model: &str, prompt: &str) -> ModelRequest {
         max_tokens: Some(512),
         temperature: None,
         stable_prefix_messages: None,
+        context_editing: None,
     }
 }
 

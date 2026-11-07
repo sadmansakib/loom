@@ -37,7 +37,8 @@ use loom_kernel::model::{
 };
 
 use crate::anthropic_wire::{
-    ANTHROPIC_VERSION, AnthropicAssembler, build_request_body, classify_status,
+    ANTHROPIC_VERSION, AnthropicAssembler, CONTEXT_MANAGEMENT_BETA, build_request_body,
+    classify_status,
 };
 use crate::http::{TimeoutConfig, build_client};
 use crate::secret::SecretString;
@@ -195,7 +196,7 @@ async fn step(state: State) -> Option<(Result<Option<ModelEvent>, ModelError>, S
     match state {
         State::Send { provider, body } => {
             let timeouts = provider.config.timeouts;
-            let headers = vec![
+            let mut headers = vec![
                 (
                     reqwest::header::HeaderName::from_static("x-api-key"),
                     provider.config.api_key.expose().to_owned(),
@@ -205,6 +206,15 @@ async fn step(state: State) -> Option<(Result<Option<ModelEvent>, ModelError>, S
                     ANTHROPIC_VERSION.to_owned(),
                 ),
             ];
+            // Server-side context editing rides a dated beta header;
+            // detection is on the built body so the header can never
+            // drift from the `context_management` key it serves.
+            if body.get("context_management").is_some() {
+                headers.push((
+                    reqwest::header::HeaderName::from_static("anthropic-beta"),
+                    CONTEXT_MANAGEMENT_BETA.to_owned(),
+                ));
+            }
             let url = format!("{}/v1/messages", provider.config.base_url);
             let response = match crate::wire_stream::send_request(
                 &provider.client,

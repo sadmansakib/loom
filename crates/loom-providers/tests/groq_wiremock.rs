@@ -64,6 +64,7 @@ fn request_for(model: &str) -> ModelRequest {
         max_tokens: None,
         temperature: None,
         stable_prefix_messages: None,
+        context_editing: None,
     }
 }
 

@@ -3,6 +3,21 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Server-side context editing hint (roadmap item 12, Anthropic slice, default-off)
+
+`ModelRequest` carries an optional provider-agnostic
+`ContextEditingHint` (trigger tokens, keep-N tool uses,
+clear-at-least, exclude list); `EngineConfig::context_editing` opts a
+frontend in (no CLI/eval surface sets it). The Anthropic adapter
+translates the hint into the Messages API `context_management`
+`clear_tool_uses_20250919` edit — every knob explicit — and attaches
+the `context-management-2025-06-27` beta header only when the edit
+rides the body. Serialized requests are byte-identical while the hint
+is off (`skip_serializing_if`), so the frozen eval protocol and every
+existing config are unchanged. Kernel projection, census, and
+compaction stay the only context authority; adapters that cannot
+honor the hint ignore it. Verified by wiremock tests both on and off.
+
 ## 2026-11 — Weak-suite flags in sweep provenance (roadmap item 1 offline remainder)
 
 `swebench-run --suite-audit <path>` embeds a suite audit's weak-suite

@@ -226,6 +226,44 @@ pub struct ModelRequest {
     /// `None` makes no promise. Old serialized requests default to it.
     #[serde(default)]
     pub stable_prefix_messages: Option<usize>,
+    /// Server-side context editing hint (roadmap item 12): past
+    /// `trigger_tokens` input tokens, adapters **may** ask the provider
+    /// to clear stale tool results server-side, keeping the
+    /// [`keep_tool_uses`](ContextEditingHint::keep_tool_uses) most
+    /// recent uses. `None` (the default) sends nothing — the kernel's
+    /// own projection and compaction stay authoritative. Additive and
+    /// skipped when off, so serialized requests are byte-identical
+    /// until a frontend opts in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_editing: Option<ContextEditingHint>,
+}
+
+/// Provider-agnostic intent for server-side clearing of stale tool
+/// results (roadmap item 12).
+///
+/// Names carry *intent*, never provider wire details — the Anthropic
+/// adapter is the only place these become
+/// `context_management.edits[clear_tool_uses_20250919]` (plus its beta
+/// header). Every knob maps one-to-one onto that strategy today, which
+/// is why the struct is provider-agnostic without being vague: an
+/// adapter that cannot honor a knob ignores the whole hint rather than
+/// half-applying it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextEditingHint {
+    /// Clear only once the request's input tokens exceed this
+    /// threshold (Anthropic requires >= 50_000 for its compaction
+    /// trigger; this field imposes no such floor — validation is the
+    /// provider's, not the kernel's).
+    pub trigger_tokens: u32,
+    /// Keep this many most-recent tool uses uncleared; older ones
+    /// become placeholders when the trigger fires.
+    pub keep_tool_uses: u32,
+    /// When set, clear at least this many tokens per activation —
+    /// clearing invalidates the cached prompt prefix, so small
+    /// clearings cost more in cache misses than they save.
+    pub clear_at_least_tokens: Option<u32>,
+    /// Tool names whose results are never cleared.
+    pub exclude_tools: Vec<String>,
 }
 
 /// What a model is capable of — descriptive facts, not policy (§3).
@@ -617,6 +655,7 @@ mod tests {
             max_tokens: Some(1_024),
             temperature: None,
             stable_prefix_messages: None,
+            context_editing: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         let back: ModelRequest = serde_json::from_str(&json).unwrap();
@@ -634,6 +673,56 @@ mod tests {
         }"#;
         let back: ModelRequest = serde_json::from_str(legacy).unwrap();
         assert_eq!(back.stable_prefix_messages, None);
+    }
+
+    #[test]
+    fn context_editing_hint_round_trips() {
+        let request = ModelRequest {
+            model: "claude-sonnet-4-5".into(),
+            messages: vec![Message::User { text: "hi".into() }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            stable_prefix_messages: None,
+            context_editing: Some(ContextEditingHint {
+                trigger_tokens: 30_000,
+                keep_tool_uses: 3,
+                clear_at_least_tokens: Some(5_000),
+                exclude_tools: vec![String::from("scout")],
+            }),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        let back: ModelRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(request, back);
+    }
+
+    #[test]
+    fn absent_context_editing_keeps_serialized_bytes_unchanged() {
+        // Default-off must be byte-off: a request without the hint
+        // serializes without the key, so every stored artifact and the
+        // frozen protocol stay identical until an operator opts in.
+        let request = ModelRequest {
+            model: "deepseek-flash".into(),
+            messages: vec![Message::User { text: "hi".into() }],
+            tools: vec![],
+            max_tokens: Some(1_024),
+            temperature: None,
+            stable_prefix_messages: Some(2),
+            context_editing: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("context_editing"));
+        // Legacy bytes (pre-hint) deserialize with the hint off.
+        let legacy = r#"{
+            "model": "deepseek-flash",
+            "messages": [{"role": "user", "text": "hi"}],
+            "tools": [],
+            "max_tokens": 1024,
+            "temperature": null,
+            "stable_prefix_messages": 2
+        }"#;
+        let back: ModelRequest = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.context_editing, None);
     }
 
     #[test]

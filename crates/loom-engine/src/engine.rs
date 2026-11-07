@@ -67,6 +67,17 @@ pub struct EngineConfig {
     /// `max_turns` governs alone and the frozen eval protocol is
     /// unchanged until a probe opts in.
     pub turn_budget: TurnBudget,
+    /// Server-side context editing hint (roadmap item 12): `None`
+    /// (the default) sends no context-management hint — the kernel's
+    /// own projection and compaction stay the only context authority,
+    /// and the frozen SWE-bench protocol is unchanged. When set, the
+    /// hint rides every `ModelRequest`; adapters that support
+    /// server-side clearing translate it (Anthropic
+    /// `clear_tool_uses_20250919` + its beta header), others ignore
+    /// it. No CLI surface sets it in this slice: a frontend opts in
+    /// programmatically, and a default-off knob nothing sets is dead
+    /// code.
+    pub context_editing: Option<loom_kernel::model::ContextEditingHint>,
     /// Path to the durable-state database (`loom.db`) the frontend selected.
     ///
     /// Used for credential accounts and, when `persist` is set, sessions and
@@ -176,6 +187,7 @@ pub(crate) fn test_config() -> EngineConfig {
         system_prompt: None,
         max_turns: 1,
         turn_budget: TurnBudget::default(),
+        context_editing: None,
         db_path: base.join("loom.db"),
         persist: false,
         catalog: None,
@@ -635,6 +647,9 @@ impl Engine {
         if overrides.bare_loop {
             agent_config.handoff_compaction = false;
         }
+        // Roadmap item 12: the operator's context-editing hint rides
+        // the agent config verbatim (default None sends nothing).
+        agent_config.context_editing = config.context_editing.clone();
         let mut agent = Agent::new(provider, compiler, registry, agent_config, config.model)
             .with_max_turns(config.max_turns)
             .with_turn_budget(config.turn_budget)
@@ -1110,6 +1125,10 @@ fn compose_scout(
         // parent-loop policy, and a bounded read-only scout never has
         // unverified work to fund.
         turn_budget: TurnBudget::default(),
+        // Read-only one-question scout: no tool-result bulk worth
+        // clearing, and the parent's context-editing choice must not
+        // leak into the child's requests.
+        context_editing: None,
         db_path: parent.db_path.clone(),
         persist: false,
         catalog: parent.catalog.clone(),

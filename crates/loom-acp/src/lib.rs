@@ -280,6 +280,7 @@ async fn handle_new_session(
         system_prompt: None,
         max_turns: options.max_turns,
         turn_budget: Default::default(),
+        context_editing: None,
         db_path: options.db_path.clone(),
         persist: true,
         catalog: None,
