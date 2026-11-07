@@ -742,7 +742,17 @@ adds four more framing findings and backlog items 26–31 below.
      the re-baseline debt at today's balance of $1.12: the N ≥ 5 re-runs
      for items 4/5/6/8/10 cost ≈$3+, and the first bare-vs-full contrast
      (10 tasks × 2 arms × N=2) ≈$0.84 — skipped on budget and recorded
-     here rather than run thin (2026-10-23 decision).
+     here rather than run thin (2026-10-23 decision). **Status 2026-11-07:
+     the re-baseline debt is PAID on a strong-model vehicle.** The funded
+     model is a paid LiteLLM gateway (`aws-bedrock/openai.gpt-6-luna`):
+     probe 4/5 resolved, then the first N=5 full-vs-bare contrast
+     executed on the same 5 frozen instances (both arms on one musl
+     binary, official scorer, 25 runs/arm, 95% cache). **Result: medians
+     identical (3/5), full costs ~1.9× requests** — the N=1 directional
+     claims for items 4/5/6/8/10 do not survive on a model this strong,
+     and G4/G5 (raise a *weaker* model) remains open pending a cheap
+     weak funded model. Full record:
+     `docs/benchmarks/swebench-n5-contrast-gpt-6-luna.md`.
      Candidate alternatives, re-checked 2026-10-18: the direct Z.ai
      API is still wiremock-only (no Z.ai key on this machine);
      DeepSeek is drained (`is_available: false`); **NVIDIA NIM is no
@@ -789,7 +799,16 @@ adds four more framing findings and backlog items 26–31 below.
      recorded as a probe, not maintenance evidence. Vehicle history:
      NIM rate-stormed structurally (40 RPM free cap), the OpenRouter
      key proved invalid, the nano gateway held at -j2 with 91.5-92.3%
-     cache. The number this
+     cache. **2026-11-07: the strong-model control ran at the
+      maintenance bar and the headline is null there** — N=5
+      full-vs-bare, funded gateway vehicle (gpt-6-luna), official
+      scorer: medians identical (3/5 both arms), full at ~1.9×
+      requests (834 vs 445) at ~95% cache both; sympy flipped bare's
+      way twice (noise). The harness neither helps nor hurts a
+      strong model on this suite — the G4/G5 claim stays strictly
+      about *weaker* models and still lacks a funded cheap weak
+      vehicle. Record:
+      `docs/benchmarks/swebench-n5-contrast-gpt-6-luna.md`. The number this
      must produce is the G4/G5 headline in `docs/benchmarks/`: the
      claim that Loom raises a weaker model's success rate, which the
      input model profiles (item 9) also need. ~~Also shipped alongside:
