@@ -175,11 +175,11 @@ mod tests {
         let db_path = scratch("pre-headers");
         std::fs::write(
             registry_path(&db_path),
-            br#"{"providers":{"bkash":{"base_url":"https://gw.test/v1","models_url":null}}}"#,
+            br#"{"providers":{"acme":{"base_url":"https://gw.test/v1","models_url":null}}}"#,
         )
         .expect("writes");
         let entry = ProviderRegistry::load(&db_path)
-            .get("bkash")
+            .get("acme")
             .expect("loads")
             .clone();
         assert!(entry.headers.is_empty());
