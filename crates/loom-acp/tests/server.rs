@@ -494,6 +494,114 @@ async fn cancel_does_not_poison_the_next_prompt() {
     assert!(result.is_ok(), "client connection failed: {result:?}");
 }
 
+/// A `session/request_permission` that the client never answers must
+/// not stall the task forever: after `permission_timeout` the program
+/// is denied (fail closed) and the task continues to completion.
+#[tokio::test]
+async fn an_unanswered_permission_request_times_out_and_denies() {
+    let (client_end, agent_end) = Channel::duplex();
+    let workspace = workspace();
+    // The manifest policy makes every unknown program `ask`, which
+    // routes through the ACP permission bridge.
+    std::fs::create_dir_all(workspace.join(".loom")).expect("manifest dir");
+    std::fs::write(
+        workspace.join(".loom/commands.toml"),
+        "[policy]\nunknown = \"ask\"\n",
+    )
+    .expect("manifest write");
+    let provider = ScriptedProvider::new(vec![
+        Script::ToolCall {
+            name: "run_command".into(),
+            arguments: json!({"program": "sleep", "args": ["0"]}),
+        },
+        Script::Reply("denied, moving on".into()),
+    ]);
+    let provider_for_factory = provider.clone();
+    let mut options = ServerOptions::new(
+        "scripted".into(),
+        "test-model".into(),
+        std::env::temp_dir().join(format!("loom-acp-asktimeout-{}.db", std::process::id())),
+    )
+    .with_overrides_factory(Arc::new(move || {
+        loom_core::EngineOverrides::default().with_provider(Box::new(provider_for_factory.clone()))
+    }));
+    // Far below the shipped 120 s default, but far above the
+    // round-trip cost so a fast answer would still win.
+    options.permission_timeout = Duration::from_millis(300);
+    tokio::spawn(async move {
+        if let Err(error) = serve(agent_end, AcpState::new(options)).await {
+            eprintln!("test server ended: {error}");
+        }
+    });
+
+    // The client receives the permission request and never answers —
+    // an editor with a wedged dialog. Every arriving request is
+    // recorded so the test proves the dialog actually happened.
+    let asked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let asked_capture = Arc::clone(&asked);
+    let started = std::time::Instant::now();
+    let result = Client
+        .v1()
+        .on_receive_request(
+            move |request: acp::RequestPermissionRequest, responder, _cx| {
+                let captured = asked_capture.clone();
+                async move {
+                    // The server mints the id from the program name.
+                    let program = request.tool_call.tool_call_id.0.to_string();
+                    if let Ok(mut seen) = captured.lock() {
+                        seen.push(program);
+                    }
+                    // Hold the responder in a detached task: the
+                    // dialog hangs without blocking the client's
+                    // dispatch loop (a pending handler would wedge
+                    // every later message, including the prompt
+                    // response we are waiting for).
+                    tokio::spawn(async move {
+                        let _held = responder;
+                        futures::future::pending::<()>().await;
+                    });
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_with(client_end, async move |cx| {
+            let _ = cx
+                .send_request(acp::InitializeRequest::new(
+                    agent_client_protocol::schema::ProtocolVersion::V1,
+                ))
+                .block_task()
+                .await
+                .expect("initialize");
+            let session = cx
+                .send_request(acp::NewSessionRequest::new(workspace))
+                .block_task()
+                .await
+                .expect("new session");
+            let response = cx
+                .send_request(acp::PromptRequest::new(
+                    session.session_id.clone(),
+                    vec![text_content("run something that needs approval")],
+                ))
+                .block_task()
+                .await
+                .expect("prompt resolves after the denial");
+            assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+            Ok(())
+        })
+        .await;
+    assert!(result.is_ok(), "client connection failed: {result:?}");
+    // The dialog happened and was denied by timeout, not answered.
+    assert!(
+        asked.lock().map(|seen| seen.len() == 1).unwrap_or(false),
+        "expected exactly one permission request"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the prompt must resolve at the timeout, not hang"
+    );
+}
+
 /// A cancel while idle (no prompt in flight) must be a no-op that
 /// leaves the next prompt unaffected.
 #[tokio::test]

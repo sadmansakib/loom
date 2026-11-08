@@ -8,6 +8,21 @@ project versions by iteration, not semver.
 - `fix(kernel)`: malformed tool-argument excerpts no longer panic on
   multi-byte UTF-8 at the 400-byte cut — the excerpt backs off to a
   char boundary (shared `head_bytes` helper with `event.rs::text_head`).
+- `fix(acp)`: one `session/cancel` no longer poisons the session —
+  each `session/prompt` gets a fresh `TaskControl`.
+- `fix(cli)`: Ctrl-C is now handled during `--best-of` rollouts (first
+  press cancels and cleans up worktrees, second exits 130); a
+  cancelled rollout exits 130 like the single-run path.
+- `fix(providers)`: Anthropic input tokens now count cache reads and
+  writes (full-prompt semantics, matching OpenAI `prompt_tokens`).
+- `fix(providers)`: an Anthropic stream of only `ping` events now
+  trips the content-stall window instead of hanging forever.
+- `fix(providers)`: an unknown `finish_reason` classifies structurally
+  (ToolCalls/EndTurn) instead of killing the run with a Protocol error.
+- `fix`: bounded waits everywhere — `Method::Command` credentials are
+  killed after 30 s, ACP permission dialogs deny after 120 s
+  (configurable, fails closed), Ctrl-D in `loom chat` cancels a
+  running task, and Ctrl-C while idle leaves cleanly with exit 130.
 
 ## 2026-11 — ACP tails: session/load and operator-gated client MCP (roadmap item 37)
 

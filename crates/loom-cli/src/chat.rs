@@ -188,6 +188,9 @@ pub fn chat(args: ChatArgs) -> anyhow::Result<ExitCode> {
     let worker_task_live = Arc::clone(&task_live);
     let workspace = args.flags.workspace.clone();
     let no_save = args.flags.no_save;
+    // The worker closure below moves `handle`; the idle Ctrl-C watcher
+    // spawned after it needs its own clone.
+    let idle_handle = handle.clone();
     let worker = std::thread::spawn(move || {
         let mut session = session;
         for message in rx {
@@ -230,6 +233,30 @@ pub fn chat(args: ChatArgs) -> anyhow::Result<ExitCode> {
                     Err(error) => eprintln!("warning: could not adopt fork {id}: {error}"),
                 },
             }
+        }
+    });
+
+    // Ctrl-C while a task runs belongs to that task's ladder (spawned
+    // per task above: first press pauses, second aborts). While idle
+    // there is no ladder, and the default SIGINT disposition would
+    // kill the process mid-prompt. This watcher installs a handler
+    // for the whole chat and routes idle interrupts through the same
+    // leave-the-session-saved exit Ctrl-D takes: sessions persist per
+    // turn, so nothing is lost. The runtime is torn down by process
+    // exit — shutting it down from inside a task it polls would
+    // deadlock.
+    let idle_live = Arc::clone(&task_live);
+    let _idle_signal = idle_handle.spawn(async move {
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                return;
+            }
+            if idle_live.load(Ordering::SeqCst) {
+                // The running task's ladder owns this press.
+                continue;
+            }
+            eprintln!("\n(interrupted — exiting; the session stays saved)");
+            std::process::exit(130);
         }
     });
 
@@ -287,7 +314,15 @@ pub fn chat(args: ChatArgs) -> anyhow::Result<ExitCode> {
         let _ = std::io::stderr().flush();
         line.clear();
         match stdin.read_line(&mut line) {
-            Ok(0) | Err(_) => break, // Ctrl-D or a closed pipe ends the chat.
+            Ok(0) | Err(_) => {
+                // Ctrl-D (or a closed pipe) while a task runs: cancel
+                // it before leaving, or the worker join below would
+                // block on a task that never sees the closed channel.
+                if running && let Some(control) = control.as_ref() {
+                    control.cancel();
+                }
+                break; // Ctrl-D or a closed pipe ends the chat.
+            }
             Ok(_) => {}
         }
 

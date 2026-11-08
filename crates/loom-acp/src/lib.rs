@@ -92,6 +92,11 @@ pub struct ServerOptions {
     /// eagerly, and nothing is written to the workspace lockfile
     /// (see `docs/acp-tails-design.md`).
     pub allow_client_mcp: bool,
+    /// How long a `session/request_permission` round-trip may hang
+    /// before the program is denied and the task moves on. An editor
+    /// that never answers (dialog closed, extension wedged) must not
+    /// stall the prompt forever; the timeout fails closed.
+    pub permission_timeout: std::time::Duration,
 }
 
 impl ServerOptions {
@@ -107,6 +112,7 @@ impl ServerOptions {
             max_turns: DEFAULT_MAX_TURNS,
             overrides_factory: Arc::new(EngineOverrides::default),
             allow_client_mcp: false,
+            permission_timeout: std::time::Duration::from_secs(120),
         }
     }
 
@@ -376,11 +382,12 @@ async fn handle_new_session(
     // the overrides.
     let ask_cx = cx.clone();
     let ask_session = acp_session_id.clone();
+    let ask_timeout = state.options.permission_timeout;
     let mut overrides = (options.overrides_factory)();
     overrides.ask = Some(Arc::new(move |program| {
         let cx = ask_cx.clone();
         let session = ask_session.clone();
-        let permission = ask_permission(cx, session, program.to_string());
+        let permission = ask_permission(cx, session, program.to_string(), ask_timeout);
         Box::pin(permission)
     }));
     // Editor-forwarded servers (item 37 tail): stdio-only, admitted
@@ -581,17 +588,23 @@ async fn handle_load_session(
 
 /// Sends one `session/request_permission` for a blocked program and
 /// resolves `true` only for an explicit allow.
+///
+/// The round-trip is bounded: an editor that never answers (dialog
+/// dismissed, extension hung) would otherwise stall the task forever.
+/// On expiry the program is denied — fail closed — and a warning is
+/// emitted for the operator.
 async fn ask_permission(
     cx: agent_client_protocol::v1::ConnectionTo<Client>,
     session: acp::SessionId,
     program: String,
+    timeout: std::time::Duration,
 ) -> bool {
     let title = format!("Run `{program}`");
     let mut fields = acp::ToolCallUpdateFields::new();
     fields.title = Some(title);
     fields.kind = Some(acp::ToolKind::Execute);
     fields.status = Some(acp::ToolCallStatus::InProgress);
-    let tool_call = acp::ToolCallUpdate::new(acp::ToolCallId::new(program), fields);
+    let tool_call = acp::ToolCallUpdate::new(acp::ToolCallId::new(program.clone()), fields);
     let request = acp::RequestPermissionRequest::new(
         session,
         tool_call,
@@ -613,14 +626,24 @@ async fn ask_permission(
             ),
         ],
     );
-    match cx.send_request(request).block_task().await {
-        Ok(response) => match response.outcome {
+    match tokio::time::timeout(timeout, cx.send_request(request).block_task()).await {
+        // The dialog expired unanswered: deny (fail closed) so the
+        // task continues with a refusal the model can see.
+        Err(_) => {
+            tracing::warn!(
+                program = %program,
+                timeout = ?timeout,
+                "permission request timed out; denying"
+            );
+            false
+        }
+        Ok(Ok(response)) => match response.outcome {
             acp::RequestPermissionOutcome::Selected(selected) => *selected.option_id.0 == *"allow",
             // Cancelled, or a future outcome kind: fail closed.
             _ => false,
         },
         // Transport failure: fail closed.
-        Err(_) => false,
+        Ok(Err(_)) => false,
     }
 }
 

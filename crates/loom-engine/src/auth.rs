@@ -234,6 +234,16 @@ pub enum AuthError {
     /// A [`Method::Command`] account's command failed.
     #[error("credential command failed: {0}")]
     Command(String),
+    /// A [`Method::Command`] account's command exceeded its deadline
+    /// and was killed. Names the command, never its output — the
+    /// output is (meant to be) the secret.
+    #[error("credential command `{command}` timed out after {millis}ms and was killed")]
+    CommandTimeout {
+        /// The shell command that stalled.
+        command: String,
+        /// The deadline that elapsed, in milliseconds.
+        millis: u64,
+    },
     /// Caller supplied an invalid value (method, id, empty input).
     #[error("invalid input: {0}")]
     Invalid(String),
@@ -831,20 +841,75 @@ fn secret_for(
     }
 }
 
-/// Runs a credential command and returns its trimmed stdout.
+/// How long a [`Method::Command`] credential command may run before
+/// it is killed. Credential helpers are operator configuration; a
+/// typo (`sleep 600` for `sleep 6`) or a two-factor prompt must not
+/// wedge engine startup forever.
+pub(crate) const CREDENTIAL_COMMAND_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+/// Runs a credential command with the standard 30 s deadline.
 pub(crate) fn run_command(command: &str) -> Result<String, AuthError> {
-    let output = std::process::Command::new("sh")
+    run_command_with_timeout(command, CREDENTIAL_COMMAND_TIMEOUT)
+}
+
+/// The injectable-deadline core of [`run_command`]; tests shorten it.
+///
+/// The wait is bounded: on timeout the child is killed and reaped so
+/// no orphan lingers, and the error names the command — never its
+/// output, which is a secret. Stderr is discarded for the same
+/// reason. The child is killed on timeout from this side (a sync
+/// poll loop rather than `kill_on_drop`, because both callers —
+/// engine open and `loom auth add` — are synchronous contexts).
+fn run_command_with_timeout(
+    command: &str,
+    timeout: std::time::Duration,
+) -> Result<String, AuthError> {
+    let mut child = std::process::Command::new("sh")
         .arg("-c")
         .arg(command)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .map_err(|error| AuthError::Command(error.to_string()))?;
-    if !output.status.success() {
+    // Drain stdout on a thread: a chatty command must not fill the
+    // pipe and deadlock the bounded wait below.
+    let pipe = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut bytes);
+        }
+        bytes
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                } else {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    let millis = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+                    return Err(AuthError::CommandTimeout {
+                        command: command.to_owned(),
+                        millis,
+                    });
+                }
+            }
+            Err(error) => return Err(AuthError::Command(error.to_string())),
+        }
+    };
+    let output = reader.join().unwrap_or_default();
+    if !status.success() {
         return Err(AuthError::Command(format!(
-            "`{command}` exited with {}",
-            output.status
+            "`{command}` exited with {status}"
         )));
     }
-    let secret = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let secret = String::from_utf8_lossy(&output).trim().to_owned();
     if secret.is_empty() {
         return Err(AuthError::Command(format!(
             "`{command}` produced no output"
@@ -1371,6 +1436,24 @@ mod tests {
 
         let error = resolve(&store, &secrets, "deepseek", None, |_| None).unwrap_err();
         assert!(matches!(error, AuthError::Command(_)));
+    }
+
+    #[test]
+    fn a_hanging_credential_command_times_out_and_names_the_command() {
+        // A shortened deadline stands in for the shipped 30 s one;
+        // the run must return at the deadline, not after `sleep 60`.
+        let started = std::time::Instant::now();
+        let error = run_command_with_timeout("sleep 60", std::time::Duration::from_millis(200))
+            .expect_err("must time out");
+        assert!(matches!(error, AuthError::CommandTimeout { .. }), "{error}");
+        // The error names the command, never its output.
+        let message = error.to_string();
+        assert!(message.contains("sleep 60"), "{message}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "returned at the deadline ({}s), not after the sleep",
+            started.elapsed().as_secs()
+        );
     }
 
     #[test]
