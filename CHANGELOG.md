@@ -41,6 +41,14 @@ project versions by iteration, not semver.
   deny (or an `unknown = "ask"` posture) skips verification with a
   policy note instead of silently auto-allowing; the standalone
   `verify` tool likewise refuses on an operator deny.
+- `fix(engine,cli)`: credential edges — an environment-method account
+  with an empty-but-set variable no longer mints an empty secret
+  (previously sent as `Authorization: Bearer `); best-of worktree
+  dirs and `loom rewind` snapshots are added to the repository's
+  local `.git/info/exclude`, so a blanket `git add -A` (model or
+  operator) can no longer stage session state or broken gitlinks —
+  the tracked `.gitignore` is never touched and manifests stay
+  shareable.
 - `fix(tools)`: the macOS Seatbelt profile denies Apple-event IPC
   (`appleevent-send` plus an exec deny of `osascript`, which the
   classic filter no longer stops on current macOS) and re-allows

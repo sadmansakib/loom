@@ -191,6 +191,11 @@ pub fn apply_restore(plan: &RestorePlan) -> Result<PathBuf> {
     let rewind_dir = plan.workspace.join(".loom").join("rewind");
     std::fs::create_dir_all(&rewind_dir)
         .with_context(|| format!("creating {}", rewind_dir.display()))?;
+    // Review item 2.8: recovery snapshots are machine-local state; a
+    // blanket `git add -A` (by the model or the operator) must not
+    // commit them. Local excludes only — the tracked .gitignore is
+    // never touched.
+    loom_core::engine::worktrees::exclude_state_from_git(&plan.workspace, &[".loom/rewind/"]);
     let patch = rewind_dir.join(format!("{timestamp}.patch"));
 
     run_git(&plan.workspace, &["add", "-A"])

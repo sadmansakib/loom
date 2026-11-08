@@ -828,8 +828,14 @@ fn secret_for(
             run_command(command).map(SecretString::new)
         }
         Method::Environment => {
+            // Review item 2.8: an empty-but-set variable is not a
+            // credential (the env-fallback path in `resolve` already
+            // skips it); an empty secret would ride onto the wire as
+            // `Authorization: Bearer `.
             for name in provider_env_names(&account.provider) {
-                if let Some(value) = get_env(&name) {
+                if let Some(value) = get_env(&name)
+                    && !value.is_empty()
+                {
                     return Ok(SecretString::new(value));
                 }
             }
@@ -1355,6 +1361,38 @@ mod tests {
         assert_eq!(resolved.secret.expose(), "account-key");
         assert_eq!(resolved.source, CredentialSource::Account);
         assert_eq!(resolved.account.unwrap().label, "work");
+    }
+
+    #[test]
+    fn an_empty_environment_is_not_a_credential_for_accounts() {
+        // Review item 2.8: an environment-method account must not mint
+        // an empty secret (it would ride the wire as `Bearer `).
+        let store = store();
+        let secrets = StubBackend::new();
+        let saved = account("deepseek", "work", Method::Environment);
+        store.insert(&saved, true).unwrap();
+
+        let error = resolve(&store, &secrets, "deepseek", None, |name| {
+            (name == "DEEPSEEK_API_KEY").then(String::new)
+        })
+        .unwrap_err();
+        assert!(matches!(error, AuthError::NoCredential { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn an_empty_environment_falls_through_to_the_next_name() {
+        let store = store();
+        let secrets = StubBackend::new();
+        let saved = account("glm", "work", Method::Environment);
+        store.insert(&saved, true).unwrap();
+
+        let resolved = resolve(&store, &secrets, "glm", None, |name| match name {
+            "ZAI_API_KEY" => Some(String::new()),
+            "Z_AI_API_KEY" => Some("second-name-key".to_owned()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(resolved.secret.expose(), "second-name-key");
     }
 
     #[test]

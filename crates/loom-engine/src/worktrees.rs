@@ -245,6 +245,63 @@ async fn git_with_stdin(dir: &Path, args: &[&str], stdin: &str) -> Result<String
     }
 }
 
+/// Best-effort: appends `entries` to the repository's local-only
+/// `.git/info/exclude` (creating it if absent) so machine-local Loom
+/// state is never staged by a blanket `git add -A` — best-of worktree
+/// dirs otherwise land in the index as broken gitlinks (160000), and
+/// rewind snapshot patches would ride into the operator's next commit.
+/// Never touches the tracked `.gitignore`: manifests
+/// (`.loom/commands.toml`, `mcp.toml`, `mcp.lock`) stay shareable; only
+/// generated state is excluded. Failures are warned and swallowed —
+/// this is hygiene, not a gate (review item 2.8).
+pub fn exclude_state_from_git(workspace: &Path, entries: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["rev-parse", "--path-format=absolute", "--git-dir"])
+        .output();
+    let Ok(output) = output else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let git_dir = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if git_dir.is_empty() {
+        return;
+    }
+    let exclude = std::path::Path::new(&git_dir).join("info").join("exclude");
+    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    let missing: Vec<&str> = entries
+        .iter()
+        .copied()
+        .filter(|entry| !existing.lines().any(|line| line.trim() == *entry))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let mut body = existing;
+    if !body.ends_with('\n') && !body.is_empty() {
+        body.push('\n');
+    }
+    if body.is_empty() {
+        body.push_str("# local excludes written by loom (session state, never committed)\n");
+    }
+    for entry in missing {
+        body.push_str(entry);
+        body.push('\n');
+    }
+    if let Err(error) =
+        std::fs::create_dir_all(exclude.parent().unwrap_or(std::path::Path::new("")))
+    {
+        tracing::warn!(%error, "cannot create .git/info dir for local excludes");
+        return;
+    }
+    if let Err(error) = std::fs::write(&exclude, body) {
+        tracing::warn!(%error, path = %exclude.display(), "cannot write local git excludes");
+    }
+}
+
 /// Captures the worktree's full diff, SWE-bench style: drop the child's
 /// `.loom` state first (session database, never part of a patch), stage
 /// everything, then read the cached diff. Best-effort: a git failure here
@@ -556,6 +613,9 @@ pub async fn best_of_n(
             ))
         })?;
     let repo_root = PathBuf::from(repo_root);
+    // Review item 2.8: worktree dirs (and their session databases) must
+    // never ride into the operator's index as gitlinks.
+    exclude_state_from_git(&repo_root, &[".loom/worktrees/"]);
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -1038,6 +1098,45 @@ mod tests {
                 .unwrap_or_else(|| vec![ScriptedProvider::end_turn_script("fallback")]);
             Ok(Box::new(ScriptedProvider::scripted(script)) as Box<dyn ModelProvider>)
         })
+    }
+
+    #[tokio::test]
+    async fn best_of_n_writes_local_git_excludes_for_state_dirs() {
+        // Review item 2.8: the worktrees dir must never ride into the
+        // operator's index (git add -A would stage a broken gitlink).
+        let base = tempfile::tempdir().expect("tempdir");
+        let repo = git_repo(base.path()).await;
+        exclude_state_from_git(&repo, &[".loom/worktrees/"]);
+        let git_dir = std::path::PathBuf::from(
+            String::from_utf8_lossy(
+                &std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(["rev-parse", "--path-format=absolute", "--git-dir"])
+                    .output()
+                    .expect("rev-parse")
+                    .stdout,
+            )
+            .trim()
+            .to_owned(),
+        );
+        let exclude = git_dir.join("info").join("exclude");
+        let body = std::fs::read_to_string(&exclude).expect("exclude written");
+        assert!(body.contains(".loom/worktrees/"), "{body}");
+
+        // Idempotent: a second call must not duplicate the entry.
+        exclude_state_from_git(&repo, &[".loom/worktrees/"]);
+        let again = std::fs::read_to_string(&exclude).expect("exclude readable");
+        assert_eq!(again.matches(".loom/worktrees/").count(), 1, "{again}");
+
+        // And git actually honors it.
+        let ignored = git(
+            &repo,
+            &["check-ignore", "-q", ".loom/worktrees/best-of-1/0"],
+        )
+        .await
+        .is_ok();
+        assert!(ignored, "git must ignore the worktrees root");
     }
 
     #[tokio::test]
