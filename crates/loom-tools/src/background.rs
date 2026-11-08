@@ -412,6 +412,7 @@ pub(crate) async fn prepare_exec(
     let limits = crate::exec::ExecLimits {
         stream_window: rule.and_then(|rule| rule.max_output_bytes),
         scrub: rule.map(|rule| rule.env_scrub.clone()).unwrap_or_default(),
+        env_allow: rule.map(|rule| rule.env_allow.clone()).unwrap_or_default(),
     };
     let grants = crate::sandbox::SandboxGrants::from_rule(rule);
     let sandbox = crate::sandbox::Sandbox::resolve(workspace_root, grants);

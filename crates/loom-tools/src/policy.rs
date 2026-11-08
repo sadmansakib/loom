@@ -52,10 +52,14 @@
 //! * `env_scrub` — extra environment variable names removed from the
 //!   child, on top of the credential floor below.
 //!
-//! The credential floor is non-negotiable: provider API keys and other
-//! Loom credentials are scrubbed from every spawned child regardless of
-//! any manifest, so a workspace process can never read them. A manifest
-//! may add names to the scrub list; it can never remove the floor.
+//! The credential floor is near-non-negotiable: provider API keys and
+//! other Loom credentials are scrubbed from every spawned child — the
+//! fixed floor plus any present variable matching a credential suffix
+//! (`_API_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`). A manifest may add
+//! names to the scrub list; it can narrow the floor only through the
+//! per-program `env_allow` list, an explicit, auditable opt-in for
+//! programs that legitimately need a credential (for example `gh`
+//! needing `GH_TOKEN`).
 //!
 //! Audit: every executed command is recorded as a structured
 //! [`CommandEffect`](loom_kernel::tool::CommandEffect) (program, args,
@@ -69,7 +73,9 @@ use serde::{Deserialize, Serialize};
 
 /// Environment variables removed from every spawned child, regardless
 /// of manifest: Loom's own credentials never leak into a workspace
-/// process.
+/// process. The list covers every provider credential env name Loom
+/// can read plus the common cloud/git tokens the suffix patterns
+/// below would otherwise only catch opportunistically.
 pub(crate) const SCRUB_FLOOR: &[&str] = &[
     "DEEPSEEK_API_KEY",
     "OPENROUTER_API_KEY",
@@ -77,7 +83,43 @@ pub(crate) const SCRUB_FLOOR: &[&str] = &[
     "OPENAI_API_KEY",
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
+    "ZAI_API_KEY",
+    "Z_AI_API_KEY",
+    "GROQ_API_KEY",
+    "NVIDIA_API_KEY",
+    "NIM_API_KEY",
+    "CUSTOM_API_KEY",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
 ];
+
+/// Suffix patterns that mark an environment variable as a credential.
+/// `loom provider add` mints `<NAME>_API_KEY` names dynamically, so a
+/// fixed list can never cover them; any *present* variable matching
+/// one of these suffixes is scrubbed alongside the floor.
+pub(crate) const SCRUB_SUFFIXES: &[&str] = &["_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD"];
+
+/// Whether `name` is a credential by the floor list or a suffix
+/// pattern. Pure, so it is testable without touching the live
+/// environment.
+fn matches_scrub(name: &str) -> bool {
+    SCRUB_FLOOR.contains(&name) || SCRUB_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
+}
+
+/// The names to remove from a child environment for one spawn: every
+/// variable currently in *this* process's environment that matches the
+/// floor or a credential suffix, minus the rule's explicit
+/// `env_allow` opt-ins. Computed from `std::env::vars_os()` at spawn
+/// time so `loom provider add <name>` credentials added after startup
+/// are still caught.
+pub(crate) fn scrub_names(allow: &[String]) -> Vec<String> {
+    std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| matches_scrub(name) && !allow.contains(name))
+        .collect()
+}
 
 /// The longest wall-time cap a manifest rule may declare. A policy
 /// timeout exists to bound a runaway command, not to license
@@ -163,6 +205,11 @@ pub struct CommandRule {
     /// Extra environment names scrubbed from the child, beyond the
     /// credential floor.
     pub env_scrub: Vec<String>,
+    /// Credential-shaped environment names this program is explicitly
+    /// allowed to receive, exempt from the floor and suffix patterns.
+    /// The auditable opt-in for tools that legitimately need a
+    /// token — for example `gh` with `GH_TOKEN`.
+    pub env_allow: Vec<String>,
     /// Grant network access inside the sandbox for this program.
     pub network: bool,
     /// Run this program outside the OS sandbox entirely — the loudest
@@ -182,6 +229,7 @@ impl CommandRule {
             timeout_secs: None,
             max_output_bytes: None,
             env_scrub: Vec::new(),
+            env_allow: Vec::new(),
             network: false,
             sandbox: true,
             extra_writable: Vec::new(),
@@ -310,6 +358,8 @@ impl CommandPolicy {
             #[serde(default)]
             env_scrub: Vec<String>,
             #[serde(default)]
+            env_allow: Vec<String>,
+            #[serde(default)]
             network: bool,
             #[serde(default = "default_sandbox")]
             sandbox: bool,
@@ -360,6 +410,7 @@ impl CommandPolicy {
                 timeout_secs: entry.timeout_secs,
                 max_output_bytes: entry.max_output_bytes,
                 env_scrub: entry.env_scrub,
+                env_allow: entry.env_allow,
                 network: entry.network,
                 sandbox: entry.sandbox,
                 extra_writable: entry.extra_writable,
@@ -454,6 +505,19 @@ fn validate(rule: &CommandRule, path: &str) -> Result<(), PolicyError> {
             return Err(PolicyError::Invalid {
                 path: path.to_owned(),
                 message: format!("env_scrub entry \"{name}\" is not an environment variable name"),
+            });
+        }
+    }
+    for name in &rule.env_allow {
+        // An allow entry that is not itself a credential shape is a
+        // no-op with a misleading smell; reject it so the manifest
+        // stays honest.
+        if name.is_empty() || name.contains('=') || !matches_scrub(name) {
+            return Err(PolicyError::Invalid {
+                path: path.to_owned(),
+                message: format!(
+                    "env_allow entry \"{name}\" is not a credential-shaped environment variable name"
+                ),
             });
         }
     }
@@ -584,6 +648,52 @@ mod tests {
     fn the_scrub_floor_covers_provider_credentials() {
         assert!(SCRUB_FLOOR.contains(&"DEEPSEEK_API_KEY"));
         assert!(SCRUB_FLOOR.contains(&"OPENROUTER_API_KEY"));
+        // The names the review found missing: every provider Loom
+        // ships plus the custom-gateway credential and the common
+        // cloud/git tokens.
+        for name in [
+            "ZAI_API_KEY",
+            "Z_AI_API_KEY",
+            "GROQ_API_KEY",
+            "NVIDIA_API_KEY",
+            "NIM_API_KEY",
+            "CUSTOM_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+        ] {
+            assert!(SCRUB_FLOOR.contains(&name), "{name} missing from the floor");
+        }
+    }
+
+    #[test]
+    fn suffix_patterns_mark_credentials_without_the_floor() {
+        assert!(matches_scrub("ANY_GATEWAY_API_KEY"));
+        assert!(matches_scrub("TEAM_SERVICE_TOKEN"));
+        assert!(matches_scrub("BUILD_DB_SECRET"));
+        assert!(matches_scrub("BUILD_DB_PASSWORD"));
+        // Not credentials: the suffix must not fire on words that
+        // merely end similarly, and plain variables stay visible.
+        assert!(!matches_scrub("TOKENS"));
+        assert!(!matches_scrub("PATH"));
+        assert!(!matches_scrub("API_KEYLESS"));
+    }
+
+    #[test]
+    fn env_allow_entries_must_be_credential_shaped() {
+        let error = CommandPolicy::parse(
+            "[[command]]\nprogram = \"sh\"\nenv_allow = [\"SOME_PLAIN_VAR\"]\n",
+        )
+        .expect_err("not credential-shaped");
+        assert!(error.to_string().contains("credential-shaped"), "{error}");
+        let policy =
+            CommandPolicy::parse("[[command]]\nprogram = \"sh\"\nenv_allow = [\"GH_TOKEN\"]\n")
+                .expect("valid");
+        assert_eq!(
+            policy.rule("sh").map(|rule| rule.env_allow.clone()),
+            Some(vec!["GH_TOKEN".to_owned()])
+        );
     }
 
     #[test]

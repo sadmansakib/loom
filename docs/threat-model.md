@@ -55,7 +55,7 @@ timing or token counts; those live below or beside the harness.
 | --- | --- |
 | Execution | sandbox for `run_command`; command policy rules (timeouts, output caps); deny list; verdict layer (`allow`/`ask`/`deny`) |
 | Execution | `Ask` verdicts bridge to the operator (CLI prompt; ACP `session/request_permission` since roadmap item 37) — fail closed |
-| Credential disclosure | env-scrub floor on every spawned child; secrets never enter tool-visible context |
+| Credential disclosure | env-scrub floor on every spawned child; secrets never enter tool-visible context. The floor lists every Loom provider credential name plus AWS/GitHub tokens, and any *present* variable matching a credential suffix (`_API_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`) is scrubbed too — so `loom provider add <name>` credentials minted after startup are caught. The single narrowing path is a per-program `env_allow` list in `.loom/commands.toml`, an explicit auditable opt-in (e.g. `gh` needing `GH_TOKEN`); entries must themselves be credential-shaped. MCP servers are stricter still: `env_clear` plus only the manifest-declared variables |
 | Repeat loops | failure ledger refuses exact repeats of failed calls |
 | Malformed calls | salvage refusals (never dispatched) |
 | Audit | every executed command and call outcome persisted in the session transcript |

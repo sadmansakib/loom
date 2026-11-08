@@ -567,6 +567,7 @@ async fn program_ok(
     let limits = ExecLimits {
         stream_window: rule.and_then(|rule| rule.max_output_bytes),
         scrub: rule.map(|rule| rule.env_scrub.clone()).unwrap_or_default(),
+        env_allow: rule.map(|rule| rule.env_allow.clone()).unwrap_or_default(),
     };
     let grants = SandboxGrants::from_rule(rule);
     let sandbox = Sandbox::resolve(workspace, grants);
@@ -605,6 +606,7 @@ async fn program_output(
     let limits = ExecLimits {
         stream_window: rule.and_then(|rule| rule.max_output_bytes),
         scrub: rule.map(|rule| rule.env_scrub.clone()).unwrap_or_default(),
+        env_allow: rule.map(|rule| rule.env_allow.clone()).unwrap_or_default(),
     };
     let grants = SandboxGrants::from_rule(rule);
     let sandbox = Sandbox::resolve(workspace, grants);

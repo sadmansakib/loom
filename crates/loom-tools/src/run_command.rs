@@ -452,6 +452,7 @@ impl Tool for RunCommandTool {
             let limits = crate::exec::ExecLimits {
                 stream_window: rule.and_then(|rule| rule.max_output_bytes),
                 scrub: rule.map(|rule| rule.env_scrub.clone()).unwrap_or_default(),
+                env_allow: rule.map(|rule| rule.env_allow.clone()).unwrap_or_default(),
             };
             let grants = crate::sandbox::SandboxGrants::from_rule(rule);
             let sandbox = crate::sandbox::Sandbox::resolve(&ctx.workspace_root, grants);
@@ -1486,6 +1487,40 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured
             "[[command]]\nprogram = \"sh\"\nenv_scrub = [\"LOOM_TEST_SECRET\"]\n",
             &[("LOOM_TEST_SECRET", "loom-test-secret")],
             "if [ -n \"$LOOM_TEST_SECRET\" ]; then echo leaked; else echo scrubbed; fi",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_suffix_patterns_scrub_dynamic_provider_keys() {
+        // `loom provider add <name>` mints <NAME>_API_KEY names the
+        // fixed floor never knew; the suffix pattern must catch them.
+        scrub_probe(
+            "[[command]]\nprogram = \"sh\"\n",
+            &[
+                ("MY_GATEWAY_API_KEY", "loom-test-secret"),
+                ("TEAM_SERVICE_TOKEN", "loom-test-secret"),
+                ("BUILD_DB_PASSWORD", "loom-test-secret"),
+            ],
+            "for v in MY_GATEWAY_API_KEY TEAM_SERVICE_TOKEN BUILD_DB_PASSWORD; do \
+             if printenv \"$v\" >/dev/null; then echo leaked:$v; fi; done; echo scrubbed",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_env_allow_entry_exempts_one_credential() {
+        // The explicit opt-in: `gh` may receive GH_TOKEN, but the
+        // exemption is per-name — the unrelated pattern match stays
+        // scrubbed.
+        scrub_probe(
+            "[[command]]\nprogram = \"sh\"\nenv_allow = [\"GH_TOKEN\"]\n",
+            &[
+                ("GH_TOKEN", "ok-to-see"),
+                ("OTHER_TOKEN", "loom-test-secret"),
+            ],
+            "if ! printenv GH_TOKEN >/dev/null; then echo leaked:no-gh; fi; \
+             if printenv OTHER_TOKEN >/dev/null; then echo leaked:other; fi; echo scrubbed",
         )
         .await;
     }

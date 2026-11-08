@@ -64,6 +64,9 @@ pub(crate) struct ExecLimits {
     pub stream_window: Option<usize>,
     /// Extra environment names removed from the child.
     pub scrub: Vec<String>,
+    /// Credential-shaped names explicitly exempt from the floor for
+    /// this program (the manifest's auditable `env_allow` opt-in).
+    pub env_allow: Vec<String>,
 }
 
 /// Kills the whole process group when dropped while still armed.
@@ -137,12 +140,15 @@ pub(crate) async fn run_bounded(
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // The credential floor plus the rule's extra names; the child
-        // never sees Loom's own keys (command execution policy).
-        for name in crate::policy::SCRUB_FLOOR
+        // The credential floor plus suffix patterns, minus the rule's
+        // explicit allowlist, plus the rule's extra names; the child
+        // never sees Loom's own keys (command execution policy). The
+        // set is computed from the live environment each spawn so
+        // `loom provider add` credentials minted after startup are
+        // caught too.
+        for name in crate::policy::scrub_names(&limits.env_allow)
             .iter()
-            .copied()
-            .chain(limits.scrub.iter().map(String::as_str))
+            .chain(limits.scrub.iter())
         {
             command.env_remove(name);
         }
