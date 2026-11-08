@@ -27,7 +27,13 @@ use serde::{Deserialize, Serialize};
 /// bumps `EVENT_SCHEMA_VERSION` in `crate::event`.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct Usage {
-    /// Tokens in the request prompt.
+    /// Tokens in the request prompt — the *full* prompt, whether or
+    /// not part of it was served from a provider-side cache.
+    /// Invariant: `cached_input_tokens ⊆ input_tokens` (and on the
+    /// Anthropic wire, `cache_creation_input_tokens ⊆ input_tokens`
+    /// as well). The OpenAI family's `prompt_tokens` already includes
+    /// the cached share; the Anthropic wire sums its three input
+    /// counters to the same meaning.
     pub input_tokens: u64,
     /// Tokens the model generated.
     pub output_tokens: u64,

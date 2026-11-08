@@ -434,17 +434,19 @@ impl AnthropicAssembler {
         }
     }
 
-    /// `message_start`: the input-side usage snapshot, including the
-    /// cached split (Anthropic reports the cached subset separately, so
-    /// the billable miss count is the difference).
+    /// `message_start`: the input-side usage snapshot. Anthropic's
+    /// `input_tokens` already *excludes* both cache reads and cache
+    /// writes, so the full prompt — the kernel's `input_tokens`
+    /// meaning, matching the OpenAI wire's `prompt_tokens` — is the
+    /// sum of all three counters.
     fn ingest_message_start(&mut self, event: &Value) {
         let usage = &event["message"]["usage"];
-        self.input_usage = usage["input_tokens"].as_u64().unwrap_or(0);
+        let input = usage["input_tokens"].as_u64().unwrap_or(0);
+        let cached = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+        let creation = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+        self.input_usage = input.saturating_add(cached).saturating_add(creation);
         self.cached_input = usage["cache_read_input_tokens"].as_u64();
         self.cache_creation = usage["cache_creation_input_tokens"].as_u64();
-        if let Some(cached) = self.cached_input {
-            self.input_usage = self.input_usage.saturating_sub(cached);
-        }
     }
 
     /// `content_block_delta`: appends the fragment to whichever buffer
@@ -949,7 +951,9 @@ mod tests {
             response.message.reasoning.as_ref().map(|r| r.text.as_str()),
             Some("ponder")
         );
-        assert_eq!(response.usage.input_tokens, 60);
+        // The full prompt: Anthropic's input_tokens excludes both
+        // cache counters, so the kernel total is their sum.
+        assert_eq!(response.usage.input_tokens, 150);
         assert_eq!(response.usage.cached_input_tokens, Some(40));
         assert_eq!(response.usage.cache_creation_input_tokens, Some(10));
         // Thinking tokens are an attribution split of the output total.
@@ -1022,7 +1026,7 @@ mod tests {
         assert_eq!(response.message.stop_reason, StopReason::ToolCalls);
         assert_eq!(response.message.tool_calls.len(), 1);
         assert_eq!(response.message.tool_calls[0].name, "read_file");
-        assert_eq!(response.usage.input_tokens, 60);
+        assert_eq!(response.usage.input_tokens, 140);
         assert_eq!(response.usage.cached_input_tokens, Some(40));
         assert_eq!(response.usage.output_tokens, 57);
         assert_eq!(response.usage.cost_usd, None);

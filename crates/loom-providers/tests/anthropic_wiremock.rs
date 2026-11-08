@@ -117,9 +117,9 @@ async fn streamed_text_completes_with_usage() {
     assert_eq!(joined_text(&events), "Hello from Anthropic");
     let response = expect_completed(events);
     assert_eq!(response.message.stop_reason, StopReason::EndTurn);
-    // 100 billed input tokens, 40 of them cache reads: the cache share
-    // is reported separately, the input count excludes it.
-    assert_eq!(response.usage.input_tokens, 60);
+    // 100 uncached input tokens + 40 cache reads: the kernel total
+    // is the full prompt (the OpenAI wire's prompt_tokens meaning).
+    assert_eq!(response.usage.input_tokens, 140);
     assert_eq!(response.usage.cached_input_tokens, Some(40));
     assert_eq!(response.usage.output_tokens, 4);
     assert_eq!(response.usage.cost_usd, None);
@@ -311,7 +311,11 @@ async fn a_55_thinking_stream_accounts_thinking_and_cache_writes() {
         response.message.reasoning.as_ref().map(|r| r.text.as_str()),
         Some("pondering")
     );
-    assert_eq!(response.usage.input_tokens, 60);
+    // The full prompt is the sum of all three input counters:
+    // Anthropic's input_tokens excludes cache reads and writes, and
+    // the kernel's meaning (matching the OpenAI wire's
+    // prompt_tokens) is the whole request prompt: 100 + 40 + 10.
+    assert_eq!(response.usage.input_tokens, 150);
     assert_eq!(response.usage.cached_input_tokens, Some(40));
     assert_eq!(response.usage.cache_creation_input_tokens, Some(10));
     assert_eq!(response.usage.thinking_tokens, Some(30));
