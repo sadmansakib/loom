@@ -286,10 +286,13 @@ const MALFORMED_ARGUMENTS_EXCERPT: usize = 400;
 impl ToolArguments {
     /// Builds the placeholder object for arguments that did not parse:
     /// `{ MALFORMED_ARGUMENTS_KEY: "<raw excerpt>" }`. The excerpt is
-    /// bounded so a runaway fragment cannot bloat the transcript.
+    /// bounded so a runaway fragment cannot bloat the transcript, and
+    /// the cut backs off to a UTF-8 char boundary — the raw text is
+    /// model-controlled, so a naive byte slice could panic.
     pub fn malformed(raw: &str) -> Self {
-        let excerpt = if raw.len() > MALFORMED_ARGUMENTS_EXCERPT {
-            format!("{}[truncated]", &raw[..MALFORMED_ARGUMENTS_EXCERPT])
+        let head = crate::event::head_bytes(raw, MALFORMED_ARGUMENTS_EXCERPT);
+        let excerpt = if head.len() < raw.len() {
+            format!("{head}[truncated]")
         } else {
             raw.to_owned()
         };
@@ -546,6 +549,28 @@ mod tests {
         .unwrap();
         assert_eq!(result["kind"], "tool_result");
         assert_eq!(result["call_id"], "call_1");
+    }
+
+    #[test]
+    fn malformed_arguments_excerpt_never_splits_a_multibyte_char() {
+        // 399 ASCII bytes then a multi-byte char: the 400-byte cut
+        // lands mid-character. The naive byte slice panics here.
+        let raw = format!("{}é…", "a".repeat(399));
+        assert!(raw.len() > MALFORMED_ARGUMENTS_EXCERPT);
+        let args = ToolArguments::malformed(&raw);
+        let excerpt = args[MALFORMED_ARGUMENTS_KEY].as_str().unwrap();
+        let head = excerpt.strip_suffix("[truncated]").unwrap_or(excerpt);
+        assert!(raw.starts_with(head));
+        assert!(head.len() <= MALFORMED_ARGUMENTS_EXCERPT);
+
+        // Same shape with an emoji straddling the cut.
+        let emoji = format!("{}😀", "b".repeat(398));
+        let args = ToolArguments::malformed(&emoji);
+        let excerpt = args[MALFORMED_ARGUMENTS_KEY].as_str().unwrap();
+        assert!(excerpt.ends_with("[truncated]"));
+        let head = excerpt.strip_suffix("[truncated]").unwrap();
+        assert!(emoji.starts_with(head));
+        assert!(head.len() <= MALFORMED_ARGUMENTS_EXCERPT);
     }
 
     #[test]

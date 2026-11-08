@@ -114,18 +114,30 @@ pub const ARGUMENTS_EVENT_HEAD: usize = 2_000;
 /// enough for the echoed command line and its exit status.
 pub const CONTENT_EVENT_HEAD: usize = 1_000;
 
-/// Head-bounds a string to `budget` bytes on a char boundary, marking
-/// the cut. Used by the tool events so the stream stays forensic
-/// without reproducing whole file bodies or tool outputs.
-pub fn text_head(text: &str, budget: usize) -> String {
+/// Head-bounds a string to at most `budget` bytes on a UTF-8 char
+/// boundary, without any truncation marker. Returns the input
+/// unchanged when it already fits.
+pub(crate) fn head_bytes(text: &str, budget: usize) -> &str {
     if text.len() <= budget {
-        return text.to_owned();
+        return text;
     }
     let mut end = budget;
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}[truncated]", &text[..end])
+    &text[..end]
+}
+
+/// Head-bounds a string to `budget` bytes on a char boundary, marking
+/// the cut. Used by the tool events so the stream stays forensic
+/// without reproducing whole file bodies or tool outputs.
+pub fn text_head(text: &str, budget: usize) -> String {
+    let head = head_bytes(text, budget);
+    if head.len() < text.len() {
+        format!("{head}[truncated]")
+    } else {
+        head.to_owned()
+    }
 }
 
 /// One observed occurrence during a task, wrapped for the wire.
