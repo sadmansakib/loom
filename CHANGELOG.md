@@ -3,6 +3,12 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Review fixes round 1: crash, hang and accounting fixes
+
+- `fix(kernel)`: malformed tool-argument excerpts no longer panic on
+  multi-byte UTF-8 at the 400-byte cut — the excerpt backs off to a
+  char boundary (shared `head_bytes` helper with `event.rs::text_head`).
+
 ## 2026-11 — ACP tails: session/load and operator-gated client MCP (roadmap item 37)
 
 `loom-acp` now serves `session/load` (advertised as
