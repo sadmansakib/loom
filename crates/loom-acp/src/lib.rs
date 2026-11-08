@@ -138,19 +138,40 @@ impl ServerOptions {
 
 /// The engine side of one ACP session. Guarded by a tokio mutex so a
 /// prompt can hold it across the task future while `session/cancel`
-/// reaches the (separately stored, cheaply cloned) control handle.
+/// reaches the control slot without contending with the prompt.
 struct SessionCore {
     engine: Arc<Engine>,
     session: Session,
-    control: TaskControl,
 }
 
-/// What the session map stores: the serialized core plus the control
-/// handle clone a cancel needs without contending with the prompt.
+/// What the session map stores: the serialized core plus the slot
+/// holding the in-flight prompt's [`TaskControl`]. A cancel needs the
+/// slot without contending with the prompt.
 #[derive(Clone)]
 struct SessionHandle {
     core: Arc<AsyncMutex<SessionCore>>,
-    control: TaskControl,
+    control: Arc<Mutex<TaskControl>>,
+}
+
+impl SessionHandle {
+    /// A handle over a freshly minted (idle) control slot.
+    fn new(core: Arc<AsyncMutex<SessionCore>>) -> Self {
+        Self {
+            core,
+            control: Arc::new(Mutex::new(TaskControl::new())),
+        }
+    }
+
+    /// Swaps in a fresh control for the prompt about to run and
+    /// returns it. `TaskControl::cancel` is permanent, so a control
+    /// cancelled for one prompt can never serve the next; storing the
+    /// current one lets `session/cancel` reach the in-flight task,
+    /// while a cancel while idle lands on a control nobody reads.
+    fn fresh_control(&self) -> TaskControl {
+        let control = TaskControl::new();
+        *lock_or_recover(&self.control) = control.clone();
+        control
+    }
 }
 
 /// Shared state behind every handler: the options and the live
@@ -289,7 +310,11 @@ where
                     .get(&notification.session_id)
                     .cloned()
                 {
-                    handle.control.cancel();
+                    // Cancels the in-flight prompt's control. Each
+                    // prompt mints a fresh control, so this never
+                    // poisons a later prompt; while idle it cancels a
+                    // control nobody reads.
+                    lock_or_recover(&handle.control).cancel();
                 }
                 async { Ok(()) }
             },
@@ -375,14 +400,11 @@ async fn handle_new_session(
             return responder.respond_with_internal_error(format!("opening the engine: {error}"));
         }
     };
-    let control = TaskControl::new();
     let core = Arc::new(AsyncMutex::new(SessionCore {
         engine: Arc::new(engine),
         session: Session::new(kernel),
-        control: control.clone(),
     }));
-    lock_or_recover(&state.sessions)
-        .insert(acp_session_id.clone(), SessionHandle { core, control });
+    lock_or_recover(&state.sessions).insert(acp_session_id.clone(), SessionHandle::new(core));
     responder.respond(acp::NewSessionResponse::new(acp_session_id))
 }
 
@@ -547,14 +569,11 @@ async fn handle_load_session(
             return responder.respond_with_error(Error::invalid_request().data("unknown session"));
         }
     };
-    let control = TaskControl::new();
     let core = Arc::new(AsyncMutex::new(SessionCore {
         engine: Arc::new(engine),
         session,
-        control: control.clone(),
     }));
-    lock_or_recover(&state.sessions)
-        .insert(request.session_id.clone(), SessionHandle { core, control });
+    lock_or_recover(&state.sessions).insert(request.session_id.clone(), SessionHandle::new(core));
     // The loaded session keeps its id: response and request agree by
     // construction, and modes/config options stay per-connection.
     responder.respond(acp::LoadSessionResponse::new())
@@ -637,7 +656,10 @@ async fn handle_prompt(
     });
     let mut core = handle.core.lock().await;
     let engine = core.engine.clone();
-    let control = core.control.clone();
+    // A fresh control per prompt (see `SessionHandle::fresh_control`):
+    // reusing the session's first control would answer every prompt
+    // after one cancel with `Cancelled`.
+    let control = handle.fresh_control();
     let outcome = engine
         .run_task(&mut core.session, prompt, &sink, &control)
         .await;

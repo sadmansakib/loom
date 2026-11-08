@@ -418,6 +418,141 @@ async fn cancel_resolves_the_prompt_as_cancelled() {
 
 // ------------------------------------------------- session/load (tail) ----
 
+/// prompt → cancel → prompt: the second prompt must complete
+/// normally. `TaskControl::cancel` is permanent, so a control shared
+/// across the whole session would answer every later prompt
+/// `Cancelled`.
+#[tokio::test]
+async fn cancel_does_not_poison_the_next_prompt() {
+    let (client_end, agent_end) = Channel::duplex();
+    let workspace = workspace();
+    let options = ServerOptions::new(
+        "scripted".into(),
+        "test-model".into(),
+        std::env::temp_dir().join(format!("loom-acp-recancel-{}.db", std::process::id())),
+    )
+    .with_overrides_factory(Arc::new(move || {
+        let provider = ScriptedProvider::new(vec![
+            Script::Hanging,
+            Script::Reply("after the cancel".into()),
+        ]);
+        loom_core::EngineOverrides::default().with_provider(Box::new(provider))
+    }));
+    tokio::spawn(async move {
+        if let Err(error) = serve(agent_end, AcpState::new(options)).await {
+            eprintln!("test server ended: {error}");
+        }
+    });
+
+    let result = Client
+        .v1()
+        .connect_with(client_end, async move |cx| {
+            let _ = cx
+                .send_request(acp::InitializeRequest::new(
+                    agent_client_protocol::schema::ProtocolVersion::V1,
+                ))
+                .block_task()
+                .await
+                .expect("initialize");
+            let session = cx
+                .send_request(acp::NewSessionRequest::new(workspace))
+                .block_task()
+                .await
+                .expect("new session");
+            let prompt = cx.send_request(acp::PromptRequest::new(
+                session.session_id.clone(),
+                vec![text_content("stall forever")],
+            ));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            cx.send_notification(acp::CancelNotification::new(session.session_id.clone()))
+                .expect("cancel sent");
+            let response = prompt.block_task().await.expect("prompt resolves");
+            assert!(
+                matches!(response.stop_reason, acp::StopReason::Cancelled),
+                "cancel must resolve the first prompt as cancelled, got {:?}",
+                response.stop_reason
+            );
+
+            // The same session must stay usable: a fresh prompt runs
+            // to completion instead of answering Cancelled.
+            let second = cx
+                .send_request(acp::PromptRequest::new(
+                    session.session_id.clone(),
+                    vec![text_content("still there?")],
+                ))
+                .block_task()
+                .await
+                .expect("second prompt resolves");
+            assert!(
+                matches!(second.stop_reason, acp::StopReason::EndTurn),
+                "a prompt after a cancel must complete normally, got {:?}",
+                second.stop_reason
+            );
+            Ok(())
+        })
+        .await;
+    assert!(result.is_ok(), "client connection failed: {result:?}");
+}
+
+/// A cancel while idle (no prompt in flight) must be a no-op that
+/// leaves the next prompt unaffected.
+#[tokio::test]
+async fn cancel_while_idle_does_not_affect_the_next_prompt() {
+    let (client_end, agent_end) = Channel::duplex();
+    let workspace = workspace();
+    let options = ServerOptions::new(
+        "scripted".into(),
+        "test-model".into(),
+        std::env::temp_dir().join(format!("loom-acp-idlecancel-{}.db", std::process::id())),
+    )
+    .with_overrides_factory(Arc::new(move || {
+        let provider = ScriptedProvider::new(vec![Script::Reply("unaffected".into())]);
+        loom_core::EngineOverrides::default().with_provider(Box::new(provider))
+    }));
+    tokio::spawn(async move {
+        if let Err(error) = serve(agent_end, AcpState::new(options)).await {
+            eprintln!("test server ended: {error}");
+        }
+    });
+
+    let result = Client
+        .v1()
+        .connect_with(client_end, async move |cx| {
+            let _ = cx
+                .send_request(acp::InitializeRequest::new(
+                    agent_client_protocol::schema::ProtocolVersion::V1,
+                ))
+                .block_task()
+                .await
+                .expect("initialize");
+            let session = cx
+                .send_request(acp::NewSessionRequest::new(workspace))
+                .block_task()
+                .await
+                .expect("new session");
+            // Cancel with nothing running.
+            cx.send_notification(acp::CancelNotification::new(session.session_id.clone()))
+                .expect("cancel sent");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let response = cx
+                .send_request(acp::PromptRequest::new(
+                    session.session_id.clone(),
+                    vec![text_content("hello")],
+                ))
+                .block_task()
+                .await
+                .expect("prompt resolves");
+            assert!(
+                matches!(response.stop_reason, acp::StopReason::EndTurn),
+                "a prompt after an idle cancel must complete normally, got {:?}",
+                response.stop_reason
+            );
+            Ok(())
+        })
+        .await;
+    assert!(result.is_ok(), "client connection failed: {result:?}");
+}
+
 /// Builds one server options set over the given db with a clone of the
 /// shared scripted provider (scripts and capture are Arc-shared).
 fn load_options(db: &std::path::Path, provider: &ScriptedProvider) -> ServerOptions {
