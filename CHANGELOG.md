@@ -23,6 +23,15 @@ project versions by iteration, not semver.
   killed after 30 s, ACP permission dialogs deny after 120 s
   (configurable, fails closed), Ctrl-D in `loom chat` cancels a
   running task, and Ctrl-C while idle leaves cleanly with exit 130.
+- `fix(tools)`: credential-shaped environment variables are scrubbed
+  from spawned children by pattern (`_API_KEY`, `_TOKEN`, `_SECRET`,
+  `_PASSWORD`), with a per-program `env_allow` opt-in in
+  `.loom/commands.toml`; the kill-on-drop process-group guard can no
+  longer arm `killpg(-1)`.
+- `fix(tools)`: filesystem tools re-verify path confinement at use
+  time (TOCTOU minimum) and write atomically (temp + fsync + rename)
+  — a crash mid-write now leaves the previous file instead of a
+  truncated one.
 
 ## 2026-11 — ACP tails: session/load and operator-gated client MCP (roadmap item 37)
 

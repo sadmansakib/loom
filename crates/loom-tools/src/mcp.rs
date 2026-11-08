@@ -310,7 +310,10 @@ fn write_lock(root: &Path, lock: &McpLock) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(error) = std::fs::write(&path, text) {
+    // Atomic replace (review item 2.3): a crash mid-write can no
+    // longer leave a truncated lockfile that would quarantine every
+    // pinned tool on the next attach.
+    if let Err(error) = crate::atomic::atomic_write(&path, text.as_bytes()) {
         tracing::warn!(path = %path.display(), %error, "cannot write MCP lockfile");
     }
 }

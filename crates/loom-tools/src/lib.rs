@@ -8,6 +8,7 @@
 //! a *discovery* filter in [`SearchTool`] — never as authorization (§9.2).
 
 mod artifact_read;
+mod atomic;
 mod autofix;
 mod background;
 mod budget;

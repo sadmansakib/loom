@@ -764,9 +764,12 @@ fn replace_symbol(
     .into_iter()
     .collect();
 
-    // Single atomic write (Serena's two-write version corrupted files
-    // when the process died between delete and insert).
-    std::fs::write(&path, &new_text)
+    // Atomic replace (review item 2.3): Serena's two-write version
+    // corrupted files when the process died between delete and
+    // insert; the pre-atomic direct write truncated on crash. The
+    // parent is re-verified confined first (review item 2.2).
+    crate::confinement::verify_parent_within(root, &path)?;
+    crate::atomic::atomic_write(&path, new_text.as_bytes())
         .map_err(|err| ToolError::Execution(format!("cannot write \"{relative}\": {err}")))?;
     Ok((
         relative,

@@ -73,6 +73,75 @@ pub(crate) fn workspace_relative(root: &Path, path: &Path) -> String {
 /// their own bound.
 const SYMLINK_LIMIT: usize = 8;
 
+/// Re-checks, at use time, that a path [`resolve_within`] already
+/// approved still lands inside the workspace (review item 2.2: the
+/// check-then-open race).
+///
+/// Between resolution and use a directory component may have been
+/// swapped to a symlink pointing outside; the open that follows would
+/// follow it. Re-canonicalising now fails closed on any swap. A
+/// microsecond window between this check and the caller's open or
+/// rename remains — see `docs/threat-model.md` for the honest
+/// residual-risk statement; this is the minimum fix, not a close.
+pub(crate) fn verify_within(root: &Path, resolved: &Path) -> Result<(), ToolError> {
+    let canonical_root = canonical_root(root);
+    match resolved.canonicalize() {
+        Ok(now) if now.starts_with(canonical_root) => Ok(()),
+        Ok(_) | Err(_) => Err(ToolError::InvalidInput(format!(
+            "path \"{}\" escapes the workspace root",
+            resolved.display()
+        ))),
+    }
+}
+
+/// The [`verify_within`] variant for a path whose final components may
+/// not exist yet (a file about to be created or replaced): the walk
+/// climbs to the deepest **existing** ancestor — a component that
+/// does not exist cannot have been swapped for a symlink — and
+/// re-verifies that one. Every existing component on the way down is
+/// covered because `canonicalize` resolves the whole chain.
+pub(crate) fn verify_parent_within(root: &Path, resolved: &Path) -> Result<(), ToolError> {
+    let canonical_root = canonical_root(root);
+    let mut probe = resolved.parent();
+    while let Some(dir) = probe {
+        match dir.canonicalize() {
+            Ok(now) => {
+                return if now.starts_with(canonical_root) {
+                    Ok(())
+                } else {
+                    Err(ToolError::InvalidInput(format!(
+                        "path \"{}\" escapes the workspace root",
+                        resolved.display()
+                    )))
+                };
+            }
+            // A not-yet-created component: climb. Any other failure
+            // (permissions, I/O) fails closed like `verify_within`.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => probe = dir.parent(),
+            Err(_) => {
+                return Err(ToolError::InvalidInput(format!(
+                    "path \"{}\" can no longer be resolved inside the workspace root",
+                    resolved.display()
+                )));
+            }
+        }
+    }
+    // Nothing on the chain exists — the root itself must still be
+    // resolvable (an unreadable or deleted workspace is not a usable
+    // confinement base).
+    Err(ToolError::InvalidInput(format!(
+        "path \"{}\" can no longer be resolved inside the workspace root",
+        resolved.display()
+    )))
+}
+
+/// The canonical workspace root, falling back exactly like
+/// [`resolve_within`] does (an absolute-but-lexical root still bounds
+/// `starts_with` checks; a non-absolute one never matches).
+fn canonical_root(root: &Path) -> PathBuf {
+    root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
+}
+
 /// One component-wise pass over `user`. `base` must be canonical;
 /// `depth` counts dangling-link recursions.
 fn walk(
@@ -409,5 +478,50 @@ mod tests {
         // everything against.
         let err = resolve_within(Path::new(""), "any/path").expect_err("empty root");
         assert!(matches!(err, ToolError::InvalidInput(msg) if msg.contains("workspace root")));
+    }
+
+    #[test]
+    fn verify_within_accepts_an_unswapped_path() {
+        let (guard, root) = temp_root();
+        fs::write(root.join("x.txt"), b"x").expect("write");
+        verify_within(&root, &root.join("x.txt")).expect("still inside");
+        let _ = guard;
+    }
+
+    #[test]
+    fn verify_within_refuses_a_swapped_component() {
+        // Review item 2.2: resolution approved `sub/x.txt` while
+        // `sub` was a real directory; by use time it is a symlink to
+        // outside. The re-check must fail closed.
+        let (guard, root) = temp_root();
+        fs::create_dir(root.join("sub")).expect("mkdir");
+        fs::write(root.join("sub/x.txt"), b"x").expect("write");
+        let resolved = resolve_within(&root, "sub/x.txt").expect("resolved");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        fs::remove_file(root.join("sub/x.txt")).expect("rm");
+        fs::remove_dir(guard.path().join("sub")).expect("rmdir");
+        symlink(outside.path(), guard.path().join("sub")).expect("swapped");
+        let err = verify_within(&root, &resolved).expect_err("swapped");
+        assert!(matches!(err, ToolError::InvalidInput(msg) if msg.contains("escapes")));
+    }
+
+    #[test]
+    fn verify_parent_within_accepts_missing_parents() {
+        // The parents of a brand-new file do not exist yet; the climb
+        // must settle on the deepest existing ancestor (the root).
+        let (_guard, root) = temp_root();
+        verify_parent_within(&root, &root.join("new/dir/file.txt")).expect("parents pending");
+    }
+
+    #[test]
+    fn verify_parent_within_refuses_a_swapped_parent() {
+        let (guard, root) = temp_root();
+        fs::create_dir(root.join("sub")).expect("mkdir");
+        let resolved = resolve_within(&root, "sub/new.txt").expect("resolved");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        fs::remove_dir(guard.path().join("sub")).expect("rmdir");
+        symlink(outside.path(), guard.path().join("sub")).expect("swapped");
+        let err = verify_parent_within(&root, &resolved).expect_err("swapped");
+        assert!(matches!(err, ToolError::InvalidInput(msg) if msg.contains("escapes")));
     }
 }

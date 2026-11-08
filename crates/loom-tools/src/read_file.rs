@@ -107,6 +107,7 @@ impl Tool for ReadFileTool {
             };
             let path = resolve_within(&ctx.workspace_root, &input.path)?;
             let display = input.path;
+            let verified_path = path.clone();
             let window =
                 tokio::task::spawn_blocking(move || window::read_file_window(&path, offset, limit))
                     .await
@@ -121,6 +122,11 @@ impl Tool for ReadFileTool {
                     "file \"{display}\" does not exist"
                 )));
             };
+            // Check-then-open re-verification (review item 2.2): the
+            // read followed any component swapped to an outside
+            // symlink after resolution — refuse before the bytes are
+            // returned to the model.
+            crate::confinement::verify_within(&ctx.workspace_root, &verified_path)?;
             let (content, truncated) =
                 window::render_window(&display, &window, offset, self.budgets.read_file_head_bytes);
             let mut output = ToolOutput::new(content);

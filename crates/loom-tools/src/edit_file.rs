@@ -530,9 +530,12 @@ fn apply_edits(
             )
         })
         .collect();
-    // Every edit matched exactly once: write everything back.
+    // Every edit matched exactly once: write everything back. Each
+    // write re-verifies confinement at use time (review item 2.2) and
+    // lands atomically (review item 2.3).
     for (path, _, text) in &files {
-        std::fs::write(path, text)
+        crate::confinement::verify_parent_within(root, path)?;
+        crate::atomic::atomic_write(path, text.as_bytes())
             .map_err(|err| ToolError::Execution(format!("cannot write: {err}")))?;
     }
     let resolved: Vec<(String, String)> = files

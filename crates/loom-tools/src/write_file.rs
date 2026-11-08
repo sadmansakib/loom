@@ -88,6 +88,7 @@ impl Tool for WriteFileTool {
             let written = content.len();
             let moved_path = path.clone();
             let moved_display = display.clone();
+            let moved_root = ctx.workspace_root.clone();
             // Tier-2 rewind capture rides the blocking write below: the
             // pre-image is read from the file the tool is about to
             // modify, before the write, and returned to the effects.
@@ -104,7 +105,15 @@ impl Tool for WriteFileTool {
                     // pre-image: raw bytes (UTF-8 loss degrades to the same
                     // empty previous the guard already tolerated).
                     let bytes = match std::fs::read(&moved_path) {
-                        Ok(bytes) => Some(bytes),
+                        Ok(bytes) => {
+                            // Check-then-open re-verification (review
+                            // item 2.2): the pre-image read follows any
+                            // component swapped to an outside symlink
+                            // after resolution — refuse before the bytes
+                            // reach the transcript.
+                            crate::confinement::verify_within(&moved_root, &moved_path)?;
+                            Some(bytes)
+                        }
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                         Err(error) => {
                             return Err(ToolError::Execution(format!(
@@ -128,7 +137,7 @@ impl Tool for WriteFileTool {
                     )
                     .into_iter()
                     .collect();
-                    write_file(&moved_path, content.as_bytes()).map_err(|err| {
+                    write_file(&moved_root, &moved_path, content.as_bytes()).map_err(|err| {
                         ToolError::Execution(format!("cannot write \"{moved_display}\": {err}"))
                     })?;
                     Ok(before_images)
@@ -165,13 +174,14 @@ impl Tool for WriteFileTool {
     }
 }
 
-/// Creates parents, then writes. Side effects are not assumed atomic
-/// (architecture §17 invariant 7).
-fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, bytes)
+/// Verifies the parent is still confined (review item 2.2), then
+/// replaces the file atomically (review item 2.3): temp file in the
+/// same directory, fsync, permissions carry-over, rename. A crash
+/// mid-write can no longer leave a truncated file behind.
+fn write_file(root: &Path, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
+    crate::confinement::verify_parent_within(root, path)?;
+    crate::atomic::atomic_write(path, bytes)
+        .map_err(|err| ToolError::Execution(format!("cannot write: {err}")))
 }
 
 #[cfg(test)]
@@ -223,6 +233,23 @@ mod tests {
             std::fs::read_to_string(guard.path().join("nested/dir/note.txt")).expect("read"),
             "hello loom"
         );
+    }
+
+    #[test]
+    fn a_parent_swapped_after_resolution_refuses_the_write() {
+        // Review item 2.2: `resolve_within` approved `sub/x.txt` while
+        // `sub` was a real directory; the write happens later, by
+        // which time `sub` is a symlink to outside. The use-time
+        // re-check must fail closed and nothing may land outside.
+        let (guard, root) = temp_root();
+        std::fs::create_dir(root.join("sub")).expect("mkdir");
+        let resolved = resolve_within(&root, "sub/x.txt").expect("resolved");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        std::fs::remove_dir(guard.path().join("sub")).expect("rmdir");
+        std::os::unix::fs::symlink(outside.path(), guard.path().join("sub")).expect("swapped");
+        let err = write_file(&root, &resolved, b"escape").expect_err("refused");
+        assert!(matches!(err, ToolError::InvalidInput(msg) if msg.contains("escapes")));
+        assert!(!outside.path().join("x.txt").exists());
     }
 
     #[tokio::test]
