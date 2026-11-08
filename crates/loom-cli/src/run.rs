@@ -125,14 +125,17 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         let config = runtime.block_on(Engine::resolve_catalog(config))?;
         let factory = loom_core::engine::worktrees::provider_factory(&config)?;
         let token = tokio_util::sync::CancellationToken::new();
-        let signal_token = token.clone();
-        let signal = runtime.spawn(async move {
-            signal_token.cancelled().await;
-            // Second Ctrl-C during rollout teardown aborts outright.
-            if tokio::signal::ctrl_c().await.is_ok() {
-                std::process::exit(130);
-            }
-        });
+        // The ladder awaits its first ctrl_c() immediately, so the
+        // handler is installed before the rollouts start: tokio
+        // registers SIGINT lazily, and the old token-then-ctrl_c
+        // ordering left Ctrl-C on the default disposition — one press
+        // killed the process and orphaned the best-of-* worktrees.
+        let ladder_token = token.clone();
+        let signal = runtime.spawn(best_of_ctrl_c_ladder(
+            || async { tokio::signal::ctrl_c().await.is_ok() },
+            ladder_token,
+            || std::process::exit(130),
+        ));
         let report = runtime.block_on(loom_core::engine::worktrees::best_of_n(
             config,
             factory,
@@ -150,7 +153,11 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         signal.abort();
         print_best_of_n(&report, args.flags.json);
         runtime.shutdown_timeout(Duration::from_secs(5));
-        return Ok(if report.applied {
+        let cancelled = token.is_cancelled();
+        return Ok(if cancelled {
+            // A user stop exits 130, matching the single-run path.
+            ExitCode::from(130)
+        } else if report.applied {
             ExitCode::SUCCESS
         } else {
             ExitCode::FAILURE
@@ -635,6 +642,34 @@ pub(crate) async fn ctrl_c_ladder(control: TaskControl) {
     }
 }
 
+/// The --best-of Ctrl-C ladder: the first press cancels the rollouts
+/// so worktree cleanup runs, a second press aborts outright. The
+/// handler must be installed (the future first polled) before the
+/// rollouts start — tokio registers SIGINT lazily, so the old
+/// token-then-ctrl_c ordering left the process on the default
+/// disposition and one Ctrl-C killed it mid-rollout.
+///
+/// Parameterized on a signal-future factory so tests can drive it
+/// with fakes; the real signal path is checked manually.
+async fn best_of_ctrl_c_ladder<S, F>(
+    mut next_signal: F,
+    token: tokio_util::sync::CancellationToken,
+    abort: impl Fn(),
+) where
+    S: Future<Output = bool>,
+    F: FnMut() -> S,
+{
+    if !next_signal().await {
+        return;
+    }
+    eprintln!("cancelling rollouts (Ctrl-C again to abort)…");
+    token.cancel();
+    if next_signal().await {
+        eprintln!("aborting…");
+        abort();
+    }
+}
+
 /// Closes the consumers' channels and collects their threads: dropping
 /// the fan-out (and with it both channel senders) ends the
 /// `blocking_recv` loops, and the trace writer — when one ran — comes
@@ -694,5 +729,87 @@ fn finish_trace(
         Ok(Some(dir)) => eprintln!("trace: {}", dir.display()),
         Ok(None) => {}
         Err(error) => eprintln!("warning: trace export failed: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::best_of_ctrl_c_ladder;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    /// A fake signal factory standing in for `tokio::signal::ctrl_c`:
+    /// each produced future awaits one channel item — `true` is a
+    /// pressed Ctrl-C, a closed channel is the real handler's Err arm
+    /// (no signal, ladder ends).
+    fn fake_signals(
+        presses: tokio::sync::mpsc::Receiver<bool>,
+    ) -> impl FnMut() -> Pin<Box<dyn Future<Output = bool> + Send>> {
+        let presses = Arc::new(tokio::sync::Mutex::new(presses));
+        move || {
+            let presses = presses.clone();
+            Box::pin(async move {
+                let mut rx = presses.lock().await;
+                rx.recv().await.unwrap_or(false)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn first_signal_cancels_and_second_aborts() {
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let token = CancellationToken::new();
+        let aborted = Arc::new(AtomicBool::new(false));
+        let flag = aborted.clone();
+        let ladder = tokio::spawn(best_of_ctrl_c_ladder(
+            fake_signals(rx),
+            token.clone(),
+            move || flag.store(true, Ordering::SeqCst),
+        ));
+        assert!(
+            !token.is_cancelled() && !aborted.load(Ordering::SeqCst),
+            "an idle ladder must not fire"
+        );
+        tx.send(true).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_millis(200), token.cancelled()).await;
+        assert!(token.is_cancelled(), "first press must cancel the rollouts");
+        assert!(
+            !aborted.load(Ordering::SeqCst),
+            "cancel alone must not abort"
+        );
+        tx.send(true).await.unwrap();
+        let _ = ladder.await;
+        assert!(aborted.load(Ordering::SeqCst), "second press must abort");
+    }
+
+    #[tokio::test]
+    async fn one_press_cancels_without_aborting() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let token = CancellationToken::new();
+        let aborted = Arc::new(AtomicBool::new(false));
+        let flag = aborted.clone();
+        // Press once, then end the stream: the second wait sees the
+        // Err arm and the ladder completes without aborting.
+        tx.send(true).await.unwrap();
+        drop(tx);
+        best_of_ctrl_c_ladder(fake_signals(rx), token.clone(), move || {
+            flag.store(true, Ordering::SeqCst)
+        })
+        .await;
+        assert!(token.is_cancelled());
+        assert!(!aborted.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn an_errored_first_signal_is_a_noop() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(tx);
+        let token = CancellationToken::new();
+        best_of_ctrl_c_ladder(fake_signals(rx), token.clone(), || panic!("no abort")).await;
+        assert!(!token.is_cancelled(), "signal error must not cancel");
     }
 }
