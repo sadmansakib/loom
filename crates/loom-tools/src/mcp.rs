@@ -258,15 +258,61 @@ fn glob_to_regex(pattern: &str) -> String {
     out
 }
 
-/// SHA-256 pin over the canonical tool definition: server, name,
-/// sanitized description, compact schema, joined by unit separators.
-fn pin_hash(server: &str, name: &str, desc: &str, schema: &str) -> String {
+/// SHA-256 pin over the canonical tool identity: the server's spawn
+/// argv (binary and arguments — a swapped server binary must
+/// quarantine like a swapped tool definition, review item 2.5),
+/// server, name, sanitized description, compact schema, joined by
+/// unit separators.
+fn pin_hash(server: &str, argv: &[String], name: &str, desc: &str, schema: &str) -> String {
     let mut hasher = Sha256::new();
-    for part in [server, name, desc, schema] {
+    hasher.update(server.as_bytes());
+    hasher.update([0x1f]);
+    for part in argv {
+        hasher.update(part.as_bytes());
+        hasher.update([0x1f]);
+    }
+    for part in [name, desc, schema] {
         hasher.update(part.as_bytes());
         hasher.update([0x1f]);
     }
     format!("{:x}", hasher.finalize())
+}
+
+/// Warns when the server argv uses a fetch-and-run runner without a
+/// version pin: `npx -y pkg` / `uvx pkg` resolve to *whatever the
+/// registry serves today*, so the pinned hash guards a moving target.
+fn warn_if_unpinned_runner(name: &str, command: &[String]) {
+    let Some(program) = command.first() else {
+        return;
+    };
+    let runner = std::path::Path::new(program)
+        .file_name()
+        .map(|file| file.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if !matches!(runner.as_str(), "npx" | "uvx" | "pnpx") {
+        return;
+    }
+    let version_pinned = command
+        .iter()
+        .skip(1)
+        .any(|arg| is_version_pinned_package(arg));
+    if !version_pinned {
+        tracing::warn!(
+            server = name,
+            argv = command.join(" "),
+            "MCP server runs through {runner} without a version pin: the binary the lock hashes is whatever the registry serves today; pin the package (e.g. `pkg@1.2.3`)"
+        );
+    }
+}
+
+/// True for `pkg@1.2.3` (version-pinned) but not for `@scope/pkg`
+/// (scope marker only) — the tail after the last `@` must start with
+/// a digit.
+fn is_version_pinned_package(arg: &str) -> bool {
+    let Some((head, tail)) = arg.rsplit_once('@') else {
+        return false;
+    };
+    !head.is_empty() && tail.chars().next().is_some_and(|c| c.is_ascii_digit())
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,6 +1101,9 @@ async fn ingest_server(
         .iter()
         .filter_map(|pattern| regex::Regex::new(&glob_to_regex(pattern)).ok())
         .collect();
+    // Item 2.5: a fetch-and-run runner without a version pin makes
+    // the pin below hash a moving target — say so at attach time.
+    warn_if_unpinned_runner(name, &decl.command);
     let pinned = lock.servers.entry(name.to_owned()).or_default();
 
     // Filters run over the full advertisement; the per-server cap is
@@ -1098,13 +1147,13 @@ async fn ingest_server(
             );
             continue;
         }
-        let hash = pin_hash(name, &raw.name, &desc, &schema);
+        let hash = pin_hash(name, &decl.command, &raw.name, &desc, &schema);
         match pinned.get(&raw.name) {
             Some(known) if *known != hash => {
                 tracing::warn!(
                     server = name,
                     tool = %raw.name,
-                    "MCP tool quarantined: definition changed since it was pinned (delete its entry in .loom/mcp.lock to re-approve)"
+                    "MCP tool quarantined: definition or server command changed since it was pinned (delete its entry in .loom/mcp.lock to re-approve)"
                 );
                 continue;
             }

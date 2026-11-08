@@ -32,6 +32,13 @@ project versions by iteration, not semver.
   time (TOCTOU minimum) and write atomically (temp + fsync + rename)
   — a crash mid-write now leaves the previous file instead of a
   truncated one.
+- `fix(tools)`: the Seatbelt profile denies Apple-event IPC and
+  re-allows `/dev/null` (the blanket write-deny had broken every
+  sandboxed `git`); osascript automation now fails under the sandbox.
+- `fix(tools)`: the MCP lock pins the server binary and arguments —
+  a changed argv quarantines the server's tools like a changed tool
+  definition, and `npx -y`/`uvx` without a version pin warn at
+  attach time.
 - `fix(tools)`: the macOS Seatbelt profile denies Apple-event IPC
   (`appleevent-send` plus an exec deny of `osascript`, which the
   classic filter no longer stops on current macOS) and re-allows

@@ -728,6 +728,32 @@ fn changed_tool_definitions_are_quarantined_by_the_lock() {
 }
 
 #[test]
+fn changed_server_args_are_quarantined_by_the_lock() {
+    let dir = workspace("pinning-argv");
+    manifest(&dir, "clean", "always_load = [\"greet\"]\n");
+    let first = attach(&dir);
+    assert!(first.iter().any(|(name, _)| name == "mcp_mock_greet"));
+
+    // Same tool definitions, but the manifest argv changed (an extra
+    // harmless flag): the pin covers the server binary + args, so the
+    // tool must quarantine exactly like a changed definition. (A
+    // fully-quarantined server yields no menu at all, so assert on
+    // the tool list.)
+    let manifest_path = dir.join(".loom/mcp.toml");
+    let body = std::fs::read_to_string(&manifest_path).unwrap();
+    std::fs::write(
+        &manifest_path,
+        body.replace("\"--nocapture\"]", "\"--nocapture\", \"--nocapture\"]"),
+    )
+    .unwrap();
+    let second = attach(&dir);
+    assert!(
+        !second.iter().any(|(name, _)| name == "mcp_mock_greet"),
+        "a changed server argv must quarantine the server's tools"
+    );
+}
+
+#[test]
 fn per_server_tool_cap_keeps_sixty_four() {
     let dir = workspace("cap");
     manifest(&dir, "many", "");
