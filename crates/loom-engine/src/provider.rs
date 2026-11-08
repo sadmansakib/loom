@@ -405,6 +405,7 @@ pub fn one_shot_provider(
         catalog: None,
         scout: None,
         routing: None,
+        stall_escalation_model: None,
         background_commands: false,
         symbols: false,
         git: false,

@@ -229,7 +229,7 @@ struct PlannedOp {
 /// Servers are untrusted: a WorkspaceEdit naming `/etc/passwd` or any
 /// other path outside the workspace is rejected here, before any IO —
 /// the confinement invariant every other loom write tool obeys.
-fn confined_path(
+pub(crate) fn confined_path(
     server: &LspServer,
     uri: &lsp_types::Url,
     op: &str,

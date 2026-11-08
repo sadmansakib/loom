@@ -248,6 +248,11 @@ pub fn chat(args: ChatArgs) -> anyhow::Result<ExitCode> {
             "background commands on: `run_background` detaches, completions steer in at the next turn boundary"
         );
     }
+    if let Some(model) = &args.flags.stall_escalation_model {
+        eprintln!(
+            "stall escalation on: a nudged task that runs out of turns or budget is retried on a session fork with {model}"
+        );
+    }
 
     // The UI-side control handle for the running task, if any.
     let mut control: Option<TaskControl> = None;

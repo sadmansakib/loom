@@ -359,6 +359,17 @@ never assistant content or reasoning.
   before the change sticks. Ecosystems without a deterministic
   offline verifier for the edit class (npm, Python, Make) decline by
   design — the never-worse contract outranks coverage.
+- **Fast-path rename, LSP fallback (roadmap item 34).** The one
+   decline class a semantic solver can rescue — target-name
+   collision, where the new name exists as a string somewhere but the
+   declared symbol is distinct — now has a second chance: when live
+   LSP servers are attached, `try_fast_path` asks the first
+   rename-capable server to resolve the declaration (exactly one
+   exact `workspace/symbol` match; ambiguity keeps the decline),
+   applies the server's edit through the same confined, before-imaged
+   machinery as `lsp_rename` under the same ≤500-edit budget, and
+   verifies with `cargo check`, restoring byte-identically on any
+   surprise. Without servers the wire behavior is unchanged.
 
 ---
 
@@ -697,7 +708,11 @@ reasoning to a dim stderr, NDJSON mode for machines; `--trace DIR`
 exports the task's evidence — see below; `--route-easy MODEL` /
 `--route-hard MODEL` wire task-start tier routing on the same
 provider — a deterministic classifier picks the tier per task and
-the decision lands in the footer as a `routing` HarnessNotice),
+the decision lands in the footer as a `routing` HarnessNotice;
+`--stall-escalation-model MODEL` arms escalation-by-fork — a task
+that exhausts its turns or budget after a loop nudge is retried on a
+fork of the session with that model, the original session and error
+survive, and an `escalation` notice names the fork),
 `loom chat` (the same render
 across many tasks: one session held open at a prompt — lines typed
 while a task runs steer it at the next turn boundary, `/pause` and

@@ -148,6 +148,12 @@ pub struct RunFlags {
     /// on the run's own model.
     #[arg(long, value_name = "MODEL", env = "LOOM_ROUTE_HARD")]
     pub route_hard: Option<String>,
+    /// Escalation-by-fork model (roadmap item 36): a task that stalls
+    /// deterministically (max turns or budget exhausted after a loop
+    /// nudge) is retried on a fork of the session with this model.
+    /// Opt-in and never-worse: the original session and error survive.
+    #[arg(long, value_name = "MODEL", env = "LOOM_STALL_ESCALATION_MODEL")]
+    pub stall_escalation_model: Option<String>,
 
     /// Background commands (item 13): register `run_background` and
     /// `command_status`, let long commands run detached instead of
@@ -919,6 +925,43 @@ mod tests {
         };
         assert_eq!(args.flags.route_easy, None);
         assert_eq!(args.flags.route_hard, None);
+    }
+
+    #[test]
+    fn stall_escalation_model_is_opt_in() {
+        let cli = parse(&[
+            "loom",
+            "run",
+            "--provider",
+            "glm",
+            "--model",
+            "glm-5",
+            "--stall-escalation-model",
+            "glm-5-max",
+            "work",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected `run`");
+        };
+        assert_eq!(
+            args.flags.stall_escalation_model.as_deref(),
+            Some("glm-5-max")
+        );
+
+        // Absent, escalation stays unwired (the byte-off default).
+        let cli = parse(&[
+            "loom",
+            "run",
+            "--provider",
+            "glm",
+            "--model",
+            "glm-5",
+            "work",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected `run`");
+        };
+        assert_eq!(args.flags.stall_escalation_model, None);
     }
 
     #[test]

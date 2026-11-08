@@ -16,10 +16,12 @@ use loom_kernel::context::{
 };
 use loom_kernel::event::{EventKind, EventSink, PersistingEventSink};
 use loom_kernel::id::SessionId;
+use loom_kernel::id::TaskId;
 use loom_kernel::model::{ModelProvider, ReasoningEffort as KernelReasoningEffort};
 use loom_kernel::session::Session;
-use loom_kernel::store::{SharedEventStore, StoreError};
+use loom_kernel::store::{SessionStore, SharedEventStore, StoreError};
 use loom_kernel::tool::ToolRegistry;
+use loom_kernel::transcript::ItemIndex;
 use loom_providers::{
     CUSTOM_PROVIDER_NAME, OPENROUTER_PROVIDER_NAME, ProviderCatalog, ReasoningEffort,
 };
@@ -163,6 +165,13 @@ pub struct EngineConfig {
     /// task on `model`; a wired `easy` can only route down (cheaper),
     /// and `hard` is a separate opt-in.
     pub routing: Option<crate::routing::RoutingConfig>,
+    /// Escalation-by-fork model (roadmap item 36): when set, a task
+    /// that exhausts max turns or budget *after* a loop nudge (the
+    /// deterministic stall signature) is retried on a fork of the
+    /// session with this model. Default-off and never-worse: the
+    /// original session is untouched, and an escalated failure still
+    /// reports the original error.
+    pub stall_escalation_model: Option<String>,
     /// Background commands (roadmap item 13): opt-in interactive-mode
     /// lever. When true the registry grows `run_background` and
     /// `command_status`, long commands run detached instead of blocking
@@ -258,6 +267,7 @@ pub(crate) fn test_config() -> EngineConfig {
         catalog: None,
         scout: None,
         routing: None,
+        stall_escalation_model: None,
         background_commands: false,
         symbols: false,
         git: false,
@@ -269,6 +279,43 @@ pub(crate) fn test_config() -> EngineConfig {
         prune: None,
         // Tests construct the default registry; autofix stays opt-in.
         autofix: false,
+    }
+}
+
+/// Counts [`EventKind::LoopNudge`] emissions for one run while
+/// forwarding every event untouched (roadmap item 36): escalation
+/// fires only for stalls the nudge machinery already tried to
+/// rescue, which is exactly the deterministic signature a fork
+/// retry can plausibly beat.
+struct StallObserver<'a> {
+    inner: &'a dyn EventSink,
+    nudges: std::sync::atomic::AtomicU32,
+}
+
+impl<'a> StallObserver<'a> {
+    fn new(inner: &'a dyn EventSink) -> Self {
+        Self {
+            inner,
+            nudges: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    fn nudges(&self) -> u32 {
+        self.nudges.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl EventSink for StallObserver<'_> {
+    fn emit(&self, task_id: TaskId, kind: EventKind) {
+        if matches!(kind, EventKind::LoopNudge { .. }) {
+            self.nudges
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.inner.emit(task_id, kind);
+    }
+
+    fn dropped(&self) -> u64 {
+        self.inner.dropped()
     }
 }
 
@@ -285,6 +332,10 @@ pub struct Engine {
     /// registry drop kills whatever still runs (the same group
     /// reaping a foreground timeout performs).
     background: Option<BackgroundJobs>,
+    /// Live LSP handles from the attachment, kept for the fast-path
+    /// rename fallback (item 34): a semantic rename resolves the
+    /// collision class the blind whole-word rename must decline.
+    lsp_servers: Vec<Arc<loom_tools::lsp::LspServer>>,
     /// Routing slice zero (roadmap item 9): the Easy-tier agent,
     /// built at open when `EngineConfig::routing` wires one. Same
     /// provider, registry (scout registration included), and agent
@@ -293,6 +344,14 @@ pub struct Engine {
     /// The Hard-tier agent, same construction as `routing_easy`.
     /// Opt-in: a config without `hard` never routes up.
     routing_hard: Option<RoutedAgent>,
+    /// Escalation-by-fork (roadmap item 36): built at open when
+    /// `EngineConfig::stall_escalation_model` names a model — same
+    /// registry, system prompt, and effort schedule as `agent`.
+    stall_escalation: Option<RoutedAgent>,
+    /// The session database path, kept so escalation can fork a
+    /// stalled session (persist branch only: a memory-only engine
+    /// has nothing to fork and never escalates).
+    db_path: Option<std::path::PathBuf>,
     /// The canonicalized workspace root, for the fast paths' file walk.
     workspace: std::path::PathBuf,
     /// The command policy the registry was built from; the fast path
@@ -362,6 +421,9 @@ pub struct EngineOverrides {
     /// tests use this; the engine never resolves credentials for
     /// them). The first agent per tier wins.
     pub routed: Option<Vec<(crate::routing::Tier, Arc<Agent>)>>,
+    /// Test seam for item 36: an injected escalation agent (label,
+    /// agent) skips the credential build exactly like `routed`.
+    pub stall_escalation: Option<(String, Arc<Agent>)>,
     /// A context compiler built by the embedder, replacing the default
     /// pruning chain.
     pub compiler: Option<Box<dyn ContextCompiler>>,
@@ -492,6 +554,9 @@ impl Engine {
                 path: config.workspace.clone(),
                 source,
             })?;
+        // The engine keeps the live server handles for the fast-path
+        // rename fallback (item 34); tools and menu flow on below.
+        let lsp_servers = lsp.servers;
 
         // Provider: an overridden provider skips the credential build
         // entirely (offline replay needs no secret); a hook then wraps
@@ -824,6 +889,21 @@ impl Engine {
                 _ => (None, None),
             },
         };
+        // Escalation-by-fork (roadmap item 36): composed like a tier
+        // agent — same registry, same agent config, one model. The
+        // bare-loop arm is a baseline and never carries escalation.
+        let stall_escalation = match overrides.stall_escalation {
+            Some((model, agent)) => Some(RoutedAgent { model, agent }),
+            None => match config.stall_escalation_model.as_deref() {
+                Some(model) if !overrides.bare_loop => Some(build_stall_escalation_agent(
+                    model,
+                    &config,
+                    &registry,
+                    &agent_config,
+                )?),
+                _ => None,
+            },
+        };
         let mut agent = Agent::new(provider, compiler, registry, agent_config, config.model)
             .with_max_turns(config.max_turns)
             .with_turn_budget(config.turn_budget)
@@ -873,8 +953,11 @@ impl Engine {
             Ok(Self {
                 agent,
                 background: background_jobs,
+                lsp_servers,
                 routing_easy,
                 routing_hard,
+                stall_escalation,
+                db_path: Some(config.db_path.clone()),
                 workspace,
                 policy,
                 // The bare-loop arm measures a basic harness, and a basic
@@ -889,8 +972,11 @@ impl Engine {
             Ok(Self {
                 agent,
                 background: background_jobs,
+                lsp_servers,
                 routing_easy,
                 routing_hard,
+                stall_escalation,
+                db_path: None,
                 workspace,
                 policy,
                 fast_paths: overrides.fast_paths.unwrap_or(true) && !overrides.bare_loop,
@@ -1137,13 +1223,82 @@ impl Engine {
         // wrapper sits above everything this method (and the loop
         // under it) emits, so the stored stream is the complete run —
         // including the engine-level markers below.
-        match &self.events {
+        //
+        // Escalation-by-fork (item 36) needs to know whether the run
+        // nudged before it failed, so an observer counts `LoopNudge`
+        // emissions while forwarding everything untouched — below the
+        // persistence wrapper, so stored streams stay byte-identical.
+        let input_text: String = input.into();
+        let observer = StallObserver::new(sink);
+        let outcome = match &self.events {
             Some(store) => {
-                let persisting = PersistingEventSink::new(store.clone(), session.id, sink);
-                self.drive_task(session, input, &persisting, control).await
+                let persisting = PersistingEventSink::new(store.clone(), session.id, &observer);
+                self.drive_task(session, input_text.clone(), &persisting, control)
+                    .await
             }
-            None => self.drive_task(session, input, sink, control).await,
+            None => {
+                self.drive_task(session, input_text.clone(), &observer, control)
+                    .await
+            }
+        };
+        // Never-worse gate: escalation fires only for the deterministic
+        // stall signature — max turns or budget exhausted *after* a
+        // loop nudge. Cancels, model errors, and protocol failures
+        // return exactly as before.
+        let stalled = matches!(
+            &outcome,
+            Err(TaskError::MaxTurns { .. } | TaskError::BudgetExhausted { .. })
+        ) && observer.nudges() > 0;
+        if !stalled {
+            return outcome;
         }
+        match self
+            .escalate_stall(session, &input_text, sink, control)
+            .await
+        {
+            Some(summary) => Ok(summary),
+            None => outcome,
+        }
+    }
+
+    /// Roadmap item 36's retry: fork the stalled session at its tip
+    /// and run the escalation agent on the fork. The original session
+    /// is never modified; a failed escalation returns `None` so the
+    /// caller reports the original error (never-worse). Requires a
+    /// persisting engine — a fork needs the durable store.
+    async fn escalate_stall(
+        &self,
+        session: &mut Session,
+        input: &str,
+        sink: &dyn EventSink,
+        control: &TaskControl,
+    ) -> Option<TaskSummary> {
+        let escalation = self.stall_escalation.as_ref()?;
+        let db_path = self.db_path.as_ref()?.clone();
+        let fork_id = SessionId::new();
+        let boundary = ItemIndex::from(session.transcript.len() as u32);
+        let store = SqliteStore::open(db_path).ok()?;
+        store.fork(&session.id, boundary, &fork_id).ok()?;
+        let mut forked = self.load_session(&fork_id).ok()??;
+        // Attribution lands in the decision footer (the routing
+        // notice's channel); the fork id makes the retry resumable.
+        if let Some(record) = session.tasks.last() {
+            sink.emit(
+                record.id,
+                EventKind::HarnessNotice {
+                    category: "escalation".to_string(),
+                    detail: format!(
+                        "stalled after nudge; forked to {fork_id}, retrying with {}",
+                        escalation.model
+                    ),
+                },
+            );
+        }
+        escalation
+            .agent
+            .run_task(&mut forked, input.to_string(), sink, control)
+            .await
+            .ok()
     }
 
     /// [`Engine::run_task`]'s body, driven against whichever sink the
@@ -1164,8 +1319,13 @@ impl Engine {
         // worse off for trying.
         let mut fast_path_decline: Option<&'static str> = None;
         if self.fast_paths {
-            let attempt =
-                loom_tools::fastpath::try_fast_path(&self.workspace, &input, &self.policy).await;
+            let attempt = loom_tools::fastpath::try_fast_path(
+                &self.workspace,
+                &input,
+                &self.policy,
+                &self.lsp_servers,
+            )
+            .await;
             match attempt.outcome {
                 Some(solve) => {
                     let summary = self
@@ -1411,6 +1571,7 @@ fn compose_scout(
         catalog: parent.catalog.clone(),
         scout: None,
         routing: None,
+        stall_escalation_model: None,
         background_commands: false,
         symbols: false,
         git: false,
@@ -1493,61 +1654,106 @@ fn build_tier_agents(
         (crate::routing::Tier::Hard, routing.hard.as_ref()),
     ] {
         let Some(model) = model else { continue };
-        let child = EngineConfig {
-            model: model.clone(),
-            // Tier children inherit everything that carries the run's
-            // gateway identity; nothing below differs but the model.
-            ..config.clone()
-        };
-        let provider = crate::provider::build(&child, credential.secret.expose())?.provider;
-        let tier_registry = ToolRegistry::from_arc_tools(registry.arc_tools());
-        let estimator: Arc<dyn loom_kernel::context::TokenEstimator> =
-            crate::estimate::estimator_for(&child.provider);
-        let compiler: Box<dyn ContextCompiler> = Box::new(
-            PruningContextCompiler::new(
-                Box::new(DefaultContextCompiler::with_estimator(estimator.clone())),
-                child
-                    .prune
-                    .unwrap_or_else(|| prune_config_for(&child.provider)),
-            )
-            .with_estimator(estimator),
-        );
-        let agent = Agent::new(
-            provider,
-            compiler,
-            tier_registry,
-            agent_config.clone(),
-            model.clone(),
-        )
-        .with_max_turns(child.max_turns)
-        .with_turn_budget(child.turn_budget)
-        .with_loop_shaping(true);
-        // Tier agents persist through the same database the main
-        // agent does — a routed task must leave the same durable
-        // transcript any other task would (separate handle, same file,
-        // exactly how the engine opens its session/artifact/event
-        // stores). Without this, `--route-easy` would silently produce
-        // sessions that cannot be resumed.
-        let agent = if config.persist {
-            let store = SqliteStore::open(config.db_path.clone()).map_err(EngineError::Session)?;
-            let artifacts =
-                SqliteStore::open(config.db_path.clone()).map_err(EngineError::Session)?;
-            agent
-                .with_store(Box::new(store))
-                .with_artifacts(Some(Arc::new(artifacts)))
-        } else {
-            agent
-        };
-        let routed = RoutedAgent {
-            agent: Arc::new(agent),
-            model: model.clone(),
-        };
+        let routed = build_child_agent(
+            model,
+            config,
+            registry,
+            agent_config,
+            credential.secret.expose(),
+        )?;
         match tier {
             crate::routing::Tier::Easy => easy = Some(routed),
             _ => hard = Some(routed),
         }
     }
     Ok((easy, hard))
+}
+
+/// Builds one child agent for a second model on the same provider
+/// (routing tiers, item 36 escalation): the child inherits everything
+/// that carries the run's gateway identity — registry, agent config,
+/// system prompt, effort schedule — and persists through the same
+/// database the main agent does. Escalation callers resolve the
+/// credential themselves; `secret` is the parent's.
+fn build_child_agent(
+    model: &str,
+    config: &EngineConfig,
+    registry: &ToolRegistry,
+    agent_config: &loom_kernel::context::AgentConfig,
+    secret: &str,
+) -> Result<RoutedAgent, EngineError> {
+    let child = EngineConfig {
+        model: model.to_string(),
+        ..config.clone()
+    };
+    let provider = crate::provider::build(&child, secret)?.provider;
+    let tier_registry = ToolRegistry::from_arc_tools(registry.arc_tools());
+    let estimator: Arc<dyn loom_kernel::context::TokenEstimator> =
+        crate::estimate::estimator_for(&child.provider);
+    let compiler: Box<dyn ContextCompiler> = Box::new(
+        PruningContextCompiler::new(
+            Box::new(DefaultContextCompiler::with_estimator(estimator.clone())),
+            child
+                .prune
+                .unwrap_or_else(|| prune_config_for(&child.provider)),
+        )
+        .with_estimator(estimator),
+    );
+    let agent = Agent::new(
+        provider,
+        compiler,
+        tier_registry,
+        agent_config.clone(),
+        model.to_string(),
+    )
+    .with_max_turns(child.max_turns)
+    .with_turn_budget(child.turn_budget)
+    .with_loop_shaping(true);
+    // Child agents persist through the same database the main
+    // agent does — a routed or escalated task must leave the same
+    // durable transcript any other task would (separate handle,
+    // same file, exactly how the engine opens its session/artifact/
+    // event stores). Without this, routing or escalation would
+    // silently produce sessions that cannot be resumed.
+    let agent = if config.persist {
+        let store = SqliteStore::open(config.db_path.clone()).map_err(EngineError::Session)?;
+        let artifacts = SqliteStore::open(config.db_path.clone()).map_err(EngineError::Session)?;
+        agent
+            .with_store(Box::new(store))
+            .with_artifacts(Some(Arc::new(artifacts)))
+    } else {
+        agent
+    };
+    Ok(RoutedAgent {
+        agent: Arc::new(agent),
+        model: model.to_string(),
+    })
+}
+
+/// Escalation-by-fork (roadmap item 36) builder: resolves the shared
+/// credential once and delegates to [`build_child_agent`].
+fn build_stall_escalation_agent(
+    model: &str,
+    config: &EngineConfig,
+    registry: &ToolRegistry,
+    agent_config: &loom_kernel::context::AgentConfig,
+) -> Result<RoutedAgent, EngineError> {
+    let store = SqliteAuthStore::open(&config.db_path).map_err(EngineError::Store)?;
+    let secrets = KeychainBackend::default();
+    let credential = auth::resolve(
+        &store,
+        &secrets,
+        &config.provider,
+        config.account.as_deref(),
+        |name| std::env::var(name).ok(),
+    )?;
+    build_child_agent(
+        model,
+        config,
+        registry,
+        agent_config,
+        credential.secret.expose(),
+    )
 }
 
 fn build_registry(
@@ -2019,6 +2225,9 @@ mod tests {
             agent,
             routing_easy: None,
             background: None,
+            stall_escalation: None,
+            db_path: None,
+            lsp_servers: Vec::new(),
             routing_hard: None,
             workspace: PathBuf::from("."),
             policy: CommandPolicy::default(),
@@ -2129,6 +2338,9 @@ mod tests {
             }),
             routing_hard: None,
             background: None,
+            stall_escalation: None,
+            db_path: None,
+            lsp_servers: Vec::new(),
             workspace: PathBuf::from("."),
             policy: CommandPolicy::default(),
             fast_paths: false,
@@ -2194,6 +2406,158 @@ mod tests {
         assert!(!kinds.iter().any(|kind| matches!(
             kind,
             EventKind::HarnessNotice { category, .. } if category == "routing"
+        )));
+    }
+
+    /// One script: a read-only tool call that never mutates the
+    /// workspace (item 36's stall shape — progress-less turns).
+    fn read_only_turn_script() -> Vec<Result<ModelEvent, ModelError>> {
+        use loom_kernel::transcript::{ToolArguments, ToolCall, ToolCallId};
+        let call = ToolCall {
+            id: ToolCallId::try_from(format!("ro-{}", std::process::id())).unwrap(),
+            name: "read_file".to_owned(),
+            arguments: ToolArguments::try_from(serde_json::json!({
+                "path": "Cargo.toml",
+            }))
+            .expect("arguments"),
+        };
+        vec![Ok(ModelEvent::Completed(ModelResponse {
+            message: AssistantMessage {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![call],
+                stop_reason: StopReason::ToolCalls,
+            },
+            usage: Usage::default(),
+        }))]
+    }
+
+    fn escalation_agent() -> Agent {
+        Agent::new(
+            Box::new(FakeProvider::scripted(vec![FakeProvider::end_turn_script(
+                "the escalation model recovered",
+            )])),
+            Box::new(DefaultContextCompiler::default()),
+            loom_kernel::tool::ToolRegistry::new(),
+            AgentConfig::new(PathBuf::from("."), "test escalation"),
+            "escalation-model",
+        )
+    }
+
+    /// Item 36: a task that exhausts its turns after a loop nudge is
+    /// retried on a fork with the escalation model; the original
+    /// session keeps its stalled transcript and the fork carries the
+    /// recovery.
+    #[tokio::test]
+    async fn stalled_task_forks_and_escalates_on_a_second_model() {
+        let base = tempfile::tempdir().expect("tempdir");
+        std::fs::write(base.path().join("Cargo.toml"), "[workspace]\n").expect("fixture");
+        let mut config = test_config();
+        config.workspace = base.path().to_path_buf();
+        config.db_path = base.path().join("loom.db");
+        config.persist = true;
+        config.max_turns = 14; // nudge lands at 12, exhaustion at 14
+        let main_scripts: Vec<_> = std::iter::repeat_n(read_only_turn_script(), 14).collect();
+        let engine = Engine::open_with(
+            config,
+            EngineOverrides {
+                provider: Some(Box::new(FakeProvider::scripted(main_scripts))),
+                fast_paths: Some(false),
+                stall_escalation: Some((
+                    "escalation-model".to_owned(),
+                    Arc::new(escalation_agent()),
+                )),
+                ..Default::default()
+            },
+        )
+        .expect("engine");
+
+        let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
+        let mut session = engine.new_session();
+        let summary = engine
+            .run_task(
+                &mut session,
+                "churn without changing anything",
+                &sink,
+                &Default::default(),
+            )
+            .await
+            .expect("the escalated attempt reports success");
+
+        // The nudge fired, the escalation notice names the fork and
+        // the model, and the success came from the escalation agent.
+        let kinds = drain(&mut receiver);
+        assert!(
+            kinds
+                .iter()
+                .any(|kind| matches!(kind, EventKind::LoopNudge { .. }))
+        );
+        let notice = kinds
+            .iter()
+            .find_map(|kind| match kind {
+                EventKind::HarnessNotice { category, detail } if category == "escalation" => {
+                    Some(detail.clone())
+                }
+                _ => None,
+            })
+            .expect("escalation notice");
+        assert!(notice.starts_with("stalled after nudge; forked to "));
+        assert!(notice.ends_with(", retrying with escalation-model"));
+        assert!(summary.turns >= 1);
+
+        // Never-worse on the original: the caller's session keeps the
+        // stalled transcript — the recovery lives on the fork.
+        let last_assistant = session
+            .transcript
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                loom_kernel::transcript::Item::Assistant(message) => Some(message.content.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert_eq!(last_assistant, "");
+    }
+
+    /// Item 36's default-off contract: without an escalation model
+    /// wired, an exhausted task surfaces its original error — the
+    /// fork path never engages.
+    #[tokio::test]
+    async fn plain_exhaustion_without_nudge_does_not_escalate() {
+        let base = tempfile::tempdir().expect("tempdir");
+        std::fs::write(base.path().join("Cargo.toml"), "[workspace]\n").expect("fixture");
+        let mut config = test_config();
+        config.workspace = base.path().to_path_buf();
+        config.db_path = base.path().join("loom.db");
+        config.persist = true;
+        config.max_turns = 3; // below the nudge threshold
+        let main_scripts: Vec<_> = std::iter::repeat_n(read_only_turn_script(), 3).collect();
+        let engine = Engine::open_with(
+            config,
+            EngineOverrides {
+                provider: Some(Box::new(FakeProvider::scripted(main_scripts))),
+                fast_paths: Some(false),
+                ..Default::default()
+            },
+        )
+        .expect("engine");
+
+        let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
+        let mut session = engine.new_session();
+        let outcome = engine
+            .run_task(
+                &mut session,
+                "churn without changing anything",
+                &sink,
+                &Default::default(),
+            )
+            .await;
+        // Never-worse default: the original error surfaces untouched.
+        assert!(matches!(outcome, Err(TaskError::MaxTurns { .. })));
+        let kinds = drain(&mut receiver);
+        assert!(!kinds.iter().any(|kind| matches!(
+            kind,
+            EventKind::HarnessNotice { category, .. } if category == "escalation"
         )));
     }
 

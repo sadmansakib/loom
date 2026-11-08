@@ -824,7 +824,7 @@ pub(crate) struct RenameInput {
 }
 
 /// Counts the document operations in a WorkspaceEdit for output text.
-fn edit_op_count(edit: &lsp_types::WorkspaceEdit) -> usize {
+pub(crate) fn edit_op_count(edit: &lsp_types::WorkspaceEdit) -> usize {
     match &edit.document_changes {
         Some(lsp_types::DocumentChanges::Operations(ops)) => ops.len(),
         Some(lsp_types::DocumentChanges::Edits(edits)) => edits.len(),

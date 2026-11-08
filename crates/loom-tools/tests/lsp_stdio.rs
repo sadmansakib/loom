@@ -972,3 +972,65 @@ fn call_hierarchy_without_capability_errors() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn fast_path_rename_falls_back_to_lsp_on_collision() {
+    // Roadmap item 34's armed trigger: the blind whole-word rename
+    // must decline when the target name exists as a string anywhere in
+    // the workspace — here `mean` sits in a comment in an untouched
+    // file. The semantic fallback resolves the one `median`
+    // declaration via workspace/symbol, renames through the mock's
+    // edit (pinned to line 3 chars 7..13 = `median`), and verifies
+    // with `cargo check`.
+    let dir = workspace("fastpath-rename-lsp");
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"fp_lsp_fallback\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    // `median` must sit at 0-based line 2 (the mock pins its symbol
+    // range and rename edit there); plain ASCII so `cargo check`
+    // compiles it.
+    let lib_rs = "// plain fixture\n\npub fn median(values: &[i64]) -> i64 {\n    values[0]\n}\n";
+    std::fs::write(dir.join("src/lib.rs"), lib_rs).unwrap();
+    std::fs::write(dir.join("src/other.rs"), "// the mean string collides\n").unwrap();
+    manifest(&dir, &[]);
+    let rt = build_runtime();
+    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let policy = loom_tools::CommandPolicy::cargo_only();
+
+    // Without servers the same attempt stays a collision decline.
+    let attempt = rt.block_on(loom_tools::fastpath::try_fast_path(
+        &dir,
+        "Rename median to mean",
+        &policy,
+        &[],
+    ));
+    assert_eq!(attempt.decline, Some("intent-rename-collision"));
+
+    // With the live server the collision class resolves semantically.
+    let attempt = rt.block_on(loom_tools::fastpath::try_fast_path(
+        &dir,
+        "Rename median to mean",
+        &policy,
+        &attachment.servers,
+    ));
+    let outcome = attempt
+        .outcome
+        .expect("the LSP fallback resolves the collision");
+    assert_eq!(outcome.kind, "rename");
+    assert!(
+        outcome.note.contains("via LSP"),
+        "the outcome names the semantic path: {}",
+        outcome.note
+    );
+    assert!(
+        outcome.note.contains("verified with `cargo check`"),
+        "{}",
+        outcome.note
+    );
+    let lib = std::fs::read_to_string(dir.join("src/lib.rs")).unwrap();
+    assert!(lib.contains("pub fn mean("), "renamed: {lib}");
+    assert!(!lib.contains("median"), "renamed: {lib}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -125,9 +125,9 @@ iterations may start early where a backlog item is cheap and measured.
 | 1 | Core service | **Done** | — (see Shipped) |
 | 2 | Core efficiency & repository intelligence | **Done 2026-10-23** (funded-measurement debt in item 1) | 1, 3✓, 4✓, 5✓, 6✓, 7✗, 8✓, 10✓ᴬ, 11⏸, 12✓, 16✓, 17✓ |
 | 3 | Intelligent subagent scheduling | Not started | 19, 21, 24 |
-| 4 | Execution safety & richer tools | **Largely shipped early** | 2✓, 13✓, 23✓ |
+| 4 | Execution safety & richer tools | **Largely shipped early** (item 36 escalation shipped 2026-11-08, default-off) | 2✓, 13✓, 23✓, 36✓ |
 | 5 | Skills & contextual knowledge | **Largely shipped 2026-10-23** (skills index + `load_skill`) | 4✓ (instructions), skills✓, 20.4 |
-| 6 | MCP & LSP integration | Started 2026-10-23 (item 18 symbol tools shipped) | 18✓, 34⏸ |
+| 6 | MCP & LSP integration | Started 2026-10-23 (item 18 symbol tools shipped; item 34 fallback shipped 2026-11-08) | 18✓, 34✓ |
 | 7 | Plugin system | Future scope | — |
 | 8 | Intelligent model routing | **Shipped 2026-11-08** (effort schedule + task-start tier routing; funded A/Bs open) | 9✓ᴬ, 14✓ |
 | 9 | Learning & self-optimization | Not started; data path partial | 1, 20 (20.2 sweepable set shipped) |
@@ -1562,6 +1562,19 @@ adds four more framing findings and backlog items 26–31 below.
       (doubled budgets, 6-line edit echo) variants — deterministic in
       child index, model unchanged, `harness_note` reported. Todo
       granularity has no knob yet (kernel-owned todo format is fixed).
+      *Sweep-level selection measured (2026-11-08, item 24, $0):* the
+      cross-run majority vote over normalized diffs is
+      information-free on this vehicle — 17/20 (dataset, instance)
+      pairs produced five distinct patches across five runs, so the
+      tie-break silently reduces selection to run 1, and it *lost* a
+      solvable instance (sympy) in 2 of 4 datasets: selected 13 vs
+      per-run mean 13.2. The weak-selector warning (arXiv 2608.03961)
+      fires via degeneracy. Sweep `selected` files are demoted to "one
+      more sample"; per-run medians stay the contrast metric. A real
+      sweep-level selector must be gate-first (per-run tests in the
+      testbed — compute-only, no model spend), same rule as the
+      runtime gate. Record:
+      [`docs/benchmarks/best-of-n-sweep-selection-measurement.md`](benchmarks/best-of-n-sweep-selection-measurement.md).
 25. **Queued user steering** (G1, G2). **Shipped 2026-10-16** — the
     `TaskControl::steer` seam queues user messages on the control (shared via
     `Arc` across clones); the turn loop drains them at each turn boundary and
@@ -1831,6 +1844,21 @@ model tier under them (arXiv 2607.06906).
      deferred until that trigger fires. Design:
      `docs/fastpath-decline-reasons-design.md`.
 
+     **Shipped (2026-11-08, item 13 follow-up).** The fallback is in:
+     `try_fast_path` takes the live `LspServer` handles (the engine
+     keeps them from the attachment), and on exactly the
+     `intent-rename-collision` decline it asks the first
+     rename-capable server to resolve the declaration — one exact
+     `workspace/symbol` match required (ambiguity keeps the decline),
+     confined URI, the same ≤500-edit budget, snapshot before the
+     first write, `apply_workspace_edit`, and `cargo check` verify
+     with byte-identical restore on any surprise. Every other guard
+     (zero occurrences, cap, verify) stays with the blind path, and
+     workspaces without LSP servers behave byte-identically. Verified
+     end to end against the mock server (`fastpath.rs` decline
+     battery + `lsp_stdio` integration test: same ask declines
+     blind, resolves via LSP, renames, verifies).
+
 
 35. **SWE-bench Multilingual: the Rust slice as a parallel eval path** (G3, G6, G8).
    Goal: a second, harder benchmark surface — 43 Rust tasks across 7
@@ -1902,6 +1930,26 @@ model tier under them (arXiv 2607.06906).
    at apply time by fastpath/autofix/LSP-apply (content-addressed), so
    strategy (c) is closer than docs/rewind-design.md assumed when it
    called mid-turn code state non-derivable.
+
+   **Shipped (2026-11-08, default-off).** `--stall-escalation-model
+   MODEL` (env `LOOM_STALL_ESCALATION_MODEL`, `loom run`/`loom chat`):
+   when a task fails with `max_turns`/budget exhaustion after a loop
+   nudge fired (the kernel nudges before every exhaustion, so the gate
+   is effectively "the kernel's own rescue attempt failed"), the engine
+   forks the session at its tip and retries the task on the fork with
+   the named model — a second agent composed exactly like a routing
+   tier (same provider/credential/headers, registry, system prompt,
+   effort schedule, session DB; persistence parity is tested). The
+   decision lands as an `escalation` HarnessNotice naming the fork id
+   and model; the original session and its error survive untouched
+   (never-worse: an escalated failure reports the *original* error),
+   and memory-only (`--no-save`) engines never escalate because a fork
+   needs the durable store. Workspace strategy: (a) continue as-is —
+   the fork starts from the stalled transcript; (b)/(c) stay open
+   tails pending the funded A/B. Offline tests: fork-and-escalate end
+   to end (FakeProvider stall → notice → recovered fork, original
+   transcript intact) and default-off (no model wired → original
+   `MaxTurns` error, no notice).
 
 
 37. **ACP server mode (`loom-acp`)** (G1, G6, G8, ADR-021). Goal: the

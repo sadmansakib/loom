@@ -35,12 +35,14 @@
 //! task runs exactly as it would have without this module.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use loom_kernel::tool::ToolContext;
 use tokio_util::sync::CancellationToken;
 
 use crate::exec::{ExecLimits, run_bounded};
+use crate::lsp::LspServer;
 use crate::policy::{CommandPolicy, PolicyVerdict};
 use crate::sandbox::{Sandbox, SandboxGrants};
 
@@ -693,6 +695,105 @@ async fn apply_rename(
     }))
 }
 
+/// The LSP fallback for exactly the collision class (roadmap item 34):
+/// a blind whole-word rename declines when the target name exists
+/// anywhere in the workspace, but a semantic rename resolves one
+/// declared symbol regardless of same-named strings elsewhere.
+/// Requires an unambiguous declaration (exactly one exact
+/// workspace-symbol match, workspace-confined), applies through the
+/// same confined edit machinery as the `lsp_rename` tool, honors the
+/// same 500-edit budget, and verifies with `cargo check`. Any
+/// surprise restores the snapshots and returns `None`, so the caller
+/// keeps the original collision decline.
+async fn apply_rename_lsp(
+    workspace: &Path,
+    policy: &CommandPolicy,
+    from: &str,
+    to: &str,
+    servers: &[Arc<LspServer>],
+) -> Option<FastPathOutcome> {
+    use lsp_types::request::{Rename, WorkspaceSymbolRequest};
+    use lsp_types::{
+        OneOf, RenameParams, TextDocumentIdentifier, TextDocumentPositionParams,
+        WorkspaceSymbolParams,
+    };
+    let server = servers.iter().find(|server| {
+        matches!(
+            &server.capabilities.rename_provider,
+            Some(OneOf::Left(true)) | Some(OneOf::Right(_))
+        )
+    })?;
+    // Resolve the declaration site: exactly one exact match.
+    let symbols = server
+        .request::<WorkspaceSymbolRequest>(WorkspaceSymbolParams {
+            query: from.to_owned(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .ok()??;
+    let flat = match symbols {
+        lsp_types::WorkspaceSymbolResponse::Flat(infos) => infos,
+        // Nested responses carry no guaranteed range; the fallback
+        // does not guess positions.
+        lsp_types::WorkspaceSymbolResponse::Nested(_) => return None,
+    };
+    let exact: Vec<_> = flat.iter().filter(|info| info.name == from).collect();
+    if exact.len() != 1 {
+        return None;
+    }
+    let location = &exact[0].location;
+    // Server-supplied URIs are untrusted: confinement before any use.
+    crate::lsp::confined_path(server, &location.uri, "rename").ok()?;
+    let edit = server
+        .request::<Rename>(RenameParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: location.uri.clone(),
+                },
+                position: location.range.start,
+            },
+            new_name: to.to_owned(),
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .ok()??;
+    let ops = crate::lsp::edit_op_count(&edit);
+    if ops == 0 || ops > 500 {
+        return None;
+    }
+    // Snapshot-guarded like the blind path: capture every Rust file's
+    // bytes before the first write, restore on any failure, so the
+    // agent loop starts from the untouched workspace.
+    let snapshots: Vec<Snapshot> = rust_files(workspace)
+        .into_iter()
+        .filter_map(|path| {
+            let bytes = std::fs::read(&path).ok()?;
+            Some(Snapshot { path, bytes })
+        })
+        .collect();
+    crate::lsp::apply_workspace_edit(server, &edit, None)
+        .await
+        .ok()?;
+    if !cargo_ok(workspace, policy, &["check"]).await {
+        restore(&snapshots);
+        return None;
+    }
+    let files_changed = snapshots
+        .iter()
+        .filter(|snap| std::fs::read(&snap.path).is_ok_and(|now| now != snap.bytes))
+        .count() as u32;
+    Some(FastPathOutcome {
+        kind: "rename",
+        files_changed,
+        note: format!(
+            "Fast path (rename via LSP `{}`): `{from}` → `{to}` — {ops} edit(s) \
+             across {files_changed} file(s); verified with `cargo check`.",
+            server.name
+        ),
+    })
+}
+
 /// Applies the constant intent at its unique declaration site.
 async fn apply_constant(
     workspace: &Path,
@@ -1126,6 +1227,7 @@ pub async fn try_fast_path(
     workspace: &Path,
     task: &str,
     policy: &CommandPolicy,
+    lsp_servers: &[Arc<LspServer>],
 ) -> FastPathAttempt {
     let Some(intent) = analyze(task) else {
         return FastPathAttempt::declined("no-intent-match");
@@ -1136,6 +1238,17 @@ pub async fn try_fast_path(
         Intent::Format => apply_format(workspace, policy, FormatClass::Auto).await,
         Intent::Rename { from, to } => match apply_rename(workspace, policy, from, to).await {
             Ok(outcome) => outcome,
+            // Roadmap item 34: the collision class is exactly what a
+            // semantic rename addresses — the target name exists as a
+            // string somewhere, but the declared symbol is distinct.
+            // Every other guard (zero occurrences, budget, verify)
+            // stays with the blind path.
+            Err(reason @ "intent-rename-collision") if !lsp_servers.is_empty() => {
+                match apply_rename_lsp(workspace, policy, from, to, lsp_servers).await {
+                    Some(outcome) => Some(outcome),
+                    None => return FastPathAttempt::declined(reason),
+                }
+            }
             Err(reason) => return FastPathAttempt::declined(reason),
         },
         Intent::Constant { name, from, to } => {
@@ -1212,7 +1325,8 @@ mod tests {
         let policy = CommandPolicy::cargo_only();
 
         // No grammar match: the decline names the absence of an intent.
-        let attempt = try_fast_path(&workspace, "Refactor the parser for clarity.", &policy).await;
+        let attempt =
+            try_fast_path(&workspace, "Refactor the parser for clarity.", &policy, &[]).await;
         assert_eq!(attempt.decline, Some("no-intent-match"));
         assert!(attempt.outcome.is_none());
 
@@ -1223,6 +1337,7 @@ mod tests {
             &workspace,
             "Rename missing_symbol to renamed_symbol",
             &policy,
+            &[],
         )
         .await;
         assert_eq!(attempt.decline, Some("intent-rename-zero-occurrences"));
@@ -1232,6 +1347,7 @@ mod tests {
             &workspace,
             "Update the dependency tiny-dep to 2.0.0",
             &policy,
+            &[],
         )
         .await;
         assert_eq!(attempt.decline, Some("intent-dependency-unsolved"));
@@ -1260,8 +1376,13 @@ mod tests {
             "pub fn parse_opts() -> u32 {\n    7\n}\npub fn parse_options() -> u32 {\n    8\n}\n",
         )
         .expect("lib");
-        let attempt =
-            try_fast_path(&workspace, "Rename parse_opts to parse_options", &policy).await;
+        let attempt = try_fast_path(
+            &workspace,
+            "Rename parse_opts to parse_options",
+            &policy,
+            &[],
+        )
+        .await;
         assert_eq!(attempt.decline, Some("intent-rename-collision"));
 
         // Collision only in an *untouched* workspace file: the
@@ -1284,8 +1405,13 @@ mod tests {
             "pub fn parse_options() -> u32 {\n    9\n}\n",
         )
         .expect("other");
-        let attempt =
-            try_fast_path(&workspace, "Rename parse_opts to parse_options", &policy).await;
+        let attempt = try_fast_path(
+            &workspace,
+            "Rename parse_opts to parse_options",
+            &policy,
+            &[],
+        )
+        .await;
         assert_eq!(attempt.decline, Some("intent-rename-collision"));
 
         // More than 500 occurrences: above the mechanical cap.
@@ -1302,7 +1428,7 @@ mod tests {
             heavy.push_str("// aaa aaa\n");
         }
         std::fs::write(workspace.join("src/lib.rs"), heavy).expect("lib");
-        let attempt = try_fast_path(&workspace, "Rename aaa to bbb", &policy).await;
+        let attempt = try_fast_path(&workspace, "Rename aaa to bbb", &policy, &[]).await;
         assert_eq!(attempt.decline, Some("intent-rename-too-many-occurrences"));
 
         // A pre-existing broken crate: the rewrite itself is sound,
@@ -1318,8 +1444,13 @@ mod tests {
         .expect("manifest");
         let broken = "pub fn parse_opts( {\n";
         std::fs::write(workspace.join("src/lib.rs"), broken).expect("lib");
-        let attempt =
-            try_fast_path(&workspace, "Rename parse_opts to parse_options", &policy).await;
+        let attempt = try_fast_path(
+            &workspace,
+            "Rename parse_opts to parse_options",
+            &policy,
+            &[],
+        )
+        .await;
         assert_eq!(attempt.decline, Some("intent-rename-verify-failed"));
         assert_eq!(
             std::fs::read_to_string(workspace.join("src/lib.rs")).expect("lib"),
@@ -1349,6 +1480,7 @@ mod tests {
             &workspace,
             "Update the dependency lodash to 4.17.21",
             &policy,
+            &[],
         )
         .await;
         assert_eq!(attempt.decline, Some("intent-dependency-unsolved"));

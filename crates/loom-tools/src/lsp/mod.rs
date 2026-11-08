@@ -16,11 +16,14 @@ mod tools;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Crate-internal seams for the fast-path LSP fallback (item 34).
+pub(crate) use apply::{apply_workspace_edit, confined_path};
 pub use client::LspServer;
 pub use manifest::{
     KNOWN_SERVERS, KnownServer, LspManifest, LspServerDecl, MANIFEST_RELATIVE_PATH,
     binary_available, candidates_for, manifest_for,
 };
+pub(crate) use tools::edit_op_count;
 
 use crate::budget::ToolBudgets;
 use tools::LspInner;
@@ -32,6 +35,10 @@ pub struct LspAttachment {
     pub tools: Vec<Box<dyn loom_kernel::tool::Tool>>,
     /// Facts-block menu text (None when no server attached).
     pub menu: Option<String>,
+    /// Live server handles (empty when none attached). The fast-path
+    /// LSP rename fallback (roadmap item 34) speaks to these directly;
+    /// everything else goes through the tools.
+    pub servers: Vec<Arc<LspServer>>,
 }
 
 /// Renders the compact facts menu (~100 tokens): servers plus the tool
@@ -98,9 +105,13 @@ pub async fn attach_lsp(workspace: &Path, budgets: ToolBudgets) -> LspAttachment
         return LspAttachment::default();
     }
     let menu = render_menu(&servers);
-    let inner = Arc::new(LspInner { servers, budgets });
+    let inner = Arc::new(LspInner {
+        servers: servers.clone(),
+        budgets,
+    });
     LspAttachment {
         tools: tools::lsp_tools(inner),
         menu: Some(menu),
+        servers,
     }
 }

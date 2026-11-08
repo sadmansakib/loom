@@ -54,6 +54,7 @@ fn main() -> anyhow::Result<()> {
         catalog: None,
         scout: None,
         routing: None,
+        stall_escalation_model: None,
         background_commands: false,
         symbols: false,
         git: false,
