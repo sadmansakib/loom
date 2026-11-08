@@ -995,3 +995,26 @@ async fn dropping_the_stream_cancels_the_request() {
         .expect("server should observe the disconnect within 5s")
         .unwrap();
 }
+
+#[tokio::test]
+async fn an_unknown_finish_reason_completes_the_run() {
+    // Fine-tuned and boutique endpoints mint vendor-specific reasons
+    // ("eos_custom", "end_of_turn", …). The run must complete with a
+    // structural stop reason instead of dying on the unknown word.
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse(&[
+            data_event(json!({"choices":[{"delta":{"content":"done"}}]})),
+            data_event(json!({"choices":[{"delta":{},"finish_reason":"eos_custom"}]})),
+        ]) + &done(),
+    )
+    .await;
+
+    let events =
+        collect(provider_at(&server.uri(), TimeoutConfig::default()).stream(&plain_request()))
+            .await;
+    let response = expect_completed(events);
+    assert_eq!(response.message.content, "done");
+    assert_eq!(response.message.stop_reason, StopReason::EndTurn);
+}

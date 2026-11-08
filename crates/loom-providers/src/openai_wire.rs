@@ -680,10 +680,24 @@ fn normalized_stop(
             calls.clear();
             Ok(StopReason::ContentFilter)
         }
-        Some(other) => Err(ModelError::new(
-            ModelErrorKind::Protocol,
-            format!("unexpected finish_reason {other:?}"),
-        )),
+        // Failure-type reasons never reach here (the dialect hook
+        // classifies them before normalization), but vendors keep
+        // minting new benign reasons ("eos", "end_of_turn",
+        // "max_output_tokens", …). Killing the run on an unknown word
+        // turns a forward-compatible stream into a hard protocol
+        // error, so classify structurally — like a missing
+        // finish_reason — and keep the name in the log.
+        Some(other) => {
+            tracing::warn!(
+                reason = other,
+                "unknown finish_reason; classifying structurally from assembled content"
+            );
+            Ok(if calls.is_empty() {
+                StopReason::EndTurn
+            } else {
+                StopReason::ToolCalls
+            })
+        }
     }
 }
 
@@ -1069,6 +1083,29 @@ mod tests {
             x_groq: None,
         });
         acc
+    }
+
+    #[test]
+    fn unknown_finish_reason_with_calls_classifies_structurally() {
+        // Vendors mint new benign reasons ("eos", "end_of_turn", …);
+        // the run must complete, not die on an unrecognized word.
+        let acc = finished(text_and_call_fragments(), "eos_custom");
+        let response = acc.finalize(true, &policy("test")).unwrap();
+        assert_eq!(response.message.stop_reason, StopReason::ToolCalls);
+        assert_eq!(response.message.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn unknown_finish_reason_without_calls_is_end_turn() {
+        let mut acc = ChunkAccumulator::default();
+        acc.ingest(chunk_with(ChunkDelta {
+            content: Some("hello".into()),
+            ..Default::default()
+        }));
+        let acc = finished(acc, "eos_custom");
+        let response = acc.finalize(true, &policy("test")).unwrap();
+        assert_eq!(response.message.stop_reason, StopReason::EndTurn);
+        assert_eq!(response.message.content, "hello");
     }
 
     #[test]
@@ -1727,19 +1764,10 @@ mod tests {
         assert_eq!(response.message.stop_reason, StopReason::ContentFilter);
     }
 
-    #[test]
-    fn unknown_finish_reason_is_protocol() {
-        let mut acc = ChunkAccumulator::default();
-        acc.ingest(ChatChunk {
-            choices: vec![ChunkChoice {
-                delta: ChunkDelta::default(),
-                finish_reason: Some("quantum_decay".into()),
-            }],
-            usage: None,
-            error: None,
-            x_groq: None,
-        });
-        let error = acc.finalize(true, &policy("test")).unwrap_err();
-        assert_eq!(error.kind, ModelErrorKind::Protocol);
-    }
+    // Pins the fix's replacement of the historical behavior: an
+    // unknown finish_reason ("quantum_decay" et al.) used to fail the
+    // run with a non-retryable Protocol error; it now classifies
+    // structurally (see the unknown_finish_reason_* tests above).
+    // Failure-type reasons still error, classified by the dialect
+    // hook in `terminal_error` before normalization runs.
 }
