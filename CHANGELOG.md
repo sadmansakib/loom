@@ -32,6 +32,11 @@ project versions by iteration, not semver.
   time (TOCTOU minimum) and write atomically (temp + fsync + rename)
   — a crash mid-write now leaves the previous file instead of a
   truncated one.
+- `fix(tools)`: the macOS Seatbelt profile denies Apple-event IPC
+  (`appleevent-send` plus an exec deny of `osascript`, which the
+  classic filter no longer stops on current macOS) and re-allows
+  `/dev/null`, which the blanket write-deny made every sandboxed
+  `git` invocation fail on.
 
 ## 2026-11 — ACP tails: session/load and operator-gated client MCP (roadmap item 37)
 

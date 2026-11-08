@@ -7,7 +7,9 @@
 //! forbids `unsafe`):
 //!
 //! * macOS — `sandbox-exec` with a generated Seatbelt profile
-//!   (`(allow default)` then re-`deny` the two deviation axes, so the
+//!   (`(allow default)` then re-`deny` the deviation axes — writes
+//!   outside the writable set and, unless granted, network — plus an
+//!   unconditional Apple-event deny, so the
 //!   default-allow surface stays broad enough for real toolchains).
 //! * Linux — `bubblewrap` (`bwrap`) with read-only system roots, a
 //!   tmpfs `/tmp`, `--unshare-net`, and bind-mounts for the writable
@@ -510,12 +512,29 @@ pub fn bwrap_remediation(stderr: &str) -> Option<String> {
 }
 
 /// The Seatbelt profile: default-allow (real toolchains need read,
-/// exec, mach-lookup, sysctl), then the two deviation axes re-denied —
-/// all writes outside the writable set, and (unless granted) all
-/// network. Later filters win, so the subpath allows land after the
-/// blanket deny.
+/// exec, mach-lookup, sysctl), then re-denied — all writes outside
+/// the writable set (with `/dev/null` re-allowed as a sink device
+/// real toolchains open read-write), Apple-event IPC, and (unless
+/// granted) all network. Later filters win, so the subpath allows
+/// land after the blanket deny.
+///
+/// Apple events get two layers because the classic filter no longer
+/// enforces everywhere: `(deny appleevent-send)` is kept for macOS
+/// versions where it still bites, and on current macOS (verified
+/// empirically — an `osascript` "tell Finder" succeeded under the
+/// deny, and the `destination` filter key is not even in the schema)
+/// the operative control is the exec deny of the stock OSA
+/// interpreter. A copied `osascript` is not a bypass: re-signing
+/// system binaries fails under codesigning enforcement, and the
+/// deny is defense-in-depth over the model never being asked to
+/// script other applications in the first place.
 pub(crate) fn seatbelt_profile(writable: &[PathBuf], network: bool) -> String {
     let mut profile = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
+    // /dev/null must be writable: real git opens it read-write during
+    // ordinary setup, and the blanket deny made every `git --version`
+    // fatal under the sandbox (pre-existing; surfaced by review item
+    // 2.4's confirmation step). A sink device is safe to allow.
+    profile.push_str("(allow file-write* (subpath \"/dev/null\"))\n");
     if !writable.is_empty() {
         profile.push_str("(allow file-write* ");
         for (index, dir) in writable.iter().enumerate() {
@@ -526,12 +545,13 @@ pub(crate) fn seatbelt_profile(writable: &[PathBuf], network: bool) -> String {
         }
         profile.push_str(")\n");
     }
+    profile.push_str("(deny appleevent-send)\n");
+    profile.push_str("(deny process-exec* (subpath \"/usr/bin/osascript\"))\n");
     if !network {
         profile.push_str("(deny network*)\n");
     }
     profile
 }
-
 /// Escapes a path for a Seatbelt string literal: backslash and quote
 /// are the two characters with meaning there.
 fn escape_seatbelt_path(path: &Path) -> String {
@@ -549,7 +569,10 @@ mod tests {
         let profile = seatbelt_profile(&[PathBuf::from("/ws")], false);
         assert!(profile.contains("(deny file-write*)"));
         assert!(profile.contains("(deny network*)"));
+        assert!(profile.contains("(deny appleevent-send)"));
+        assert!(profile.contains("(subpath \"/usr/bin/osascript\")"));
         assert!(profile.contains("(subpath \"/ws\")"));
+        assert!(profile.contains("(subpath \"/dev/null\")"));
         // The subpath allow must come after the blanket deny.
         let deny = profile.find("(deny file-write*)").unwrap();
         let allow = profile.find("(allow file-write*").unwrap();
@@ -560,6 +583,71 @@ mod tests {
     fn seatbelt_network_grant_omits_the_deny() {
         let profile = seatbelt_profile(&[PathBuf::from("/ws")], true);
         assert!(!profile.contains("(deny network*)"));
+        // The Apple-event deny is unconditional: there is no grant
+        // axis for IPC to other applications.
+        assert!(profile.contains("(deny appleevent-send)"));
+    }
+
+    /// Runs `program args...` under the real Seatbelt wrapper with the
+    /// shipped profile, in a scratch workspace (integration check;
+    /// macOS only).
+    #[cfg(target_os = "macos")]
+    fn run_under_seatbelt(program: &str, args: &[&str]) -> std::process::Output {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let profile = seatbelt_profile(&[workspace.path().to_path_buf()], false);
+        std::process::Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(&profile)
+            .arg("--")
+            .arg(program)
+            .args(args)
+            .output()
+            .expect("spawn under sandbox-exec")
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_blocks_apple_events() {
+        // Review item 2.4: a model-reachable child must not be able
+        // to script other applications. The exec deny is the
+        // operative layer on current macOS (see the profile docs).
+        let output = run_under_seatbelt(
+            "/usr/bin/osascript",
+            &["-e", "tell application \"Finder\" to get name"],
+        );
+        assert!(
+            !output.status.success(),
+            "osascript automation escaped the sandbox: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_still_runs_real_toolchains() {
+        // The added IPC/exec denies must not break the programs the
+        // profile exists for. Probes are self-contained binaries:
+        // /usr/bin/git and /usr/bin/python3 are xcode-select *shims*
+        // on some machines and the shims write /dev/null, which the
+        // pre-existing (deny file-write*) has always refused — a
+        // machine artifact, not this profile's regression. Where the
+        // real CLT toolchain exists, exercise it directly.
+        let mut probes: Vec<(String, Vec<&str>)> = vec![
+            ("/usr/bin/sw_vers".to_owned(), vec![]),
+            ("/bin/ls".to_owned(), vec!["/usr/bin"]),
+        ];
+        let clt_git = "/Library/Developer/CommandLineTools/usr/bin/git";
+        if std::path::Path::new(clt_git).exists() {
+            probes.push((clt_git.to_owned(), vec!["--version"]));
+        }
+        for (program, args) in probes {
+            let output = run_under_seatbelt(&program, &args);
+            assert!(
+                output.status.success(),
+                "{program} no longer runs under the profile: {:?}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]
