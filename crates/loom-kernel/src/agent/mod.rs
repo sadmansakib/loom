@@ -2957,6 +2957,11 @@ fn append_failure_hint(content: &mut String, kind: ToolFailure, tool_hint: Optio
 }
 
 /// How one model attempt ended.
+// `Completed` is a plain data carrier sized by `ModelResponse`; boxing
+// it would touch every construction site for no measured win. Allowed
+// after clippy 1.98 began flagging it (only under workspace feature
+// unification).
+#[allow(clippy::large_enum_variant)]
 enum Attempt {
     /// The provider reported completion with an authoritative response.
     Completed(ModelResponse),

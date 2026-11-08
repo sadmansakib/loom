@@ -384,6 +384,11 @@ impl ModelCapabilities {
 /// without it, is an error.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
+// `Completed` is the authoritative payload and dominates the enum's
+// size; boxing it is a public API change (every provider matches on
+// this variant) with no measured win. Allowed after clippy 1.98 began
+// flagging it (only under workspace feature unification).
+#[allow(clippy::large_enum_variant)]
 pub enum ModelEvent {
     /// A fragment of visible assistant text, for display only.
     TextDelta(String),
