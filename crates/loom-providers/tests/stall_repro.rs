@@ -10,7 +10,9 @@
 
 use futures::StreamExt;
 use loom_kernel::model::{ModelError, ModelErrorKind, ModelProvider, ModelRequest};
-use loom_providers::{NvidiaConfig, NvidiaProvider, TimeoutConfig};
+use loom_providers::{
+    AnthropicConfig, AnthropicProvider, NvidiaConfig, NvidiaProvider, TimeoutConfig,
+};
 use std::future::pending;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -71,6 +73,86 @@ async fn bound_listener() -> (tokio::net::TcpListener, std::net::SocketAddr) {
     let addr = listener.local_addr().unwrap();
     (listener, addr)
 }
+/// Serve the Messages API head, one `message_start`, then an endless
+/// `ping` stream with no content: the Anthropic analogue of the NIM
+/// stall — byte flow alive, response never arriving.
+#[expect(
+    clippy::unwrap_used,
+    reason = "test-only socket setup; failures should panic"
+)]
+async fn pinging_anthropic_server(listener: tokio::net::TcpListener) {
+    let (mut sock, _) = listener.accept().await.unwrap();
+    let mut buf = [0u8; 8192];
+    let _ = sock.read(&mut buf).await; // request head (may split; enough)
+    let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n";
+    sock.write_all(head.as_bytes()).await.unwrap();
+    sock.write_all(
+        b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n",
+    )
+    .await
+    .unwrap();
+    let _ = sock.flush().await;
+    loop {
+        // Pings keep arriving faster than any configured window: the
+        // idle timer never expires, only the stall window can.
+        if sock
+            .write_all(b"data: {\"type\":\"ping\"}\n\n")
+            .await
+            .is_err()
+        {
+            break;
+        }
+        let _ = sock.flush().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    pending::<()>().await;
+}
+
+#[tokio::test]
+async fn ping_only_anthropic_stream_trips_the_content_stall_window() {
+    let (listener, addr) = bound_listener().await;
+    tokio::spawn(pinging_anthropic_server(listener));
+    let provider = AnthropicProvider::new(
+        AnthropicConfig::new("test-key")
+            .with_base_url(format!("http://{addr}"))
+            .with_timeouts(TimeoutConfig {
+                idle: Duration::from_secs(30),
+                stall: Duration::from_secs(1),
+                ..TimeoutConfig::default()
+            }),
+    )
+    .unwrap();
+    let request = ModelRequest {
+        model: "claude-sonnet-5-5".into(),
+        messages: vec![loom_kernel::model::Message::User { text: "hi".into() }],
+        tools: vec![],
+        max_tokens: None,
+        temperature: None,
+        stable_prefix_messages: None,
+        context_editing: None,
+        reasoning_effort: None,
+    };
+    let mut stream = provider.stream(&request);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let Some(event) = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .expect("the ping-only stream must fail within the stall window, not outlive it")
+        else {
+            panic!("stream ended without a stall error");
+        };
+        if let Err(error) = event {
+            assert_eq!(error.kind, ModelErrorKind::Transport);
+            assert!(error.is_retryable(), "a stall is retryable");
+            assert!(
+                error.to_string().contains("stall timeout"),
+                "the stall window, not the idle window, must fire: {error}"
+            );
+            return;
+        }
+    }
+}
+
 #[tokio::test]
 async fn stalled_sse_stream_trips_idle_timeout() {
     let (listener, addr) = bound_listener().await;
@@ -78,7 +160,6 @@ async fn stalled_sse_stream_trips_idle_timeout() {
     let provider = provider_at(&format!("http://{addr}"), Duration::from_secs(1));
     let request = request();
     let mut stream = provider.stream(&request);
-
     // Outer bound: the whole point is that this cannot hang. Generous
     // 10 s vs the 1 s idle window leaves no room for scheduling noise.
     let outcome = tokio::time::timeout(Duration::from_secs(10), stream.next()).await;

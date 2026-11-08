@@ -177,7 +177,8 @@ enum State {
     },
     /// Headers received; body streaming. `pending` holds display
     /// deltas from the last ingested event; `saw_stop` records
-    /// `message_stop`.
+    /// `message_stop`; `last_progress` is the last content-progressing
+    /// event (pings do not count) for the stall window.
     Body {
         provider: AnthropicProvider,
         body_stream: futures::stream::BoxStream<'static, reqwest::Result<bytes::Bytes>>,
@@ -185,6 +186,7 @@ enum State {
         assembler: Box<AnthropicAssembler>,
         pending: VecDeque<ModelEvent>,
         saw_stop: bool,
+        last_progress: tokio::time::Instant,
     },
     /// Terminal.
     Done,
@@ -252,6 +254,7 @@ async fn step(state: State) -> Option<(Result<Option<ModelEvent>, ModelError>, S
                     assembler: Box::default(),
                     pending: VecDeque::new(),
                     saw_stop: false,
+                    last_progress: tokio::time::Instant::now(),
                 },
             ))
         }
@@ -262,6 +265,7 @@ async fn step(state: State) -> Option<(Result<Option<ModelEvent>, ModelError>, S
             mut assembler,
             mut pending,
             mut saw_stop,
+            mut last_progress,
         } => {
             if let Some(event) = pending.pop_front() {
                 return Some((
@@ -273,6 +277,7 @@ async fn step(state: State) -> Option<(Result<Option<ModelEvent>, ModelError>, S
                         assembler,
                         pending,
                         saw_stop,
+                        last_progress,
                     },
                 ));
             }
@@ -283,15 +288,17 @@ async fn step(state: State) -> Option<(Result<Option<ModelEvent>, ModelError>, S
                     State::Done,
                 ));
             }
-            let idle = provider.config.timeouts.idle;
-            match tokio::time::timeout(idle, body_stream.next()).await {
-                Err(_) => Some((
-                    Err(ModelError::new(
-                        ModelErrorKind::Transport,
-                        "idle timeout: no SSE event within the configured window",
-                    )),
-                    State::Done,
-                )),
+            // Same dual window as the OpenAI wire: the idle window
+            // measures raw byte flow (pings reset it), the stall window
+            // measures content events (a ping-only stream must not
+            // outlive it). Whichever expiry comes first decides the
+            // error.
+            let window = crate::wire_stream::read_window(provider.config.timeouts, last_progress);
+            match tokio::time::timeout(window.window, body_stream.next()).await {
+                Err(_) if window.content_stall => {
+                    Some((Err(crate::wire_stream::content_stall_error()), State::Done))
+                }
+                Err(_) => Some((Err(crate::wire_stream::idle_timeout_error()), State::Done)),
                 Ok(None) => {
                     // The Messages API terminates with a dispatched
                     // `message_stop`; EOF without it is a truncated
@@ -326,10 +333,13 @@ async fn step(state: State) -> Option<(Result<Option<ModelEvent>, ModelError>, S
                     };
                     for event in events {
                         match assembler.ingest(&event.data) {
-                            Ok((mut deltas, stop)) => {
+                            Ok((mut deltas, stop, progressed)) => {
                                 pending.extend(deltas.drain(..));
                                 if stop {
                                     saw_stop = true;
+                                }
+                                if progressed {
+                                    last_progress = tokio::time::Instant::now();
                                 }
                             }
                             Err(error) => {
@@ -346,6 +356,7 @@ async fn step(state: State) -> Option<(Result<Option<ModelEvent>, ModelError>, S
                             assembler,
                             pending,
                             saw_stop,
+                            last_progress,
                         },
                     ))
                 }

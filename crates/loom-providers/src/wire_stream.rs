@@ -300,6 +300,52 @@ struct Ingested {
     progressed: bool,
 }
 
+/// One body read's bounding window under the dual idle/stall
+/// discipline, shared by both wire drivers.
+///
+/// The idle window measures raw byte flow (keep-alive comments and
+/// pings reset it); the stall window measures dispatched content
+/// events (they do not). Whichever expiry comes first decides the
+/// error the read reports on timeout.
+pub(crate) struct ReadWindow {
+    /// How long this read may wait for the next body chunk.
+    pub(crate) window: std::time::Duration,
+    /// A timeout on this read is a content stall: the stall window is
+    /// the one that expired (byte flow may still be alive).
+    pub(crate) content_stall: bool,
+}
+
+/// Computes the read window for one body chunk. `last_progress` is
+/// the instant the last content-progressing event was dispatched.
+pub(crate) fn read_window(
+    timeouts: TimeoutConfig,
+    last_progress: tokio::time::Instant,
+) -> ReadWindow {
+    let stall_remaining = timeouts.stall.saturating_sub(last_progress.elapsed());
+    ReadWindow {
+        window: timeouts.idle.min(stall_remaining),
+        content_stall: stall_remaining <= timeouts.idle,
+    }
+}
+
+/// The error for a read whose content-stall window expired: bytes may
+/// still be flowing (keep-alive pings), but no content arrived.
+pub(crate) fn content_stall_error() -> ModelError {
+    ModelError::new(
+        ModelErrorKind::Transport,
+        "stall timeout: no SSE event within the configured window \
+         (keep-alive pings do not count as progress)",
+    )
+}
+
+/// The error for a read whose idle window expired: no bytes at all.
+pub(crate) fn idle_timeout_error() -> ModelError {
+    ModelError::new(
+        ModelErrorKind::Transport,
+        "idle timeout: no SSE event within the configured window",
+    )
+}
+
 /// Ingests one body chunk: decodes SSE events, parses each data chunk
 /// into the accumulator, and extends `pending` with the display deltas.
 /// Reports the updated `saw_done` and whether any event was dispatched;
@@ -449,31 +495,15 @@ async fn step<P: WireEndpoint>(
             // byte flow (keep-alive comments reset it), the stall window
             // measures dispatched events (they do not). Whichever expiry
             // comes first decides the error.
-            let timeouts = provider.timeouts();
-            let stall_remaining = timeouts.stall.saturating_sub(last_progress.elapsed());
-            let window = timeouts.idle.min(stall_remaining);
-            let content_stall = stall_remaining <= timeouts.idle;
-            match tokio::time::timeout(window, body_stream.next()).await {
-                Err(_) if content_stall => {
+            let window = read_window(provider.timeouts(), last_progress);
+            match tokio::time::timeout(window.window, body_stream.next()).await {
+                Err(_) if window.content_stall => {
                     log_finish_reason(&accumulator);
-                    Some((
-                        Err(ModelError::new(
-                            ModelErrorKind::Transport,
-                            "stall timeout: no SSE event within the configured window \
-                             (keep-alive pings do not count as progress)",
-                        )),
-                        State::Done,
-                    ))
+                    Some((Err(content_stall_error()), State::Done))
                 }
                 Err(_) => {
                     log_finish_reason(&accumulator);
-                    Some((
-                        Err(ModelError::new(
-                            ModelErrorKind::Transport,
-                            "idle timeout: no SSE event within the configured window",
-                        )),
-                        State::Done,
-                    ))
+                    Some((Err(idle_timeout_error()), State::Done))
                 }
                 Ok(None) => {
                     let saw_done = eof_is_done(saw_done, &decoder);

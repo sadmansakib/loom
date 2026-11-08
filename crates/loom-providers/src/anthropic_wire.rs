@@ -385,9 +385,14 @@ enum Block {
 }
 
 impl AnthropicAssembler {
-    /// Ingests one SSE `data` payload; returns display deltas to emit
-    /// and whether this event was the terminal `message_stop`.
-    pub(crate) fn ingest(&mut self, data: &str) -> Result<(Vec<ModelEvent>, bool), ModelError> {
+    /// Ingests one SSE `data` payload; returns display deltas to emit,
+    /// whether this event was the terminal `message_stop`, and whether
+    /// it counts as content progress for the stall window (false only
+    /// for `ping`: pings keep the byte flow alive but are not content).
+    pub(crate) fn ingest(
+        &mut self,
+        data: &str,
+    ) -> Result<(Vec<ModelEvent>, bool, bool), ModelError> {
         let event: Value = serde_json::from_str(data).map_err(|error| {
             ModelError::new(
                 ModelErrorKind::Protocol,
@@ -398,7 +403,7 @@ impl AnthropicAssembler {
         match kind {
             "message_start" => {
                 self.ingest_message_start(&event);
-                Ok((Vec::new(), false))
+                Ok((Vec::new(), false, true))
             }
             "content_block_start" => {
                 // Close any open block (a stop event should have done
@@ -413,19 +418,19 @@ impl AnthropicAssembler {
                     },
                     _ => Block::Text,
                 });
-                Ok((Vec::new(), false))
+                Ok((Vec::new(), false, true))
             }
-            "content_block_delta" => Ok((self.ingest_block_delta(&event["delta"]), false)),
+            "content_block_delta" => Ok((self.ingest_block_delta(&event["delta"]), false, true)),
             "content_block_stop" => {
                 self.close_current();
-                Ok((Vec::new(), false))
+                Ok((Vec::new(), false, true))
             }
             "message_delta" => {
                 self.ingest_message_delta(&event);
-                Ok((Vec::new(), false))
+                Ok((Vec::new(), false, true))
             }
-            "message_stop" => Ok((Vec::new(), true)),
-            "ping" => Ok((Vec::new(), false)),
+            "message_stop" => Ok((Vec::new(), true, true)),
+            "ping" => Ok((Vec::new(), false, false)),
             "error" => Err(classify_stream_error(data)),
             other => Err(ModelError::new(
                 ModelErrorKind::Protocol,
