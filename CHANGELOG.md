@@ -49,6 +49,10 @@ project versions by iteration, not semver.
   operator) can no longer stage session state or broken gitlinks —
   the tracked `.gitignore` is never touched and manifests stay
   shareable.
+- `fix(tools)`: `edit_file` matches LF-only `old_string`s against CRLF
+  (and BOM-prefixed) files through a normalized view with an offset
+  map — the file's own endings and BOM are preserved, mixed endings
+  are never rewritten, and a missing trailing newline stays missing.
 - `fix(tools)`: the macOS Seatbelt profile denies Apple-event IPC
   (`appleevent-send` plus an exec deny of `osascript`, which the
   classic filter no longer stops on current macOS) and re-allows

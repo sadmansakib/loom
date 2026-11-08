@@ -299,6 +299,89 @@ struct EditOutcome {
 /// informational "does not exist": a write path that targets nothing is a
 /// model mistake (read first, or use write_file), and the loop's failure
 /// ledger should refuse a blind repeat (ADR-020).
+/// The line-ending/BOM rescue (review item 3.1): models emit LF-only
+/// `old_string`s, while checkout tools and Windows editors leave CRLF
+/// (and sometimes a BOM) in files. Matching happens against a
+/// normalized *view* (BOM stripped, CRLF folded to LF); the matched
+/// span maps back to original-text byte offsets, so the file's own
+/// endings and BOM are preserved verbatim and mixed line endings are
+/// never rewritten wholesale.
+struct NormalizedView {
+    /// BOM-stripped, CRLF-folded copy used only for matching.
+    view: String,
+    /// View byte offset → original byte offset, one entry per view
+    /// byte (multi-byte view chars advance both sides together).
+    map: Vec<usize>,
+    /// Whether every newline in the original is CRLF (drives whether
+    /// inserted text adopts CRLF; mixed files keep the model's LF).
+    all_crlf: bool,
+}
+
+/// Builds the normalized view of `text`. Cheap single pass; called
+/// only after an exact match already failed.
+fn normalized_view(text: &str) -> NormalizedView {
+    let bom_len = if text.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
+    let mut view = String::with_capacity(text.len());
+    let mut map = Vec::with_capacity(text.len() + 1);
+    let mut saw_lone_lf = bom_len > 0 && text[bom_len..].starts_with('\n');
+    let mut i = bom_len;
+    while let Some(c) = text.get(i..).and_then(|rest| rest.chars().next()) {
+        if c == '\r' && text[i + 1..].starts_with('\n') {
+            view.push('\n');
+            map.push(i);
+            i += 2;
+            continue;
+        }
+        if c == '\n' {
+            saw_lone_lf = true;
+        }
+        view.push(c);
+        let len = c.len_utf8();
+        for k in 0..len {
+            map.push(i + k);
+        }
+        i += len;
+    }
+    map.push(text.len());
+    NormalizedView {
+        view,
+        map,
+        all_crlf: !saw_lone_lf && text.contains("\r\n"),
+    }
+}
+
+impl NormalizedView {
+    /// True when there is nothing to rescue (the view equals the
+    /// original), so callers can skip the probe entirely.
+    fn is_identity(&self, original: &str) -> bool {
+        self.view == original
+    }
+
+    /// Maps a `(start, len)` span in the view to original-text byte
+    /// offsets. `len` is measured in view bytes (LF counts once).
+    fn map_span(&self, start: usize, len: usize) -> (usize, usize) {
+        let original_start = self.map[start];
+        let original_end = if start + len >= self.view.len() {
+            // The sentinel entry maps view-end to original-end.
+            self.map[self.view.len()]
+        } else {
+            self.map[start + len]
+        };
+        (original_start, original_end - original_start)
+    }
+}
+
+/// Normalizes the model's `old_string` the same way (BOM strip,
+/// CRLF fold) so either side of the mismatch is rescued.
+fn normalized_old(old: &str) -> String {
+    let stripped = old.strip_prefix('\u{feff}').unwrap_or(old);
+    stripped.replace("\r\n", "\n")
+}
+
 fn load_edit_files(
     edits: &[(PathBuf, String, String)],
 ) -> Result<Vec<(PathBuf, String, String)>, ToolError> {
@@ -497,6 +580,30 @@ fn apply_edits(
         }
         match (text.matches(old).count(), text.find(old)) {
             (0, _) => {
+                // Review item 3.1: try the CRLF/BOM-normalized view
+                // before the whitespace repair — a byte-exact miss is
+                // most often a line-ending mismatch, not a stale copy.
+                let normalized = normalized_view(text);
+                if !normalized.is_identity(text) {
+                    let old_norm = normalized_old(old);
+                    if let (1, Some(start)) = (
+                        normalized.view.matches(&old_norm).count(),
+                        normalized.view.find(&old_norm),
+                    ) {
+                        let (orig_start, orig_len) = normalized.map_span(start, old_norm.len());
+                        let adapted = if normalized.all_crlf {
+                            new.replace('\n', "\r\n")
+                        } else {
+                            new.clone()
+                        };
+                        replace_span(text, &mut spans[file_idx], orig_start, orig_len, &adapted);
+                        repairs.push(format!(
+                            "{}old_string matched after normalizing line endings (CRLF/BOM); the file keeps its own endings",
+                            prefix(index)
+                        ));
+                        continue;
+                    }
+                }
                 if let Some(start) = trimmed_match(text, old) {
                     replace_span(text, &mut spans[file_idx], start, old.trim().len(), new);
                     repairs.push(format!(
@@ -667,6 +774,108 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(guard.path().join("f.rs")).expect("read"),
             "fn add() { 1 }\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn crlf_file_matches_an_lf_old_string_and_keeps_crlf() {
+        // Review item 3.1: the model's LF-only old_string must match a
+        // CRLF file, and the written file keeps CRLF throughout.
+        let (guard, root) = temp_root();
+        std::fs::write(guard.path().join("f.rs"), b"fn a() {}\r\nfn b() {}\r\n").expect("seed");
+        let output = edit(
+            &root,
+            json!({
+                "path": "f.rs",
+                "old_string": "fn a() {}\nfn b() {}",
+                "new_string": "fn a() { 1 }\nfn b() { 2 }"
+            }),
+        )
+        .await
+        .expect("edit ok");
+        assert!(
+            output
+                .content
+                .contains("matched after normalizing line endings"),
+            "{}",
+            output.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(guard.path().join("f.rs")).expect("read"),
+            "fn a() { 1 }\r\nfn b() { 2 }\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bom_file_edits_and_the_bom_survives() {
+        let (guard, root) = temp_root();
+        std::fs::write(
+            guard.path().join("f.rs"),
+            b"\xef\xbb\xbffrid fn main() {}\n",
+        )
+        .expect("seed");
+        edit(
+            &root,
+            json!({
+                "path": "f.rs",
+                "old_string": "fn main() {}",
+                "new_string": "fn main() { 42 }"
+            }),
+        )
+        .await
+        .expect("edit ok");
+        let written = std::fs::read(guard.path().join("f.rs")).expect("read");
+        assert_eq!(
+            written,
+            b"\xef\xbb\xbffrid fn main() { 42 }\n".to_vec(),
+            "the BOM must survive the edit untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_endings_are_never_rewritten() {
+        // A mixed-endings file: only the matched span changes, and the
+        // model's LF new_string stays LF (no wholesale rewrite).
+        let (guard, root) = temp_root();
+        std::fs::write(
+            guard.path().join("f.rs"),
+            b"fn a() {}\r\nfn b() {}\nfn c() {}\r\n",
+        )
+        .expect("seed");
+        edit(
+            &root,
+            json!({
+                "path": "f.rs",
+                "old_string": "fn b() {}\nfn c() {}",
+                "new_string": "fn b() { 1 }\nfn c() { 2 }"
+            }),
+        )
+        .await
+        .expect("edit ok");
+        assert_eq!(
+            std::fs::read_to_string(guard.path().join("f.rs")).expect("read"),
+            "fn a() {}\r\nfn b() { 1 }\nfn c() { 2 }\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_without_a_trailing_newline_keeps_it_that_way() {
+        let (guard, root) = temp_root();
+        std::fs::write(guard.path().join("f.rs"), b"fn a() {}").expect("seed");
+        edit(
+            &root,
+            json!({
+                "path": "f.rs",
+                "old_string": "fn a() {}",
+                "new_string": "fn a() { 1 }"
+            }),
+        )
+        .await
+        .expect("edit ok");
+        assert_eq!(
+            std::fs::read_to_string(guard.path().join("f.rs")).expect("read"),
+            "fn a() { 1 }",
+            "no trailing newline may be introduced"
         );
     }
 
