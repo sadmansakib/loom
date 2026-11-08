@@ -76,17 +76,21 @@ pub(crate) struct ExecLimits {
 /// survive it. The child is spawned as its own group leader
 /// ([`ProcessGroup::leader`]), so one best-effort `killpg` reaps the
 /// tree on the cancellation path. Disarmed on normal completion: a
-/// reaped pgid could be reused by an unrelated process.
+/// reaped pgid could be reused by an unrelated process. `pgid` is an
+/// `Option` so a nonsensical pid can only disarm the kill, never
+/// degrade into `killpg(-1)` (every process the user owns).
 struct GroupKillOnDrop {
-    pgid: i32,
+    pgid: Option<i32>,
     armed: bool,
 }
 
 impl Drop for GroupKillOnDrop {
     fn drop(&mut self) {
-        if self.armed {
+        if self.armed
+            && let Some(pgid) = self.pgid
+        {
             // Best effort: cancellation must not wait on the doomed tree.
-            let pgid = nix::unistd::Pid::from_raw(self.pgid);
+            let pgid = nix::unistd::Pid::from_raw(pgid);
             let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
         }
     }
@@ -158,11 +162,15 @@ pub(crate) async fn run_bounded(
     .map_err(|error| ToolError::Execution(format!("cannot run \"{program}\": {error}")))?;
     let mut guard = match child.id() {
         Some(pid) => GroupKillOnDrop {
-            pgid: i32::try_from(pid).unwrap_or(-1),
+            // `unwrap_or(-1)` here would arm a `killpg(-1)` — every
+            // process the user owns — on a nonsensical pid; a failed
+            // conversion instead disarms the group kill (the direct
+            // child's own kill-on-drop still applies).
+            pgid: i32::try_from(pid).ok(),
             armed: true,
         },
         None => GroupKillOnDrop {
-            pgid: -1,
+            pgid: None,
             armed: false,
         },
     };
@@ -211,9 +219,12 @@ pub(crate) async fn run_bounded(
         Err(_elapsed) => {
             // Pipes still held: reap the process group. If the group is
             // gone (whole tree dead), the pipes would have closed — so
-            // the pgid is still live and not reused.
-            let pgid = nix::unistd::Pid::from_raw(guard.pgid);
-            let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+            // the pgid is still live and not reused. A `None` pgid
+            // (disarmed guard) skips the signal entirely.
+            if let Some(pgid) = guard.pgid {
+                let pgid = nix::unistd::Pid::from_raw(pgid);
+                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+            }
             match tokio::time::timeout(
                 STREAM_FORCED_GRACE,
                 join_readers(&mut stdout_task, &mut stderr_task),
