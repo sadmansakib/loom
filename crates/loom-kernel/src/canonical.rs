@@ -19,50 +19,59 @@ use serde_json::Value;
 /// serde_json itself keeps sorted (default builds), and identical for
 /// two values that differ only in object key insertion order.
 pub(crate) fn canonical_json(value: &Value) -> String {
-    let mut out = String::new();
+    // `serde_json::to_writer` writes to `io::Write`; use one shared
+    // byte buffer for the whole tree rather than allocating a `String`
+    // for every scalar/key and copying it into its parent.
+    let mut out = Vec::new();
     write_canonical(value, &mut out);
-    out
+    // serde_json always emits UTF-8; retain a panic-free fallback if a
+    // future serializer change violates that invariant.
+    String::from_utf8(out).unwrap_or_default()
 }
 
-fn write_canonical(value: &Value, out: &mut String) {
+fn write_canonical(value: &Value, out: &mut Vec<u8>) {
     match value {
-        Value::Null => out.push_str("null"),
-        Value::Bool(bool) => out.push_str(if *bool { "true" } else { "false" }),
-        Value::Number(number) => out.push_str(&number.to_string()),
-        Value::String(string) => {
-            out.push_str(&string_escape(string));
+        Value::Null => out.extend_from_slice(b"null"),
+        Value::Bool(bool) => out.extend_from_slice(if *bool { b"true" } else { b"false" }),
+        Value::Number(number) => {
+            // Serialize directly into the shared output buffer instead
+            // of allocating a temporary `String` per scalar (review
+            // item 3.2). `Number` has no serializer failure mode.
+            let _ = serde_json::to_writer(out, number);
         }
+        Value::String(string) => write_string(string, out),
         Value::Array(items) => {
-            out.push('[');
+            out.push(b'[');
             for (index, item) in items.iter().enumerate() {
                 if index > 0 {
-                    out.push(',');
+                    out.push(b',');
                 }
                 write_canonical(item, out);
             }
-            out.push(']');
+            out.push(b']');
         }
         Value::Object(map) => {
             let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
             keys.sort_unstable();
-            out.push('{');
+            out.push(b'{');
             for (index, key) in keys.iter().enumerate() {
                 if index > 0 {
-                    out.push(',');
+                    out.push(b',');
                 }
-                out.push_str(&string_escape(key));
-                out.push(':');
+                write_string(key, out);
+                out.push(b':');
                 write_canonical(&map[*key], out);
             }
-            out.push('}');
+            out.push(b'}');
         }
     }
 }
 
-/// Serializes one JSON string scalar. `to_string` cannot fail for a
-/// `&str`/`&String`; the fallback keeps this panic-free anyway.
-fn string_escape(string: &str) -> String {
-    serde_json::to_string(string).unwrap_or_else(|_| "\"\"".to_string())
+/// Serializes one JSON string scalar directly into the shared buffer:
+/// the serializer writes quotes and escaping without allocating an
+/// intermediate `String` per key/value.
+fn write_string(string: &str, out: &mut Vec<u8>) {
+    let _ = serde_json::to_writer(out, string);
 }
 
 #[cfg(test)]

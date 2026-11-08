@@ -260,13 +260,19 @@ pub(super) fn census(
     let mut assistant_history = 0u32;
     let mut reasoning_replay = 0u32;
     let mut tool_results = 0u32;
-    for message in &request.messages {
+    // Serialize each message exactly once, then reuse those bytes for
+    // attribution and compose the list payload from them for the
+    // authoritative total. The previous implementation serialized each
+    // message for attribution *and* serialized the whole list again.
+    let serialized_messages: Vec<String> = request.messages.iter().map(serialize_compact).collect();
+    for (message, serialized) in request.messages.iter().zip(&serialized_messages) {
+        let message_tokens = estimator.estimate(serialized);
         match message {
             Message::System { .. } => {
-                system_total = system_total.saturating_add(estimate_serialized(estimator, message));
+                system_total = system_total.saturating_add(message_tokens);
             }
             Message::User { .. } => {
-                user_items = user_items.saturating_add(estimate_serialized(estimator, message));
+                user_items = user_items.saturating_add(message_tokens);
             }
             Message::Assistant(assistant) => {
                 // Reasoning is attributed on its own; the rest of the
@@ -277,29 +283,26 @@ pub(super) fn census(
                     .as_ref()
                     .map_or(0, |trace| estimate_serialized(estimator, trace));
                 reasoning_replay = reasoning_replay.saturating_add(reasoning);
-                assistant_history = assistant_history.saturating_add(
-                    estimate_serialized(estimator, message).saturating_sub(reasoning),
-                );
+                assistant_history =
+                    assistant_history.saturating_add(message_tokens.saturating_sub(reasoning));
             }
             Message::ToolResult(_) => {
-                tool_results = tool_results.saturating_add(estimate_serialized(estimator, message));
+                tool_results = tool_results.saturating_add(message_tokens);
             }
         }
     }
-    let tool_specs: u32 = request
-        .tools
+    let serialized_tools: Vec<String> = request.tools.iter().map(serialize_compact).collect();
+    let tool_specs = serialized_tools
         .iter()
-        .map(|spec| estimate_serialized(estimator, spec))
+        .map(|json| estimator.estimate(json))
         .fold(0u32, u32::saturating_add);
-
-    let messages = super::messages_serialized(&request.messages);
-    let tools = serde_json::to_string(&request.tools);
-    debug_assert!(tools.is_ok(), "tool-spec serialization must not fail");
+    let messages = compose_json_array(&serialized_messages);
+    let tools = compose_json_array(&serialized_tools);
     // Saturating on each half: a compiler that reports `u32::MAX`
     // estimated tokens will simply exceed any budget.
     let total = estimator
         .estimate(&messages)
-        .saturating_add(estimator.estimate(&tools.unwrap_or_default()))
+        .saturating_add(estimator.estimate(&tools))
         .saturating_add(u32::try_from(request.messages.len()).unwrap_or(u32::MAX));
 
     ContextCensus {
@@ -316,6 +319,30 @@ pub(super) fn census(
     }
 }
 
+/// Compact JSON for one infallibly serializable schema value. This
+/// replaces `estimate_serialized` where the byte string is reused for
+/// both attribution and the aggregate payload.
+fn serialize_compact<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string(value).unwrap_or_default()
+}
+
+/// Composes the already-serialized array members into exactly the JSON
+/// byte shape `serde_json::to_string(&Vec<T>)` emits: `[`, comma-joined
+/// compact members, `]`. Stable ordering and whitespace are unchanged.
+fn compose_json_array(items: &[String]) -> String {
+    let capacity = items.iter().map(String::len).sum::<usize>() + items.len() + 1;
+    let mut out = String::with_capacity(capacity);
+    out.push('[');
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(item);
+    }
+    out.push(']');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +356,12 @@ mod tests {
         AssistantMessage, ReasoningTrace, ToolArguments, ToolCall, ToolCallId, ToolResult,
         ToolStatus,
     };
+
+    /// Existing byte oracle used to prove the one-pass census's array
+    /// composition is identical to serde_json's ordinary serialization.
+    fn old_list_serialization<T: serde::Serialize>(items: &[T]) -> String {
+        serde_json::to_string(items).unwrap_or_default()
+    }
     use futures::future::BoxFuture;
     use serde_json::{Value, json};
     use std::path::PathBuf;
@@ -807,6 +840,40 @@ mod tests {
         assert!(census.tool_results > 0, "tool result attributed");
         assert!(census.tool_specs > 0, "tool specs attributed");
         assert!(census.total > 0);
+    }
+
+    #[test]
+    fn reused_per_message_serialization_preserves_canonical_request_bytes() {
+        // Property-style byte proof for item 3.2's one-pass census:
+        // independently serialized elements joined into an array must
+        // equal serde_json's authoritative whole-list representation,
+        // so neither request-prefix bytes nor total token count change.
+        let mut s = session();
+        s.push_item(Item::User { text: TASK.into() }).unwrap();
+        let mut msg = assistant("calling", StopReason::ToolCalls);
+        msg.tool_calls = vec![call("c1", "read_file")];
+        s.append_turn(msg, vec![result_for("c1")]).unwrap();
+        let compiled = compile(&s, &registry(), budget()).expect("within budget");
+        let request = &compiled.request;
+
+        let old_messages = old_list_serialization(&request.messages);
+        let new_messages = compose_json_array(
+            &request
+                .messages
+                .iter()
+                .map(serialize_compact)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(old_messages, new_messages);
+        let old_tools = old_list_serialization(&request.tools);
+        let new_tools = compose_json_array(
+            &request
+                .tools
+                .iter()
+                .map(serialize_compact)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(old_tools, new_tools);
     }
 
     #[test]

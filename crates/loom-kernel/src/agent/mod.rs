@@ -2908,6 +2908,10 @@ fn malformed_arguments_result(call: &ToolCall) -> ToolResult {
 /// fall through to the full, re-bounded cached content, which is exactly
 /// what the model needs to recover what pruning took away.
 fn visible_call_ids(request: &ModelRequest, stubbed: &[String]) -> HashSet<String> {
+    // Review item 3.2: build the membership index once instead of
+    // rescanning every stub id for every projected tool result (O(n*m)
+    // on long transcripts).
+    let stubbed: HashSet<&str> = stubbed.iter().map(String::as_str).collect();
     request
         .messages
         .iter()
@@ -2915,7 +2919,7 @@ fn visible_call_ids(request: &ModelRequest, stubbed: &[String]) -> HashSet<Strin
             Message::ToolResult(result) => Some(result.call_id.as_str().to_owned()),
             _ => None,
         })
-        .filter(|call_id| !stubbed.iter().any(|stubbed| stubbed == call_id))
+        .filter(|call_id| !stubbed.contains(call_id.as_str()))
         .collect()
 }
 

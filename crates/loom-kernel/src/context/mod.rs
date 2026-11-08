@@ -34,7 +34,7 @@ pub use pruning::{
     StubDecision, StubReason,
 };
 
-use crate::model::{Message, ModelCapabilities, ModelRequest};
+use crate::model::{ModelCapabilities, ModelRequest};
 use crate::session::{Session, TaskRecord};
 use crate::tool::ToolRegistry;
 use serde::{Deserialize, Serialize};
@@ -85,17 +85,11 @@ pub(crate) fn estimate_serialized<T: serde::Serialize>(
     serde_json::to_string(value).map_or(0, |json| estimator.estimate(&json))
 }
 
-/// Serializes a list of [`Message`]s into a canonical string for token
-/// estimation.
-///
-/// Infallible for the message types in this crate: every field is a
-/// `String` or a serde-supported `Value`, so JSON string serialization
-/// cannot fail. A `debug_assert` documents the invariant and catches a
-/// future field type that could make it fallible.
-fn messages_serialized(messages: &[Message]) -> String {
-    let json = serde_json::to_string(messages);
-    debug_assert!(json.is_ok(), "message serialization must not fail");
-    json.unwrap_or_default()
+/// Test-only oracle for the pre-optimization message-list serialization;
+/// pruning tests use it to assert prompt bytes remain identical.
+#[cfg(test)]
+pub(crate) fn messages_serialized(messages: &[crate::model::Message]) -> String {
+    serde_json::to_string(messages).unwrap_or_default()
 }
 
 /// How much of a model's context window a request may consume.

@@ -367,6 +367,9 @@ pub struct PruningContextCompiler {
     inner: Box<dyn ContextCompiler>,
     config: PruneConfig,
     estimator: Arc<dyn TokenEstimator>,
+    /// Reclaim total for the currently frozen checkpoint. Frozen call
+    /// ids and transcript ordinals do not change as the session grows.
+    frozen_reclaim_cache: std::sync::Mutex<Option<(PruneCheckpoint, u64)>>,
 }
 
 impl PruningContextCompiler {
@@ -380,6 +383,7 @@ impl PruningContextCompiler {
             inner,
             config,
             estimator: Arc::new(HeuristicEstimator),
+            frozen_reclaim_cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -390,6 +394,31 @@ impl PruningContextCompiler {
     pub fn with_estimator(mut self, estimator: Arc<dyn TokenEstimator>) -> Self {
         self.estimator = estimator;
         self
+    }
+
+    /// Reuses frozen-decision reclaim across turns. A poisoned cache is
+    /// recovered and recomputed; cache state never affects correctness.
+    fn cached_frozen_reclaim(
+        &self,
+        session: &Session,
+        frozen: Option<&PruneCheckpoint>,
+        estimator: &dyn TokenEstimator,
+    ) -> u64 {
+        let Some(frozen) = frozen else {
+            return 0;
+        };
+        let mut cache = self
+            .frozen_reclaim_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((cached_checkpoint, reclaimed)) = cache.as_ref()
+            && cached_checkpoint == frozen
+        {
+            return *reclaimed;
+        }
+        let reclaimed = frozen_reclaim(session, frozen, estimator);
+        *cache = Some((frozen.clone(), reclaimed));
+        reclaimed
     }
 }
 
@@ -595,22 +624,32 @@ impl ContextCompiler for PruningContextCompiler {
                 decisions.elided_reasoning.clear();
                 decisions.elided_assistant_text.clear();
             }
-            let candidate_report = prune_report(
-                if window_triggered {
-                    PruneTrigger::Window
-                } else {
-                    PruneTrigger::AgeMask
-                },
-                session,
-                &decisions,
-                &*self.estimator,
-            );
-            let already = checkpoint.as_ref().map_or(0, |frozen| {
-                frozen_reclaim(session, frozen, &*self.estimator)
-            });
-            if candidate_report.reclaimed_tokens
+            // Review item 3.2: the gate reads the reclaim total alone;
+            // the per-call attribution (`prune_report`) is only built
+            // once the gate passes, so a steady-state aging turn — the
+            // common case — pays one estimate walk instead of two.
+            // The frozen side is memoized across turns for the same
+            // checkpoint; see `cached_frozen_reclaim`.
+            let candidate_reclaim = projected_reclaim(session, &decisions, &*self.estimator);
+            let already =
+                self.cached_frozen_reclaim(session, checkpoint.as_ref(), &*self.estimator);
+            if candidate_reclaim
                 >= already.saturating_add(u64::from(self.config.min_reclaim_tokens))
             {
+                let candidate_report = prune_report(
+                    if window_triggered {
+                        PruneTrigger::Window
+                    } else {
+                        PruneTrigger::AgeMask
+                    },
+                    session,
+                    &decisions,
+                    &*self.estimator,
+                );
+                debug_assert_eq!(
+                    candidate_report.reclaimed_tokens, candidate_reclaim,
+                    "the gate and the attribution share one walk"
+                );
                 stubbed_calls.extend(apply_stubs(&mut compiled.request, &decisions.stubbed));
                 if handoff_active {
                     apply_elisions(&mut compiled.request, &decisions.elided_args, &[], &[], &[]);
@@ -912,6 +951,37 @@ fn prune_report(
     decisions: &DecisionSet,
     estimator: &dyn TokenEstimator,
 ) -> PruneReport {
+    let (reclaimed_tokens, calls) = reclaim_walk(session, decisions, estimator, true);
+    PruneReport {
+        trigger,
+        calls,
+        reclaimed_tokens,
+    }
+}
+
+/// The reclaim total alone — the min-reclaim gate's input — without
+/// building the per-call attribution (review item 3.2: the gate fails
+/// on most aging turns, and a failing turn no longer pays for the
+/// `PrunedCall` walk). Shares one walk implementation with
+/// [`prune_report`], so the two numbers are equal by construction.
+fn projected_reclaim(
+    session: &Session,
+    decisions: &DecisionSet,
+    estimator: &dyn TokenEstimator,
+) -> u64 {
+    reclaim_walk(session, decisions, estimator, false).0
+}
+
+/// The single walk behind both [`prune_report`] and
+/// [`projected_reclaim`]: per matched decision, full item estimate less
+/// its replacement's. `collect` controls whether the `PrunedCall`
+/// entries are built (report) or skipped (gate).
+fn reclaim_walk(
+    session: &Session,
+    decisions: &DecisionSet,
+    estimator: &dyn TokenEstimator,
+    collect: bool,
+) -> (u64, Vec<PrunedCall>) {
     let by_call: HashMap<&str, StubReason> = decisions
         .stubbed
         .iter()
@@ -929,6 +999,7 @@ fn prune_report(
     let elided_user_stub = Message::User {
         text: StubReason::ElidedUser.stub_text().to_owned(),
     };
+    let mut reclaim = 0u64;
     let mut calls = Vec::new();
     let mut user_ordinal = 0usize;
     let mut assistant_ordinal = 0usize;
@@ -940,11 +1011,14 @@ fn prune_report(
                 };
                 let full = estimate_serialized(estimator, item);
                 let stub = stub_tokens(&result.call_id, &result.status, reason, estimator);
-                calls.push(PrunedCall {
-                    call_id: result.call_id.as_str().to_owned(),
-                    reason,
-                    reclaimed_tokens: u64::from(full.saturating_sub(stub)),
-                });
+                reclaim += u64::from(full.saturating_sub(stub));
+                if collect {
+                    calls.push(PrunedCall {
+                        call_id: result.call_id.as_str().to_owned(),
+                        reason,
+                        reclaimed_tokens: u64::from(full.saturating_sub(stub)),
+                    });
+                }
             }
             Item::Assistant(assistant) => {
                 for call in &assistant.tool_calls {
@@ -953,32 +1027,43 @@ fn prune_report(
                     };
                     let full = estimate_serialized(estimator, &call.arguments);
                     let elided_tokens = estimate_serialized(estimator, elided);
-                    calls.push(PrunedCall {
-                        call_id: call.id.as_str().to_owned(),
-                        reason: StubReason::ElidedArgs,
-                        reclaimed_tokens: u64::from(full.saturating_sub(elided_tokens)),
-                    });
+                    reclaim += u64::from(full.saturating_sub(elided_tokens));
+                    if collect {
+                        calls.push(PrunedCall {
+                            call_id: call.id.as_str().to_owned(),
+                            reason: StubReason::ElidedArgs,
+                            reclaimed_tokens: u64::from(full.saturating_sub(elided_tokens)),
+                        });
+                    }
                 }
                 if assistant.stop_reason != StopReason::ContentFilter {
                     if elided_reasoning.contains(&assistant_ordinal)
                         && let Some(trace) = &assistant.reasoning
                     {
-                        calls.push(PrunedCall {
-                            call_id: format!("assistant:{assistant_ordinal}"),
-                            reason: StubReason::ElidedReasoning,
-                            reclaimed_tokens: u64::from(estimate_serialized(estimator, trace)),
-                        });
+                        let tokens = u64::from(estimate_serialized(estimator, trace));
+                        reclaim += tokens;
+                        if collect {
+                            calls.push(PrunedCall {
+                                call_id: format!("assistant:{assistant_ordinal}"),
+                                reason: StubReason::ElidedReasoning,
+                                reclaimed_tokens: tokens,
+                            });
+                        }
                     }
                     if elided_assistant_text.contains(&assistant_ordinal) {
                         let signature = elide_text(&assistant.content);
-                        calls.push(PrunedCall {
-                            call_id: format!("assistant:{assistant_ordinal}"),
-                            reason: StubReason::ElidedAssistantText,
-                            reclaimed_tokens: u64::from(
-                                estimate_serialized(estimator, &assistant.content)
-                                    .saturating_sub(estimate_serialized(estimator, &signature)),
-                            ),
-                        });
+                        let tokens = u64::from(
+                            estimate_serialized(estimator, &assistant.content)
+                                .saturating_sub(estimate_serialized(estimator, &signature)),
+                        );
+                        reclaim += tokens;
+                        if collect {
+                            calls.push(PrunedCall {
+                                call_id: format!("assistant:{assistant_ordinal}"),
+                                reason: StubReason::ElidedAssistantText,
+                                reclaimed_tokens: tokens,
+                            });
+                        }
                     }
                     assistant_ordinal += 1;
                 }
@@ -987,24 +1072,29 @@ fn prune_report(
                 if elided_users.contains(&user_ordinal) {
                     let full = Message::User { text: text.clone() };
                     let stub = estimate_serialized(estimator, &elided_user_stub);
-                    calls.push(PrunedCall {
-                        call_id: format!("user:{user_ordinal}"),
-                        reason: StubReason::ElidedUser,
-                        reclaimed_tokens: u64::from(
-                            estimate_serialized(estimator, &full).saturating_sub(stub),
-                        ),
-                    });
+                    let tokens =
+                        u64::from(estimate_serialized(estimator, &full).saturating_sub(stub));
+                    reclaim += tokens;
+                    if collect {
+                        calls.push(PrunedCall {
+                            call_id: format!("user:{user_ordinal}"),
+                            reason: StubReason::ElidedUser,
+                            reclaimed_tokens: tokens,
+                        });
+                    }
                 }
                 user_ordinal += 1;
             }
         }
     }
-    let reclaimed_tokens = calls.iter().map(|call| call.reclaimed_tokens).sum();
-    PruneReport {
-        trigger,
-        calls,
-        reclaimed_tokens,
+    if collect {
+        debug_assert_eq!(
+            reclaim,
+            calls.iter().map(|call| call.reclaimed_tokens).sum::<u64>(),
+            "the running total and the per-call attribution must agree"
+        );
     }
+    (reclaim, calls)
 }
 
 /// Facts gathered from the transcript for the decision pass.
@@ -1019,19 +1109,23 @@ struct ResultFacts {
     tokens: u32,
     /// Tool name + canonical arguments, when the call is known and
     /// read-only; `None` otherwise (unknown or mutating — never a dedupe,
-    /// supersede or age-out candidate).
-    read_call: Option<(String, String, Vec<String>)>,
+    /// supersede or age-out candidate). An index into
+    /// [`TranscriptFacts::call_meta`] — the metadata is owned once per
+    /// call, not cloned per result (review item 3.2).
+    read_call: Option<usize>,
 }
 
 /// Facts about one assistant tool call, for argument elision.
-struct CallFacts {
+struct CallFacts<'a> {
     /// Transcript index of the assistant item carrying the call.
     index: usize,
     /// Assistant turn the call belongs to (1-based).
     turn: usize,
-    call_id: ToolCallId,
-    /// The call's arguments — elision runs over a copy of these.
-    arguments: ToolArguments,
+    call_id: &'a str,
+    /// Borrow of the call's immutable transcript arguments: the
+    /// transcript is append-only for this compile, and elision builds
+    /// an owned replacement only when one is chosen.
+    arguments: &'a ToolArguments,
 }
 
 /// Facts about one assistant reasoning trace, for reasoning elision.
@@ -1065,13 +1159,25 @@ struct AssistantTextFacts {
     signature_tokens: u32,
 }
 
+/// Per-call metadata gathered in scan 1 and referenced by index from
+/// every result of that call — `name`, canonical `args`, and the
+/// declared `reads` were previously cloned as a triple into each
+/// `ResultFacts` (review item 3.2).
+struct CallMeta {
+    name: String,
+    args: String,
+    reads: Vec<String>,
+}
+
 /// Everything the strategy passes reason over, collected in two
 /// transcript scans: per-result facts, per-call facts, assistant turn
 /// boundaries, user-item ordinals, and the writes that can supersede
 /// earlier reads.
-struct TranscriptFacts {
+struct TranscriptFacts<'a> {
     results: Vec<ResultFacts>,
-    calls: Vec<CallFacts>,
+    calls: Vec<CallFacts<'a>>,
+    /// One entry per tool call, referenced by `ResultFacts::read_call`.
+    call_meta: Vec<CallMeta>,
     reasoning_at: Vec<ReasoningFacts>,
     assistant_text_at: Vec<AssistantTextFacts>,
     /// Transcript index of every assistant item — the turn boundaries.
@@ -1086,22 +1192,31 @@ struct TranscriptFacts {
     last_write_turn: Option<usize>,
 }
 
-impl TranscriptFacts {
+impl<'a> TranscriptFacts<'a> {
     /// The two fact-gathering scans behind [`decide`].
-    fn collect(session: &Session, registry: &ToolRegistry, estimator: &dyn TokenEstimator) -> Self {
+    fn collect(
+        session: &'a Session,
+        registry: &ToolRegistry,
+        estimator: &dyn TokenEstimator,
+    ) -> Self {
         let transcript: &[Item] = &session.transcript;
 
         // Scan 1 — call metadata (name, canonical args, declared reads)
         // from assistant tool_calls, keyed by call id for O(1) lookup.
-        let mut calls: HashMap<&str, (String, String, Vec<String>)> = HashMap::new();
+        // Owned exactly once here; scan 2 stores only the index
+        // (review item 3.2: no per-result triple clone).
+        let mut call_meta: Vec<CallMeta> = Vec::new();
+        let mut meta_by_id: HashMap<&str, usize> = HashMap::new();
         for item in transcript {
             if let Item::Assistant(assistant) = item {
                 for call in &assistant.tool_calls {
                     let reads = read_paths(registry, &call.name, &call.arguments);
-                    calls.insert(
-                        call.id.as_str(),
-                        (call.name.clone(), call.arguments.to_string(), reads),
-                    );
+                    meta_by_id.insert(call.id.as_str(), call_meta.len());
+                    call_meta.push(CallMeta {
+                        name: call.name.clone(),
+                        args: call.arguments.to_string(),
+                        reads,
+                    });
                 }
             }
         }
@@ -1128,8 +1243,8 @@ impl TranscriptFacts {
                         call_facts.push(CallFacts {
                             index,
                             turn,
-                            call_id: call.id.clone(),
-                            arguments: call.arguments.clone(),
+                            call_id: call.id.as_str(),
+                            arguments: &call.arguments,
                         });
                     }
                     if assistant.stop_reason != StopReason::ContentFilter {
@@ -1157,13 +1272,10 @@ impl TranscriptFacts {
                     }
                 }
                 Item::ToolResult(result) => {
-                    let read_call =
-                        calls
-                            .get(result.call_id.as_str())
-                            .and_then(|(name, args, reads)| {
-                                is_read_only(name)
-                                    .then(|| (name.clone(), args.clone(), reads.clone()))
-                            });
+                    let read_call = meta_by_id
+                        .get(result.call_id.as_str())
+                        .copied()
+                        .filter(|&meta| is_read_only(&call_meta[meta].name));
                     if !result.effects.files_written.is_empty()
                         || !result.effects.files_deleted.is_empty()
                     {
@@ -1188,6 +1300,7 @@ impl TranscriptFacts {
         Self {
             results,
             calls: call_facts,
+            call_meta,
             reasoning_at,
             assistant_text_at,
             assistant_at,
@@ -1195,6 +1308,11 @@ impl TranscriptFacts {
             writes,
             last_write_turn,
         }
+    }
+
+    /// Resolves a `ResultFacts::read_call` index to its call metadata.
+    fn read_meta(&self, result: &ResultFacts) -> Option<&CallMeta> {
+        result.read_call.map(|index| &self.call_meta[index])
     }
 
     /// Index of the first unprotected item: the protected tail reaches
@@ -1286,11 +1404,11 @@ fn dedupe_reads(
     // instead of scanning every later result per candidate.
     let mut newest_by_call: HashMap<(&str, &str), usize> = HashMap::new();
     for result in &facts.results {
-        let Some((name, args, _)) = result.read_call.as_ref() else {
+        let Some(meta) = facts.read_meta(result) else {
             continue;
         };
         newest_by_call
-            .entry((name.as_str(), args.as_str()))
+            .entry((meta.name.as_str(), meta.args.as_str()))
             .and_modify(|index| *index = (*index).max(result.index))
             .or_insert(result.index);
     }
@@ -1298,11 +1416,11 @@ fn dedupe_reads(
         if earlier.index >= protected_from {
             continue;
         }
-        let Some((name, args, _)) = earlier.read_call.as_ref() else {
+        let Some(meta) = facts.read_meta(earlier) else {
             continue;
         };
         let is_newest = newest_by_call
-            .get(&(name.as_str(), args.as_str()))
+            .get(&(meta.name.as_str(), meta.args.as_str()))
             .is_some_and(|index| *index == earlier.index);
         if !is_newest {
             pass.add(earlier, StubReason::DuplicateRead, estimator);
@@ -1321,12 +1439,13 @@ fn supersede_reads(
         if !pass.eligible(earlier, protected_from) {
             continue;
         }
-        let Some((_, _, reads)) = earlier.read_call.as_ref() else {
+        let Some(meta) = facts.read_meta(earlier) else {
             continue;
         };
         let superseded = facts.writes.iter().any(|(index, changed)| {
             *index > earlier.index
-                && reads
+                && meta
+                    .reads
                     .iter()
                     .any(|read| changed.iter().any(|path| paths_overlap(read, path)))
         });
@@ -1484,11 +1603,11 @@ fn elide_aged_calls(
     for call in &facts.calls {
         if call.index >= protected_from
             || total_turns.saturating_sub(call.turn) <= max_age
-            || pass.elided_arg_ids.contains(call.call_id.as_str())
+            || pass.elided_arg_ids.contains(call.call_id)
         {
             continue;
         }
-        let Some(elided) = elide_arguments(&call.arguments, config.elide_arg_chars) else {
+        let Some(elided) = elide_arguments(call.arguments, config.elide_arg_chars) else {
             continue;
         };
         let reclaim = estimate_serialized(estimator, &call.arguments)
@@ -1497,9 +1616,9 @@ fn elide_aged_calls(
             continue;
         }
         pass.reclaim_tokens += u64::from(reclaim);
-        pass.elided_arg_ids.insert(call.call_id.as_str().to_owned());
+        pass.elided_arg_ids.insert(call.call_id.to_owned());
         pass.elided_args.push(ArgElision {
-            call_id: call.call_id.as_str().to_owned(),
+            call_id: call.call_id.to_owned(),
             arguments: elided,
         });
     }
@@ -1802,9 +1921,8 @@ fn read_paths(registry: &ToolRegistry, name: &str, arguments: &serde_json::Value
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{
-        AgentConfig, ContextBudget, ContextInput, DefaultContextCompiler, messages_serialized,
-    };
+    use crate::context::messages_serialized;
+    use crate::context::{AgentConfig, ContextBudget, ContextInput, DefaultContextCompiler};
     use crate::model::{ModelCapabilities, StopReason};
     use crate::session::{Session, TaskRecord};
     use crate::transcript::{AssistantMessage, ToolArguments, ToolCall, ToolCallId};
@@ -2038,6 +2156,51 @@ mod tests {
             .expect("compiles");
         assert!(compiled.prune_checkpoint.is_none());
         assert!(compiled.census.total < 64_000);
+    }
+
+    #[test]
+    fn gate_reclaim_matches_the_report_walk_on_existing_sessions() {
+        // Property-style parity check: for the existing session shapes
+        // exercised across this module (read stubs, arg/user/reasoning/
+        // assistant-text elisions), the cheap gate total must be exactly
+        // the full per-call report total. This pins output identity while
+        // allowing the failed-gate path to omit attribution allocation.
+        let mut items = vec![Item::User {
+            text: "task brief".to_owned(),
+        }];
+        for index in 0..24 {
+            let id = format!("call-{index}");
+            items.push(assistant_calls(
+                "read",
+                vec![read_call(&id, &format!("src/{index}.rs"))],
+            ));
+            items.push(result(&id, &big("body", 4)));
+            if index % 3 == 0 {
+                items.push(assistant_text(&big("older assistant prose", 1)));
+                items.push(Item::User {
+                    text: big("follow up", 1),
+                });
+            }
+        }
+        items.push(assistant_text("current task"));
+        let session = session_with(items);
+        let registry = registry();
+        let estimator = HeuristicEstimator;
+        for config in [
+            PruneConfig::default(),
+            PruneConfig {
+                age_mask_turns: Some(2),
+                elide_turns: Some(2),
+                elide_reasoning: Some(2),
+                elide_assistant_text: Some(2),
+                ..PruneConfig::default()
+            },
+        ] {
+            let decisions = decide(&session, &registry, config, &estimator, true);
+            let gated = projected_reclaim(&session, &decisions, &estimator);
+            let reported = prune_report(PruneTrigger::Window, &session, &decisions, &estimator);
+            assert_eq!(gated, reported.reclaimed_tokens);
+        }
     }
 
     /// A 100 KiB read at turn 1, 60 KiB of later history, nine filler

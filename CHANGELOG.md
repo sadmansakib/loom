@@ -3,6 +3,23 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Context compiler hot-path reductions (item 3.2)
+
+- `perf(kernel)`: the pruning gate now computes reclaim totals without
+  allocating per-call attribution on rejected candidates; the accepted
+  path builds the report once from the same walk. Frozen reclaim totals
+  are cached by checkpoint across turns.
+- `perf(kernel)`: pruning facts borrow tool-call arguments and share
+  per-call metadata across results; projected-call membership uses a set.
+  Canonical JSON writes into one shared buffer, and context census reuses
+  per-message/tool serialization for attribution and aggregate payloads.
+- Regression checks pin gate/report reclaim parity and byte-identical
+  request-array serialization. Recorded replay remained byte-identical:
+  2 turns, 4,859 input tokens, 0 reclaimed, 0 freezes, prefix stability
+  1.0000 before and after. This old schema-3 trace cannot validate current
+  pruning-event semantics; it shows no token/cache delta and is not a
+  wall-clock benchmark.
+
 ## 2026-11 — Review fixes round 1: crash, hang and accounting fixes
 
 - `fix(kernel)`: malformed tool-argument excerpts no longer panic on
