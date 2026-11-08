@@ -15,6 +15,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use crate::confinement::{resolve_within, workspace_relative};
+use crate::policy::CommandPolicy;
 
 /// Creates or overwrites one UTF-8 text file, confined to the workspace
 /// root, creating missing parent directories.
@@ -24,6 +25,11 @@ pub struct WriteFileTool {
     /// machine-applicable fix round under a never-worse gate (roadmap
     /// item 33). Off by default; set from the engine's opt-in config.
     autofix: bool,
+    /// Workspace command policy consulted by the fused-verify path
+    /// (item 2.6): an explicit deny on the fixed-table program skips
+    /// the verification. Default = permissive, keeping the
+    /// historical auto-allow.
+    policy: CommandPolicy,
 }
 
 impl WriteFileTool {
@@ -31,6 +37,13 @@ impl WriteFileTool {
     #[must_use]
     pub fn with_autofix(mut self, autofix: bool) -> Self {
         self.autofix = autofix;
+        self
+    }
+
+    /// Sets the workspace policy consulted by fused verify (item 2.6).
+    #[must_use]
+    pub fn with_policy(mut self, policy: CommandPolicy) -> Self {
+        self.policy = policy;
         self
     }
 }
@@ -155,7 +168,8 @@ impl Tool for WriteFileTool {
             let mut notices = Vec::new();
             if let Some(scope) = scope {
                 let (rendered, fused_effects) =
-                    crate::fusion::run_fused(scope, ctx, &relative, self.autofix).await?;
+                    crate::fusion::run_fused(scope, ctx, &relative, self.autofix, &self.policy)
+                        .await?;
                 content = format!("{content}\n\n--- verify ---\n{}", rendered.content);
                 truncated = rendered.truncated;
                 notices = rendered.notices;
@@ -448,6 +462,40 @@ mod tests {
         );
         assert_eq!(output.effects.files_written, vec!["src/lib.rs".to_string()]);
         assert_eq!(output.effects.commands_run.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_policy_deny_skips_the_fused_verify() {
+        // Item 2.6: an explicit operator deny on the fixed-table
+        // program blocks the fused verification; the write itself
+        // stands and no command effect is recorded. (Cargo is always
+        // ruled Allow by the shipped table — parse rejects denying a
+        // ruled program — so `make` is the representable deny.)
+        let (_guard, root) = temp_root();
+        std::fs::write(root.join("Makefile"), "check:\n\t@exit 0\n").expect("Makefile");
+        let policy = crate::policy::CommandPolicy::parse("[[deny]]\nprogram = \"make\"\n")
+            .expect("policy parses");
+        let output = WriteFileTool::default()
+            .with_policy(policy)
+            .call(
+                json!({
+                    "path": "note.txt",
+                    "content": "hello",
+                    "verify": "check"
+                }),
+                &crate_ctx(&root),
+            )
+            .await
+            .expect("ok");
+        assert!(output.content.starts_with("wrote "), "{}", output.content);
+        assert!(
+            output
+                .content
+                .contains("verify skipped: program \"make\" is denied by workspace policy"),
+            "{}",
+            output.content
+        );
+        assert_eq!(output.effects.commands_run.len(), 0);
     }
 
     #[tokio::test]

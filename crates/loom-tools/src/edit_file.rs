@@ -23,6 +23,7 @@ use std::sync::OnceLock;
 
 use crate::budget::{self, ToolBudgets};
 use crate::confinement::{resolve_within, workspace_relative};
+use crate::policy::CommandPolicy;
 
 /// Edits larger than this are refused: the whole file is read into memory and
 /// rewritten, so an unbounded read is a memory spike (a large generated file
@@ -57,6 +58,9 @@ pub struct EditFileTool {
     /// machine-applicable fix round under a never-worse gate (roadmap
     /// item 33). Off by default; set from the engine's opt-in config.
     autofix: bool,
+    /// Workspace command policy consulted by the fused-verify path
+    /// (item 2.6); see [`WriteFileTool::policy`].
+    policy: CommandPolicy,
 }
 
 impl EditFileTool {
@@ -71,6 +75,13 @@ impl EditFileTool {
     #[must_use]
     pub fn with_autofix(mut self, autofix: bool) -> Self {
         self.autofix = autofix;
+        self
+    }
+
+    /// Sets the workspace policy consulted by fused verify (item 2.6).
+    #[must_use]
+    pub fn with_policy(mut self, policy: CommandPolicy) -> Self {
+        self.policy = policy;
         self
     }
 }
@@ -237,8 +248,14 @@ impl Tool for EditFileTool {
                     .first()
                     .map(|(relative, _)| relative.clone())
                     .unwrap_or_default();
-                let (rendered, fused_effects) =
-                    crate::fusion::run_fused(scope, ctx, &verify_target, self.autofix).await?;
+                let (rendered, fused_effects) = crate::fusion::run_fused(
+                    scope,
+                    ctx,
+                    &verify_target,
+                    self.autofix,
+                    &self.policy,
+                )
+                .await?;
                 content = format!("{content}\n\n--- verify ---\n{}", rendered.content);
                 truncated = rendered.truncated;
                 notices = rendered.notices;

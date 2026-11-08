@@ -1783,14 +1783,19 @@ fn build_registry(
     )?;
     register(
         "write_file",
-        Box::new(WriteFileTool::default().with_autofix(autofix)),
+        Box::new(
+            WriteFileTool::default()
+                .with_autofix(autofix)
+                .with_policy(policy.clone()),
+        ),
     )?;
     register(
         "edit_file",
         Box::new(
             EditFileTool::default()
                 .with_budgets(budgets)
-                .with_autofix(autofix),
+                .with_autofix(autofix)
+                .with_policy(policy.clone()),
         ),
     )?;
     let mut run_command = RunCommandTool::with_policy(policy.clone()).with_budgets(budgets);

@@ -6,8 +6,10 @@
 //! the change in the turn that made it. The ecosystem is detected from
 //! the workspace's marker files (falling back to cargo when none match,
 //! preserving the original behaviour), and the program comes from the
-//! fixed table in [`crate::verify`], so this path needs no allow-list
-//! decision either.
+//! fixed table in [`crate::verify`], so the default posture needs no
+//! allow-list decision — but an explicit operator deny (or
+//! unknown=ask) still refuses, exactly like the standalone verify
+//! tool (review item 2.6).
 
 use loom_kernel::tool::{CommandEffect, ToolContext, ToolEffects, ToolError, ToolOutput};
 
@@ -35,6 +37,7 @@ pub(crate) async fn run_fused(
     ctx: &ToolContext,
     changed: &str,
     autofix: bool,
+    policy: &crate::policy::CommandPolicy,
 ) -> Result<(ToolOutput, ToolEffects), ToolError> {
     let ecosystem =
         crate::verify::detect_ecosystem(&ctx.workspace_root).unwrap_or(Ecosystem::Cargo);
@@ -45,6 +48,29 @@ pub(crate) async fn run_fused(
             return Ok((note, ToolEffects::none()));
         }
     };
+    // Review item 2.6: the fixed table auto-allowed its programs with
+    // no policy say at all. An explicit deny (or an unknown=ask
+    // posture without a frontend) now refuses — fail closed exactly
+    // like the standalone verify tool; an Allow verdict (the default
+    // posture) keeps the historical auto-allow.
+    let verdict = policy.verdict(program);
+    match verdict {
+        crate::policy::PolicyVerdict::Allow => {}
+        crate::policy::PolicyVerdict::Deny => {
+            let note = ToolOutput::new(format!(
+                "verify skipped: program \"{program}\" is denied by workspace policy \
+                 (.loom/commands.toml)"
+            ));
+            return Ok((note, ToolEffects::none()));
+        }
+        crate::policy::PolicyVerdict::Ask => {
+            let note = ToolOutput::new(format!(
+                "verify skipped: program \"{program}\" needs operator approval \
+                 (policy unknown = \"ask\"); no interactive frontend is attached"
+            ));
+            return Ok((note, ToolEffects::none()));
+        }
+    }
     // A declared container/remote runner (item 23) executes the fused
     // verification too — the evidence contract is shared with the
     // standalone tool, so the substrate moves but the output does not.

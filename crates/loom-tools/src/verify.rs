@@ -881,4 +881,26 @@ FAILED tests/test_math.py::TestSum::test_sum - assert 4 == 5
         std::fs::write(dir.path().join("Makefile"), "test:\n\t@exit 7\n").expect("makefile");
         assert_eq!(tool.suite_verdict(dir.path(), &cancel).await, Some(false));
     }
+
+    #[tokio::test]
+    async fn an_operator_deny_blocks_verify() {
+        // Item 2.6: an explicit deny verdict on the fixed-table
+        // program refuses the verification (no verdict renders);
+        // without the deny the same fixture yields one.
+        let cancel = CancellationToken::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("Makefile"), "test:\n\t@exit 0\n").expect("makefile");
+        assert_eq!(
+            VerifyTool::new().suite_verdict(dir.path(), &cancel).await,
+            Some(true)
+        );
+        let denied = VerifyTool::with_policy(
+            CommandPolicy::parse("[[deny]]\nprogram = \"make\"\n").expect("policy parses"),
+        );
+        assert_eq!(
+            denied.suite_verdict(dir.path(), &cancel).await,
+            None,
+            "a denied program must not run the suite"
+        );
+    }
 }
