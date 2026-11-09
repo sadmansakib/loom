@@ -688,6 +688,9 @@ fn replace_symbol(
     artifacts: Option<std::sync::Arc<dyn loom_kernel::store::ArtifactStore>>,
 ) -> Result<(String, String, String, Symbol, Vec<BeforeImage>), ToolError> {
     let path = resolve_within(root, display_path)?;
+    // Symbol splicing mutates the file, so control state is off-limits
+    // like any other write.
+    crate::confinement::ensure_mutable(root, &path)?;
     let relative = workspace_relative(root, &path);
     let lang = SymbolLanguage::for_path(&path).ok_or_else(|| {
         ToolError::InvalidInput(format!(

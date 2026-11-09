@@ -3,6 +3,32 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Adversarial review round 2: workspace control-state protection (PR1)
+
+- `fix(tools)`: `write_file`, `edit_file`, and `replace_symbol` now refuse
+  workspace control state — `.loom/`, `.git/`, and `.cargo/` at the
+  workspace root (case-folded; nested `sub/.git` is ordinary content;
+  reads unaffected). A model-written `.loom/verify.toml` runner or
+  `.loom/commands.toml` escalation was unsandboxed host execution
+  (review F-02/F-12), and `.git/hooks`/`config` planted from inside the
+  sandbox were executed by host-side git (F-03).
+- `fix(tools)`: the sandbox holds control state read-only even though the
+  workspace is writable — Seatbelt re-denies `.loom`, `.cargo`, and
+  git's `config`/`config.lock`/`hooks`/`modules` after the workspace
+  allow (later filters win; `subpath` matches case variants because it
+  sees the vnode's on-disk name, verified empirically), and bwrap binds
+  them `--ro-bind-try` after every writable bind. The git index and
+  object database stay writable, so `git status`/`add`/`commit` keep
+  working inside the sandbox; an operator's `extra_writable` grant
+  overrides the defaults.
+- Regression coverage: the review's escape reproduction is pinned as
+  `seatbelt_blocks_control_state_writes_but_not_git` (real
+  sandbox-exec: `.loom/verify.toml`, `.git/hooks/pre-commit`, and
+  `.git/config` writes fail; `git status`/`git add` succeed), plus
+  profile/argv ordering tests and the `ensure_mutable` gate tests.
+  Residual, tracked for the next PR: a repo *shipped* with a malicious
+  manifest or `.git/config` still loads as-is (trust gate pending).
+
 ## 2026-11 — Context compiler hot-path reductions (item 3.2)
 
 - `perf(kernel)`: the pruning gate now computes reclaim totals without

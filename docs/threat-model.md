@@ -42,8 +42,10 @@ timing or token counts; those live below or beside the harness.
    admitted.
 2. **Privilege escalation by manifest write.** Injected content
    steers `write_file` to `.loom/commands.toml`, widening the policy
-   for a later turn (defense: manifests are trusted, so *writes to
-   trusted paths* are exactly as sensitive as commands).
+   for a later turn (defense: `.loom/`, `.git/`, and `.cargo/` at the
+   workspace root are control state — mutating tools refuse them
+   outright (`confinement::ensure_mutable`), and the sandbox holds
+   them read-only even though the workspace is writable).
 3. **Trojan edits.** Injected content steers `edit_file` to introduce
    a vulnerability rather than the requested fix.
 4. **Exfiltration over egress.** Any of the above used to move
@@ -58,6 +60,7 @@ timing or token counts; those live below or beside the harness.
 | Execution | `Ask` verdicts bridge to the operator (CLI prompt; ACP `session/request_permission` since roadmap item 37) — fail closed |
 | Credential disclosure | env-scrub floor on every spawned child; secrets never enter tool-visible context. The floor lists every Loom provider credential name plus AWS/GitHub tokens, and any *present* variable matching a credential suffix (`_API_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`) is scrubbed too — so `loom provider add <name>` credentials minted after startup are caught. The single narrowing path is a per-program `env_allow` list in `.loom/commands.toml`, an explicit auditable opt-in (e.g. `gh` needing `GH_TOKEN`); entries must themselves be credential-shaped. MCP servers are stricter still: `env_clear` plus only the manifest-declared variables |
 | Trojan edits | every filesystem tool resolves paths component-wise against symlink escapes (`confinement::resolve_within`); no tool opens a path that was not resolved first |
+| Privilege escalation by manifest write (scenario 2) | `.loom/`, `.git/`, and `.cargo/` at the workspace root are control state: `write_file`/`edit_file`/`replace_symbol` refuse them (`confinement::ensure_mutable`, case-folded, root-only — a nested `sub/.git` is ordinary content), and the sandbox re-denies them read-only after the workspace allow (Seatbelt: later filters win, and `subpath` matches case variants because it sees the vnode's on-disk name — verified empirically; bwrap: `--ro-bind-try` after every writable bind). Git's index and object database stay writable so `git status`/`add`/`commit` keep working; an operator's `extra_writable` grant overrides the defaults. Residual (tracked separately): a repo *shipped* with a malicious `.git/config` or manifest still needs a trust gate on load |
 | Trojan edits / TOCTOU | a resolved path is re-verified at use time: reads re-canonicalise after open, writes re-verify the deepest existing ancestor (a not-yet-created component cannot be a swapped symlink) before the atomic rename. **Residual race, stated honestly:** a microsecond window remains between re-check and open/rename — an attacker winning a same-instant directory swap can still redirect one read or write. Closing it fully needs `openat`-style confined descriptors (a new dependency), deliberately not taken; no `unsafe` is used to reach for it |
 | Torn writes | tool writes are atomic: temp file in the target directory → fsync → permission carry-over → rename. A crash mid-write leaves the previous file intact, never a truncated one (review item 2.3; also fixes `symbols.rs`, whose comment claimed atomicity it did not have, and the MCP lockfile, whose corruption would quarantine every pinned tool) |
 | Repeat loops | failure ledger refuses exact repeats of failed calls |

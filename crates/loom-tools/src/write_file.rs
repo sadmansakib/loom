@@ -95,6 +95,10 @@ impl Tool for WriteFileTool {
                 .map_err(|err| ToolError::InvalidInput(format!("invalid arguments: {err}")))?;
             let display = input.path;
             let path = resolve_within(&ctx.workspace_root, &display)?;
+            // Control-state gate (threat-model trust boundary 2): a
+            // model-written `.loom/commands.toml` or `.git/hooks/*` is
+            // escalation wearing the operator's signature.
+            crate::confinement::ensure_mutable(&ctx.workspace_root, &path)?;
             let relative = workspace_relative(&ctx.workspace_root, &path);
             let scope = input.verify;
             let content = input.content;

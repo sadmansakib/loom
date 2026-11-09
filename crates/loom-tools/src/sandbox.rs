@@ -141,6 +141,37 @@ impl Sandbox {
         dirs
     }
 
+    /// Workspace control state that stays read-only *inside* the
+    /// sandbox even though the workspace is writable (review items
+    /// F-02/F-03/F-04/F-12): `.loom` policy manifests, `.cargo`
+    /// config (aliases/wrappers execute any program), and the git
+    /// config/hooks/modules subtree of `.git`, whose settings
+    /// (`core.fsmonitor`, `core.hooksPath`, filter commands) host-side
+    /// git executes outside the sandbox.
+    ///
+    /// Not the whole `.git`: the index and object database stay
+    /// writable so `git status`/`git add`/`git commit` keep working.
+    /// The list is denial-of-write only — reads are untouched, and a
+    /// fresh `git init` inside the sandbox still creates its own
+    /// config (harmless: host git is separately hardened with
+    /// `-c` overrides when loom itself runs it).
+    fn protected(&self) -> Vec<PathBuf> {
+        let mut paths = vec![
+            self.workspace.join(".loom"),
+            self.workspace.join(".cargo"),
+            self.workspace.join(".git/config"),
+            self.workspace.join(".git/config.lock"),
+            self.workspace.join(".git/hooks"),
+            self.workspace.join(".git/modules"),
+        ];
+        // The grants are the operator's explicit escalation; an
+        // operator-granted writable dir wins over the defaults.
+        for granted in &self.grants.extra_writable {
+            paths.retain(|protected| !protected.starts_with(granted));
+        }
+        paths
+    }
+
     /// Whether commands under this sandbox are OS-confined. `false`
     /// means every wrap passes through: the policy opted out, or the
     /// platform has no wrapper at all — a fact the trace surfaces as a
@@ -189,7 +220,7 @@ impl Sandbox {
         // wrapper forks and calls setsid(), which is why it needs the
         // explicit PID-namespace arrangement documented in
         // `bubblewrap_argv`.
-        let profile = seatbelt_profile(&self.writable(), self.grants.network);
+        let profile = seatbelt_profile(&self.writable(), &self.protected(), self.grants.network);
         let mut wrapped = vec![
             "-p".to_owned(),
             profile,
@@ -214,6 +245,7 @@ impl Sandbox {
             .chain(self.grants.extra_writable.iter().cloned())
             .collect();
         let home = std::env::var_os("HOME").map(|home| home.to_string_lossy().into_owned());
+        let protected = self.protected();
         let wrapped = bubblewrap_argv(
             program,
             args,
@@ -222,6 +254,7 @@ impl Sandbox {
                 optional: &optional,
                 temp: &self.temp,
             },
+            &protected,
             self.grants.network,
             home.as_deref(),
         );
@@ -256,6 +289,7 @@ fn bubblewrap_argv(
     program: &str,
     args: &[String],
     writable: &BubblewrapWritable<'_>,
+    protected: &[PathBuf],
     network: bool,
     home: Option<&str>,
 ) -> Vec<String> {
@@ -357,6 +391,20 @@ fn bubblewrap_argv(
     // reason as the grants.
     let temp = writable.temp.to_string_lossy().into_owned();
     wrapped.extend(["--bind-try", &temp, &temp].iter().map(|s| (*s).to_owned()));
+    // Control state (`protected`) is bound read-only *after* every
+    // read-write bind: bubblewrap mounts in argument order, so a later
+    // `--ro-bind-try` shadows the workspace bind at that subtree and
+    // writes to `.loom`, `.cargo`, or git's config/hooks land on a
+    // read-only mount. `-try` keeps a fresh workspace without `.git`
+    // (or without `.loom`) from aborting the sandbox.
+    for path in protected {
+        let path = path.to_string_lossy().into_owned();
+        wrapped.extend(
+            ["--ro-bind-try", &path, &path]
+                .iter()
+                .map(|s| (*s).to_owned()),
+        );
+    }
     wrapped.extend(["--chdir", &workspace].iter().map(|s| (*s).to_owned()));
     wrapped.push(program.to_owned());
     wrapped.extend(args.iter().cloned());
@@ -528,7 +576,11 @@ pub fn bwrap_remediation(stderr: &str) -> Option<String> {
 /// system binaries fails under codesigning enforcement, and the
 /// deny is defense-in-depth over the model never being asked to
 /// script other applications in the first place.
-pub(crate) fn seatbelt_profile(writable: &[PathBuf], network: bool) -> String {
+pub(crate) fn seatbelt_profile(
+    writable: &[PathBuf],
+    protected: &[PathBuf],
+    network: bool,
+) -> String {
     let mut profile = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
     // /dev/null must be writable: real git opens it read-write during
     // ordinary setup, and the blanket deny made every `git --version`
@@ -542,6 +594,19 @@ pub(crate) fn seatbelt_profile(writable: &[PathBuf], network: bool) -> String {
                 profile.push(' ');
             }
             profile.push_str(&format!("(subpath \"{}\")", escape_seatbelt_path(dir)));
+        }
+        profile.push_str(")\n");
+    }
+    // Control state is re-denied *after* the writable allow: later
+    // filters win, so the workspace stays writable while `.loom`,
+    // `.cargo`, and git's config/hooks/modules subtree do not.
+    // (Verified empirically: subpath matching resolves case variants —
+    // `.GIT/config` matches `.git/config` — because the filter sees the
+    // vnode's on-disk name, not the syscall string.)
+    if !protected.is_empty() {
+        profile.push_str("(deny file-write*");
+        for dir in protected {
+            profile.push_str(&format!(" (subpath \"{}\")", escape_seatbelt_path(dir)));
         }
         profile.push_str(")\n");
     }
@@ -566,7 +631,7 @@ mod tests {
 
     #[test]
     fn seatbelt_denies_writes_and_network_by_default() {
-        let profile = seatbelt_profile(&[PathBuf::from("/ws")], false);
+        let profile = seatbelt_profile(&[PathBuf::from("/ws")], &[], false);
         assert!(profile.contains("(deny file-write*)"));
         assert!(profile.contains("(deny network*)"));
         assert!(profile.contains("(deny appleevent-send)"));
@@ -580,8 +645,57 @@ mod tests {
     }
 
     #[test]
+    fn seatbelt_re_denies_control_state_after_the_writable_allow() {
+        // Later filters win, so the control-state deny must land after
+        // the workspace allow it carves out of.
+        let workspace = PathBuf::from("/ws");
+        let sandbox = Sandbox::resolve(&workspace, SandboxGrants::from_rule(None));
+        let profile = seatbelt_profile(&[workspace], &sandbox.protected(), false);
+        for relative in [".loom", ".cargo", ".git/config", ".git/hooks"] {
+            assert!(
+                profile.contains(&format!("(subpath \"/ws/{relative}\")")),
+                "{relative} missing from the control-state deny in:\n{profile}"
+            );
+        }
+        let allow = profile.find("(allow file-write*").unwrap();
+        let deny = profile.rfind("(deny file-write*").unwrap();
+        assert!(
+            allow < deny,
+            "control-state deny must follow the allow:\n{profile}"
+        );
+    }
+
+    #[test]
+    fn grants_override_the_control_state_defaults() {
+        // An operator-granted writable dir is the explicit escalation
+        // layer; the defaults must not fight it.
+        let workspace = PathBuf::from("/ws");
+        let grants = SandboxGrants {
+            enabled: true,
+            network: false,
+            extra_writable: vec![PathBuf::from("/ws/.loom")],
+        };
+        let sandbox = Sandbox::resolve(&workspace, grants);
+        assert!(
+            !sandbox
+                .protected()
+                .iter()
+                .any(|path| path.starts_with("/ws/.loom")),
+            "granted writable dir still protected: {:?}",
+            sandbox.protected()
+        );
+        assert!(
+            sandbox
+                .protected()
+                .iter()
+                .any(|path| path.ends_with(".git/config")),
+            "ungranted control state must stay protected"
+        );
+    }
+
+    #[test]
     fn seatbelt_network_grant_omits_the_deny() {
-        let profile = seatbelt_profile(&[PathBuf::from("/ws")], true);
+        let profile = seatbelt_profile(&[PathBuf::from("/ws")], &[], true);
         assert!(!profile.contains("(deny network*)"));
         // The Apple-event deny is unconditional: there is no grant
         // axis for IPC to other applications.
@@ -594,7 +708,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn run_under_seatbelt(program: &str, args: &[&str]) -> std::process::Output {
         let workspace = tempfile::tempdir().expect("tempdir");
-        let profile = seatbelt_profile(&[workspace.path().to_path_buf()], false);
+        let sandbox = Sandbox::resolve(workspace.path(), SandboxGrants::from_rule(None));
+        let profile = seatbelt_profile(&sandbox.writable(), &sandbox.protected(), false);
         std::process::Command::new("/usr/bin/sandbox-exec")
             .arg("-p")
             .arg(&profile)
@@ -650,9 +765,85 @@ mod tests {
         }
     }
 
+    /// The sandbox-escape regression from the adversarial review
+    /// (F-02/F-03/F-04), inverted: a sandboxed `sh` must not be able
+    /// to plant policy manifests or git hook/config state, while the
+    /// ordinary git workflow (status/add — index and object writes)
+    /// keeps working. macOS integration check.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_blocks_control_state_writes_but_not_git() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let root = workspace.path();
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .arg(root)
+                .status()
+                .expect("git init")
+                .success(),
+            "fixture needs git"
+        );
+        std::fs::write(root.join("tracked.txt"), "content\n").expect("fixture file");
+        std::fs::create_dir_all(root.join(".loom")).expect("loom dir");
+
+        let sandbox = Sandbox::resolve(root, SandboxGrants::from_rule(None));
+        let profile = seatbelt_profile(&sandbox.writable(), &sandbox.protected(), false);
+        let run = |script: &str| {
+            std::process::Command::new("/usr/bin/sandbox-exec")
+                .arg("-p")
+                .arg(&profile)
+                .arg("--")
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .current_dir(root)
+                .output()
+                .expect("spawn under sandbox-exec")
+        };
+
+        for target in [".loom/verify.toml", ".git/hooks/pre-commit", ".git/config"] {
+            let output = run(&format!("echo pwned > {target}"));
+            assert!(
+                !output.status.success(),
+                "sandboxed write to {target} succeeded: {:?}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(
+            !root.join(".loom/verify.toml").exists(),
+            ".loom/verify.toml must not be creatable from inside the sandbox"
+        );
+        assert!(
+            !root.join(".git/hooks/pre-commit").exists(),
+            "hooks must not be plantable from inside the sandbox"
+        );
+        // The on-disk config byte-for-byte unchanged (the write must
+        // fail, not truncate-then-fail).
+        assert!(
+            std::fs::read_to_string(root.join(".git/config"))
+                .expect("git config")
+                .contains("[core]"),
+            "git config was damaged by the blocked write"
+        );
+
+        // The carve-out must not break ordinary git: `status` refreshes
+        // the index, `add` writes the index and the object database.
+        for git_args in [["status", "--porcelain"], ["add", "-A"]] {
+            let output = run(&format!("git {}", git_args.join(" ")));
+            assert!(
+                output.status.success(),
+                "git {} no longer runs under the profile: {:?}",
+                git_args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     #[test]
     fn seatbelt_escapes_path_metacharacters() {
-        let profile = seatbelt_profile(&[PathBuf::from("/ws/na\"me\\dir")], false);
+        let profile = seatbelt_profile(&[PathBuf::from("/ws/na\"me\\dir")], &[], false);
         assert!(profile.contains("/ws/na\\\"me\\\\dir"));
     }
 
@@ -673,6 +864,8 @@ mod tests {
             .map(PathBuf::from)
             .chain(std::iter::once(PathBuf::from("/loom-absent-granted-dir")))
             .collect();
+        let protected =
+            Sandbox::resolve(Path::new("/ws"), SandboxGrants::from_rule(None)).protected();
         bubblewrap_argv(
             "cargo",
             &["build".to_owned(), "--release".to_owned()],
@@ -681,6 +874,7 @@ mod tests {
                 optional: &optional,
                 temp: Path::new("/tmp"),
             },
+            &protected,
             network,
             Some("/home/dev"),
         )
@@ -751,6 +945,43 @@ mod tests {
         let strict = bind_pairs(&argv, "--bind");
         assert_eq!(strict.len(), 1, "unexpected strict binds in {argv:?}");
         assert_eq!(strict[0], ["/ws".to_owned(), "/ws".to_owned()]);
+    }
+
+    #[test]
+    fn bubblewrap_binds_control_state_read_only_after_every_writable_bind() {
+        // Later mounts shadow earlier ones, so the control-state
+        // `--ro-bind-try`s must come after the workspace `--bind` (and
+        // after every optional writable bind) to carve `.loom`,
+        // `.cargo`, and git's config/hooks back out of the writable
+        // workspace.
+        let argv = bwrap_argv(false, Some("/home/dev/.cargo"));
+        let read_only = bind_pairs(&argv, "--ro-bind-try");
+        for relative in [".loom", ".cargo", ".git/config", ".git/hooks"] {
+            let path = format!("/ws/{relative}");
+            assert!(
+                read_only
+                    .iter()
+                    .any(|[src, dest]| src == &path && dest == &path),
+                "{path} not bound read-only in {argv:?}"
+            );
+        }
+        // Every read-only control-state bind lands after the last
+        // read-write bind of any kind.
+        let last_rw = argv
+            .iter()
+            .enumerate()
+            .filter(|(_, arg)| arg.as_str() == "--bind" || arg.as_str() == "--bind-try")
+            .map(|(index, _)| index)
+            .next_back()
+            .unwrap_or_else(|| panic!("no writable binds in {argv:?}"));
+        for (index, arg) in argv.iter().enumerate() {
+            if arg == "--ro-bind-try" && argv[index + 1].starts_with("/ws/.") {
+                assert!(
+                    index > last_rw,
+                    "control-state bind before a writable bind in {argv:?}"
+                );
+            }
+        }
     }
 
     #[test]

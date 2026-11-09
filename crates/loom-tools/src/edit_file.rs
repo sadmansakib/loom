@@ -144,14 +144,20 @@ impl EditInput {
 
 /// Resolves every edit's display path against the workspace root.
 /// Confinement is checked per edit before anything runs: a batch that
-/// would escape the workspace fails as a whole, before any file is read.
+/// would escape the workspace — or write workspace control state
+/// (`.loom`/`.git`/`.cargo`, [`crate::confinement::ensure_mutable`]) —
+/// fails as a whole, before any file is read.
 fn resolve_edits(
     root: &Path,
     batch: Vec<(String, String, String)>,
 ) -> Result<Vec<(PathBuf, String, String)>, ToolError> {
     batch
         .into_iter()
-        .map(|(display, old, new)| Ok((resolve_within(root, &display)?, old, new)))
+        .map(|(display, old, new)| {
+            let path = resolve_within(root, &display)?;
+            crate::confinement::ensure_mutable(root, &path)?;
+            Ok((path, old, new))
+        })
         .collect()
 }
 

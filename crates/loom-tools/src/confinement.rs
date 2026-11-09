@@ -73,6 +73,42 @@ pub(crate) fn workspace_relative(root: &Path, path: &Path) -> String {
 /// their own bound.
 const SYMLINK_LIMIT: usize = 8;
 
+/// Workspace control state that mutating tools refuse to touch: a
+/// `.loom/` manifest is the policy/escalation layer (`commands.toml`
+/// can disable the sandbox; `verify.toml` runs a declared runner
+/// unsandboxed), `.git/` config and hooks are executed by host-side
+/// git (facts scan, rewind, worktrees), and `.cargo/` config can
+/// alias or wrap any program. Reading stays allowed — the model may
+/// legitimately read a manifest to explain it — but a model-written
+/// manifest is privilege escalation wearing the operator's signature
+/// (threat-model trust boundary 2), so only mutation is refused.
+pub(crate) const CONTROL_STATE_PREFIXES: &[&str] = &[".loom", ".git", ".cargo"];
+
+/// Gates a *mutating* tool call: `resolved` must have come from
+/// [`resolve_within`], and its first workspace-relative component must
+/// not be workspace control state ([`CONTROL_STATE_PREFIXES`]).
+///
+/// The comparison case-folds the component: on case-insensitive
+/// filesystems (macOS's default APFS) `.GIT/config` and `.git/config`
+/// name the same file. A nested `sub/.git` is *not* control state —
+/// loom and host git only ever read manifests and config from the
+/// workspace root.
+pub(crate) fn ensure_mutable(root: &Path, resolved: &Path) -> Result<(), ToolError> {
+    let relative = workspace_relative(root, resolved);
+    let head = relative
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if CONTROL_STATE_PREFIXES.contains(&head.as_str()) {
+        return Err(ToolError::InvalidInput(format!(
+            "\"{relative}\" is workspace control state (.loom/.git/.cargo) — \
+             model tools cannot write it; ask the operator to edit it"
+        )));
+    }
+    Ok(())
+}
+
 /// Re-checks, at use time, that a path [`resolve_within`] already
 /// approved still lands inside the workspace (review item 2.2: the
 /// check-then-open race).
@@ -523,5 +559,36 @@ mod tests {
         symlink(outside.path(), guard.path().join("sub")).expect("swapped");
         let err = verify_parent_within(&root, &resolved).expect_err("swapped");
         assert!(matches!(err, ToolError::InvalidInput(msg) if msg.contains("escapes")));
+    }
+
+    #[test]
+    fn ensure_mutable_refuses_workspace_control_state() {
+        // The F-02/F-03/F-04 gate: a model-written manifest, git hook,
+        // or cargo config is escalation wearing the operator's
+        // signature, so every protected prefix is refused — case-folded
+        // (`.GIT/config` is the same file as `.git/config` on
+        // case-insensitive filesystems), and only at the workspace
+        // root (a nested `sub/.git` is ordinary content).
+        let (_guard, root) = temp_root();
+        for display in [
+            ".loom/verify.toml",
+            ".loom/commands.toml",
+            ".git/config",
+            ".git/hooks/pre-commit",
+            ".cargo/config.toml",
+            ".LOOM/commands.toml",
+            ".Git/hooks/pre-commit",
+        ] {
+            let resolved = resolve_within(&root, display).expect("resolved");
+            let err = ensure_mutable(&root, &resolved).expect_err(display);
+            assert!(
+                matches!(&err, ToolError::InvalidInput(msg) if msg.contains(display)),
+                "{display}: {err:?}"
+            );
+        }
+        let nested = resolve_within(&root, "sub/.git/config").expect("resolved");
+        ensure_mutable(&root, &nested).expect("nested control state is ordinary content");
+        let plain = resolve_within(&root, "src/main.rs").expect("resolved");
+        ensure_mutable(&root, &plain).expect("ordinary paths stay writable");
     }
 }

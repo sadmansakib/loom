@@ -415,6 +415,18 @@ canonical root to produce a workspace-relative path. The high-severity
 regression tests — `..` after a missing path through a symlink, dangling
 links, link cycles, links pointing outside the root — pin this behavior.
 
+Mutating tools additionally pass `ensure_mutable`: `.loom/`, `.git/`, and
+`.cargo/` at the workspace root are workspace control state (policy
+manifests, git config/hooks that host-side git executes, cargo aliases),
+so `write_file`, `edit_file`, and `replace_symbol` refuse them — reads
+stay allowed, the comparison case-folds (`.GIT/config` is the same file
+as `.git/config` on case-insensitive filesystems), and only the root's
+own entries are protected (a nested `sub/.git` is ordinary content). The
+sandbox applies the same carve-out from the other side: `.loom`,
+`.cargo`, and git's `config`/`hooks`/`modules` subtree are re-denied
+read-only after the workspace allow, while the index and object database
+stay writable so `git status`/`add`/`commit` keep working.
+
 ### 6.4 Output budgets and artifacts
 
 Every tool output passes `bound()`: a 64 KiB cap, cut on a char boundary.
