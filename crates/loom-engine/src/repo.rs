@@ -594,11 +594,16 @@ fn git_state(root: &Path) -> GitState {
 }
 
 /// Runs `git -C <root> <args>` and returns stdout on success.
+///
+/// Every invocation is hardened (see [`crate::hostgit`]): the repo's
+/// own config cannot name programs for git to execute.
 fn run_git(root: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
-        // Absolute paths and no quoting ambiguity in `status --porcelain`.
-        .arg("-c")
-        .arg("core.quotepath=false")
+        .args(crate::hostgit::CONFIG_ARGS)
+        .env(
+            crate::hostgit::ENV_NOSYSTEM.0,
+            crate::hostgit::ENV_NOSYSTEM.1,
+        )
         .arg("-C")
         .arg(root)
         .args(args)
@@ -1011,6 +1016,59 @@ mod tests {
         let facts = scan(root);
         assert_eq!(facts.git.branch.as_deref(), Some("main"));
         assert_eq!(facts.git.changed_files, vec!["tracked.txt".to_owned()]);
+    }
+
+    /// F-03 regression: `.git/config` naming a program (`core.fsmonitor`
+    /// spawns on every status) must not execute during loom's own facts
+    /// scan — the host-git helpers override the knob (see `hostgit`).
+    #[test]
+    #[cfg(unix)]
+    fn git_state_ignores_a_planted_fsmonitor() {
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("git not available; skipping");
+            return;
+        }
+        let dir = tempdir();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .expect("run git");
+            assert!(status.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        fs::write(root.join("tracked.txt"), "hello\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-qm", "init"]);
+
+        // Plant the fsmonitor: a script whose whole job is to leave a
+        // probe behind when git executes it.
+        let probe = dir.path().join("fsmonitor-ran");
+        let monitor = dir.path().join("fake-fsmonitor.sh");
+        fs::write(&monitor, format!("#!/bin/sh\ntouch {}\n", probe.display())).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&monitor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        git(&[
+            "config",
+            "core.fsmonitor",
+            monitor.to_str().expect("utf8 path"),
+        ]);
+
+        let state = git_state(root);
+        assert!(state.branch.is_some(), "hardened status still works");
+        assert!(
+            !probe.exists(),
+            "planted core.fsmonitor executed during loom's facts scan"
+        );
     }
 
     #[test]

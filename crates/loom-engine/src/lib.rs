@@ -38,6 +38,7 @@ pub mod auth;
 pub mod catalog;
 pub mod engine;
 mod estimate;
+pub mod hostgit;
 mod provider;
 pub mod registry;
 pub mod replay;

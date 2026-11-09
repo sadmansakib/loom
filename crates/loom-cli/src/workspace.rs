@@ -34,9 +34,16 @@ use loom_core::kernel::transcript::Item;
 ///
 /// The error message is git's stderr when it has one — the caller
 /// surfaces it, and a git that is missing or unhappy should never be
-/// papered over here.
+/// papered over here. Every invocation is hardened
+/// (`loom_core::engine::hostgit`): the repo's own config cannot name
+/// programs for git to execute.
 fn run_git(root: &Path, args: &[&str]) -> std::result::Result<String, String> {
     let output = std::process::Command::new("git")
+        .args(loom_core::engine::hostgit::CONFIG_ARGS)
+        .env(
+            loom_core::engine::hostgit::ENV_NOSYSTEM.0,
+            loom_core::engine::hostgit::ENV_NOSYSTEM.1,
+        )
         .arg("-C")
         .arg(root)
         .args(args)
@@ -200,7 +207,14 @@ pub fn apply_restore(plan: &RestorePlan) -> Result<PathBuf> {
 
     run_git(&plan.workspace, &["add", "-A"])
         .map_err(|error| anyhow::anyhow!("staging for the recovery snapshot: {error}"))?;
-    let diff = match run_git(&plan.workspace, &["diff", "--cached"]) {
+    let diff = match run_git(
+        &plan.workspace,
+        // `--no-ext-diff --no-textconv`: the cached diff feeds the
+        // rewind snapshot, and both flags can name repo-config
+        // *programs* (`diff.<driver>.command`) — the one diff site
+        // must not become a config-driven exec (see `hostgit`).
+        &["diff", "--cached", "--no-ext-diff", "--no-textconv"],
+    ) {
         Ok(diff) => diff,
         // Staging happened; undo it so a failed snapshot leaves the
         // index as it was (reset --hard would rewrite it anyway, but a

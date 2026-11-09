@@ -185,9 +185,15 @@ impl WorktreeError {
 }
 
 /// Runs `git` in `dir`, returning raw stdout. Non-zero exits carry the
-/// stderr tail in the error.
+/// stderr tail in the error. Every invocation is hardened
+/// ([`crate::hostgit`]): repo config cannot name programs to execute.
 async fn git_raw(dir: &Path, args: &[&str]) -> Result<String, WorktreeError> {
     let output = tokio::process::Command::new("git")
+        .args(crate::hostgit::CONFIG_ARGS)
+        .env(
+            crate::hostgit::ENV_NOSYSTEM.0,
+            crate::hostgit::ENV_NOSYSTEM.1,
+        )
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -216,6 +222,11 @@ async fn git(dir: &Path, args: &[&str]) -> Result<String, WorktreeError> {
 async fn git_with_stdin(dir: &Path, args: &[&str], stdin: &str) -> Result<String, WorktreeError> {
     use tokio::io::AsyncWriteExt;
     let mut child = tokio::process::Command::new("git")
+        .args(crate::hostgit::CONFIG_ARGS)
+        .env(
+            crate::hostgit::ENV_NOSYSTEM.0,
+            crate::hostgit::ENV_NOSYSTEM.1,
+        )
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -256,6 +267,11 @@ async fn git_with_stdin(dir: &Path, args: &[&str], stdin: &str) -> Result<String
 /// this is hygiene, not a gate (review item 2.8).
 pub fn exclude_state_from_git(workspace: &Path, entries: &[&str]) {
     let output = std::process::Command::new("git")
+        .args(crate::hostgit::CONFIG_ARGS)
+        .env(
+            crate::hostgit::ENV_NOSYSTEM.0,
+            crate::hostgit::ENV_NOSYSTEM.1,
+        )
         .arg("-C")
         .arg(workspace)
         .args(["rev-parse", "--path-format=absolute", "--git-dir"])
@@ -1137,6 +1153,56 @@ mod tests {
         .await
         .is_ok();
         assert!(ignored, "git must ignore the worktrees root");
+    }
+
+    /// F-03 regression: `.git/config` naming a hooks directory
+    /// (`core.hooksPath`) must not fire during loom's own git runs.
+    /// `reset --hard` executes `post-checkout` when the knob is
+    /// honored — exactly the shape of the CLI rewind path.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn git_invocations_ignore_a_planted_hooks_path() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let repo = git_repo(base.path()).await;
+
+        // Plant the hooks dir outside the repo with a post-checkout
+        // hook whose whole job is to leave a probe behind.
+        let probe = base.path().join("hook-ran");
+        let hooks = base.path().join("planted-hooks");
+        tokio::fs::create_dir_all(&hooks).await.expect("hooks dir");
+        tokio::fs::write(
+            hooks.join("post-checkout"),
+            format!("#!/bin/sh\ntouch {}\n", probe.display()),
+        )
+        .await
+        .expect("hook body");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                hooks.join("post-checkout"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("hook exec bit");
+        }
+        git(
+            &repo,
+            &[
+                "config",
+                "core.hooksPath",
+                hooks.to_str().expect("utf8 path"),
+            ],
+        )
+        .await
+        .expect("plant hooksPath");
+
+        // `reset --hard` fires post-checkout when the knob is honored.
+        git_raw(&repo, &["reset", "--hard", "HEAD"])
+            .await
+            .expect("hardened reset still works");
+        assert!(
+            !probe.exists(),
+            "planted core.hooksPath hook executed during loom's git run"
+        );
     }
 
     #[tokio::test]

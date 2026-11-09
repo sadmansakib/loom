@@ -3,6 +3,25 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Adversarial review round 2: host-git hardening (PR2)
+
+- `fix(engine,cli)`: every git invocation loom itself runs on the host —
+  the facts scan (`repo.rs`), worktree machinery (`worktrees.rs`), and
+  the CLI rewind checkpoint (`cli/workspace.rs`) — now passes
+  `-c core.quotepath=false -c core.fsmonitor=false -c
+  core.hooksPath=/dev/null` and `GIT_CONFIG_NOSYSTEM=1` (new
+  `engine::hostgit` module). A `.git/config` naming programs for git to
+  execute (fsmonitor spawns on every status; `core.hooksPath` fires on
+  `reset --hard` during rewind) no longer runs them under loom's own
+  credentials (review F-03). The rewind snapshot diff passes
+  `--no-ext-diff --no-textconv` so repo-config diff drivers cannot
+  execute either. Residual: `filter.*` commands on content-rewriting
+  operations (`git add -A`, worktree checkout) have no blanket `-c`;
+  the shipped-manifest trust gate owns that class.
+- Regression coverage: `git_state_ignores_a_planted_fsmonitor` and
+  `git_invocations_ignore_a_planted_hooks_path` pin the knobs with real
+  probe scripts.
+
 ## 2026-11 — Adversarial review round 2: workspace control-state protection (PR1)
 
 - `fix(tools)`: `write_file`, `edit_file`, and `replace_symbol` now refuse
