@@ -3,6 +3,38 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Adversarial review round 2: sandbox LaunchServices seal, home secrets, canonical grants (PR3)
+
+- `fix(tools)`: the Seatbelt profile now carries a blanket
+  `(deny mach-lookup)`, sealing the LaunchServices escape found in
+  review (F-08: `open -g -j ./P.app` started a bundle *outside* the
+  sandbox through `(allow default)`; named per-service mach denies do
+  not enforce on current macOS). Exec denies of
+  `/usr/bin/open|automator|shortcuts` add friction against the same
+  front door. Verified empirically that toolchains are unaffected:
+  git, cargo (full build), python, and DNS/HTTP under a network
+  grant all run under the blanket deny. Regression test launches a
+  real app bundle under the profile and asserts both that `open`
+  fails and that the bundle never ran.
+- `fix(tools)`: home credential material is now denied *read* inside
+  the sandbox (review F-11): `~/.ssh`, `~/.gnupg`, `~/.aws`,
+  `~/.kube`, `~/.netrc`, `~/.git-credentials`, loom's own database
+  and config (`~/.local/share/loom`, `~/.config/loom`, plus the
+  `LOOM_DATA_DIR`/`LOOM_DB`/`LOOM_CONFIG_DIR` overrides), and on
+  macOS the on-disk keychain stores (`~/Library/Keychains`,
+  `~/Library/Security`; the daemon's IPC is sealed by the mach
+  deny). bwrap parity via empty `--tmpfs` shadows. An operator's
+  `extra_writable` grant covering a secret remains the single,
+  explicit escalation axis (e.g. admitting sandboxed `ssh`).
+- `fix(tools)`: every writable sandbox entry — workspace, temp, cargo
+  home, `CARGO_TARGET_DIR`, and manifest `extra_writable` grants — is
+  canonicalized as far as it exists before entering the profile or
+  bind list (review F-01). A grant spelled through a symlink
+  (`/tmp/…` on macOS resolving to `/private/tmp/…`) now matches the
+  child's real syscalls; before, every write fell through to the
+  blanket deny (the cause of all eight sandbox test failures in the
+  review's symlinked-`CARGO_TARGET_DIR` run).
+
 ## 2026-11 — Adversarial review round 2: host-git hardening (PR2)
 
 - `fix(engine,cli)`: every git invocation loom itself runs on the host —

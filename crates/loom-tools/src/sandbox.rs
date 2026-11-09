@@ -99,20 +99,28 @@ impl Sandbox {
     /// Resolves the writable set for a command in `workspace` under
     /// `grants`.
     pub(crate) fn resolve(workspace: &Path, grants: SandboxGrants) -> Self {
-        let workspace = workspace
-            .canonicalize()
-            .unwrap_or_else(|_| workspace.to_path_buf());
-        let temp = std::env::temp_dir()
-            .canonicalize()
-            .unwrap_or_else(|_| std::env::temp_dir());
+        let workspace = canonicalize_maybe(workspace);
+        let temp = canonicalize_maybe(&std::env::temp_dir());
         let cargo_home = std::env::var_os("CARGO_HOME")
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")));
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+            .map(|dir| canonicalize_maybe(&dir));
         // Same tolerance for the cargo target dir: when `CARGO_TARGET_DIR`
         // is set it must be writable (its debug/.cargo-build-lock is opened
         // by every cargo invocation), even if it sits outside the workspace
         // being sandboxed — a temp-dir crate targeting the repo's scratch.
-        let cargo_target_dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
+        let cargo_target_dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .map(|dir| canonicalize_maybe(&dir));
+        // Grants are operator paths spelled in a manifest; they get the
+        // same canonicalization or a symlinked spelling (`/tmp/...` on
+        // macOS) would never match the child's real syscalls (F-01).
+        let mut grants = grants;
+        grants.extra_writable = grants
+            .extra_writable
+            .iter()
+            .map(|dir| canonicalize_maybe(dir))
+            .collect();
         // The cargo home is legitimately absent (a container's first
         // `cargo` run creates it, and `rustup` installs elsewhere on many
         // hosts). It is kept in the set either way: it is bound with
@@ -172,6 +180,55 @@ impl Sandbox {
         paths
     }
 
+    /// Home state a sandboxed child must not *read* (review F-11):
+    /// private key material, credential stores, and loom's own
+    /// database and config. Denied even though the profile is
+    /// otherwise default-allow — exfiltrating `~/.ssh` or the
+    /// keychain is a credential breach, never a toolchain need; the
+    /// macOS keychain's IPC channel is sealed by the same profile's
+    /// blanket mach deny. The operator's single escalation axis
+    /// applies: an `extra_writable` grant covering a secret drops it
+    /// (e.g. an operator explicitly admitting sandboxed `ssh`).
+    fn home_secrets(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let mut push = |path: PathBuf| {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        };
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            for secret in [
+                ".ssh",
+                ".gnupg",
+                ".aws",
+                ".kube",
+                ".netrc",
+                ".git-credentials",
+                ".config/loom",
+                ".local/share/loom",
+            ] {
+                push(home.join(secret));
+            }
+            // macOS keychain material on disk; the daemon path is the
+            // mach deny.
+            push(home.join("Library/Keychains"));
+            push(home.join("Library/Security"));
+        }
+        // Test/CI overrides point loom state at other locations; cover
+        // them when present so a sandboxed child cannot read the very
+        // database the tests run against.
+        for var in ["LOOM_DATA_DIR", "LOOM_DB", "LOOM_CONFIG_DIR"] {
+            if let Some(path) = std::env::var_os(var) {
+                push(PathBuf::from(path));
+            }
+        }
+        for granted in &self.grants.extra_writable {
+            paths.retain(|secret| !secret.starts_with(granted));
+        }
+        paths
+    }
+
     /// Whether commands under this sandbox are OS-confined. `false`
     /// means every wrap passes through: the policy opted out, or the
     /// platform has no wrapper at all — a fact the trace surfaces as a
@@ -220,7 +277,12 @@ impl Sandbox {
         // wrapper forks and calls setsid(), which is why it needs the
         // explicit PID-namespace arrangement documented in
         // `bubblewrap_argv`.
-        let profile = seatbelt_profile(&self.writable(), &self.protected(), self.grants.network);
+        let profile = seatbelt_profile(
+            &self.writable(),
+            &self.protected(),
+            &self.home_secrets(),
+            self.grants.network,
+        );
         let mut wrapped = vec![
             "-p".to_owned(),
             profile,
@@ -246,6 +308,7 @@ impl Sandbox {
             .collect();
         let home = std::env::var_os("HOME").map(|home| home.to_string_lossy().into_owned());
         let protected = self.protected();
+        let secrets = self.home_secrets();
         let wrapped = bubblewrap_argv(
             program,
             args,
@@ -255,6 +318,7 @@ impl Sandbox {
                 temp: &self.temp,
             },
             &protected,
+            &secrets,
             self.grants.network,
             home.as_deref(),
         );
@@ -290,6 +354,7 @@ fn bubblewrap_argv(
     args: &[String],
     writable: &BubblewrapWritable<'_>,
     protected: &[PathBuf],
+    secrets: &[PathBuf],
     network: bool,
     home: Option<&str>,
 ) -> Vec<String> {
@@ -404,6 +469,13 @@ fn bubblewrap_argv(
                 .iter()
                 .map(|s| (*s).to_owned()),
         );
+    }
+    // Home secrets (`secrets`) are masked with an empty tmpfs (F-11):
+    // the home dir is already readable, so `~/.ssh` et al. need their
+    // own mount shadow to read empty instead of credential material.
+    for path in secrets {
+        let path = path.to_string_lossy().into_owned();
+        wrapped.extend(["--tmpfs", &path].iter().map(|s| (*s).to_owned()));
     }
     wrapped.extend(["--chdir", &workspace].iter().map(|s| (*s).to_owned()));
     wrapped.push(program.to_owned());
@@ -579,6 +651,7 @@ pub fn bwrap_remediation(stderr: &str) -> Option<String> {
 pub(crate) fn seatbelt_profile(
     writable: &[PathBuf],
     protected: &[PathBuf],
+    secrets: &[PathBuf],
     network: bool,
 ) -> String {
     let mut profile = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
@@ -610,13 +683,67 @@ pub(crate) fn seatbelt_profile(
         }
         profile.push_str(")\n");
     }
+    // Home secrets are denied *read* even under `(allow default)`
+    // (F-11): private keys, credential stores, loom's own database.
+    if !secrets.is_empty() {
+        profile.push_str("(deny file-read*");
+        for path in secrets {
+            profile.push_str(&format!(" (subpath \"{}\")", escape_seatbelt_path(path)));
+        }
+        profile.push_str(")\n");
+    }
     profile.push_str("(deny appleevent-send)\n");
     profile.push_str("(deny process-exec* (subpath \"/usr/bin/osascript\"))\n");
+    // LaunchServices seal (F-08): `open -g -j ./P.app` reached
+    // LaunchServices through `(allow default)` and started a bundle
+    // *outside* the sandbox. On current macOS named mach-lookup
+    // denials parse but do not enforce (verified empirically for the
+    // LaunchServices and syslog service names, matching the
+    // `appleevent-send` finding), so the blanket class deny is the
+    // operative control. Verified not to disturb what the profile
+    // exists for: git, cargo (including a real build), python,
+    // sw_vers, and DNS/HTTP under a network grant all run under it.
+    // The exec denies on `open`/`automator`/`shortcuts` are friction
+    // against the same vector through other front doors.
+    profile.push_str("(deny mach-lookup)\n");
+    profile.push_str("(deny process-exec* (subpath \"/usr/bin/open\"))\n");
+    profile.push_str("(deny process-exec* (subpath \"/usr/bin/automator\"))\n");
+    profile.push_str("(deny process-exec* (subpath \"/usr/bin/shortcuts\"))\n");
     if !network {
         profile.push_str("(deny network*)\n");
     }
     profile
 }
+/// Canonicalizes `path` as far as it exists, keeping the
+/// not-yet-created remainder verbatim. Sandbox profile matching
+/// (Seatbelt `subpath`, bwrap binds) is path-based, so a writable
+/// entry spelled through a symlink — `/tmp/...` where macOS resolves
+/// to `/private/tmp/...` — never matches the child's real syscalls
+/// and every write lands on the blanket deny (review F-01: this is
+/// what made a symlinked `CARGO_TARGET_DIR` fail eight tests).
+fn canonicalize_maybe(path: &Path) -> PathBuf {
+    if let Ok(full) = path.canonicalize() {
+        return full;
+    }
+    // Walk up to the deepest existing ancestor, canonicalize that, and
+    // rejoin the pending tail.
+    let mut pending: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = path.to_path_buf();
+    while !current.exists() {
+        match (current.parent(), current.file_name()) {
+            (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+                pending.push(name.to_owned());
+                current = parent.to_path_buf();
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+    match current.canonicalize() {
+        Ok(base) => pending.iter().rev().fold(base, |acc, part| acc.join(part)),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
 /// Escapes a path for a Seatbelt string literal: backslash and quote
 /// are the two characters with meaning there.
 fn escape_seatbelt_path(path: &Path) -> String {
@@ -631,7 +758,7 @@ mod tests {
 
     #[test]
     fn seatbelt_denies_writes_and_network_by_default() {
-        let profile = seatbelt_profile(&[PathBuf::from("/ws")], &[], false);
+        let profile = seatbelt_profile(&[PathBuf::from("/ws")], &[], &[], false);
         assert!(profile.contains("(deny file-write*)"));
         assert!(profile.contains("(deny network*)"));
         assert!(profile.contains("(deny appleevent-send)"));
@@ -650,7 +777,7 @@ mod tests {
         // the workspace allow it carves out of.
         let workspace = PathBuf::from("/ws");
         let sandbox = Sandbox::resolve(&workspace, SandboxGrants::from_rule(None));
-        let profile = seatbelt_profile(&[workspace], &sandbox.protected(), false);
+        let profile = seatbelt_profile(&[workspace], &sandbox.protected(), &[], false);
         for relative in [".loom", ".cargo", ".git/config", ".git/hooks"] {
             assert!(
                 profile.contains(&format!("(subpath \"/ws/{relative}\")")),
@@ -695,7 +822,7 @@ mod tests {
 
     #[test]
     fn seatbelt_network_grant_omits_the_deny() {
-        let profile = seatbelt_profile(&[PathBuf::from("/ws")], &[], true);
+        let profile = seatbelt_profile(&[PathBuf::from("/ws")], &[], &[], true);
         assert!(!profile.contains("(deny network*)"));
         // The Apple-event deny is unconditional: there is no grant
         // axis for IPC to other applications.
@@ -709,7 +836,12 @@ mod tests {
     fn run_under_seatbelt(program: &str, args: &[&str]) -> std::process::Output {
         let workspace = tempfile::tempdir().expect("tempdir");
         let sandbox = Sandbox::resolve(workspace.path(), SandboxGrants::from_rule(None));
-        let profile = seatbelt_profile(&sandbox.writable(), &sandbox.protected(), false);
+        let profile = seatbelt_profile(
+            &sandbox.writable(),
+            &sandbox.protected(),
+            &sandbox.home_secrets(),
+            false,
+        );
         std::process::Command::new("/usr/bin/sandbox-exec")
             .arg("-p")
             .arg(&profile)
@@ -789,7 +921,12 @@ mod tests {
         std::fs::create_dir_all(root.join(".loom")).expect("loom dir");
 
         let sandbox = Sandbox::resolve(root, SandboxGrants::from_rule(None));
-        let profile = seatbelt_profile(&sandbox.writable(), &sandbox.protected(), false);
+        let profile = seatbelt_profile(
+            &sandbox.writable(),
+            &sandbox.protected(),
+            &sandbox.home_secrets(),
+            false,
+        );
         let run = |script: &str| {
             std::process::Command::new("/usr/bin/sandbox-exec")
                 .arg("-p")
@@ -841,10 +978,186 @@ mod tests {
         }
     }
 
+    /// F-08 regression: `open -g -j ./P.app` reached LaunchServices
+    /// through `(allow default)` and started the bundle *outside* the
+    /// sandbox (verified in the review with a real bundle). The
+    /// blanket mach deny must seal it: the launch fails and the
+    /// bundle's executable never runs. macOS integration check.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_blocks_launchservices_app_launch() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let root = workspace.path();
+        let app = root.join("P.app/Contents/MacOS");
+        std::fs::create_dir_all(&app).expect("bundle dir");
+        std::fs::write(
+            app.join("P"),
+            format!("#!/bin/sh\ntouch {}\n", root.join("probe").display()),
+        )
+        .expect("executable");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(app.join("P"), std::fs::Permissions::from_mode(0o755))
+                .expect("exec bit");
+        }
+        std::fs::write(
+            root.join("P.app/Contents/Info.plist"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+             \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\"><dict>\
+             <key>CFBundleExecutable</key><string>P</string>\
+             <key>CFBundleIdentifier</key><string>com.loomtest.P</string>\
+             </dict></plist>\n",
+        )
+        .expect("Info.plist");
+
+        let sandbox = Sandbox::resolve(root, SandboxGrants::from_rule(None));
+        let profile = seatbelt_profile(
+            &sandbox.writable(),
+            &sandbox.protected(),
+            &sandbox.home_secrets(),
+            false,
+        );
+        let output = std::process::Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(&profile)
+            .arg("--")
+            .arg("/usr/bin/open")
+            .arg("-g")
+            .arg("-j")
+            .arg(root.join("P.app"))
+            .output()
+            .expect("spawn under sandbox-exec");
+        // LaunchServices is unreachable, so `open` itself fails.
+        assert!(
+            !output.status.success(),
+            "open should not reach LaunchServices: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // The decisive assertion: even if a future macOS reports
+        // success, the bundle must never have run.
+        std::thread::sleep(std::time::Duration::from_millis(2_000));
+        assert!(
+            !root.join("probe").exists(),
+            "P.app launched outside the sandbox via LaunchServices"
+        );
+    }
+
+    /// F-11 regression: home credential material must be unreadable
+    /// from inside the sandbox. Skips (loudly) on hosts without
+    /// `~/.ssh` so it never reads the operator's real keys to pass.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_blocks_home_secret_reads() {
+        let home = std::env::var_os("HOME").expect("HOME set");
+        let ssh = std::path::Path::new(&home).join(".ssh");
+        if !ssh.exists() {
+            eprintln!("no ~/.ssh on this host; skipping");
+            return;
+        }
+        let output = run_under_seatbelt("/bin/ls", &[&ssh.to_string_lossy()]);
+        assert!(
+            !output.status.success(),
+            "~/.ssh must be unreadable from inside the sandbox"
+        );
+    }
+
     #[test]
     fn seatbelt_escapes_path_metacharacters() {
-        let profile = seatbelt_profile(&[PathBuf::from("/ws/na\"me\\dir")], &[], false);
+        let profile = seatbelt_profile(&[PathBuf::from("/ws/na\"me\\dir")], &[], &[], false);
         assert!(profile.contains("/ws/na\\\"me\\\\dir"));
+    }
+
+    #[test]
+    fn seatbelt_denies_launchservices_and_home_secrets() {
+        // F-08: the blanket mach deny is the LaunchServices seal; F-11:
+        // home credential material is denied read even under
+        // `(allow default)`.
+        let workspace = PathBuf::from("/ws");
+        let sandbox = Sandbox::resolve(&workspace, SandboxGrants::from_rule(None));
+        let profile = seatbelt_profile(
+            &[workspace],
+            &sandbox.protected(),
+            &sandbox.home_secrets(),
+            false,
+        );
+        assert!(profile.contains("(deny mach-lookup)"));
+        for program in ["/usr/bin/open", "/usr/bin/automator", "/usr/bin/shortcuts"] {
+            assert!(
+                profile.contains(&format!("(subpath \"{program}\")")),
+                "{program} exec deny missing from:\n{profile}"
+            );
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            for secret in [
+                ".ssh",
+                ".gnupg",
+                ".aws",
+                ".kube",
+                ".config/loom",
+                ".local/share/loom",
+            ] {
+                assert!(
+                    profile.contains(&format!(
+                        "(subpath \"{}\")",
+                        escape_seatbelt_path(&home.join(secret))
+                    )),
+                    "{secret} missing from the home-secrets deny in:\n{profile}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn grants_override_the_home_secrets_defaults() {
+        // The operator's escalation axis applies to secrets the same
+        // way it applies to control state: an explicitly granted
+        // writable dir (e.g. for sandboxed `ssh`) is not denied read.
+        let workspace = PathBuf::from("/ws");
+        let ssh = std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(".ssh"))
+            .expect("HOME set");
+        let grants = SandboxGrants {
+            enabled: true,
+            network: false,
+            extra_writable: vec![ssh.clone()],
+        };
+        let sandbox = Sandbox::resolve(&workspace, grants);
+        assert!(
+            !sandbox.home_secrets().contains(&ssh),
+            "granted ~/.ssh still denied: {:?}",
+            sandbox.home_secrets()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn writable_entries_are_canonicalized() {
+        // F-01: a grant spelled through a symlink must land in the
+        // writable set as its real path, or the Seatbelt subpath allow
+        // and the bwrap bind never match the child's syscalls.
+        let base = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(base.path().join("real")).expect("real dir");
+        std::os::unix::fs::symlink(base.path().join("real"), base.path().join("link"))
+            .expect("symlink");
+        let granted = base.path().join("link/pending/dir");
+        let sandbox = Sandbox::resolve(
+            base.path(),
+            SandboxGrants {
+                enabled: true,
+                network: false,
+                extra_writable: vec![granted],
+            },
+        );
+        let expected = base.path().join("real").canonicalize().expect("canonical");
+        let expected = expected.join("pending/dir");
+        assert!(
+            sandbox.writable().contains(&expected),
+            "canonical grant path missing from {:?}",
+            sandbox.writable()
+        );
     }
 
     #[test]
@@ -864,8 +1177,7 @@ mod tests {
             .map(PathBuf::from)
             .chain(std::iter::once(PathBuf::from("/loom-absent-granted-dir")))
             .collect();
-        let protected =
-            Sandbox::resolve(Path::new("/ws"), SandboxGrants::from_rule(None)).protected();
+        let sandbox = Sandbox::resolve(Path::new("/ws"), SandboxGrants::from_rule(None));
         bubblewrap_argv(
             "cargo",
             &["build".to_owned(), "--release".to_owned()],
@@ -874,7 +1186,8 @@ mod tests {
                 optional: &optional,
                 temp: Path::new("/tmp"),
             },
-            &protected,
+            &sandbox.protected(),
+            &sandbox.home_secrets(),
             network,
             Some("/home/dev"),
         )
@@ -981,6 +1294,38 @@ mod tests {
                     "control-state bind before a writable bind in {argv:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn bubblewrap_masks_home_secrets_with_an_empty_tmpfs() {
+        // F-11 parity on Linux: the home dir is read-only-mounted
+        // whole, so `~/.ssh` et al. need their own tmpfs shadow to
+        // read empty instead of credential material. `home_secrets()`
+        // derives from the process HOME, so assert against that.
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("HOME set");
+        let argv = bwrap_argv(false, Some("/home/dev/.cargo"));
+        let tmpfs: Vec<String> = argv
+            .iter()
+            .enumerate()
+            .filter(|(_, arg)| arg.as_str() == "--tmpfs")
+            .map(|(index, _)| argv[index + 1].clone())
+            .collect();
+        for secret in [
+            home.join(".ssh"),
+            home.join(".gnupg"),
+            home.join(".aws"),
+            home.join(".kube"),
+            home.join(".config/loom"),
+            home.join(".local/share/loom"),
+        ] {
+            assert!(
+                tmpfs.contains(&secret.to_string_lossy().into_owned()),
+                "{} not masked by a tmpfs in {argv:?}",
+                secret.display()
+            );
         }
     }
 

@@ -508,7 +508,21 @@ resolved once at `Engine::open`, is the *escalation* layer on top.
   bind that must exist (a missing workspace is a misconfiguration and
   fails loudly); every other writable grant is bound tolerantly, so a
   host with no `~/.cargo` and no `CARGO_HOME` — containers, CI —
-  still gets a sandbox instead of a failed spawn.
+  still gets a sandbox instead of a failed spawn. Every writable
+  entry — workspace, temp, cargo home, `CARGO_TARGET_DIR`, manifest
+  grants — is canonicalized as far as it exists before it enters the
+  profile or the bind list, so a grant spelled through a symlink
+  (`/tmp/…` vs macOS `/private/tmp/…`) still matches the child's
+  real syscalls instead of falling through to the blanket deny
+  (review F-01: a symlinked `CARGO_TARGET_DIR` failed every
+  sandboxed cargo run before this).
+- Home credential material is denied read inside the sandbox
+  (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.netrc`,
+  `~/.git-credentials`, loom's own database and config, and on macOS
+  the on-disk keychain stores) — a sandboxed child cannot exfiltrate
+  credentials it should never need (Seatbelt `deny file-read*`
+  subpaths; bwrap `--tmpfs` shadows). An operator's `extra_writable`
+  grant covering a secret is the explicit opt-out.
 - Network denied by default.
 - The wrapper leads the process group (existing bounded capture and
   group kill unchanged), and the confinement is inherited by every
@@ -527,6 +541,12 @@ resolved once at `Engine::open`, is the *escalation* layer on top.
   green while the Linux flags are missing.
 - Bare names are resolved on `PATH` before wrapping, so a missing
   program fails with the same legible error as before.
+- The macOS profile additionally carries a blanket
+  `(deny mach-lookup)`: it is the seal against LaunchServices escapes
+  (`open -g -j ./P.app` could otherwise start a bundle outside the
+  sandbox; named per-service denials do not enforce on current macOS).
+  Verified not to disturb the profile's purpose: git, cargo builds,
+  python, and DNS/HTTP under a network grant all run under it.
 
 **Escalation** (`.loom/commands.toml`, `[[command]]` rules keyed by
 bare program name): `network = true` lifts the network deny;
