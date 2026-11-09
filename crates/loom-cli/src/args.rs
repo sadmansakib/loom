@@ -48,6 +48,20 @@ pub enum Command {
     /// session through the real compiler under different prune knobs
     /// (`docs/replay-context-design.md`).
     ReplayContext(ReplayContextArgs),
+    /// Review and pin workspace manifests (`.loom/commands.toml`,
+    /// `.loom/verify.toml`, `.loom/mcp.toml`): unpinned manifests
+    /// load without their escalation grants.
+    Trust(TrustArgs),
+}
+
+/// Arguments for `loom trust`.
+#[derive(Debug, Args)]
+pub struct TrustArgs {
+    /// The workspace to pin (default: the current directory).
+    pub workspace: Option<PathBuf>,
+    /// Show each manifest's trust state without pinning anything.
+    #[arg(long)]
+    pub status: bool,
 }
 
 /// Arguments for `loom run`.

@@ -51,6 +51,13 @@ fn verify_mock_runner() {
 
 /// A cargo workspace with a runner manifest pointing at the mock.
 fn workspace() -> PathBuf {
+    // The trust gate must honor this runner manifest (review F-02: a
+    // repo-shipped `verify.toml` refuses until pinned). Point the
+    // store at a per-process temp file before any loom code resolves
+    // it, then pin the manifest just written.
+    loom_tools::trust::use_store(
+        std::env::temp_dir().join(format!("loom-trust-verify-{}.toml", std::process::id())),
+    );
     let dir = std::env::temp_dir().join(format!(
         "loom-verify-runner-test-{}-{:x}",
         std::process::id(),
@@ -69,6 +76,7 @@ fn workspace() -> PathBuf {
         ),
     )
     .unwrap();
+    loom_tools::trust::pin(&dir).unwrap();
     dir
 }
 

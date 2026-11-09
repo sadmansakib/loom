@@ -914,6 +914,21 @@ pub async fn attach_mcp(workspace: &Path, budgets: crate::budget::ToolBudgets) -
             return McpAttachment::default();
         }
     };
+    // Manifest servers are *spawned processes with declared
+    // environments* — the same power class as the command policy's
+    // escalations, so the trust gate applies here too (review
+    // F-02/F-12): a repo-shipped `.loom/mcp.toml` attaches nothing
+    // until the operator pins it (`loom trust`).
+    if crate::trust::TrustGate::open().decide(workspace, MANIFEST_RELATIVE_PATH)
+        == crate::trust::Trust::Untrusted
+    {
+        tracing::warn!(
+            path = %manifest_path.display(),
+            "MCP manifest not pinned in the trust store; attaching no servers \
+             (run `loom trust` to review and pin)"
+        );
+        return McpAttachment::default();
+    }
     let manifest = match McpManifest::parse(&text) {
         Ok(manifest) => manifest,
         Err(error) => {

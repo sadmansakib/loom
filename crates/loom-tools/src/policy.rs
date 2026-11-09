@@ -250,6 +250,11 @@ pub struct CommandPolicy {
     rules: Vec<CommandRule>,
     unknown: PolicyVerdict,
     denied: Vec<String>,
+    /// Set when the manifest was loaded *restrictively* because the
+    /// operator has not pinned it in the trust store (review
+    /// F-02/F-12): every escalation field was stripped. Diagnostic
+    /// surface, not a branch callers are expected to inspect.
+    restricted_manifest: bool,
 }
 
 impl CommandPolicy {
@@ -260,6 +265,7 @@ impl CommandPolicy {
             rules: vec![CommandRule::bare("cargo")],
             unknown: PolicyVerdict::Allow,
             denied: Vec::new(),
+            restricted_manifest: false,
         }
     }
 
@@ -275,6 +281,7 @@ impl CommandPolicy {
             rules: programs.into_iter().map(CommandRule::bare).collect(),
             unknown: PolicyVerdict::Allow,
             denied: Vec::new(),
+            restricted_manifest: false,
         }
     }
 
@@ -441,6 +448,13 @@ impl CommandPolicy {
     /// manifest that exists but is unreadable or invalid is an error —
     /// a policy that silently degrades to default would widen
     /// execution behind the operator's back.
+    ///
+    /// A manifest the operator has not pinned in the trust store
+    /// (review F-02/F-12: a cloned repo *ships* `.loom/commands.toml`)
+    /// loads *restrictively*: rules survive with their limits and the
+    /// deny list, but every escalation field — `sandbox = false`,
+    /// `network = true`, `extra_writable`, `env_allow` — is stripped.
+    /// `loom trust` pins the reviewed manifest and restores it.
     pub fn from_manifest(root: &Path) -> Result<Self, PolicyError> {
         let path = root.join(MANIFEST_RELATIVE_PATH);
         let text = match std::fs::read_to_string(&path) {
@@ -455,13 +469,49 @@ impl CommandPolicy {
                 });
             }
         };
-        Self::parse(&text).map_err(|error| match error {
+        let policy = Self::parse(&text).map_err(|error| match error {
             PolicyError::Invalid { message, .. } => PolicyError::Invalid {
                 path: path.display().to_string(),
                 message,
             },
             other => other,
-        })
+        })?;
+        match crate::trust::TrustGate::open().decide(root, MANIFEST_RELATIVE_PATH) {
+            crate::trust::Trust::Trusted | crate::trust::Trust::Absent => Ok(policy),
+            crate::trust::Trust::Untrusted => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "commands manifest not pinned in the trust store; \
+                     loading without escalation fields (run `loom trust` to review and pin)"
+                );
+                Ok(policy.restricted())
+            }
+        }
+    }
+
+    /// The escalation-stripped form of this policy for an unpinned
+    /// manifest (review F-02/F-12). Keeps: the program allowlist,
+    /// `timeout_secs`, `max_output_bytes`, `env_scrub`, the deny
+    /// list, and the unknown-verdict (all limit, never widen).
+    /// Strips: `sandbox = false`, `network = true`, `extra_writable`,
+    /// `env_allow` — the fields that grant anything.
+    #[must_use]
+    pub(crate) fn restricted(mut self) -> Self {
+        for rule in &mut self.rules {
+            rule.network = false;
+            rule.sandbox = true;
+            rule.extra_writable.clear();
+            rule.env_allow.clear();
+        }
+        self.restricted_manifest = true;
+        self
+    }
+
+    /// Whether this policy was loaded restrictively from an unpinned
+    /// manifest (diagnostics; see [`Self::from_manifest`]).
+    #[must_use]
+    pub fn is_restricted(&self) -> bool {
+        self.restricted_manifest
     }
 }
 
@@ -618,6 +668,42 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let policy = CommandPolicy::from_manifest(dir.path()).expect("default");
         assert_eq!(policy, CommandPolicy::cargo_only());
+    }
+
+    #[test]
+    fn an_unpinned_manifest_loads_without_escalation() {
+        // Review F-12: a repo-shipped `.loom/commands.toml` declaring
+        // `sandbox = false`/`network = true` must not load those grants
+        // until the operator pins it. `use_store` keeps the test off
+        // the operator's real store.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".loom")).expect("mkdir");
+        std::fs::write(
+            dir.path().join(MANIFEST_RELATIVE_PATH),
+            "[[command]]\nprogram = \"curl\"\nnetwork = true\nsandbox = false\n\
+             extra_writable = [\"/etc\"]\nenv_allow = [\"CI_TOKEN\"]\ntimeout_secs = 30\n",
+        )
+        .expect("manifest");
+        crate::trust::use_store(dir.path().join("trust.toml"));
+        let policy = CommandPolicy::from_manifest(dir.path()).expect("loads restrictively");
+        assert!(
+            policy.is_restricted(),
+            "unpinned manifest must be restricted"
+        );
+        let rule = policy.rule("curl").expect("the program allowlist survives");
+        assert!(!rule.network, "network grant stripped");
+        assert!(rule.sandbox, "sandbox-off grant stripped");
+        assert!(rule.extra_writable.is_empty(), "writable grants stripped");
+        assert!(rule.env_allow.is_empty(), "credential exemptions stripped");
+        assert_eq!(rule.timeout_secs, Some(30), "limits survive");
+
+        // Pinning the reviewed manifest restores it in full.
+        crate::trust::pin(dir.path()).expect("pin");
+        let policy = CommandPolicy::from_manifest(dir.path()).expect("loads after pin");
+        assert!(!policy.is_restricted());
+        let rule = policy.rule("curl").expect("rule survives");
+        assert!(rule.network && !rule.sandbox, "escalations restored");
+        assert_eq!(rule.extra_writable, vec!["/etc".to_owned()]);
     }
 
     #[test]

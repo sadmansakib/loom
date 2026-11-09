@@ -85,18 +85,41 @@ pub(crate) struct RunnerOutcome {
 ///
 /// `Ok(None)` means no manifest: local verification, byte-identical to
 /// today. Any present-but-unusable manifest is an error so callers can
-/// fail closed.
+/// fail closed. That includes a manifest the operator has not pinned
+/// in the trust store (review F-02): the runner executes *unsandboxed
+/// on the host*, so a repo-shipped `verify.toml` is exactly the
+/// payload the gate exists for — verification is unavailable until the
+/// operator reviews and pins it (`loom trust`) or deletes it.
 pub(crate) fn runner_for(root: &Path) -> Result<Option<VerifyRunner>, String> {
+    runner_for_under(root, &crate::trust::TrustGate::open())
+}
+
+/// `runner_for` with an explicit trust gate, so in-crate tests can
+/// pin the tempdir workspaces they construct.
+pub(crate) fn runner_for_under(
+    root: &Path,
+    gate: &crate::trust::TrustGate,
+) -> Result<Option<VerifyRunner>, String> {
     let path = root.join(MANIFEST);
     if !path.is_file() {
         return Ok(None);
     }
+    // Validate first, gate the return: an invalid manifest reports its
+    // validation error either way, and only a *valid* untrusted one
+    // reports the trust error. Both fail closed.
     let text = std::fs::read_to_string(&path)
         .map_err(|error| format!("cannot read {MANIFEST}: {error}"))?;
     let manifest: Manifest =
         toml::from_str(&text).map_err(|error| format!("invalid {MANIFEST}: {error}"))?;
     let runner = VerifyRunner::new(&manifest.runner.command)
         .map_err(|error| format!("invalid {MANIFEST}: {error}"))?;
+    if gate.decide(root, MANIFEST) == crate::trust::Trust::Untrusted {
+        return Err(format!(
+            "{MANIFEST} is present but not pinned in the trust store, and a runner \
+             executes unsandboxed on the host — review it, then `loom trust` to pin \
+             it, or delete it"
+        ));
+    }
     Ok(Some(runner))
 }
 
@@ -262,7 +285,12 @@ mod tests {
             "[runner]\ncommand = 'docker run --rm {program} {args}'\n",
         )
         .expect("write");
-        let runner = runner_for(dir.path())
+        let gate = crate::trust::TrustGate::at(dir.path().join("trust.toml"));
+        let error =
+            runner_for_under(dir.path(), &gate).expect_err("unpinned manifest refuses the runner");
+        assert!(error.contains("not pinned"), "{error}");
+        gate.pin(dir.path()).expect("pin");
+        let runner = runner_for_under(dir.path(), &gate)
             .expect("valid manifest")
             .expect("runner");
         assert_eq!(runner.tokens.len(), 5);

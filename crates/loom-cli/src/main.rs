@@ -21,6 +21,7 @@ mod rewind_command;
 mod run;
 mod sessions_command;
 mod stats_command;
+mod trust_command;
 mod workspace;
 
 use args::{Cli, Command};
@@ -39,6 +40,7 @@ fn main() -> ExitCode {
         Command::Stats(args) => stats_command::run(args),
         Command::Lessons(args) => lessons_command::run(args),
         Command::ReplayContext(args) => replay_command::run(args),
+        Command::Trust(args) => trust_command::run(args),
     };
 
     match outcome {

@@ -552,7 +552,17 @@ resolved once at `Engine::open`, is the *escalation* layer on top.
 bare program name): `network = true` lifts the network deny;
 `extra_writable = ["/abs/path"]` adds writable roots (absolute paths
 only, validated); `sandbox = false` runs unsandboxed — for trusted,
-sandbox-incompatible tools only. The old limits still apply:
+sandbox-incompatible tools only. **Escalation fields load only from a
+pinned manifest**: the manifest's SHA-256 must be recorded in the
+operator's trust store (`~/.config/loom/trust.toml`, outside every
+workspace; `loom trust` reviews and pins, `--status` inspects) — an
+unpinned or edited-since-pinning manifest keeps its limits and deny
+list but loads with every escalation stripped, so a cloned repo
+cannot ship itself execution power (review F-02/F-12). The same gate
+sits in front of the other two manifests: an unpinned
+`.loom/verify.toml` refuses to run its (host-executed) runner, and an
+unpinned `.loom/mcp.toml` attaches no servers. The old limits still
+apply:
 `timeout_secs` (≤ 3600; on expiry the whole process group is killed
 and the call fails visibly), `max_output_bytes` (per-stream head/tail
 window, ≤ 1 MiB), and `env_scrub` (extra variables removed from the

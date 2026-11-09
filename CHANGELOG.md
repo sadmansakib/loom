@@ -3,6 +3,25 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Adversarial review round 2: manifest trust gate (PR4)
+
+- `feat(tools,cli)`: workspace manifests now load through an operator
+  trust store (review F-02/F-12 — the *shipped* malicious manifest,
+  the case PR1's write gate could not cover). `.loom/commands.toml`,
+  `.loom/verify.toml`, and `.loom/mcp.toml` are honored in full only
+  when their SHA-256 is pinned in `~/.config/loom/trust.toml` (path
+  outside every workspace; `LOOM_TRUST_FILE` overrides for tests and
+  harnesses). Unpinned or edited-since-pinning: the command policy
+  keeps its program allowlist, limits, and deny list but loads with
+  every escalation field stripped (`sandbox = false`, `network =
+  true`, `extra_writable`, `env_allow`); the verify runner refuses to
+  run (it executes unsandboxed on the host); MCP manifests attach no
+  servers. New `loom trust` subcommand reviews and pins (or
+  `--status`); the store is per-workspace-path, digest-keyed, written
+  atomically under a mutex. A `.loom/mcp.toml` allowlist remains an
+  explicit operator opt-in — the gate just checks the operator
+  actually saw the bytes.
+
 ## 2026-11 — Adversarial review round 2: sandbox LaunchServices seal, home secrets, canonical grants (PR3)
 
 - `fix(tools)`: the Seatbelt profile now carries a blanket

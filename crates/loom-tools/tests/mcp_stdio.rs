@@ -297,6 +297,13 @@ fn call_result(tool: &str) -> &'static str {
 // -------------------------------------------------------------- helpers ----
 
 fn workspace(name: &str) -> PathBuf {
+    // The trust gate must honor these test manifests (review F-02:
+    // repo-shipped manifests load restrictively until pinned). Point
+    // the store at a per-process temp file before any loom code
+    // resolves it, then pin inside `manifest`.
+    loom_tools::trust::use_store(
+        std::env::temp_dir().join(format!("loom-trust-mcp-{}.toml", std::process::id())),
+    );
     let dir = std::env::temp_dir().join(format!("loom-mcp-test-{}-{name}", std::process::id()));
     std::fs::create_dir_all(dir.join(".loom")).unwrap();
     dir
@@ -313,6 +320,9 @@ fn manifest(dir: &Path, server_mode: &str, extra: &str) {
         mock_command()
     );
     std::fs::write(dir.join(".loom/mcp.toml"), body).unwrap();
+    // The digest changed with the write: re-pin so `attach_mcp` honors
+    // this exact manifest.
+    loom_tools::trust::pin(dir).unwrap();
 }
 
 fn build_runtime() -> tokio::runtime::Runtime {
@@ -694,6 +704,7 @@ fn cross_server_references_are_rejected() {
         mock_command()
     );
     std::fs::write(dir.join(".loom/mcp.toml"), body).unwrap();
+    loom_tools::trust::pin(&dir).unwrap();
     let menu = menu_of(&dir);
     // The shadowing tool that names another server is rejected; its
     // well-behaved sibling and the clean server survive.
@@ -722,6 +733,7 @@ fn changed_tool_definitions_are_quarantined_by_the_lock() {
             ),
     )
     .unwrap();
+    loom_tools::trust::pin(&dir).unwrap();
     let second = menu_of(&dir);
     assert!(!second.contains("mcp_mock_shifting"));
     assert!(second.contains("mcp_mock_steady"));
@@ -746,6 +758,7 @@ fn changed_server_args_are_quarantined_by_the_lock() {
         body.replace("\"--nocapture\"]", "\"--nocapture\", \"--nocapture\"]"),
     )
     .unwrap();
+    loom_tools::trust::pin(&dir).unwrap();
     let second = attach(&dir);
     assert!(
         !second.iter().any(|(name, _)| name == "mcp_mock_greet"),
@@ -834,6 +847,7 @@ fn proxy_manifest(dir: &Path, port: u16, network: bool) {
         if network { "network = true" } else { "" },
     );
     std::fs::write(dir.join(".loom/mcp.toml"), toml).unwrap();
+    loom_tools::trust::pin(dir).unwrap();
 }
 
 #[test]

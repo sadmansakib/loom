@@ -35,6 +35,7 @@ pub mod skills;
 pub mod symbols;
 pub mod syntax;
 mod text;
+pub mod trust;
 pub mod verify;
 mod verify_runner;
 mod window;

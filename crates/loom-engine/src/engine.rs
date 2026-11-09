@@ -3181,6 +3181,15 @@ mod tests {
             "[[command]]\nprogram = \"echo\"\nsandbox = false\n",
         )
         .expect("manifest");
+        // The escalation above (`sandbox = false`) only loads when the
+        // manifest is pinned in the trust store (review F-12): pin it
+        // into a per-process store so the passthrough notice fires.
+        // Single test in this binary uses the override, so the
+        // process-wide pointer cannot race another reader.
+        loom_tools::trust::use_store(
+            std::env::temp_dir().join(format!("loom-trust-engine-{}.toml", std::process::id())),
+        );
+        loom_tools::trust::pin(&workspace).expect("pin manifest");
         let mut config = test_config();
         config.workspace = workspace.clone();
         config.db_path = base.path().join("loom.db");
