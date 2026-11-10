@@ -333,20 +333,43 @@ impl EventStore for MemoryEventStore {
 /// persisting event sink keeps.
 pub type SharedEventStore = Arc<dyn EventStore>;
 
+/// The read-side integrity check shared by every [`ArtifactStore`]
+/// implementation (review S2): a body must still hash to its recorded
+/// `sha256` before it is returned. Refusal beats best-effort — a body
+/// that drifted (bit rot, a hand-edited blob, a foreign store) never
+/// reaches a restore.
+pub fn verify_body_hash(id: &ArtifactId, recorded: &str, body: &[u8]) -> Result<(), StoreError> {
+    let computed = crate::artifact::sha256_hex(body);
+    if computed == recorded {
+        return Ok(());
+    }
+    Err(StoreError::Corrupt(format!(
+        "artifact {id} body hashes to {computed} but its record says {recorded}; \
+         refusing to return a body that drifted from its content address"
+    )))
+}
+
 /// Stores artifact bodies addressed by [`ArtifactId`] (ADR-012).
 ///
 /// Kept separate from [`SessionStore`] because the two are written in the same
 /// transaction by the SQLite implementation but read independently: the loop
 /// only needs session append during a run, while `artifact_read` (2D) only
 /// needs lookup.
+///
+/// Read integrity is part of the contract (review S2): `get` and
+/// `find_by_sha256` verify the body still hashes to the recorded
+/// `sha256` before returning it — a body that drifted (bit rot, a
+/// hand-edited blob, a foreign store) surfaces as
+/// [`StoreError::Corrupt`] instead of flowing into restores.
 pub trait ArtifactStore: Send + Sync {
     /// Stores a body. Storing the same id twice replaces the row.
     fn put(&self, artifact: &StoredArtifact) -> Result<(), StoreError>;
 
-    /// Fetches a body by id.
+    /// Fetches a body by id, verifying its content hash first.
     fn get(&self, id: &ArtifactId) -> Result<Option<StoredArtifact>, StoreError>;
 
-    /// Finds a body by content hash, for deduplication.
+    /// Finds a body by content hash, for deduplication; the body
+    /// returned is verified to still hash to `sha256`.
     fn find_by_sha256(&self, sha256: &str) -> Result<Option<StoredArtifact>, StoreError>;
 
     /// Lists every artifact's metadata, oldest first. Bodies are not
@@ -592,15 +615,24 @@ impl ArtifactStore for MemoryArtifactStore {
     }
 
     fn get(&self, id: &ArtifactId) -> Result<Option<StoredArtifact>, StoreError> {
-        Ok(self.lock()?.get(id).map(|(artifact, _)| artifact.clone()))
+        let guard = self.lock()?;
+        let Some((artifact, _)) = guard.get(id) else {
+            return Ok(None);
+        };
+        verify_body_hash(id, &artifact.sha256, &artifact.body)?;
+        Ok(Some(artifact.clone()))
     }
 
     fn find_by_sha256(&self, sha256: &str) -> Result<Option<StoredArtifact>, StoreError> {
-        Ok(self
-            .lock()?
+        let guard = self.lock()?;
+        let Some((artifact, _)) = guard
             .values()
             .find(|(artifact, _)| artifact.sha256 == sha256)
-            .map(|(artifact, _)| artifact.clone()))
+        else {
+            return Ok(None);
+        };
+        verify_body_hash(&artifact.id, &artifact.sha256, &artifact.body)?;
+        Ok(Some(artifact.clone()))
     }
 
     fn list(&self) -> Result<Vec<ArtifactStat>, StoreError> {
@@ -904,13 +936,45 @@ mod tests {
     fn artifact_store_round_trips_and_finds_by_hash() {
         let store = MemoryArtifactStore::new();
         let id = ArtifactId::new();
-        let artifact = StoredArtifact::new(id, "read_file", "abc123", b"hello".to_vec());
+        let sha = crate::artifact::sha256_hex(b"hello");
+        let artifact = StoredArtifact::new(id, "read_file", sha.clone(), b"hello".to_vec());
         assert_eq!(artifact.bytes, 5);
         store.put(&artifact).unwrap();
 
         assert_eq!(store.get(&id).unwrap(), Some(artifact.clone()));
-        assert_eq!(store.find_by_sha256("abc123").unwrap(), Some(artifact));
+        assert_eq!(store.find_by_sha256(&sha).unwrap(), Some(artifact));
         assert_eq!(store.find_by_sha256("missing").unwrap(), None);
         assert_eq!(store.get(&ArtifactId::new()).unwrap(), None);
+    }
+
+    #[test]
+    fn a_drifted_artifact_body_refuses_instead_of_returning() {
+        // Review S2: `put` trusts the caller's sha (the kernel computes
+        // it); `get` verifies it against the body before anything
+        // flows back out — a body swapped out from under its record
+        // refuses rather than feeds a restore.
+        let store = MemoryArtifactStore::new();
+        let id = ArtifactId::new();
+        let sha = crate::artifact::sha256_hex(b"original");
+        store
+            .put(&StoredArtifact::new(
+                id,
+                "read_file",
+                sha.clone(),
+                b"original".to_vec(),
+            ))
+            .unwrap();
+        store
+            .put(&StoredArtifact::new(
+                id,
+                "read_file",
+                sha.clone(),
+                b"tampered".to_vec(),
+            ))
+            .unwrap();
+        let error = store.get(&id).unwrap_err();
+        assert!(matches!(error, StoreError::Corrupt(_)), "{error:?}");
+        let error = store.find_by_sha256(&sha).unwrap_err();
+        assert!(matches!(error, StoreError::Corrupt(_)), "{error:?}");
     }
 }

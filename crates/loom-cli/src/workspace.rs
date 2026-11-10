@@ -362,6 +362,55 @@ fn ensure_safe_restore_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// A restore must not write *through* a symlink (review S1): a
+/// sandboxed model can plant `ln -s ~/.ssh/authorized_keys victim.txt`
+/// inside the workspace and let a later rewind "restore" a pre-image
+/// straight out of it. Every component of the target — intermediate
+/// directories and the final entry alike — must be a real path, not a
+/// link. Components below a missing one cannot exist, so the walk
+/// stops at the first miss.
+fn ensure_no_symlink_traversal(workspace: &Path, relative: &str) -> Result<()> {
+    let mut cursor = workspace.to_path_buf();
+    for segment in relative.split('/').filter(|segment| !segment.is_empty()) {
+        cursor.push(segment);
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(meta) if meta.file_type().is_symlink() => bail!(
+                "\"{relative}\" passes through the symlink {} — refusing to \
+                 restore through it; delete the link if it is not yours",
+                cursor.display()
+            ),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    Ok(())
+}
+
+/// Writes a restored pre-image through a temp file in the target's
+/// own directory, then renames it into place. A rename replaces the
+/// target's directory entry itself, so even a link planted in the
+/// race window between the traversal check and the write is
+/// *replaced*, never followed out of the workspace (review S1).
+fn restore_via_rename(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let parent = target
+        .parent()
+        .ok_or_else(|| std::io::Error::other("restore target has no parent directory"))?;
+    let temp = parent.join(format!(
+        ".loom-restore-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::write(&temp, bytes)?;
+    match std::fs::rename(&temp, target) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(error)
+        }
+    }
+}
+
 /// Checks everything a tier-2 boundary restore claims, read-only, and
 /// returns the plan. Invariant 2 — refusal beats best-effort — wants
 /// refusals BEFORE the fork runs, so the caller plans first and applies
@@ -370,9 +419,11 @@ fn ensure_safe_restore_path(path: &str) -> Result<()> {
 /// Refuses when the recorded workspace is gone; when a first-touched
 /// path has no pre-image entry (its touch predates tier-2 capture or
 /// ran without an artifact store — a missing entry is an honest "not
-/// provable", never a guess); and when a path would escape the
+/// provable", never a guess); when a path would escape the
 /// workspace or land inside `.loom/rewind` (a restore must never
-/// destroy its own recovery snapshots).
+/// destroy its own recovery snapshots); and when any component of a
+/// target path is a symlink (a planted link would otherwise carry the
+/// restored bytes outside the workspace — review S1).
 pub fn plan_boundary_restore(
     session: &Session,
     boundary: u32,
@@ -392,6 +443,7 @@ pub fn plan_boundary_restore(
     let mut entries = Vec::with_capacity(first_touch.len());
     for (path, image) in &first_touch {
         ensure_safe_restore_path(path)?;
+        ensure_no_symlink_traversal(workspace, path)?;
         let Some(image) = image else {
             bail!(
                 "no pre-image was captured for \"{path}\" (its first touch \
@@ -420,6 +472,10 @@ pub fn plan_boundary_restore(
 /// Every write is proven: the pre-image body comes from the artifact
 /// store, and its sha256 must match the recorded reference — a body
 /// that drifted (foreign store, bit rot) refuses rather than writes.
+/// No path is written through a symlink: each entry's components are
+/// re-checked at apply time (the plan ran before the fork), and the
+/// write itself is a directory-entry rename that replaces a link
+/// instead of following it (review S1).
 pub fn apply_boundary_restore(
     plan: &BoundaryRestorePlan,
     artifacts: &dyn ArtifactStore,
@@ -476,6 +532,9 @@ pub fn apply_boundary_restore(
         .with_context(|| "writing the snapshot manifest")?;
 
     for entry in &plan.entries {
+        // Re-checked here because the plan ran before the fork: a link
+        // planted in that window must still refuse (review S1).
+        ensure_no_symlink_traversal(&plan.workspace, &entry.path)?;
         let target = plan.workspace.join(&entry.path);
         match &entry.content {
             // Absent at the boundary: the entry positively claims the
@@ -520,7 +579,7 @@ pub fn apply_boundary_restore(
                     std::fs::create_dir_all(parent)
                         .with_context(|| format!("creating {}", parent.display()))?;
                 }
-                std::fs::write(&target, &stored.body).with_context(|| {
+                restore_via_rename(&target, &stored.body).with_context(|| {
                     format!("restoring {} from its pre-image", target.display())
                 })?;
             }
@@ -853,6 +912,66 @@ mod tests {
         assert!(
             manifest.contains("\"existed\": true") && manifest.contains("notes.txt"),
             "manifest should record what existed: {manifest}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn boundary_plan_refuses_a_planted_intermediate_symlink() {
+        // Review S1: a sandboxed model can plant a symlink inside the
+        // workspace (`ln -s` is a plain command); restoring "through"
+        // it would carry the pre-image's bytes to the link's victim
+        // outside the workspace. Here `src` itself is the link.
+        let artifacts = MemoryArtifactStore::new();
+        let session = boundary_session(&artifacts, false);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "precious\n").expect("victim");
+        std::os::unix::fs::symlink("victim.txt", dir.path().join("src")).expect("link");
+
+        let error =
+            plan_boundary_restore(&session, 2, dir.path()).expect_err("intermediate symlink");
+        assert!(
+            error.to_string().contains("passes through the symlink"),
+            "error said: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read"),
+            "precious\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn boundary_apply_rechecks_a_symlink_planted_after_the_plan() {
+        // The plan runs before the fork; the model can plant the link
+        // in that window. Apply re-checks each entry before writing
+        // and refuses — the victim keeps its bytes (review S1's race
+        // window), and the write itself is a rename that would
+        // replace a link rather than follow it.
+        let artifacts = MemoryArtifactStore::new();
+        let session = boundary_session(&artifacts, false);
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("dirs");
+        std::fs::write(dir.path().join("src/lib.rs"), "new lib\n").expect("write");
+        std::fs::write(dir.path().join("notes.txt"), "late notes\n").expect("write");
+
+        let plan = plan_boundary_restore(&session, 2, dir.path()).expect("provable plan");
+
+        // The window: swap lib.rs for a link to the victim.
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "precious\n").expect("victim");
+        std::fs::remove_file(dir.path().join("src/lib.rs")).expect("clear");
+        std::os::unix::fs::symlink("../victim.txt", dir.path().join("src/lib.rs")).expect("link");
+
+        let error = apply_boundary_restore(&plan, &artifacts).expect_err("recheck");
+        assert!(
+            error.to_string().contains("passes through the symlink"),
+            "error said: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read"),
+            "precious\n"
         );
     }
 

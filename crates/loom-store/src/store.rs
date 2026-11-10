@@ -9,7 +9,7 @@ use loom_kernel::id::{ArtifactId, SessionId};
 use loom_kernel::session::{PlannedTurn, Session, TaskRecord, TodoList};
 use loom_kernel::store::{
     ArtifactStat, ArtifactStore, EventStore, ForkProvenance, SessionStore, StartCheckpoint,
-    StoreError, StoredArtifact,
+    StoreError, StoredArtifact, verify_body_hash,
 };
 use loom_kernel::transcript::{Item, ItemIndex};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -628,7 +628,14 @@ impl ArtifactStore for SqliteStore {
             )
             .optional()
             .map_err(backend)?;
-        Ok(row.map(|(sha256, kind, body)| StoredArtifact::new(*id, kind, sha256, body)))
+        let Some((sha256, kind, body)) = row else {
+            return Ok(None);
+        };
+        // The recorded hash is metadata; the body is what gets written
+        // into files. Verify one against the other on every read
+        // (review S2) so a drifted blob refuses instead of restoring.
+        verify_body_hash(id, &sha256, &body)?;
+        Ok(Some(StoredArtifact::new(*id, kind, sha256, body)))
     }
 
     fn find_by_sha256(&self, sha256: &str) -> Result<Option<StoredArtifact>, StoreError> {
@@ -651,7 +658,8 @@ impl ArtifactStore for SqliteStore {
             return Ok(None);
         };
         let id = raw_id.parse::<ArtifactId>().map_err(corrupt)?;
-        Ok(Some(StoredArtifact::new(id, kind, sha256, body)))
+        verify_body_hash(&id, sha256, &body)?;
+        Ok(Some(StoredArtifact::new(id, kind, sha256.to_owned(), body)))
     }
 
     fn list(&self) -> Result<Vec<ArtifactStat>, StoreError> {

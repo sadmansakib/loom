@@ -3,6 +3,24 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Adversarial review round 2: rewind + artifact integrity (PR7)
+
+- `fix(cli)`: a tier-2 boundary restore no longer writes through
+  symlinks (review S1). A sandboxed model can plant
+  `ln -s ~/.ssh/authorized_keys victim.txt` inside the workspace and
+  let the next rewind "restore" a pre-image straight out of it;
+  planning now refuses any entry whose path passes through a symlink
+  (intermediate directories included), apply re-checks each entry in
+  the fork window, and the restore write itself is a same-directory
+  temp-file + rename, which replaces a link instead of following it.
+- `fix(kernel,store)`: artifact reads now verify the body still
+  hashes to its recorded sha256 (review S2 — the sha column was
+  metadata a restore trusted blindly). Both the SQLite and memory
+  stores re-hash on `get`/`find_by_sha256` and return
+  `StoreError::Corrupt` on drift (bit rot, a hand-edited blob, a
+  foreign store), so a drifted pre-image refuses instead of landing
+  in a file.
+
 ## 2026-11 — Adversarial review round 2: batch-edit spans + path overlap (PR6)
 
 - `fix(tools)`: a batch edit whose `old_string` swallowed an earlier

@@ -6,6 +6,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use loom_kernel::artifact::sha256_hex;
 use loom_kernel::event::{EVENT_SCHEMA_VERSION, EventEnvelope, EventKind};
 use loom_kernel::id::{ArtifactId, SessionId, TaskId};
 use loom_kernel::model::StopReason;
@@ -217,20 +218,68 @@ fn a_lease_for_an_unknown_session_is_corrupt() {
 fn artifacts_round_trip_and_are_findable_by_hash() {
     let store = SqliteStore::open_in_memory().unwrap();
     let id = ArtifactId::new();
-    let artifact = StoredArtifact::new(id, "tool_output", "abc123", b"body".to_vec());
+    // The recorded sha must be the body's real content hash: reads
+    // verify it (review S2).
+    let sha = sha256_hex(b"body");
+    let artifact = StoredArtifact::new(id, "tool_output", sha.clone(), b"body".to_vec());
     store.put(&artifact).unwrap();
 
     assert_eq!(store.get(&id).unwrap(), Some(artifact.clone()));
-    assert_eq!(store.find_by_sha256("abc123").unwrap(), Some(artifact));
+    assert_eq!(store.find_by_sha256(&sha).unwrap(), Some(artifact));
     assert!(store.get(&ArtifactId::new()).unwrap().is_none());
     assert!(store.find_by_sha256("missing").unwrap().is_none());
 }
 
 #[test]
+fn a_drifted_artifact_body_refuses_instead_of_returning() {
+    // Review S2: the sha column is metadata; the body is what a rewind
+    // restore writes. A blob that drifted from its content address
+    // (bit rot, a hand edit through the backend) must refuse, not
+    // round-trip.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("loom.db");
+    let store = SqliteStore::open(&db).unwrap();
+    let id = ArtifactId::new();
+    let sha = sha256_hex(b"original");
+    store
+        .put(&StoredArtifact::new(
+            id,
+            "pre_image",
+            sha.clone(),
+            b"original".to_vec(),
+        ))
+        .unwrap();
+    assert_eq!(store.get(&id).unwrap().unwrap().body, b"original".to_vec());
+
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE artifacts SET body = ?1 WHERE id = ?2",
+            rusqlite::params![b"tampered".to_vec(), id.to_string()],
+        )
+        .unwrap();
+
+    let error = store.get(&id).unwrap_err();
+    assert!(matches!(error, StoreError::Corrupt(_)), "{error:?}");
+    let error = store.find_by_sha256(&sha).unwrap_err();
+    assert!(matches!(error, StoreError::Corrupt(_)), "{error:?}");
+}
+
+#[test]
 fn artifact_listing_is_oldest_first_and_delete_removes_only_that_body() {
     let store = SqliteStore::open_in_memory().unwrap();
-    let older = StoredArtifact::new(ArtifactId::new(), "tool_output", "aa", b"older".to_vec());
-    let newer = StoredArtifact::new(ArtifactId::new(), "tool_output", "bb", b"newer!".to_vec());
+    let older = StoredArtifact::new(
+        ArtifactId::new(),
+        "tool_output",
+        sha256_hex(b"older"),
+        b"older".to_vec(),
+    );
+    let newer = StoredArtifact::new(
+        ArtifactId::new(),
+        "tool_output",
+        sha256_hex(b"newer!"),
+        b"newer!".to_vec(),
+    );
     let older_id = older.id;
     store.put(&older).unwrap();
     // created_at has millisecond resolution, so same-tick writes tie and
