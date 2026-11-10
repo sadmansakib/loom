@@ -9,6 +9,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+permissions:
+  contents: read
+
 jobs:
   lint:
     name: fmt + clippy
@@ -91,3 +94,11 @@ jobs:
           tool: cargo-audit
       - name: audit Cargo.lock
         run: cargo audit --locked
+
+  deny:
+    name: dependency policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v1

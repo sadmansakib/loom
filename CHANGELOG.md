@@ -3,6 +3,22 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Adversarial review round 2: CI and residual cleanup, part 3
+
+- `ci`: workflow permissions now default to read-only repository contents;
+  cargo-deny checks dependency advisories, license policy, bans, and
+  source policy alongside cargo-audit. Internal workspace path crates
+  carry their matching `0.1.0` version requirements, allowing wildcard
+  dependency requirements to remain denied. The known unmaintained
+  Linux Secret Service transitive crates remain informational until
+  their upstream migration settles; vulnerability advisories are still
+  blocked by the dedicated audit job.
+- `test(providers)`: raw TCP stall/cancellation fixtures now consume the
+  complete HTTP request before responding, avoiding a race where an early
+  response reset reqwest while it was still sending the JSON body.
+- `docs`: README now says macOS and Linux are the supported host
+  platforms; Windows support is explicitly not available yet.
+
 ## 2026-11 — Adversarial review round 2: residual cleanup, part 2 (S5/S6/S7/F-03)
 
 - `fix(engine)`: the auth database connection now waits up to five

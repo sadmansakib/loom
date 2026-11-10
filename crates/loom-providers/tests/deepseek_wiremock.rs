@@ -37,6 +37,42 @@ fn provider_at(base_url: &str, timeouts: TimeoutConfig) -> DeepSeekProvider {
     .unwrap()
 }
 
+/// Consume a complete HTTP request before sending a response. These raw TCP
+/// fixtures used to respond as soon as the first request bytes arrived, which
+/// could reset reqwest while it was still writing the JSON body and turn a
+/// response-path assertion into a flaky connect/send error.
+async fn read_request(socket: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+    let mut request = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let read = socket.read(&mut chunk).await?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "client closed before completing request",
+            ));
+        }
+        request.extend_from_slice(&chunk[..read]);
+        let Some(separator) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+            continue;
+        };
+        let body_start = separator + 4;
+        let headers = String::from_utf8_lossy(&request[..separator]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        if request.len() >= body_start + content_length {
+            return Ok(());
+        }
+    }
+}
+
 /// A minimal user request with no tools.
 fn plain_request() -> ModelRequest {
     ModelRequest {
@@ -737,6 +773,9 @@ async fn header_stall_is_retryable_transport() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
+        if read_request(&mut socket).await.is_err() {
+            return;
+        }
         // Accept the connection but never send headers.
         let mut buf = [0u8; 64];
         loop {
@@ -771,6 +810,9 @@ async fn idle_stall_is_retryable_transport() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
+        if read_request(&mut socket).await.is_err() {
+            return;
+        }
         socket
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n\
@@ -817,6 +859,9 @@ async fn keep_alive_only_stream_trips_the_stall_timeout() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
+        if read_request(&mut socket).await.is_err() {
+            return;
+        }
         socket
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
             .await
@@ -927,6 +972,9 @@ async fn stalled_error_body_asserts_kind(
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
+        if read_request(&mut socket).await.is_err() {
+            return;
+        }
         socket.write_all(headers.as_bytes()).await.unwrap();
         let mut buf = [0u8; 64];
         loop {
@@ -962,6 +1010,9 @@ async fn dropping_the_stream_cancels_the_request() {
     let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
+        if read_request(&mut socket).await.is_err() {
+            return;
+        }
         socket
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n\

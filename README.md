@@ -50,8 +50,10 @@ cargo install --git https://github.com/sadmansakib/loom loom-cli
 
 From a checkout: `cargo install --path crates/loom-cli`.
 
-macOS uses Seatbelt and Linux uses bubblewrap for sandboxed command
-execution; on Linux install `bubblewrap` with your package manager first.
+Supported host platforms are macOS and Linux. macOS uses Seatbelt and
+Linux uses bubblewrap for sandboxed command execution; on Linux install
+`bubblewrap` with your package manager first. Windows support is not
+currently available.
 
 ## Quickstart
 

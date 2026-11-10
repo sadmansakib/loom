@@ -31,12 +31,12 @@ tree-sitter-python = "0.23"
 tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
 # internal crates
-loom-kernel = { path = "crates/loom-kernel" }
-loom-store = { path = "crates/loom-store" }
-loom-providers = { path = "crates/loom-providers" }
-loom-tools = { path = "crates/loom-tools" }
-loom-engine = { path = "crates/loom-engine" }
-loom-core = { path = "crates/loom-core" }
+loom-kernel = { path = "crates/loom-kernel", version = "0.1.0" }
+loom-store = { path = "crates/loom-store", version = "0.1.0" }
+loom-providers = { path = "crates/loom-providers", version = "0.1.0" }
+loom-tools = { path = "crates/loom-tools", version = "0.1.0" }
+loom-engine = { path = "crates/loom-engine", version = "0.1.0" }
+loom-core = { path = "crates/loom-core", version = "0.1.0" }
 
 # async runtime (research.md §2: tokio 1.x + tokio-util CancellationToken).
 # Version pinned here only — crates add the features they need, so the

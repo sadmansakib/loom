@@ -1,0 +1,50 @@
+# Dependency policy for `cargo deny check` (CI).
+
+[graph]
+all-features = false
+no-default-features = false
+
+[advisories]
+# Keep direct workspace dependencies maintained. The current Linux
+# keyring adapter still depends on the zbus 5 stack; zbus 6 exists but
+# the adapter has not migrated to it yet. cargo-audit reports those
+# transitive informational advisories without failing its vulnerability
+# gate.
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+# Treat wildcard requirements as policy violations. Internal private
+# workspace path dependencies are exempted separately.
+wildcards = "deny"
+allow-wildcard-paths = true
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
