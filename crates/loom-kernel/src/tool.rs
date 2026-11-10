@@ -105,8 +105,31 @@ impl PathTouch {
 /// write to `src/a.rs` contend; `src/a.rs` and `src/b.rs` do not. `.` (the
 /// workspace root) is an ancestor of everything. Shared by scheduling
 /// (V13) and result caching (V14).
+///
+/// Comparison is on normalized spellings: repeated `/`, leading `./`, and
+/// trailing `/` are equivalent (review E2: one touch declaring `./a` and
+/// another `a` named the same file but used to run concurrently and miss
+/// in the cache, because the raw strings differ).
 pub(crate) fn paths_overlap(a: &str, b: &str) -> bool {
-    a == b || is_ancestor(a, b) || is_ancestor(b, a)
+    let a = normalize_rel(a);
+    let b = normalize_rel(b);
+    a == b || is_ancestor(&a, &b) || is_ancestor(&b, &a)
+}
+
+/// Collapses empty (`//`) and `.` path segments, so `./a`, `a//`, and
+/// `a` all map to `a` and `.` maps to `""` (the root).
+fn normalize_rel(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for segment in path.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('/');
+        }
+        out.push_str(segment);
+    }
+    out
 }
 
 /// Whether `dir` is a strict ancestor directory of `path`.
@@ -1100,6 +1123,38 @@ mod tests {
                 },
             }
         }
+    }
+
+    #[test]
+    fn equivalent_path_spellings_overlap() {
+        // Review E2: `./a` and `a` name the same file but used to
+        // compare unequal, so one batch could touch it concurrently
+        // (V13 scheduling) and a cache entry survived its own write
+        // (V14) — the raw strings differ, the paths do not.
+        assert!(paths_overlap("./a", "a"));
+        assert!(paths_overlap("a//b", "a/b"));
+        assert!(paths_overlap("src/", "src"));
+        assert!(paths_overlap("././src/a.rs", "src/a.rs"));
+        assert!(paths_overlap(".", "src/a.rs"));
+        assert!(paths_overlap("src/./a.rs", "src/a.rs"));
+    }
+
+    #[test]
+    fn distinct_paths_still_do_not_overlap() {
+        assert!(!paths_overlap("./src/a.rs", "src/b.rs"));
+        assert!(!paths_overlap("src/a.rs", "srca.rs"));
+        assert!(!paths_overlap("./a/b", "a/c"));
+    }
+
+    #[test]
+    fn the_root_spelling_matches_everything_it_should() {
+        // `is_ancestor` sees already-normalized strings (paths_overlap
+        // normalizes both sides first), so the root spellings are "."
+        // and "" — while equivalent directory spellings still overlap
+        // through paths_overlap.
+        assert!(is_ancestor(".", "a.rs"));
+        assert!(paths_overlap("./src", "src/a.rs"));
+        assert!(!is_ancestor("a", "a"));
     }
 
     #[test]

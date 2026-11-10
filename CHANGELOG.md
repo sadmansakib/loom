@@ -3,6 +3,23 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Adversarial review round 2: batch-edit spans + path overlap (PR6)
+
+- `fix(tools)`: a batch edit whose `old_string` swallowed an earlier
+  edit's replacement no longer panics *after* the file is written
+  (review E1). `replace_span` now drops recorded echo spans that
+  intersect the replacement range — their bytes are gone — instead of
+  shifting them to stale, sometimes mid-UTF-8 offsets that the echo
+  renderer byte-slices through. The engine no longer crashes on a
+  legal (if unusual) model batch, and the echo shows one honest
+  region for the swallowing edit.
+- `fix(kernel)`: path-overlap checks now compare normalized
+  spellings (review E2): `./a`, `a//`, and `a` are the same file, so
+  touches that spell one path differently no longer escape V13
+  scheduling mutual-exclusion or leave stale V14 cache entries
+  behind their own writes. Shared by the scheduler, the tool cache,
+  and context pruning.
+
 ## 2026-11 — Adversarial review round 2: dependency advisories + CI audit (PR5)
 
 - `chore(deps)`: cleared all eight RustSec advisories the review found

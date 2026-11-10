@@ -419,13 +419,16 @@ fn load_edit_files(
     Ok(files)
 }
 
-/// Replaces `old_len` bytes at `start` with `new` in `text`, shifting the
-/// file's already-recorded spans that sit after the replacement so later
-/// edits on the same file move earlier spans instead of orphaning them,
-/// and records the replacement's own span.
+/// Replaces `old_len` bytes at `start` with `new` in `text`, dropping
+/// the file's already-recorded spans the replacement range intersects
+/// (their bytes are gone — an edit whose `old_string` swallowed an
+/// earlier edit's replacement), shifting the spans that sit after it,
+/// and recording the replacement's own span.
 ///
-/// A replaced range can never overlap a recorded span: each consumed a
-/// distinct unique match.
+/// This keeps every recorded span on UTF-8 char boundaries in the
+/// final text, which `render_echo` byte-slices through (review E1:
+/// an overlapped span used to survive with stale offsets and panic
+/// the echo *after* the file had already been written).
 fn replace_span(
     text: &mut String,
     file_spans: &mut Vec<(usize, usize)>,
@@ -433,7 +436,12 @@ fn replace_span(
     old_len: usize,
     new: &str,
 ) {
-    text.replace_range(start..start + old_len, new);
+    let end = start + old_len;
+    file_spans.retain(|(recorded_start, recorded_len)| {
+        let recorded_end = recorded_start + recorded_len;
+        recorded_end <= start || *recorded_start >= end
+    });
+    text.replace_range(start..end, new);
     let delta = new.len() as isize - old_len as isize;
     for (recorded_start, _) in file_spans.iter_mut() {
         if start < *recorded_start {
@@ -1014,6 +1022,45 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(guard.path().join("f.rs")).expect("read"),
             "fn uno() {}\nfn two() {}\nfn tres() {}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_that_swallows_an_earlier_edits_region_drops_its_stale_span() {
+        // Review E1: edit 2's old_string contains edit 1's
+        // replacement, so edit 1's recorded span points into bytes
+        // that no longer exist once edit 2 lands. The stale span used
+        // to survive with shifted offsets and panic the echo *after*
+        // the file had already been written.
+        let (guard, root) = temp_root();
+        std::fs::write(
+            guard.path().join("f.rs"),
+            "fn main() {\n    let x = compute(value);\n    let y = 2;\n}\n",
+        )
+        .expect("seed");
+        let output = edit(
+            &root,
+            json!({
+                "path": "f.rs",
+                "edits": [
+                    {"old_string": "compute(value)", "new_string": "compute"},
+                    {"old_string": "let x = compute;\n    let y = 2;", "new_string": "let x = compute(2);"}
+                ]
+            }),
+        )
+        .await
+        .expect("ok");
+        assert_eq!(
+            std::fs::read_to_string(guard.path().join("f.rs")).expect("read"),
+            "fn main() {\n    let x = compute(2);\n}\n"
+        );
+        // Exactly one echoed region: the swallowed edit's stale span
+        // is dropped rather than rendered from bogus offsets.
+        assert_eq!(
+            output.content.matches("f.rs: lines").count(),
+            1,
+            "{}",
+            output.content
         );
     }
 
