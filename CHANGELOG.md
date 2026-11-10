@@ -3,6 +3,32 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Adversarial review round 2: provider wire hardening (PR9)
+
+- `fix(providers)`: `Retry-After` in HTTP-date form
+  (`Sun, 06 Nov 1994 08:49:37 GMT`) is now honored, not just
+  delay-seconds; a date already in the past means "retry now"
+  (review P1).
+- `fix(providers)`: the Anthropic adapter tolerates a trailing slash
+  in its base URL, same as every OpenAI-wire adapter —
+  `https://host/` no longer produces `//v1/messages` (review P2).
+- `fix(providers)`: a stream that sends the same tool-call id on two
+  distinct calls now fails with a `Protocol` error naming the id
+  instead of dispatching ambiguous duplicates (review P3).
+- `fix(providers)`: an unknown mid-stream 4xx is classified
+  `InvalidRequest` — permanent — instead of falling into the
+  retryable `Server` catch-all that re-sent the same rejected
+  request (review P4; retrying after provisional deltas remains
+  by design: `ModelRetry` marks the discard point).
+- `fix(providers)`: every base-URL entry point (the six
+  `with_base_url` builders plus `CustomConfig::new`) warns when the
+  URL is plain `http://` to a non-local host: the API key and the
+  conversation travel unencrypted. Loopback, link-local, and
+  `.local`/`.internal` gateways stay quiet (review P5).
+- `fix(providers)`: the Anthropic stream stops ingesting at
+  `message_stop`; trailing events in the same batch (keepalives,
+  junk from a proxy) no longer land in the response (review P6).
+
 ## 2026-11 — Adversarial review round 2: session single-writer lease (PR8)
 
 - `fix(kernel,store,engine)`: the session lease (ADR-008) is no longer

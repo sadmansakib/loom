@@ -593,6 +593,26 @@ impl ChunkAccumulator {
             calls.push(assemble_call(partial, policy.id_prefix));
         }
 
+        // Duplicate call ids (a provider reusing one id across two
+        // calls, or a model-sent id colliding with a synthesized one)
+        // would make every id-keyed surface ambiguous — the transcript
+        // pairs tool results with calls by id. Refuse loudly instead
+        // of dispatching both; the model can reissue the calls.
+        {
+            let mut seen = std::collections::HashSet::new();
+            for call in &calls {
+                if !seen.insert(call.id.as_str()) {
+                    return Err(ModelError::new(
+                        ModelErrorKind::Protocol,
+                        format!(
+                            "provider sent the same tool-call id `{}` for more than one call",
+                            call.id.as_str()
+                        ),
+                    ));
+                }
+            }
+        }
+
         let stop_reason = normalized_stop(self.finish_reason.as_deref(), &mut calls)?;
 
         let message = AssistantMessage {
@@ -745,6 +765,13 @@ pub(crate) fn classify_wire_error(status: Option<u16>, _message: &str) -> ModelE
         Some(429) => ModelErrorKind::RateLimited,
         Some(503) => ModelErrorKind::Overloaded,
         Some(code) if code >= 500 => ModelErrorKind::Server,
+        // Other 4xx client errors are permanent: the request shape,
+        // scope, or route was rejected, and retrying re-sends the same
+        // rejected request (double-billing a response that already
+        // streamed).
+        Some(400..=499) => ModelErrorKind::InvalidRequest,
+        // Absent code, 1xx/3xx, anything odd: an unattributed failure
+        // is better retried within bounds than failed permanently.
         _ => ModelErrorKind::Server,
     }
 }
@@ -1179,6 +1206,85 @@ mod tests {
         let error = acc.finalize(true, &policy("test")).unwrap_err();
         assert_eq!(error.kind, ModelErrorKind::Protocol);
         assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn duplicate_tool_call_ids_fail_loudly() {
+        // Two distinct calls (distinct indexes) carrying the same id:
+        // every id-keyed downstream surface — the transcript pairs
+        // tool results with calls by id — would be ambiguous, so
+        // finalize refuses instead of dispatching both.
+        let mut acc = ChunkAccumulator::default();
+        for index in 0..2u32 {
+            acc.ingest(chunk_with(ChunkDelta {
+                tool_calls: vec![ToolCallDelta {
+                    index: Some(index),
+                    id: Some("call_same".into()),
+                    function: Some(ToolCallFunctionDelta {
+                        name: Some("read_file".into()),
+                        arguments: Some("{}".into()),
+                    }),
+                }],
+                ..Default::default()
+            }));
+        }
+        let acc = finished(acc, "tool_calls");
+        let error = acc.finalize(true, &policy("test")).unwrap_err();
+        assert_eq!(error.kind, ModelErrorKind::Protocol);
+        assert!(!error.is_retryable());
+        assert!(
+            error.message.contains("call_same"),
+            "names the reused id: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn distinct_tool_call_ids_still_assemble() {
+        let mut acc = ChunkAccumulator::default();
+        for (index, id) in [(0, "call_a"), (1, "call_b")] {
+            acc.ingest(chunk_with(ChunkDelta {
+                tool_calls: vec![ToolCallDelta {
+                    index: Some(index),
+                    id: Some(id.into()),
+                    function: Some(ToolCallFunctionDelta {
+                        name: Some("read_file".into()),
+                        arguments: Some("{}".into()),
+                    }),
+                }],
+                ..Default::default()
+            }));
+        }
+        let acc = finished(acc, "tool_calls");
+        let response = acc.finalize(true, &policy("test")).unwrap();
+        assert_eq!(response.message.tool_calls.len(), 2);
+    }
+
+    #[test]
+    fn mid_stream_client_errors_are_permanent() {
+        // An unknown 4xx reported as a stream error object is a
+        // request rejection — retrying re-sends the same rejected
+        // request. Known codes keep their specific kinds; absent or
+        // odd codes stay retryable.
+        assert_eq!(
+            classify_wire_error(Some(400), "bad request"),
+            ModelErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            classify_wire_error(Some(404), "no route"),
+            ModelErrorKind::InvalidRequest
+        );
+        assert!(!classify_wire_error(Some(422), "nope").is_retryable());
+        assert_eq!(
+            classify_wire_error(Some(429), "slow down"),
+            ModelErrorKind::RateLimited
+        );
+        assert_eq!(
+            classify_wire_error(Some(502), "boom"),
+            ModelErrorKind::Server
+        );
+        assert_eq!(classify_wire_error(None, "mystery"), ModelErrorKind::Server);
+        assert!(classify_wire_error(None, "mystery").is_retryable());
     }
 
     #[test]

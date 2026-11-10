@@ -156,7 +156,9 @@ impl DeepSeekConfig {
     /// Overrides the base URL (builder style).
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into();
+        let base_url = base_url.into();
+        crate::http::warn_plain_http(&base_url);
+        self.base_url = base_url;
         self
     }
 

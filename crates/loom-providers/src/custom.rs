@@ -71,8 +71,10 @@ pub struct CustomConfig {
 impl CustomConfig {
     /// Creates a config for `base_url` with default timeouts.
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
+        let base_url = base_url.into();
+        crate::http::warn_plain_http(&base_url);
         Self {
-            base_url: base_url.into(),
+            base_url,
             api_key: SecretString::new(api_key),
             timeouts: TimeoutConfig::default(),
             headers: Vec::new(),

@@ -126,6 +126,41 @@ async fn streamed_text_completes_with_usage() {
 }
 
 #[tokio::test]
+async fn events_after_message_stop_are_not_ingested() {
+    // A gateway that keeps the connection open after `message_stop`
+    // (keepalives, trailing junk, a second message) must not land in
+    // the response: ingestion stops at the stop event and the rest of
+    // the batch is dropped.
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse(&[
+            serde_json::json!({
+                "type": "message_start",
+                "message": {"usage": {"input_tokens": 10}}
+            }),
+            serde_json::json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "clean"}}),
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+            serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}}),
+            serde_json::json!({"type": "message_stop"}),
+            // Everything below arrives after the stop.
+            serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "TRAILING JUNK"}}),
+            serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "max_tokens"}}),
+        ]),
+    )
+    .await;
+
+    let provider = provider_at(&server.uri());
+    let events = collect(provider.stream(&plain_request("claude-sonnet-4-5"))).await;
+
+    assert_eq!(joined_text(&events), "clean");
+    let response = expect_completed(events);
+    assert_eq!(response.message.stop_reason, StopReason::EndTurn);
+    assert_eq!(response.message.content, "clean");
+}
+
+#[tokio::test]
 async fn per_turn_effort_arrives_as_a_trailing_system_turn() {
     let server = MockServer::start().await;
     mount_sse(&server, text_response()).await;

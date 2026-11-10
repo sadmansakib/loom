@@ -72,7 +72,9 @@ impl AnthropicConfig {
     /// Overrides the base URL (wiremock tests, proxies).
     #[must_use]
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
-        self.base_url = url.into();
+        let url = url.into();
+        crate::http::warn_plain_http(&url);
+        self.base_url = url;
         self
     }
 
@@ -217,7 +219,13 @@ async fn step(state: State) -> Option<(Result<Option<ModelEvent>, ModelError>, S
                     CONTEXT_MANAGEMENT_BETA.to_owned(),
                 ));
             }
-            let url = format!("{}/v1/messages", provider.config.base_url);
+            // Tolerate a trailing slash, same as the OpenAI-wire
+            // adapters: `https://host/` + path would otherwise produce
+            // `//v1/messages`, which some proxies 404.
+            let url = format!(
+                "{}/v1/messages",
+                provider.config.base_url.trim_end_matches('/')
+            );
             let response = match crate::wire_stream::send_request(
                 &provider.client,
                 url,
@@ -337,6 +345,13 @@ async fn step(state: State) -> Option<(Result<Option<ModelEvent>, ModelError>, S
                                 pending.extend(deltas.drain(..));
                                 if stop {
                                     saw_stop = true;
+                                    // Nothing after `message_stop` belongs
+                                    // to this response; a gateway that
+                                    // appends trailing events (keepalives,
+                                    // junk) must not land in the
+                                    // transcript. Stop ingesting here and
+                                    // drop the rest of the batch.
+                                    break;
                                 }
                                 if progressed {
                                     last_progress = tokio::time::Instant::now();

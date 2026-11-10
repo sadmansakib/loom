@@ -75,6 +75,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 
 # async combinators (BoxStream / BoxFuture for dyn seams)
 futures = "0.3.34"
+# Retry-After HTTP-date parsing (loom-providers): tiny, zero-dep.
+httpdate = "1"
 
 # identifiers: UUID v7, time-ordered (architecture.md §2 `id` module)
 uuid = { version = "1.27.0", features = ["v7", "serde"] }
