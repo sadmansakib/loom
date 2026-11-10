@@ -381,12 +381,16 @@ pub(crate) async fn prepare_exec(
     args: &[String],
     workspace_root: &std::path::Path,
 ) -> Result<PreparedExec, ToolError> {
-    match policy.verdict(program) {
+    match policy.verdict_for_argv(program, args) {
         PolicyVerdict::Allow => {}
         PolicyVerdict::Deny => {
+            let wrapped = policy.wrapped_denied_name(program, args);
             return Err(ToolError::InvalidInput(format!(
-                "program \"{program}\" is denied by workspace policy (.loom/commands.toml); \
+                "program \"{program}\" is denied by workspace policy (.loom/commands.toml){}; \
                  pick another approach",
+                wrapped.map_or_else(String::new, |name| format!(
+                    " — it wraps the denied program \"{name}\""
+                )),
             )));
         }
         PolicyVerdict::Ask => {

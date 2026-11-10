@@ -559,7 +559,7 @@ async fn program_ok(
     program: &str,
     args: &[&str],
 ) -> bool {
-    if policy.verdict(program) != PolicyVerdict::Allow {
+    if policy.verdict_for_argv(program, args) != PolicyVerdict::Allow {
         return false;
     }
     let owned: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
@@ -598,7 +598,7 @@ async fn program_output(
     program: &str,
     args: &[&str],
 ) -> Option<String> {
-    if policy.verdict(program) != PolicyVerdict::Allow {
+    if policy.verdict_for_argv(program, args) != PolicyVerdict::Allow {
         return None;
     }
     let owned: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();

@@ -377,17 +377,25 @@ fn load_symbols(
              \"{relative}\" is not one"
         ))
     })?;
-    let size = std::fs::metadata(&path)
-        .map_err(|_| ToolError::InvalidInput(format!("file does not exist: {relative}")))?
-        .len();
-    if size > SYMBOLS_MAX_FILE_BYTES {
+    // Review E3: bounded read on the handle, not stat-then-read — a
+    // file growing between metadata and read used to load unbounded.
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(
+            std::fs::File::open(&path)
+                .map_err(|_| ToolError::InvalidInput(format!("file does not exist: {relative}")))?,
+            SYMBOLS_MAX_FILE_BYTES + 1,
+        ),
+        &mut bytes,
+    )
+    .map_err(|err| ToolError::Execution(format!("cannot read \"{relative}\": {err}")))?;
+    if bytes.len() as u64 > SYMBOLS_MAX_FILE_BYTES {
         return Err(ToolError::InvalidInput(format!(
-            "file is too large for symbol tools ({size} bytes; \
-             limit {SYMBOLS_MAX_FILE_BYTES})"
+            "file is too large for symbol tools ({} bytes; \
+             limit {SYMBOLS_MAX_FILE_BYTES})",
+            bytes.len()
         )));
     }
-    let bytes = std::fs::read(&path)
-        .map_err(|err| ToolError::Execution(format!("cannot read \"{relative}\": {err}")))?;
     let source = String::from_utf8(bytes)
         .map_err(|_| ToolError::Execution(format!("\"{relative}\" is not valid UTF-8")))?;
     let (_, symbols) = parse_symbols(lang, &source).map_err(ToolError::Execution)?;
@@ -698,17 +706,25 @@ fn replace_symbol(
              \"{relative}\" is not one"
         ))
     })?;
-    let size = std::fs::metadata(&path)
-        .map_err(|_| ToolError::InvalidInput(format!("file does not exist: {relative}")))?
-        .len();
-    if size > SYMBOLS_MAX_FILE_BYTES {
+    // Review E3: bounded read on the handle, not stat-then-read — a
+    // file growing between metadata and read used to load unbounded.
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(
+            std::fs::File::open(&path)
+                .map_err(|_| ToolError::InvalidInput(format!("file does not exist: {relative}")))?,
+            SYMBOLS_MAX_FILE_BYTES + 1,
+        ),
+        &mut bytes,
+    )
+    .map_err(|err| ToolError::Execution(format!("cannot read \"{relative}\": {err}")))?;
+    if bytes.len() as u64 > SYMBOLS_MAX_FILE_BYTES {
         return Err(ToolError::InvalidInput(format!(
-            "file is too large for symbol tools ({size} bytes; \
-             limit {SYMBOLS_MAX_FILE_BYTES})"
+            "file is too large for symbol tools ({} bytes; \
+             limit {SYMBOLS_MAX_FILE_BYTES})",
+            bytes.len()
         )));
     }
-    let bytes = std::fs::read(&path)
-        .map_err(|err| ToolError::Execution(format!("cannot read \"{relative}\": {err}")))?;
     let source = String::from_utf8(bytes)
         .map_err(|_| ToolError::Execution(format!("\"{relative}\" is not valid UTF-8")))?;
     let (_, flat) = parse_symbols(lang, &source).map_err(ToolError::Execution)?;

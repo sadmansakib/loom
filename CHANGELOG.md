@@ -3,6 +3,35 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Adversarial review round 2: residual cleanup, part 1 (F-09/E3/E4)
+
+- `fix(tools)`: the deny list is argv-aware (review F-09, High). It
+  matched argv[0] only, so with `[[deny]] program = "curl"` the
+  reproductions `sh -c "curl --version"`, `env curl --version`, and
+  `xargs -n1 curl --version` all ran. Every verdict gate
+  (`run_command`, `run_background`'s shared `prepare_exec`,
+  fast-path, fused verify) now consults `verdict_for_argv`: for the
+  known exec-wrapper set (sh/bash/zsh/dash/ksh, env, nice, nohup,
+  timeout, xargs, sudo, watch, find) the arguments are scanned —
+  direct tokens for wrapper-style invocation, split words of a shell
+  `-c` payload — and a denied name refuses the call, naming the
+  wrapped program in the error. Non-wrappers keep argv[0]-only
+  semantics (`grep curl file` still runs); obfuscated payloads remain
+  out of scope for a name-scan — the sandbox is the boundary, the
+  deny list shapes UX.
+- `fix(tools)`: bounded reads replace stat-then-read in
+  `edit_file` and both symbol-tool load paths (review E3) — a file
+  growing between `metadata` and `read` used to load unbounded; the
+  limit is now enforced on what was actually read through a `take()`
+  handle.
+- `fix(tools)`: atomic-write temp files are no longer predictable or
+  followable (review E4): the name mixes pid + counter + nanoseconds,
+  and the handle is created with `create_new` (O_EXCL) — a planted
+  symlink at a guessed temp name can never be written through;
+  collisions retry under a fresher name. Test carpet-bombs 192
+  symlink names and asserts the target file still lands while the
+  linked host file stays untouched.
+
 ## 2026-11 — Adversarial review round 2: eval integrity + doc drift (PR12)
 
 - `fix(eval)`: SWE-bench runs can no longer mine the fix locally or

@@ -52,8 +52,10 @@ pub(crate) async fn run_fused(
     // no policy say at all. An explicit deny (or an unknown=ask
     // posture without a frontend) now refuses — fail closed exactly
     // like the standalone verify tool; an Allow verdict (the default
-    // posture) keeps the historical auto-allow.
-    let verdict = policy.verdict(program);
+    // posture) keeps the historical auto-allow. Full-argv (review
+    // F-09): a fixed-table command wrapping a denied program refuses
+    // too, same as run_command.
+    let verdict = policy.verdict_for_argv(program, &args);
     match verdict {
         crate::policy::PolicyVerdict::Allow => {}
         crate::policy::PolicyVerdict::Deny => {

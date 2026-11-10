@@ -396,19 +396,29 @@ fn load_edit_files(
         if files.iter().any(|(p, _, _)| p == path) {
             continue;
         }
-        let size = std::fs::metadata(path)
-            .map_err(|err| {
-                ToolError::Execution(format!("cannot read \"{}\": {err}", path.display()))
-            })?
-            .len();
-        if size > MAX_EDIT_FILE_BYTES {
-            return Err(ToolError::Execution(format!(
-                "file is too large to edit ({size} bytes; limit {MAX_EDIT_FILE_BYTES} bytes)"
-            )));
-        }
-        let bytes = std::fs::read(path).map_err(|err| {
+        // Review E3: checking metadata and then reading is a TOCTOU —
+        // a file growing between the two calls loaded unbounded. Read
+        // through a bounded handle instead: the limit is enforced on
+        // what was actually read, not on a stat that may be stale.
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(
+                std::fs::File::open(path).map_err(|err| {
+                    ToolError::Execution(format!("cannot read \"{}\": {err}", path.display()))
+                })?,
+                MAX_EDIT_FILE_BYTES + 1,
+            ),
+            &mut bytes,
+        )
+        .map_err(|err| {
             ToolError::Execution(format!("cannot read \"{}\": {err}", path.display()))
         })?;
+        if bytes.len() as u64 > MAX_EDIT_FILE_BYTES {
+            return Err(ToolError::Execution(format!(
+                "file is too large to edit ({} bytes; limit {MAX_EDIT_FILE_BYTES} bytes)",
+                bytes.len()
+            )));
+        }
         let text = String::from_utf8(bytes)
             .map_err(|_| ToolError::Execution(String::from("file is not valid UTF-8")))?;
         // The untouched text rides along so the syntax guard below can

@@ -406,15 +406,21 @@ impl Tool for RunCommandTool {
                 }
             }
             // The verdict layer gates execution before anything runs:
-            // denied programs never execute, and `ask` verdicts need
-            // operator approval (failing closed without a frontend).
-            match self.policy.verdict(&input.program) {
+            // denied programs never execute (wrappers carrying a
+            // denied program in their arguments are refused too —
+            // review F-09), and `ask` verdicts need operator approval
+            // (failing closed without a frontend).
+            match self.policy.verdict_for_argv(&input.program, &input.args) {
                 PolicyVerdict::Allow => {}
                 PolicyVerdict::Deny => {
+                    let wrapped = self.policy.wrapped_denied_name(&input.program, &input.args);
                     return Err(ToolError::InvalidInput(format!(
-                        "program \"{}\" is denied by workspace policy (.loom/commands.toml); \
+                        "program \"{}\" is denied by workspace policy (.loom/commands.toml){}; \
                          pick another approach",
-                        input.program
+                        input.program,
+                        wrapped.map_or_else(String::new, |name| format!(
+                            " — it wraps the denied program \"{name}\""
+                        )),
                     )));
                 }
                 PolicyVerdict::Ask => {
