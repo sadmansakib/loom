@@ -3,6 +3,27 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Adversarial review round 2: dependency advisories + CI audit (PR5)
+
+- `chore(deps)`: cleared all eight RustSec advisories the review found
+  in `Cargo.lock` (F-07): rustls 0.23.45 → 0.23.46 (RUSTSEC-2026-0346
+  through -0349: Debug-printed session secrets, ECH rejection data
+  leak, pre-auth Brotli decompression bomb, ServerHello key-exchange
+  downgrade), rustls-webpki 0.103.15 → 0.103.16 (-0382: distrusted
+  intermediates accepted), webpki-root-certs 1.0.9 → 1.0.11 (-0383:
+  distrusted emSign intermediates trusted), ctutils 0.4.3 → 0.4.8
+  (-0385: non-constant-time mask generation), and libsqlite3-sys
+  0.38.2 → 0.39.1 (-0459: bundled C SQLite CVE-2026-119375), which
+  required rusqlite 0.40.2 → 0.41.1. tokio 1.53.1 → 1.54.1 and
+  async-executor 1.14.0 → 1.14.1 clear an unsound `AsyncFd` advisory
+  and a yanked release. Full workspace suite green on the new graph
+  (51/51); `cargo audit` now reports zero vulnerabilities, with the
+  unmaintained zbus 5 line (Linux keyring store, upstream-blocked)
+  remaining as visible warnings.
+- `ci`: new `cargo audit` job runs on every push and PR, so a stale
+  lockfile or an advisory published against a pinned version fails the
+  build instead of shipping (review §6: no audit step existed).
+
 ## 2026-11 — Adversarial review round 2: manifest trust gate (PR4)
 
 - `feat(tools,cli)`: workspace manifests now load through an operator
