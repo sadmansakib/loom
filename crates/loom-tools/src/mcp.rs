@@ -275,7 +275,11 @@ fn pin_hash(server: &str, argv: &[String], name: &str, desc: &str, schema: &str)
         hasher.update(part.as_bytes());
         hasher.update([0x1f]);
     }
-    format!("{:x}", hasher.finalize())
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Warns when the server argv uses a fetch-and-run runner without a

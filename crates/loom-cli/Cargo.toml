@@ -15,7 +15,6 @@ loom-core = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 serde_json = { workspace = true }
-tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # The binary owns the runtime: multi-thread (the provider's timeouts need the
 # time driver), macros (async main / select), signal (Ctrl-C), sync, rt.

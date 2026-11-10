@@ -80,10 +80,8 @@ jobs:
   # Review F-07: eight RustSec advisories shipped in Cargo.lock with
   # nothing in CI to notice the next one. The lockfile is committed, so
   # auditing it on every push/PR catches both direct bumps and stale
-  # transitive pins. `cargo-audit` fails only on vulnerabilities;
-  # unmaintained-crate warnings (currently the zbus stack behind the
-  # Linux keyring store) stay visible in the log without failing the
-  # job until upstream ships a maintained line.
+  # transitive pins. `cargo-audit` fails on vulnerabilities and reports
+  # unmaintained crates so dependency-policy regressions remain visible.
   audit:
     name: cargo audit
     runs-on: ubuntu-latest

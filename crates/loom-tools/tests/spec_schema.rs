@@ -94,7 +94,13 @@ fn every_tool_schema_is_a_closed_described_object() {
 fn tool_specs_are_compact_and_noise_free() {
     for (name, tool) in tools() {
         let json = serde_json::to_string(&tool.spec()).expect("spec serializes");
-        for banned in ["\"$ref\"", "\"definitions\"", "\"default\"", "\"format\""] {
+        for banned in [
+            "\"$ref\"",
+            "\"$defs\"",
+            "\"definitions\"",
+            "\"default\"",
+            "\"format\"",
+        ] {
             assert!(
                 !json.contains(banned),
                 "{name}: spec still carries {banned}"

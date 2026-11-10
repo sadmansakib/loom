@@ -575,7 +575,7 @@ fn ensure_default_store() {
         }
         #[cfg(target_os = "linux")]
         {
-            let secret_service = match zbus_secret_service_keyring_store::Store::new() {
+            let secret_service = match dbus_secret_service_keyring_store::Store::new() {
                 Ok(store) => {
                     keyring_core::set_default_store(store);
                     true

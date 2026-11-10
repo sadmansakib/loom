@@ -3,16 +3,28 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — dependency maintenance
+
+- `deps`: update direct dependencies to current stable releases: `schemars`
+  1.2.3, `sha2` 0.11.1, `nix` 0.31.3, and `toml` 1.2.1. Adapt SHA-256
+  hex rendering and schema normalization for the updated APIs and JSON
+  Schema 2020-12 output.
+- `deps`: replace the Linux zbus Secret Service adapter with the maintained
+  D-Bus adapter, removing the three unmaintained `zbus_names`/`zvariant`
+  advisories while retaining the keyutils fallback.
+- `chore`: remove unused `tracing` dependencies and refresh the lockfile.
+  `cargo audit` reports no advisories; remaining `cargo outdated` entries
+  are lockfile candidates without resolved dependency paths.
+
 ## 2026-11 — Adversarial review round 2: CI and residual cleanup, part 3
 
 - `ci`: workflow permissions now default to read-only repository contents;
   cargo-deny checks dependency advisories, license policy, bans, and
   source policy alongside cargo-audit. Internal workspace path crates
   carry their matching `0.1.0` version requirements, allowing wildcard
-  dependency requirements to remain denied. The known unmaintained
-  Linux Secret Service transitive crates remain informational until
-  their upstream migration settles; vulnerability advisories are still
-  blocked by the dedicated audit job.
+  dependency requirements to remain denied. Unmaintained-crate findings
+  remain informational unless introduced again; vulnerability advisories
+  are blocked by the dedicated audit job.
 - `test(providers)`: raw TCP stall/cancellation fixtures now consume the
   complete HTTP request before responding, avoiding a race where an early
   response reset reqwest while it was still sending the JSON body.
@@ -217,8 +229,8 @@ project versions by iteration, not semver.
   async-executor 1.14.0 → 1.14.1 clear an unsound `AsyncFd` advisory
   and a yanked release. Full workspace suite green on the new graph
   (51/51); `cargo audit` now reports zero vulnerabilities, with the
-  unmaintained zbus 5 line (Linux keyring store, upstream-blocked)
-  remaining as visible warnings.
+  unmaintained Linux keyring adapter dependency remaining as a visible
+  warning.
 - `ci`: new `cargo audit` job runs on every push and PR, so a stale
   lockfile or an advisory published against a pinned version fails the
   build instead of shipping (review §6: no audit step existed).

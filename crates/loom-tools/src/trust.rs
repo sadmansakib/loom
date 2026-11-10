@@ -186,7 +186,12 @@ impl TrustGate {
     fn digest_of(path: &Path) -> Option<String> {
         use sha2::{Digest, Sha256};
         let bytes = std::fs::read(path).ok()?;
-        Some(format!("{:x}", Sha256::digest(&bytes)))
+        Some(
+            Sha256::digest(&bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        )
     }
 
     /// Decides `manifest` (a `MANIFESTS` relative path) for

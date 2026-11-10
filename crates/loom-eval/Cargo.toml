@@ -23,7 +23,7 @@ loom-core = { workspace = true }
 futures = { workspace = true }
 # binary-digest provenance for sweep reports (honesty rule: one
 # headline, one engine build — the digest is the check).
-sha2 = "0.10"
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

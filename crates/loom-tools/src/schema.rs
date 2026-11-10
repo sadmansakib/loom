@@ -33,8 +33,8 @@ pub(crate) fn parameters<T: JsonSchema>() -> serde_json::Value {
     value
 }
 
-/// Replaces `{"$ref": "#/definitions/<Name>"}` nodes with the definition body
-/// and drops the now-unused `definitions` table.
+/// Replaces local definition refs with their body and drops the now-unused
+/// definition table (`$defs` in JSON Schema 2020-12, `definitions` before it).
 ///
 /// `schemars` emits a named enum (e.g. `verify`'s `Scope`) as a top-level
 /// `definitions` entry referenced by `$ref`. The model only ever sees one
@@ -42,21 +42,23 @@ pub(crate) fn parameters<T: JsonSchema>() -> serde_json::Value {
 /// also lets [`compact`] see through the copy. A schemars `$ref` is wrapped in
 /// a single-element `allOf`, so that wrapper is collapsed too.
 fn inline_definitions(root: &mut serde_json::Value) {
-    let Some(definitions) = root
-        .get("definitions")
-        .and_then(serde_json::Value::as_object)
-    else {
+    let Some((key, definitions)) = ["$defs", "definitions"].iter().find_map(|key| {
+        root.get(*key)
+            .and_then(serde_json::Value::as_object)
+            .map(|definitions| (*key, definitions))
+    }) else {
         return;
     };
     let definitions = definitions.clone();
-    resolve_refs(root, &definitions);
+    resolve_refs(root, key, &definitions);
     if let Some(object) = root.as_object_mut() {
-        object.remove("definitions");
+        object.remove(key);
     }
 }
 
 fn resolve_refs(
     value: &mut serde_json::Value,
+    definition_key: &str,
     definitions: &serde_json::Map<String, serde_json::Value>,
 ) {
     match value {
@@ -64,16 +66,29 @@ fn resolve_refs(
             let replacement = map
                 .get("$ref")
                 .and_then(serde_json::Value::as_str)
-                .and_then(|r| r.strip_prefix("#/definitions/"))
+                .and_then(|r| r.strip_prefix(&format!("#/{definition_key}/")))
                 .and_then(|name| definitions.get(name))
-                .cloned();
-            if let Some(mut resolved) = replacement {
-                resolve_refs(&mut resolved, definitions);
+                .cloned()
+                .map(|resolved| {
+                    let overrides = map
+                        .iter()
+                        .filter(|(key, _)| key.as_str() != "$ref")
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect::<Vec<_>>();
+                    (resolved, overrides)
+                });
+            if let Some((mut resolved, overrides)) = replacement {
+                resolve_refs(&mut resolved, definition_key, definitions);
+                if let Some(object) = resolved.as_object_mut() {
+                    for (key, value) in overrides {
+                        object.insert(key, value);
+                    }
+                }
                 *value = resolved;
                 return;
             }
             for child in map.values_mut() {
-                resolve_refs(child, definitions);
+                resolve_refs(child, definition_key, definitions);
             }
             // Collapse `{"allOf": [<one schema>]}` left by a resolved `$ref`,
             // keeping the parent's own keys (e.g. its `description`).
@@ -89,7 +104,7 @@ fn resolve_refs(
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                resolve_refs(item, definitions);
+                resolve_refs(item, definition_key, definitions);
             }
         }
         _ => {}
@@ -111,11 +126,9 @@ fn resolve_refs(
 ///
 /// * `"minimum": 1.0` becomes `"minimum": 1` — `schemars` serialises integer
 ///   bounds as floats, and the trailing `.0` is re-sent on every request.
-/// * A `oneOf` whose branches are each a single-value string enum (how
-///   `schemars` renders a field-less Rust `enum`) collapses to one plain
-///   `enum` list. `{"oneOf":[{"enum":["check"]},{"enum":["test"]}]}` and
-///   `"enum": ["check","test"]` accept exactly the same values; the branch
-///   descriptions duplicate the field's own description, so they go too.
+/// * A `oneOf` whose branches are each a single string enum or `const` (how
+///   `schemars` renders field-less Rust enums across JSON Schema drafts)
+///   collapses to one plain `enum` list.
 fn compact(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
@@ -131,11 +144,48 @@ fn compact(value: &mut serde_json::Value) {
             for child in map.values_mut() {
                 compact(child);
             }
+            if let Some(properties) = map
+                .get_mut("properties")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                for property in properties.values_mut() {
+                    if property.get("description").is_some() {
+                        remove_enum_descriptions(property);
+                    }
+                }
+            }
             collapse_singleton_enum(map);
         }
         serde_json::Value::Array(items) => {
             for item in items {
                 compact(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Enum type/variant docs duplicate the field description in tool schemas.
+fn remove_enum_descriptions(value: &mut serde_json::Value) {
+    remove_nested_enum_descriptions(value, true);
+}
+
+fn remove_nested_enum_descriptions(value: &mut serde_json::Value, is_root: bool) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if !is_root
+                && (map.contains_key("enum") || map.contains_key("const"))
+                && map.get("type") == Some(&serde_json::Value::String("string".to_owned()))
+            {
+                map.remove("description");
+            }
+            for child in map.values_mut() {
+                remove_nested_enum_descriptions(child, false);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                remove_nested_enum_descriptions(item, false);
             }
         }
         _ => {}
@@ -156,12 +206,17 @@ fn collapse_singleton_enum(map: &mut serde_json::Map<String, serde_json::Value>)
         let Some(object) = branch.as_object() else {
             return;
         };
+        if object.get("type") != Some(&serde_json::Value::String("string".to_owned())) {
+            return;
+        }
+        if let Some(value) = object.get("const") {
+            values.push(value.clone());
+            continue;
+        }
         let Some(variants) = object.get("enum").and_then(serde_json::Value::as_array) else {
             return;
         };
-        if variants.len() != 1
-            || object.get("type") != Some(&serde_json::Value::String("string".to_owned()))
-        {
+        if variants.len() != 1 {
             return;
         }
         values.push(variants[0].clone());
