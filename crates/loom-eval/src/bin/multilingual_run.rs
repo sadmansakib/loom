@@ -31,8 +31,7 @@ use std::process::Command;
 
 use loom_eval::multilingual::{self, MultilingualInstance, RUST_CONTAINER_SCRIPT, SELECTION_RULE};
 use loom_eval::swebench::{
-    self, AgentKind, ContainerSpec, Prediction, RunUsage, api_key_envs, docker_run_argv,
-    run_outcome, run_usage,
+    self, AgentKind, ContainerSpec, RunUsage, api_key_envs, docker_run_argv, run_outcome, run_usage,
 };
 
 struct Args {
@@ -630,52 +629,18 @@ fn main() {
         }
     }
 
-    // Per-run predictions files (one row per instance, never duplicated).
-    for (index, rows) in predictions.iter().enumerate() {
-        if rows.is_empty() {
-            continue;
-        }
-        let borrowed: Vec<Prediction<'_>> = rows
-            .iter()
-            .map(|(instance_id, model, patch)| Prediction {
-                instance_id,
-                model_name_or_path: model,
-                model_patch: patch,
-            })
-            .collect();
-        let path = base.join(format!("predictions-ml-{file_model}-{}.jsonl", index + 1));
-        swebench::write_predictions(&path, &borrowed);
-        prediction_paths.push(path);
-    }
-
-    // Best-of-N selection, same rule as the Verified sweep: the most
-    // frequent normalized diff across runs becomes the prediction.
+    prediction_paths.extend(swebench::write_prediction_sets(
+        &base,
+        &format!("predictions-ml-{file_model}"),
+        &predictions,
+        args.runs,
+    ));
     if args.runs > 1 && !predictions.is_empty() {
-        let mut selected_rows: Vec<(String, String, String)> = Vec::new();
-        for index in 0..predictions[0].len() {
-            let patches: Vec<&str> = predictions
-                .iter()
-                .map(|rows| rows[index].2.as_str())
-                .collect();
-            let (instance_id, model, _) = &predictions[0][index];
-            selected_rows.push((
-                instance_id.clone(),
-                model.clone(),
-                swebench::select_patch(&patches).to_owned(),
-            ));
-        }
-        let borrowed: Vec<Prediction<'_>> = selected_rows
-            .iter()
-            .map(|(instance_id, model, patch)| Prediction {
-                instance_id,
-                model_name_or_path: model,
-                model_patch: patch,
-            })
-            .collect();
-        let path = base.join(format!("predictions-ml-{file_model}-selected.jsonl"));
-        swebench::write_predictions(&path, &borrowed);
-        prediction_paths.push(path.clone());
-        println!("best-of-{} selection: {}", args.runs, path.display());
+        println!(
+            "best-of-{} selection: {}",
+            args.runs,
+            prediction_paths.last().unwrap().display()
+        );
     }
 
     let sweep = serde_json::json!({

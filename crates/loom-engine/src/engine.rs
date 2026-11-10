@@ -1926,17 +1926,15 @@ pub fn turn_budget_with_env(
 ) -> (TurnBudget, Vec<String>) {
     let mut budget = base;
     let mut warnings = Vec::new();
-    let mut apply = |slot: &mut u32, name: &str, allow_zero: bool| {
-        if let Some(raw) = get(name) {
-            match raw.trim().parse::<u32>() {
-                Ok(value) if allow_zero || value > 0 => *slot = value,
-                _ => warnings.push(format!("ignoring invalid {name}={raw:?}")),
-            }
-        }
-    };
-    apply(&mut budget.initial_turns, TURN_BUDGET_ENV_VARS[0], true);
-    apply(&mut budget.extension_turns, TURN_BUDGET_ENV_VARS[1], false);
-    apply(&mut budget.max_extensions, TURN_BUDGET_ENV_VARS[2], false);
+    apply_env_overrides(
+        [
+            (&mut budget.initial_turns, TURN_BUDGET_ENV_VARS[0], true),
+            (&mut budget.extension_turns, TURN_BUDGET_ENV_VARS[1], false),
+            (&mut budget.max_extensions, TURN_BUDGET_ENV_VARS[2], false),
+        ],
+        &get,
+        &mut warnings,
+    );
     (budget, warnings)
 }
 
@@ -1948,6 +1946,24 @@ pub const PRUNE_ENV_VARS: [&str; 5] = [
     "LOOM_PRUNE_TAIL_TOKENS",
     "LOOM_PHASE_MASK_TURNS",
 ];
+
+/// Applies typed positive environment overrides; zero is allowed for
+/// settings where it has an explicit meaning.
+fn apply_env_overrides<T, const N: usize>(
+    overrides: [(&mut T, &str, bool); N],
+    get: &impl Fn(&str) -> Option<String>,
+    warnings: &mut Vec<String>,
+) where
+    T: std::str::FromStr + PartialOrd + Default,
+{
+    for (slot, name, allow_zero) in overrides {
+        let Some(raw) = get(name) else { continue };
+        match raw.trim().parse::<T>() {
+            Ok(value) if allow_zero || value > T::default() => *slot = value,
+            _ => warnings.push(format!("ignoring invalid {name}={raw:?}")),
+        }
+    }
+}
 
 /// Applies `LOOM_*` per-tool budget overrides (roadmap item 20.2) over
 /// `base`. Pure — the caller supplies the env reader — so the frozen
@@ -1961,32 +1977,43 @@ pub fn budgets_with_env(
 ) -> (ToolBudgets, Vec<String>) {
     let mut budgets = base;
     let mut warnings = Vec::new();
-    let mut apply = |slot: &mut usize, name: &str| {
-        if let Some(raw) = get(name) {
-            match raw.trim().parse::<usize>() {
-                Ok(value) if value > 0 => *slot = value,
-                _ => warnings.push(format!("ignoring invalid {name}={raw:?}")),
-            }
-        }
-    };
-    apply(&mut budgets.read_file_head_bytes, BUDGET_ENV_VARS[0]);
-    apply(&mut budgets.command_head_bytes, BUDGET_ENV_VARS[1]);
-    apply(&mut budgets.command_tail_bytes, BUDGET_ENV_VARS[2]);
-    apply(&mut budgets.edit_echo_max_bytes, BUDGET_ENV_VARS[3]);
-    apply(&mut budgets.edit_echo_context_lines, BUDGET_ENV_VARS[4]);
-    apply(&mut budgets.symbols_overview_max_bytes, BUDGET_ENV_VARS[5]);
-    apply(&mut budgets.skill_body_head_bytes, BUDGET_ENV_VARS[6]);
-    apply(&mut budgets.replace_symbol_head_bytes, BUDGET_ENV_VARS[7]);
-    // The u32 slot is inline after the closure's last use (a second
-    // closure would double-borrow `warnings`). `0` = "never evict" is a
-    // code-level policy, not an env knob: keep the
-    // ignore-invalid-and-zero convention.
-    if let Some(raw) = get(BUDGET_ENV_VARS[8]) {
-        match raw.trim().parse::<u32>() {
-            Ok(value) if value > 0 => budgets.mcp_idle_evict_turns = value,
-            _ => warnings.push(format!("ignoring invalid {}={raw:?}", BUDGET_ENV_VARS[8])),
-        }
-    }
+    apply_env_overrides(
+        [
+            (&mut budgets.read_file_head_bytes, BUDGET_ENV_VARS[0], false),
+            (&mut budgets.command_head_bytes, BUDGET_ENV_VARS[1], false),
+            (&mut budgets.command_tail_bytes, BUDGET_ENV_VARS[2], false),
+            (&mut budgets.edit_echo_max_bytes, BUDGET_ENV_VARS[3], false),
+            (
+                &mut budgets.edit_echo_context_lines,
+                BUDGET_ENV_VARS[4],
+                false,
+            ),
+            (
+                &mut budgets.symbols_overview_max_bytes,
+                BUDGET_ENV_VARS[5],
+                false,
+            ),
+            (
+                &mut budgets.skill_body_head_bytes,
+                BUDGET_ENV_VARS[6],
+                false,
+            ),
+            (
+                &mut budgets.replace_symbol_head_bytes,
+                BUDGET_ENV_VARS[7],
+                false,
+            ),
+        ],
+        &get,
+        &mut warnings,
+    );
+    // `0` = "never evict" is a code-level policy, not an env knob, so
+    // keep the ignore-invalid-and-zero convention for this u32 slot too.
+    apply_env_overrides(
+        [(&mut budgets.mcp_idle_evict_turns, BUDGET_ENV_VARS[8], false)],
+        &get,
+        &mut warnings,
+    );
     (budgets, warnings)
 }
 
@@ -2000,18 +2027,16 @@ pub fn prune_with_env(
 ) -> (PruneConfig, Vec<String>) {
     let mut config = prune_config_for(provider);
     let mut warnings = Vec::new();
-    let mut apply = |slot: &mut u32, name: &str| {
-        if let Some(raw) = get(name) {
-            match raw.trim().parse::<u32>() {
-                Ok(value) if value > 0 => *slot = value,
-                _ => warnings.push(format!("ignoring invalid {name}={raw:?}")),
-            }
-        }
-    };
-    apply(&mut config.trigger_percent, PRUNE_ENV_VARS[0]);
-    apply(&mut config.floor_tokens, PRUNE_ENV_VARS[1]);
-    apply(&mut config.min_reclaim_tokens, PRUNE_ENV_VARS[2]);
-    apply(&mut config.protected_tail_tokens, PRUNE_ENV_VARS[3]);
+    apply_env_overrides(
+        [
+            (&mut config.trigger_percent, PRUNE_ENV_VARS[0], false),
+            (&mut config.floor_tokens, PRUNE_ENV_VARS[1], false),
+            (&mut config.min_reclaim_tokens, PRUNE_ENV_VARS[2], false),
+            (&mut config.protected_tail_tokens, PRUNE_ENV_VARS[3], false),
+        ],
+        &get,
+        &mut warnings,
+    );
     // Option<usize> slot: any positive value enables phase-aware
     // retention with that window; 0/invalid warn and stay off.
     if let Some(raw) = get(PRUNE_ENV_VARS[4]) {

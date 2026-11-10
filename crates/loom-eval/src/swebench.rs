@@ -894,6 +894,63 @@ pub fn write_predictions(path: &Path, rows: &[Prediction<'_>]) {
     std::fs::write(path, body).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
 }
 
+/// Writes one prediction file per run and, when there are multiple runs,
+/// a best-of-N file selected by normalized-diff majority.
+pub fn write_prediction_sets(
+    directory: &Path,
+    filename_prefix: &str,
+    predictions: &[Vec<(String, String, String)>],
+    runs: usize,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for (index, rows) in predictions.iter().enumerate() {
+        if rows.is_empty() {
+            continue;
+        }
+        let borrowed: Vec<_> = rows
+            .iter()
+            .map(|(instance_id, model, patch)| Prediction {
+                instance_id,
+                model_name_or_path: model,
+                model_patch: patch,
+            })
+            .collect();
+        let path = directory.join(format!("{filename_prefix}-{}.jsonl", index + 1));
+        write_predictions(&path, &borrowed);
+        paths.push(path);
+    }
+
+    if runs > 1 && !predictions.is_empty() {
+        let selected: Vec<_> = (0..predictions[0].len())
+            .map(|index| {
+                let patches: Vec<_> = predictions
+                    .iter()
+                    .map(|rows| rows[index].2.as_str())
+                    .collect();
+                let (instance_id, model, _) = &predictions[0][index];
+                (
+                    instance_id.clone(),
+                    model.clone(),
+                    select_patch(&patches).to_owned(),
+                )
+            })
+            .collect();
+        let borrowed: Vec<_> = selected
+            .iter()
+            .map(|(instance_id, model, patch)| Prediction {
+                instance_id,
+                model_name_or_path: model,
+                model_patch: patch,
+            })
+            .collect();
+        let path = directory.join(format!("{filename_prefix}-selected.jsonl"));
+        write_predictions(&path, &borrowed);
+        paths.push(path);
+    }
+
+    paths
+}
+
 /// Filesystem-safe run id: `/` and `:` folded to `-` (the same slug
 /// rule the in-house harness used).
 pub fn slug(id: &str) -> String {
@@ -1644,6 +1701,41 @@ fn predictions_write_the_official_shape() {
     assert_eq!(parsed["instance_id"], "org/one-1");
     assert_eq!(parsed["model_name_or_path"], "deepseek-flash");
     assert_eq!(parsed["model_patch"], "--- a/x\n+++ b/x\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prediction_sets_write_per_run_and_selected_files() {
+    let dir = std::env::temp_dir().join(format!("loom-swe-sets-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let predictions = vec![
+        vec![("one".into(), "model".into(), "patch-a".into())],
+        vec![("one".into(), "model".into(), "patch-a\n".into())],
+    ];
+
+    let paths = write_prediction_sets(&dir, "predictions-model", &predictions, 2);
+
+    assert_eq!(
+        paths
+            .iter()
+            .map(|path| path.file_name().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            std::ffi::OsStr::new("predictions-model-1.jsonl"),
+            std::ffi::OsStr::new("predictions-model-2.jsonl"),
+            std::ffi::OsStr::new("predictions-model-selected.jsonl"),
+        ]
+    );
+    let selected: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(paths.last().unwrap())
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(selected["model_patch"], "patch-a");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

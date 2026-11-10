@@ -377,12 +377,19 @@ fn load_symbols(
              \"{relative}\" is not one"
         ))
     })?;
+    let source = read_symbol_source(&path, &relative)?;
+    let (_, symbols) = parse_symbols(lang, &source).map_err(ToolError::Execution)?;
+    Ok((source, symbols, relative))
+}
+
+/// Reads a symbol-tool target with a hard bound on the open file handle.
+fn read_symbol_source(path: &Path, relative: &str) -> Result<String, ToolError> {
     // Review E3: bounded read on the handle, not stat-then-read — a
     // file growing between metadata and read used to load unbounded.
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(
         &mut std::io::Read::take(
-            std::fs::File::open(&path)
+            std::fs::File::open(path)
                 .map_err(|_| ToolError::InvalidInput(format!("file does not exist: {relative}")))?,
             SYMBOLS_MAX_FILE_BYTES + 1,
         ),
@@ -398,8 +405,7 @@ fn load_symbols(
     }
     let source = String::from_utf8(bytes)
         .map_err(|_| ToolError::Execution(format!("\"{relative}\" is not valid UTF-8")))?;
-    let (_, symbols) = parse_symbols(lang, &source).map_err(ToolError::Execution)?;
-    Ok((source, symbols, relative))
+    Ok(source)
 }
 
 /// Head-bounded excerpt of replaced text for the result echo.
@@ -706,27 +712,7 @@ fn replace_symbol(
              \"{relative}\" is not one"
         ))
     })?;
-    // Review E3: bounded read on the handle, not stat-then-read — a
-    // file growing between metadata and read used to load unbounded.
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(
-        &mut std::io::Read::take(
-            std::fs::File::open(&path)
-                .map_err(|_| ToolError::InvalidInput(format!("file does not exist: {relative}")))?,
-            SYMBOLS_MAX_FILE_BYTES + 1,
-        ),
-        &mut bytes,
-    )
-    .map_err(|err| ToolError::Execution(format!("cannot read \"{relative}\": {err}")))?;
-    if bytes.len() as u64 > SYMBOLS_MAX_FILE_BYTES {
-        return Err(ToolError::InvalidInput(format!(
-            "file is too large for symbol tools ({} bytes; \
-             limit {SYMBOLS_MAX_FILE_BYTES})",
-            bytes.len()
-        )));
-    }
-    let source = String::from_utf8(bytes)
-        .map_err(|_| ToolError::Execution(format!("\"{relative}\" is not valid UTF-8")))?;
+    let source = read_symbol_source(&path, &relative)?;
     let (_, flat) = parse_symbols(lang, &source).map_err(ToolError::Execution)?;
 
     let matches: Vec<&FlatSymbol> = flat

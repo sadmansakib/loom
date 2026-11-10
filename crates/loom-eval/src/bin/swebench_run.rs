@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use loom_eval::swebench::{
-    self, AgentKind, ContainerSpec, EXPECTED_ROWS, Prediction, RunUsage, SweInstance, api_key_envs,
+    self, AgentKind, ContainerSpec, EXPECTED_ROWS, RunUsage, SweInstance, api_key_envs,
     build_prompt, dataset_cache_path, docker_run_argv, fetch_dataset_verified, load_dataset_cached,
     run_outcome, run_usage, select_instances, testbed_image,
 };
@@ -742,56 +742,18 @@ fn main() {
         }
     }
 
-    // Per-run predictions files (one row per instance, never duplicated).
-    for (index, rows) in predictions.iter().enumerate() {
-        if rows.is_empty() {
-            continue;
-        }
-        let borrowed: Vec<Prediction<'_>> = rows
-            .iter()
-            .map(|(instance_id, model, patch)| Prediction {
-                instance_id,
-                model_name_or_path: model,
-                model_patch: patch,
-            })
-            .collect();
-        let path = base.join(format!("predictions-{file_model}-{}.jsonl", index + 1));
-        swebench::write_predictions(&path, &borrowed);
-        prediction_paths.push(path);
-    }
-
-    // Best-of-N selection (Trae/Agentless majority voting): when an
-    // instance ran more than once, the most frequent normalized diff
-    // across runs becomes the sweep's prediction — independent runs
-    // converging on the same change is stronger evidence than any
-    // single rollout. Rows stay in instance order because outcomes
-    // were re-assembled in selection order above.
+    prediction_paths.extend(swebench::write_prediction_sets(
+        &base,
+        &format!("predictions-{file_model}"),
+        &predictions,
+        args.runs,
+    ));
     if args.runs > 1 && !predictions.is_empty() {
-        let mut selected_rows: Vec<(String, String, String)> = Vec::new();
-        for index in 0..predictions[0].len() {
-            let patches: Vec<&str> = predictions
-                .iter()
-                .map(|rows| rows[index].2.as_str())
-                .collect();
-            let (instance_id, model, _) = &predictions[0][index];
-            selected_rows.push((
-                instance_id.clone(),
-                model.clone(),
-                swebench::select_patch(&patches).to_owned(),
-            ));
-        }
-        let borrowed: Vec<Prediction<'_>> = selected_rows
-            .iter()
-            .map(|(instance_id, model, patch)| Prediction {
-                instance_id,
-                model_name_or_path: model,
-                model_patch: patch,
-            })
-            .collect();
-        let path = base.join(format!("predictions-{file_model}-selected.jsonl"));
-        swebench::write_predictions(&path, &borrowed);
-        prediction_paths.push(path.clone());
-        println!("best-of-{} selection: {}", args.runs, path.display());
+        println!(
+            "best-of-{} selection: {}",
+            args.runs,
+            prediction_paths.last().unwrap().display()
+        );
     }
 
     // Roadmap item 1's offline remainder: when the operator points at

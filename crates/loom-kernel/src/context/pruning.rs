@@ -1507,12 +1507,12 @@ fn age_out_large_reads(
     }
 }
 
-/// Pass 5 — turn-age masking: stub successful read-only results older
-/// than `age_mask_turns` assistant turns, independent of the window
-/// trigger — the transcript replay is capped at a rolling window, so a
-/// long task's request size plateaus instead of growing without bound.
-/// Runs after the other passes so already-stubbed calls keep their more
-/// specific reasons; the protected tail always wins.
+/// Passes 5 and 5b — mask successful read-only results older than the
+/// configured age windows. Turn-age masking is independent of the window
+/// trigger; writing-phase masking is enabled only after a recent write.
+/// Runs after earlier passes so already-stubbed calls keep their more
+/// specific reasons, and in general-before-specific order so turn-age
+/// wins when both windows apply. The protected tail always wins.
 fn mask_aged_reads(
     facts: &TranscriptFacts,
     protected_from: usize,
@@ -1521,18 +1521,27 @@ fn mask_aged_reads(
     estimator: &dyn TokenEstimator,
     pass: &mut DecisionSet,
 ) {
-    let Some(max_age) = config.age_mask_turns else {
-        return;
-    };
-    for earlier in &facts.results {
-        if !pass.eligible(earlier, protected_from) {
+    let writing_phase = facts
+        .last_write_turn
+        .is_some_and(|turn| total_turns.saturating_sub(turn) <= WRITING_PHASE_DETECT_TURNS);
+    let phase_mask_turns = config.phase_mask_turns.filter(|_| writing_phase);
+    let windows = [
+        (config.age_mask_turns, StubReason::TurnAge),
+        (phase_mask_turns, StubReason::WritingPhase),
+    ];
+
+    for (max_age, reason) in windows {
+        let Some(max_age) = max_age else {
             continue;
-        }
-        if earlier.status == ToolStatus::Success
-            && earlier.read_call.is_some()
-            && total_turns.saturating_sub(earlier.turn) > max_age
-        {
-            pass.add(earlier, StubReason::TurnAge, estimator);
+        };
+        for result in &facts.results {
+            if pass.eligible(result, protected_from)
+                && result.status == ToolStatus::Success
+                && result.read_call.is_some()
+                && total_turns.saturating_sub(result.turn) > max_age
+            {
+                pass.add(result, reason, estimator);
+            }
         }
     }
 }
@@ -1542,44 +1551,6 @@ fn mask_aged_reads(
 /// deterministic phase classifier, and selfopt sweeps the *mask* window
 /// (`LOOM_PHASE_MASK_TURNS`), not the classifier.
 const WRITING_PHASE_DETECT_TURNS: usize = 3;
-
-/// Pass 5b — phase-aware retention (roadmap item 10): while the loop is
-/// in the writing phase (a write/delete within the trailing
-/// `WRITING_PHASE_DETECT_TURNS` assistant turns), stub successful
-/// read-only results older than `phase_mask_turns` — a tighter window
-/// than turn-age masking, because exploration reads lose their value
-/// fastest once editing starts. Runs after [`mask_aged_reads`] so an
-/// already-masked read keeps its more general reason; the protected
-/// tail always wins.
-fn mask_writing_phase_reads(
-    facts: &TranscriptFacts,
-    protected_from: usize,
-    config: PruneConfig,
-    total_turns: usize,
-    estimator: &dyn TokenEstimator,
-    pass: &mut DecisionSet,
-) {
-    let Some(max_age) = config.phase_mask_turns else {
-        return;
-    };
-    let writing = facts
-        .last_write_turn
-        .is_some_and(|t| total_turns.saturating_sub(t) <= WRITING_PHASE_DETECT_TURNS);
-    if !writing {
-        return;
-    }
-    for earlier in &facts.results {
-        if !pass.eligible(earlier, protected_from) {
-            continue;
-        }
-        if earlier.status == ToolStatus::Success
-            && earlier.read_call.is_some()
-            && total_turns.saturating_sub(earlier.turn) > max_age
-        {
-            pass.add(earlier, StubReason::WritingPhase, estimator);
-        }
-    }
-}
 
 /// Pass 6 — argument elision: tool calls older than `elide_turns`
 /// assistant turns have their arguments reduced to a signature — every
@@ -1799,14 +1770,6 @@ fn decide(
         &mut pass,
     );
     mask_aged_reads(
-        &facts,
-        protected_from,
-        config,
-        total_turns,
-        estimator,
-        &mut pass,
-    );
-    mask_writing_phase_reads(
         &facts,
         protected_from,
         config,

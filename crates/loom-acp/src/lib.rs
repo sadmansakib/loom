@@ -199,6 +199,40 @@ impl AcpState {
     }
 }
 
+/// Builds the shared engine configuration for a session rooted at `workspace`.
+fn engine_config(options: &ServerOptions, workspace: std::path::PathBuf) -> EngineConfig {
+    EngineConfig {
+        provider: options.provider.clone(),
+        model: options.model.clone(),
+        base_url: options.base_url.clone(),
+        headers: Vec::new(),
+        models_url: None,
+        reasoning_effort: ReasoningEffort::default(),
+        account: None,
+        workspace,
+        system_prompt: None,
+        max_turns: options.max_turns,
+        turn_budget: Default::default(),
+        context_editing: None,
+        db_path: options.db_path.clone(),
+        persist: true,
+        catalog: None,
+        scout: None,
+        routing: None,
+        stall_escalation_model: None,
+        background_commands: false,
+        symbols: false,
+        git: false,
+        skills: false,
+        lessons: false,
+        mcp: false,
+        lsp: false,
+        budgets: Default::default(),
+        prune: None,
+        autofix: false,
+    }
+}
+
 /// Locks a std mutex, recovering from poisoning: session bookkeeping
 /// holds no invariant a panicked handler could break.
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -213,13 +247,12 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// channel that a per-prompt forwarder drains onto the wire, so
 /// emission order survives without blocking the engine.
 struct SessionUpdateSink {
-    session: acp::SessionId,
     tx: mpsc::UnboundedSender<acp::SessionUpdate>,
 }
 
 impl EventSink for SessionUpdateSink {
     fn emit(&self, _task_id: TaskId, kind: EventKind) {
-        for update in updates_for(&self.session, &kind) {
+        for update in updates_for(&kind) {
             if self.tx.send(update).is_err() {
                 // Forwarder gone (prompt aborted): drop the update;
                 // the prompt response carries the outcome.
@@ -339,36 +372,7 @@ async fn handle_new_session(
     cx: agent_client_protocol::v1::ConnectionTo<Client>,
 ) -> Result<(), Error> {
     let options = state.options.clone();
-    let config = EngineConfig {
-        provider: options.provider.clone(),
-        model: options.model.clone(),
-        base_url: options.base_url.clone(),
-        headers: Vec::new(),
-        models_url: None,
-        reasoning_effort: ReasoningEffort::default(),
-        account: None,
-        workspace: request.cwd.clone(),
-        system_prompt: None,
-        max_turns: options.max_turns,
-        turn_budget: Default::default(),
-        context_editing: None,
-        db_path: options.db_path.clone(),
-        persist: true,
-        catalog: None,
-        scout: None,
-        routing: None,
-        stall_escalation_model: None,
-        background_commands: false,
-        symbols: false,
-        git: false,
-        skills: false,
-        lessons: false,
-        mcp: false,
-        lsp: false,
-        budgets: Default::default(),
-        prune: None,
-        autofix: false,
-    };
+    let config = engine_config(&options, request.cwd.clone());
     // The ACP session id *is* the kernel session id in string form, so
     // a later connection's `session/load` names the same durable
     // transcript. Kernel ids are UUIDv7; editors treat them as opaque
@@ -537,36 +541,7 @@ async fn handle_load_session(
         );
     }
     let options = state.options.clone();
-    let config = EngineConfig {
-        provider: options.provider.clone(),
-        model: options.model.clone(),
-        base_url: options.base_url.clone(),
-        headers: Vec::new(),
-        models_url: None,
-        reasoning_effort: ReasoningEffort::default(),
-        account: None,
-        workspace: request.cwd.clone(),
-        system_prompt: None,
-        max_turns: options.max_turns,
-        turn_budget: Default::default(),
-        context_editing: None,
-        db_path: options.db_path.clone(),
-        persist: true,
-        catalog: None,
-        scout: None,
-        routing: None,
-        stall_escalation_model: None,
-        background_commands: false,
-        symbols: false,
-        git: false,
-        skills: false,
-        lessons: false,
-        mcp: false,
-        lsp: false,
-        budgets: Default::default(),
-        prune: None,
-        autofix: false,
-    };
+    let config = engine_config(&options, request.cwd.clone());
     let engine = match Engine::open_async_with(config, (options.overrides_factory)()).await {
         Ok(engine) => engine,
         Err(error) => {
@@ -669,10 +644,7 @@ async fn handle_prompt(
     };
     let prompt = prompt_text(&request.prompt);
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let sink = SessionUpdateSink {
-        session: request.session_id.clone(),
-        tx,
-    };
+    let sink = SessionUpdateSink { tx };
     let forward_session = request.session_id.clone();
     let forward_cx = _cx.clone();
     let forwarder = tokio::spawn(async move {
@@ -744,8 +716,7 @@ fn prompt_text(blocks: &[acp::ContentBlock]) -> String {
 /// autofix bookkeeping, steering, budget extensions, loop nudges,
 /// terminal task state. An editor sees message chunks, thoughts, tool
 /// activity, and the plan — the things a human reads.
-fn updates_for(session: &acp::SessionId, kind: &EventKind) -> Vec<acp::SessionUpdate> {
-    let _ = session;
+fn updates_for(kind: &EventKind) -> Vec<acp::SessionUpdate> {
     let text_block = |text: &str| acp::ContentBlock::Text(acp::TextContent::new(text.to_owned()));
     match kind {
         EventKind::TextDelta { text } => {
@@ -810,8 +781,6 @@ fn tool_kind(name: &str) -> acp::ToolKind {
 fn tool_status(status: ToolStatus) -> acp::ToolCallStatus {
     match status {
         ToolStatus::Success => acp::ToolCallStatus::Completed,
-        ToolStatus::Error(_) => acp::ToolCallStatus::Failed,
-        ToolStatus::Cancelled { .. } => acp::ToolCallStatus::Failed,
         _ => acp::ToolCallStatus::Failed,
     }
 }
@@ -839,10 +808,6 @@ fn plan_entry(item: &TodoItem) -> acp::PlanEntry {
 mod tests {
     use super::*;
 
-    fn session() -> acp::SessionId {
-        acp::SessionId::new("test-session")
-    }
-
     fn kinds(updates: &[acp::SessionUpdate]) -> String {
         updates
             .iter()
@@ -860,12 +825,9 @@ mod tests {
 
     #[test]
     fn text_and_reasoning_deltas_map_to_chunks() {
-        let updates = updates_for(
-            &session(),
-            &EventKind::TextDelta {
-                text: "hello".into(),
-            },
-        );
+        let updates = updates_for(&EventKind::TextDelta {
+            text: "hello".into(),
+        });
         assert_eq!(kinds(&updates), "message");
         let acp::SessionUpdate::AgentMessageChunk(chunk) = &updates[0] else {
             panic!("must be a message chunk");
@@ -875,12 +837,9 @@ mod tests {
             other => panic!("must be text, got {other:?}"),
         }
 
-        let updates = updates_for(
-            &session(),
-            &EventKind::ReasoningDelta {
-                text: "thinking".into(),
-            },
-        );
+        let updates = updates_for(&EventKind::ReasoningDelta {
+            text: "thinking".into(),
+        });
         assert_eq!(kinds(&updates), "thought");
     }
 
@@ -888,14 +847,11 @@ mod tests {
     fn tool_events_map_with_kind_status_and_content() {
         let call_id = loom_core::kernel::transcript::ToolCallId::try_from("call-1".to_owned())
             .expect("valid call id");
-        let started = updates_for(
-            &session(),
-            &EventKind::ToolStarted {
-                name: "run_command".into(),
-                call_id: call_id.clone(),
-                arguments: "{\"program\":\"cargo\"}".into(),
-            },
-        );
+        let started = updates_for(&EventKind::ToolStarted {
+            name: "run_command".into(),
+            call_id: call_id.clone(),
+            arguments: "{\"program\":\"cargo\"}".into(),
+        });
         assert_eq!(kinds(&started), "tool_call");
         let acp::SessionUpdate::ToolCall(call) = &started[0] else {
             panic!("must be a tool call");
@@ -904,15 +860,12 @@ mod tests {
         assert!(matches!(call.kind, acp::ToolKind::Execute));
         assert!(matches!(call.status, acp::ToolCallStatus::InProgress));
 
-        let completed = updates_for(
-            &session(),
-            &EventKind::ToolCompleted {
-                name: "run_command".into(),
-                call_id,
-                status: ToolStatus::Error(loom_core::kernel::transcript::ToolFailure::UnknownTool),
-                content_head: "boom".into(),
-            },
-        );
+        let completed = updates_for(&EventKind::ToolCompleted {
+            name: "run_command".into(),
+            call_id,
+            status: ToolStatus::Error(loom_core::kernel::transcript::ToolFailure::UnknownTool),
+            content_head: "boom".into(),
+        });
         assert_eq!(kinds(&completed), "tool_update");
         let acp::SessionUpdate::ToolCallUpdate(update) = &completed[0] else {
             panic!("must be a tool update");
@@ -951,24 +904,21 @@ mod tests {
 
     #[test]
     fn todo_updates_map_to_plan_entries() {
-        let updates = updates_for(
-            &session(),
-            &EventKind::TodoUpdated {
-                revision: 2,
-                items: vec![
-                    TodoItem {
-                        id: "1".into(),
-                        text: "first".into(),
-                        status: TodoStatus::Done,
-                    },
-                    TodoItem {
-                        id: "2".into(),
-                        text: "second".into(),
-                        status: TodoStatus::InProgress,
-                    },
-                ],
-            },
-        );
+        let updates = updates_for(&EventKind::TodoUpdated {
+            revision: 2,
+            items: vec![
+                TodoItem {
+                    id: "1".into(),
+                    text: "first".into(),
+                    status: TodoStatus::Done,
+                },
+                TodoItem {
+                    id: "2".into(),
+                    text: "second".into(),
+                    status: TodoStatus::InProgress,
+                },
+            ],
+        });
         assert_eq!(kinds(&updates), "plan");
         let acp::SessionUpdate::Plan(plan) = &updates[0] else {
             panic!("must be a plan");
@@ -1004,7 +954,7 @@ mod tests {
             },
         ] {
             assert!(
-                updates_for(&session(), &kind).is_empty(),
+                updates_for(&kind).is_empty(),
                 "internal telemetry must not reach the editor"
             );
         }

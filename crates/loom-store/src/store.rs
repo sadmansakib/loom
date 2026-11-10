@@ -204,48 +204,15 @@ impl SessionStore for SqliteStore {
         index: ItemIndex,
         item: &Item,
     ) -> Result<(), StoreError> {
-        let value = serde_json::to_value(item).map_err(backend)?;
-        let kind = value
-            .get("kind")
-            .and_then(|kind| kind.as_str())
-            .unwrap_or_default()
-            .to_owned();
         let connection = self.lock()?;
-        connection
-            .execute(
-                "INSERT INTO items (session_id, idx, kind, body_json) VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    session.to_string(),
-                    i64::from(index.as_u32()),
-                    kind,
-                    value.to_string()
-                ],
-            )
-            .map_err(backend)?;
-        Ok(())
+        insert_item(&connection, session, index, item)
     }
 
     fn append_turn(&self, session: &SessionId, turn: &PlannedTurn) -> Result<(), StoreError> {
         let mut connection = self.lock()?;
         let transaction = connection.transaction().map_err(backend)?;
         for (index, item) in turn.items() {
-            let value = serde_json::to_value(&item).map_err(backend)?;
-            let kind = value
-                .get("kind")
-                .and_then(|kind| kind.as_str())
-                .unwrap_or_default()
-                .to_owned();
-            transaction
-                .execute(
-                    "INSERT INTO items (session_id, idx, kind, body_json) VALUES (?1, ?2, ?3, ?4)",
-                    params![
-                        session.to_string(),
-                        i64::from(index.as_u32()),
-                        kind,
-                        value.to_string()
-                    ],
-                )
-                .map_err(backend)?;
+            insert_item(&transaction, session, index, &item)?;
         }
         transaction.commit().map_err(backend)?;
         Ok(())
@@ -510,33 +477,18 @@ impl SessionStore for SqliteStore {
             return Ok(None);
         }
 
-        let mut transcript = Vec::new();
-        {
-            let mut query = connection
-                .prepare("SELECT body_json FROM items WHERE session_id = ?1 ORDER BY idx ASC")
-                .map_err(backend)?;
-            let rows = query
-                .query_map([session.to_string()], |row| row.get::<_, String>(0))
-                .map_err(backend)?;
-            for row in rows {
-                let body = row.map_err(backend)?;
-                transcript.push(serde_json::from_str::<Item>(&body).map_err(corrupt)?);
-            }
-        }
-
-        let mut tasks = Vec::new();
-        {
-            let mut query = connection
-                .prepare("SELECT body_json FROM tasks WHERE session_id = ?1 ORDER BY id ASC")
-                .map_err(backend)?;
-            let rows = query
-                .query_map([session.to_string()], |row| row.get::<_, String>(0))
-                .map_err(backend)?;
-            for row in rows {
-                let body = row.map_err(backend)?;
-                tasks.push(serde_json::from_str::<TaskRecord>(&body).map_err(corrupt)?);
-            }
-        }
+        let transcript = load_json_rows(
+            &connection,
+            "SELECT body_json FROM items WHERE session_id = ?1 ORDER BY idx ASC",
+            session,
+            |body| serde_json::from_str::<Item>(body),
+        )?;
+        let tasks = load_json_rows(
+            &connection,
+            "SELECT body_json FROM tasks WHERE session_id = ?1 ORDER BY id ASC",
+            session,
+            |body| serde_json::from_str::<TaskRecord>(body),
+        )?;
 
         // The kernel-owned todo list is not item-keyed: a session
         // rebuilt from items starts with an empty list. The transcript's
@@ -558,12 +510,11 @@ impl SessionStore for SqliteStore {
         let rows = query
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(backend)?;
-        let mut ids = Vec::new();
-        for row in rows {
+        rows.map(|row| {
             let raw = row.map_err(backend)?;
-            ids.push(raw.parse::<SessionId>().map_err(corrupt)?);
-        }
-        Ok(ids)
+            raw.parse::<SessionId>().map_err(corrupt)
+        })
+        .collect()
     }
 }
 
@@ -720,18 +671,17 @@ impl ArtifactStore for SqliteStore {
                 ))
             })
             .map_err(backend)?;
-        let mut stats = Vec::new();
-        for row in rows {
+        rows.map(|row| {
             let (raw_id, kind, bytes, created_at) = row.map_err(backend)?;
             let id = raw_id.parse::<ArtifactId>().map_err(corrupt)?;
-            stats.push(ArtifactStat {
+            Ok(ArtifactStat {
                 id,
                 kind,
                 bytes: bytes.unsigned_abs(),
                 created_at: created_at.unsigned_abs(),
-            });
-        }
-        Ok(stats)
+            })
+        })
+        .collect()
     }
 
     fn delete(&self, id: &ArtifactId) -> Result<(), StoreError> {
@@ -749,6 +699,54 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or_default()
+}
+
+/// Serializes an item once for both its denormalized kind and authoritative
+/// body columns.
+fn serialize_item(item: &Item) -> Result<(String, String), StoreError> {
+    let value = serde_json::to_value(item).map_err(backend)?;
+    let kind = value
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Ok((kind, value.to_string()))
+}
+
+/// Inserts one transcript item, keeping its indexed kind and JSON body in sync.
+fn insert_item(
+    connection: &Connection,
+    session: &SessionId,
+    index: ItemIndex,
+    item: &Item,
+) -> Result<(), StoreError> {
+    let (kind, body) = serialize_item(item)?;
+    connection
+        .execute(
+            "INSERT INTO items (session_id, idx, kind, body_json) VALUES (?1, ?2, ?3, ?4)",
+            params![session.to_string(), i64::from(index.as_u32()), kind, body],
+        )
+        .map_err(backend)?;
+    Ok(())
+}
+
+/// Loads and decodes one JSON body column in the requested deterministic
+/// order. Both transcript items and task records use this storage shape.
+fn load_json_rows<T>(
+    connection: &Connection,
+    sql: &str,
+    session: &SessionId,
+    decode: impl for<'a> Fn(&'a str) -> Result<T, serde_json::Error>,
+) -> Result<Vec<T>, StoreError> {
+    let mut query = connection.prepare(sql).map_err(backend)?;
+    let rows = query
+        .query_map([session.to_string()], |row| row.get::<_, String>(0))
+        .map_err(backend)?;
+    rows.map(|row| {
+        let body = row.map_err(backend)?;
+        decode(&body).map_err(corrupt)
+    })
+    .collect()
 }
 
 /// Wraps a deserialisation failure as corrupt stored state.
