@@ -359,6 +359,7 @@ sandbox = false
 program = "git"
 sandbox = false
 EOF
+git -C /testbed for-each-ref --format='%(refname)' | grep -v '^HEAD$' | while read -r ref; do git -C /testbed update-ref -d "$ref" 2>/dev/null || true; done; git -C /testbed reflog expire --expire=now --all 2>/dev/null || true; git -C /testbed gc --prune=now --quiet 2>/dev/null || true
 if [ -n "${LOOM_BASE_URL:-}" ]; then set -- --base-url "$LOOM_BASE_URL"; else set --; fi; timeout "$LOOM_TIMEOUT_SECS" /loom/loom run --json --no-save --provider "$LOOM_PROVIDER" --model "$LOOM_MODEL" "$@" --max-turns "$LOOM_MAX_TURNS" --workspace /testbed "$(cat /prompt.txt)" > /out/run.json 2> /out/run.err; status=$?; rm -rf /testbed/.loom; cd /testbed && git add -A && git diff --cached > /out/patch.diff 2> /out/patch.err; exit $status"#;
 
 /// The slice's provenance block, appended to the sweep report: what was
@@ -622,9 +623,11 @@ mod tests {
     #[test]
     fn rust_script_pins_by_hash_and_shares_the_python_tail() {
         // Frozen: any edit here is a deliberate, reviewable change.
+        // 2026-11: re-pinned after the F-05 history strip joined the
+        // shared tail (same bytes as CONTAINER_SCRIPT's).
         assert_eq!(
             swebench::sha256_hex(RUST_CONTAINER_SCRIPT.as_bytes()),
-            "7e267a0f913d095c5a104fd381a6d51aede3c4305afa6f01c554a048fb211780",
+            "fe234590a27f9931c04cafb51d6f4ca13e642d8d8da60596dc5dd88b052a7613",
             "RUST_CONTAINER_SCRIPT changed; update provenance consciously"
         );
         // The manifest carries the Rust toolchain the agent needs...

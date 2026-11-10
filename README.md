@@ -1,8 +1,8 @@
 # Loom
 
 [![Status: Early release](https://img.shields.io/badge/status-early%20release-blue)]()
-[![Tests: 1268](https://img.shields.io/badge/tests-1268-brightgreen)]()
-[![SWE-bench Verified: 90/100](https://img.shields.io/badge/SWE--bench%20Verified-90%2F100-blue)]()
+[![Tests: 1408](https://img.shields.io/badge/tests-1408-brightgreen)]()
+[![SWE-bench Verified: 90/100 frozen subset](https://img.shields.io/badge/SWE--bench%20Verified-90%2F100%20frozen%20subset-blue)]()
 
 > **Early release.** The headless agent core is usable today: the `loom`
 > binary runs tasks end to end against real providers, and `loom-core`
@@ -22,7 +22,13 @@ Measured: **90/100 resolved** on a frozen 100-instance SWE-bench Verified
 subset (first 20 dataset rows of astropy/django/scikit-learn/sphinx/sympy;
 official testbeds + official scorer, `deepseek-flash`, prompt v3, N=1).
 Not comparable to full-500 published numbers — smaller, five-repo mix;
-see docs/eval.md.
+see docs/eval.md. Two caveats the badge cannot carry: the sweep spanned
+two engine builds (recorded in CHANGELOG when discovered — the
+one-headline-one-binary rule and its build-digest enforcement postdate
+it), and the sweep JSON/predictions that would reproduce it were never
+published, so treat 90/100 as a historical baseline of that build and
+prompt, not a claim about head. The prompt has since moved to v5;
+re-measuring head requires a fresh sweep.
 
 ## Principles
 

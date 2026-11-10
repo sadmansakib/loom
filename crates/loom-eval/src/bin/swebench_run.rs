@@ -662,6 +662,17 @@ fn main() {
             let (events, task_failed) = outcome;
             let usage = run_usage(&out_dir.join("run.json"));
             usage_total.merge(usage);
+            // F-05 enforcement: a trajectory that fetched the fix (or
+            // installed packages mid-run) is flagged in the row; the
+            // sweep summary derives its total from these rows and
+            // refuses a clean-sweep read.
+            let flags = swebench::integrity_flags(&out_dir.join("run.json"));
+            if !flags.is_empty() {
+                eprintln!(
+                    "run {slug} #{run}: INTEGRITY FLAGS (not a clean solve): {}",
+                    flags.join("; ")
+                );
+            }
             let row = serde_json::json!({
                 "run": run,
                 "container": container_name,
@@ -670,6 +681,7 @@ fn main() {
                 "patch_empty": patch.trim().is_empty(),
                 "events": events,
                 "task_failed": task_failed,
+                "integrity_flags": flags,
                 "usage": {
                     "input_tokens": usage.input_tokens,
                     "cached_input_tokens": usage.cached_input_tokens,
@@ -845,6 +857,20 @@ fn main() {
         "base_url": args.base_url,
         "arm": args.arm,
         "dataset": swebench::DATASET_ID,
+        // F-05: zero means every trajectory stayed inside the
+        // testbed; anything else names runs whose score must be read
+        // as assisted, not clean (details in each run row's
+        // integrity_flags).
+        "integrity_flagged_runs": report
+            .iter()
+            .filter_map(|row| row["runs"].as_array())
+            .map(|runs| runs
+                .iter()
+                .filter(|run| run["integrity_flags"]
+                    .as_array()
+                    .is_some_and(|flags| !flags.is_empty()))
+                .count())
+            .sum::<usize>(),
         "provenance": provenance_json,
         "instances": report,
         "predictions_files": prediction_paths
@@ -878,6 +904,15 @@ fn main() {
     if prediction_paths.is_empty() {
         eprintln!("no runs completed — nothing to score");
         std::process::exit(1);
+    }
+    let flagged: usize = sweep["integrity_flagged_runs"].as_u64().unwrap_or(0) as usize;
+    if flagged > 0 {
+        eprintln!(
+            "\nINTEGRITY: {flagged} run(s) reached outside the testbed (git fetch/clone/pull,\n\
+             github.com, or pip install/download — see each row's integrity_flags).\n\
+             Their patches still score, but the sweep headline must not count them as\n\
+             clean solves; the sweep report records integrity_flagged_runs = {flagged}."
+        );
     }
     eprintln!("\nnext: score each predictions file with the official harness —");
     eprintln!("if any images were built locally (not pulled), alias them to");

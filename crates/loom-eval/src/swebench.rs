@@ -371,6 +371,16 @@ pub fn api_key_envs(provider: &str) -> Vec<String> {
 /// (python/pip/shell/git) with `sandbox = false`. `LOOM_SKIP_SANDBOX_
 /// PREFLIGHT` skips the bwrap probe for the same reason. The manifest
 /// is removed before the diff so it never leaks into `model_patch`.
+///
+/// Anti-cheat (review F-05): before the agent starts, the testbed's
+/// git history is destroyed — every ref except `HEAD` deleted,
+/// reflogs expired, unreachable objects pruned — so the fix commit
+/// (which exists in upstream history up to `base_commit` in some
+/// testbeds) cannot be recovered locally with `git log`/`show`/`fsck`.
+/// The scorer compares patches, so a refless worktree scores
+/// identically. The runner additionally scans each trajectory for
+/// network-retrieval commands and flags them (`integrity_flags` in
+/// the sweep row).
 pub const CONTAINER_SCRIPT: &str = r#"mkdir -p /testbed/.loom && cat > /testbed/.loom/commands.toml <<'EOF'
 [[command]]
 program = "bash"
@@ -400,6 +410,7 @@ sandbox = false
 program = "git"
 sandbox = false
 EOF
+git -C /testbed for-each-ref --format='%(refname)' | grep -v '^HEAD$' | while read -r ref; do git -C /testbed update-ref -d "$ref" 2>/dev/null || true; done; git -C /testbed reflog expire --expire=now --all 2>/dev/null || true; git -C /testbed gc --prune=now --quiet 2>/dev/null || true
 if [ -n "${LOOM_BASE_URL:-}" ]; then set -- --base-url "$LOOM_BASE_URL"; else set --; fi; timeout "$LOOM_TIMEOUT_SECS" /loom/loom run --json --no-save --provider "$LOOM_PROVIDER" --model "$LOOM_MODEL" "$@" --max-turns "$LOOM_MAX_TURNS" --workspace /testbed "$(cat /prompt.txt)" > /out/run.json 2> /out/run.err; status=$?; rm -rf /testbed/.loom; cd /testbed && git add -A && git diff --cached > /out/patch.diff 2> /out/patch.err; exit $status"#;
 
 /// Which agent the container runs. `Loom` is the product under test;
@@ -635,6 +646,77 @@ pub fn run_outcome(run_json: &Path) -> (usize, Option<String>) {
         }
     }
     (events, failure)
+}
+
+/// Scans one run's JSONL trajectory for commands that could have
+/// retrieved the fix (or a newer release of the package under test)
+/// from outside the testbed — review F-05's enforcement half. The
+/// container's git history is already destroyed before the agent
+/// starts ([`CONTAINER_SCRIPT`]); this catches the network routes:
+/// `git fetch/clone/pull`, any `github.com` URL (curl/wget/pip from
+/// git), and `pip install|download` of anything (the official
+/// testbeds ship the dependency set the gold patch assumes, so any
+/// install during a run is suspect).
+///
+/// Reads `tool_started` arguments (precisely: `program`/`args` parse
+/// back out of the head-bounded JSON — schema 11 keeps the head, so
+/// pathologically long argv can truncate; best effort) and
+/// `tool_completed` content heads (command echoes). Returns one
+/// human-readable flag per hit; empty means clean.
+pub fn integrity_flags(run_json: &Path) -> Vec<String> {
+    let Ok(body) = std::fs::read_to_string(run_json) else {
+        return Vec::new();
+    };
+    let mut flags = Vec::new();
+    for line in body.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let kind = &value["kind"];
+        match kind["type"].as_str() {
+            Some("tool_started") => {
+                let arguments = kind["arguments"].as_str().unwrap_or_default();
+                // Prefer the structured fields; fall back to substring
+                // sweeps for shell-wrapped invocations (`bash -c …`).
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(arguments) {
+                    let program = parsed["program"].as_str().unwrap_or_default();
+                    let args: Vec<&str> = parsed["args"]
+                        .as_array()
+                        .map(|entries| entries.iter().filter_map(|entry| entry.as_str()).collect())
+                        .unwrap_or_default();
+                    let subcommand = args.iter().find(|arg| !arg.starts_with('-'));
+                    let sub = *subcommand.unwrap_or(&"");
+                    // Global flags (`-C dir`) shift the subcommand, so
+                    // match the verb anywhere in argv — a path literally
+                    // named `fetch` false-positives, but the flag is a
+                    // human-reviewed pointer, not a verdict.
+                    if program == "git"
+                        && args
+                            .iter()
+                            .any(|arg| matches!(*arg, "fetch" | "clone" | "pull"))
+                    {
+                        flags.push("git fetch/clone/pull during run".to_string());
+                    }
+                    if matches!(program, "pip" | "pip3") && matches!(sub, "install" | "download") {
+                        flags.push("pip install/download during run".to_string());
+                    }
+                }
+                let lower = arguments.to_ascii_lowercase();
+                if lower.contains("github.com/") {
+                    flags.push("github.com URL in tool arguments".to_string());
+                }
+            }
+            Some("tool_completed") => {
+                let head = kind["content_head"].as_str().unwrap_or_default();
+                if head.to_ascii_lowercase().contains("github.com/") {
+                    flags.push("github.com URL in tool output".to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    flags.dedup();
+    flags
 }
 
 /// Model turns in a run's JSONL event stream: the count of
@@ -1375,6 +1457,95 @@ fn run_turns_counts_turn_started_events() {
     .unwrap();
     assert_eq!(run_turns(&path), 3);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn integrity_flags_catch_retrieval_routes() {
+    let dir = std::env::temp_dir().join(format!("loom-swe-integrity-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("run.json");
+
+    // Missing file: never started, nothing to flag.
+    assert!(integrity_flags(&path).is_empty());
+
+    // Clean trajectory: reads, tests, plain git status — no flags.
+    std::fs::write(
+        &path,
+        "{\"kind\":{\"type\":\"tool_started\",\"name\":\"run_command\",\"arguments\":\"{\\\"program\\\":\\\"git\\\",\\\"args\\\":[\\\"status\\\"]}\"}}\n\
+         {\"kind\":{\"type\":\"tool_started\",\"name\":\"run_command\",\"arguments\":\"{\\\"program\\\":\\\"python\\\",\\\"args\\\":[\\\"-m\\\",\\\"pytest\\\",\\\"-q\\\"]}\"}}\n",
+    )
+    .unwrap();
+    assert!(integrity_flags(&path).is_empty(), "clean run flagged");
+
+    // Every retrieval route F-05 names, one per line: git fetch
+    // (including flag-prefixed argv), pip download, github.com in
+    // arguments (curl) and in tool output (content_head).
+    std::fs::write(
+        &path,
+        "{\"kind\":{\"type\":\"tool_started\",\"arguments\":\"{\\\"program\\\":\\\"git\\\",\\\"args\\\":[\\\"fetch\\\",\\\"origin\\\"]}\"}}\n\
+         {\"kind\":{\"type\":\"tool_started\",\"arguments\":\"{\\\"program\\\":\\\"git\\\",\\\"args\\\":[\\\"-C\\\",\\\"/testbed\\\",\\\"clone\\\"]}\"}}\n\
+         {\"kind\":{\"type\":\"tool_started\",\"arguments\":\"{\\\"program\\\":\\\"pip3\\\",\\\"args\\\":[\\\"install\\\",\\\"--upgrade\\\",\\\"sympy\\\"]}\"}}\n\
+         {\"kind\":{\"type\":\"tool_started\",\"arguments\":\"{\\\"program\\\":\\\"curl\\\",\\\"args\\\":[\\\"-s\\\",\\\"https://github.com/django/django/commit/abc.patch\\\"]}\"}}\n\
+         {\"kind\":{\"type\":\"tool_completed\",\"content_head\":\"Cloning into 'django' from github.com/django/django\\n\"}}\n",
+    )
+    .unwrap();
+    let flags = integrity_flags(&path);
+    assert!(
+        flags
+            .iter()
+            .any(|flag| flag.contains("git fetch/clone/pull")),
+        "{flags:?}"
+    );
+    assert!(
+        flags
+            .iter()
+            .any(|flag| flag.contains("pip install/download")),
+        "{flags:?}"
+    );
+    assert_eq!(
+        flags
+            .iter()
+            .filter(|flag| flag.contains("github.com"))
+            .count(),
+        2,
+        "{flags:?}"
+    );
+
+    // pip list / pip show stay legal: the review's own scans hit them
+    // as benign version checks.
+    std::fs::write(
+        &path,
+        "{\"kind\":{\"type\":\"tool_started\",\"arguments\":\"{\\\"program\\\":\\\"pip\\\",\\\"args\\\":[\\\"list\\\"]}\"}}\n",
+    )
+    .unwrap();
+    assert!(integrity_flags(&path).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn container_script_strips_the_testbed_history_before_the_agent_runs() {
+    // F-05's other half: refs deleted, reflogs expired, objects
+    // pruned — all before /loom/loom starts, so no in-run git command
+    // can reach the fix commit.
+    let strip = CONTAINER_SCRIPT
+        .split("if [ -n")
+        .next()
+        .expect("script keeps the loom invocation last");
+    assert!(strip.contains("for-each-ref --format='%(refname)'"));
+    assert!(strip.contains("update-ref -d"));
+    assert!(strip.contains("reflog expire --expire=now --all"));
+    assert!(strip.contains("gc --prune=now"));
+    assert!(
+        strip.contains("git -C /testbed for-each-ref"),
+        "strip runs against the testbed"
+    );
+    let loom_pos = CONTAINER_SCRIPT.find("/loom/loom run").expect("loom runs");
+    let strip_pos = CONTAINER_SCRIPT.find("for-each-ref").expect("strip");
+    assert!(
+        strip_pos < loom_pos,
+        "history is destroyed before the agent starts"
+    );
 }
 
 #[test]

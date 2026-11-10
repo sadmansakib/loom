@@ -111,30 +111,24 @@ Invariants the session layer enforces (and tests):
    type; a second finish attempt cannot overwrite the recorded end reason.
 
 **Events** (`event.rs`) are the observation stream: `EventEnvelope`
-(`schema_version: 8`, per-sink monotonically increasing `sequence`,
+(`schema_version: 15`, per-sink monotonically increasing `sequence`,
 snake_case `type` tag). The persisting sink (`PersistingEventSink`)
 stores every kind *except* the per-token streams — `TextDelta` and
 `ReasoningDelta` forward live but are never written (review S4: they
 were ~65% of all rows at one synchronous INSERT per provider chunk;
 `ModelCompleted` and the transcript already hold the same content
-durably), so stored sequences stay contiguous from zero. Version 2
-adds `Usage.cost_usd`, the
-provider-reported charge; version 3 adds `ContextPruned` (prune
-attribution); version 4 adds `AwaitingInput` (engine idle marker after a
-task ends, naming the session — the signal a resume loop keys on);
-version 5 adds `TaskPaused` (graceful between-turns stop, distinct from
-`TaskCancelled`'s mid-flight abort); version 6 adds `ContextHandoff`
-(one-shot LLM handoff compaction); version 7 adds `FastPathHit` (a
-zero-request solve booked as a transcript-shaped turn); version 8 adds
-the surfaced-decision kinds — `FastPathDeclined` (the coarse reason a
-fast path fell through: no intent matched, or the solver's guards said
-no), `CapabilitiesResolved` (which authority — catalog row, provider
-table, or replay recording — fixed the model's capabilities, emitted
-once per engine), and `HarnessNotice` (per-command deviations the tools
-layer reports: sandbox passthrough, a stream truncated by a
-pipe-holding descendant; one event per distinct notice per batch). All
-new fields are additive, so older payloads still
-deserialize. A lock spans numbering and send, so arrival order
+durably), so stored sequences stay contiguous from zero. The
+authoritative version history lives on
+[`EVENT_SCHEMA_VERSION`](../crates/loom-kernel/src/event.rs); in
+brief: v2 `Usage.cost_usd`; v3 `ContextPruned`; v4 `AwaitingInput`
+(engine idle marker); v5 `TaskPaused`; v6 `ContextHandoff`; v7
+`FastPathHit`; v8 the surfaced-decision kinds (`FastPathDeclined`,
+`CapabilitiesResolved`, `HarnessNotice`); v9 `TodoUpdated`; v10
+`SteeringApplied`; v11 `LoopNudge` plus tool-event argument/content
+head budgets; v12 `TurnBudgetExtended`; v13 the `WritingPhase` stop
+reason; v14 `AutofixApplied`; v15 the `FastPathDeclined`
+rename-reason split. All new fields are additive, so older payloads
+still deserialize. A lock spans numbering and send, so arrival order
 equals sequence order even with concurrent emitters. The channel sink is
 unbounded — a slow consumer queues rather than back-pressures the agent;
 only a closed receiver drops (counted, warned once). `FanoutSink`

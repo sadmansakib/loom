@@ -3,6 +3,33 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Adversarial review round 2: eval integrity + doc drift (PR12)
+
+- `fix(eval)`: SWE-bench runs can no longer mine the fix locally or
+  fetch it silently (review F-05). The container script destroys the
+  testbed's git history before the agent starts (refs except HEAD
+  deleted, reflogs expired, unreachable objects pruned — the scorer
+  compares patches, so a refless worktree scores identically; the
+  multilingual Rust script carries the same tail, hash re-pinned).
+  After each run, `swebench-run` scans the trajectory for
+  `git fetch/clone/pull`, `github.com` URLs, and `pip
+  install/download`, writes per-run `integrity_flags`, prints them,
+  and totals `integrity_flagged_runs` in the sweep report; docs/eval.md
+  adds the matching honesty rule (a flagged run is not a clean solve).
+  In 105 audited pre-guard runs no trajectory hit any of these routes —
+  the guards make that a property, not an observation.
+- `docs`: README badge drift fixed (Tests 1268 → 1408, actually counted;
+  the 90/100 badge now says "frozen subset"), the measured-90/100
+  paragraph now carries the two caveats the badge cannot (the sweep
+  spanned two engine builds — pre-dating the one-headline-one-binary
+  rule — and its sweep JSON/predictions were never published, so the
+  number is a historical baseline, not a head claim; review F-06
+  code-side half; full remediation needs a re-run with published
+  artifacts). architecture.md's event-schema paragraph caught up with
+  the code: schema_version 8 → 15 with the version history summarized
+  and its source of truth pointed at `EVENT_SCHEMA_VERSION` (review
+  F-14).
+
 ## 2026-11 — Adversarial review round 2: event persistence diet (PR11)
 
 - `fix(kernel)`: per-token events no longer hit the events table

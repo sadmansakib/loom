@@ -220,6 +220,23 @@ is the honesty rule: until the spend-gated mutant re-grade runs, a
 headline reading this block cites structural hypotheses, not
 verdicts. Without the flag, provenance is byte-identical to before.
 
+**Trajectory integrity (review round 2, F-05).** Two mechanical
+guards now bracket every run. Before the agent starts, the container
+script destroys the testbed's git history — every ref except `HEAD`
+deleted, reflogs expired, unreachable objects pruned — so the fix
+commit (present in some testbeds' upstream history) cannot be
+recovered locally; the scorer compares patches, so a refless worktree
+scores identically. After the run, `swebench-run` scans the
+trajectory for network-retrieval routes — `git fetch`/`clone`/`pull`,
+any `github.com` URL in tool arguments or output, `pip
+install`/`download` — and writes hits to that run row's
+`integrity_flags`, prints them, and totals them in the sweep report's
+`integrity_flagged_runs`. The scan is head-bounded (schema 11
+truncates long argv), so it is a tripwire, not a proof; flagged
+patches still score, but a headline quoting them as clean solves is a
+misreading the report now makes hard. In 105 audited pre-guard runs
+no trajectory hit any of these routes.
+
 ## Multilingual Rust slice (item 35)
 
 A second benchmark surface: the 43 Rust tasks of SWE-bench Multilingual
@@ -321,3 +338,7 @@ Related open tails, recorded here so they stop living in prose:
   runs-per-instance, and model are part of the claim, not footnote
   material — a 100-of-500 five-repo subset must not read as a full-set
   score.
+- A run with `integrity_flags` is not a clean solve: its patch may
+  score, but a headline counting it must say so, and
+  `integrity_flagged_runs > 0` in a sweep report must be named in any
+  prose quoting that sweep.
