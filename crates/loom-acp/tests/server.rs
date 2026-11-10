@@ -8,6 +8,7 @@
 //! task on the other channel end. A notification handler on the
 //! client captures every `session/update` in wire order.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -53,43 +54,53 @@ struct Capture {
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
 }
 
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl Capture {
+    fn has_request(&self) -> bool {
+        !lock_or_recover(&self.requests).is_empty()
+    }
+
     fn any_user_text(&self, needle: &str) -> bool {
-        self.requests
-            .lock()
-            .map(|requests| {
-                requests
-                    .iter()
-                    .any(|request| request.user_texts.iter().any(|t| t == needle))
-            })
-            .unwrap_or(false)
+        lock_or_recover(&self.requests)
+            .iter()
+            .any(|request| request.user_texts.iter().any(|text| text == needle))
     }
 
     fn all_tools(&self) -> Vec<String> {
-        self.requests
-            .lock()
-            .map(|requests| {
-                requests
-                    .iter()
-                    .flat_map(|request| request.tool_names.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+        lock_or_recover(&self.requests)
+            .iter()
+            .flat_map(|request| request.tool_names.iter().cloned())
+            .collect()
     }
 }
 
 #[derive(Clone)]
 struct ScriptedProvider {
-    scripts: Arc<Mutex<Vec<Script>>>,
+    scripts: Arc<Mutex<VecDeque<Script>>>,
     capture: Capture,
 }
 
 impl ScriptedProvider {
     fn new(scripts: Vec<Script>) -> Self {
+        Self::with_capture(scripts, Capture::default())
+    }
+
+    fn with_capture(scripts: Vec<Script>, capture: Capture) -> Self {
         Self {
-            scripts: Arc::new(Mutex::new(scripts)),
-            capture: Capture::default(),
+            scripts: Arc::new(Mutex::new(scripts.into_iter().collect())),
+            capture,
         }
+    }
+
+    fn next_script(&self) -> Script {
+        lock_or_recover(&self.scripts)
+            .pop_front()
+            .expect("scripted provider received an unexpected extra request")
     }
 
     /// The shared request log for assertions.
@@ -129,21 +140,14 @@ impl ModelProvider for ScriptedProvider {
             .map(|tool| tool.name.clone())
             .collect::<Vec<_>>();
         let index = {
-            let mut requests = match self.capture.requests.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let mut requests = lock_or_recover(&self.capture.requests);
             requests.push(CapturedRequest {
                 user_texts,
                 tool_names,
             });
             requests.len()
         };
-        let script = self
-            .scripts
-            .lock()
-            .map(|mut scripts| scripts.remove(0))
-            .unwrap_or(Script::Reply(String::new()));
+        let script = self.next_script();
         match script {
             Script::Hanging => Box::pin(futures::stream::pending()),
             Script::Reply(text) => {
@@ -214,13 +218,27 @@ async fn await_updates(
     check: impl Fn(&[CapturedUpdate]) -> bool,
 ) {
     for _ in 0..400 {
-        if updates.lock().map(|u| check(&u)).unwrap_or(false) {
+        let satisfied = {
+            let updates = lock_or_recover(updates);
+            check(&updates)
+        };
+        if satisfied {
             return;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let snapshot = updates.lock().map(|u| u.clone()).unwrap_or_default();
+    let snapshot = lock_or_recover(updates).clone();
     panic!("updates never satisfied the check: {snapshot:#?}");
+}
+
+async fn await_request(capture: &Capture) {
+    for _ in 0..400 {
+        if capture.has_request() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("scripted provider never received a request");
 }
 
 #[tokio::test]
@@ -229,15 +247,11 @@ async fn initialize_new_session_and_prompt_run_end_to_end() {
     let workspace = workspace();
     let updates: Arc<Mutex<Vec<CapturedUpdate>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let options = ServerOptions::new(
-        "scripted".into(),
-        "test-model".into(),
-        std::env::temp_dir().join(format!("loom-acp-e2e-{}.db", std::process::id())),
-    )
-    .with_overrides_factory(Arc::new(move || {
-        let provider = ScriptedProvider::new(vec![Script::Reply("Hello from loom.".into())]);
-        loom_core::EngineOverrides::default().with_provider(Box::new(provider))
-    }));
+    let options = ServerOptions::new("scripted".into(), "test-model".into(), unique_db("e2e"))
+        .with_overrides_factory(Arc::new(move || {
+            let provider = ScriptedProvider::new(vec![Script::Reply("Hello from loom.".into())]);
+            loom_core::EngineOverrides::default().with_provider(Box::new(provider))
+        }));
     tokio::spawn(async move {
         if let Err(error) = serve(agent_end, AcpState::new(options)).await {
             eprintln!("test server ended: {error}");
@@ -255,9 +269,7 @@ async fn initialize_new_session_and_prompt_run_end_to_end() {
                     session: notification.session_id.clone(),
                     update: notification.update.clone(),
                 };
-                if let Ok(mut seen) = capture.lock() {
-                    seen.push(captured);
-                }
+                lock_or_recover(&capture).push(captured);
                 async { Ok(()) }
             },
             agent_client_protocol::on_receive_notification!(),
@@ -317,17 +329,11 @@ async fn initialize_new_session_and_prompt_run_end_to_end() {
 #[tokio::test]
 async fn unknown_session_prompt_is_an_error() {
     let (client_end, agent_end) = Channel::duplex();
-    let workspace = workspace();
-    let _ = workspace;
-    let options = ServerOptions::new(
-        "scripted".into(),
-        "test-model".into(),
-        std::env::temp_dir().join(format!("loom-acp-unknown-{}.db", std::process::id())),
-    )
-    .with_overrides_factory(Arc::new(|| {
-        let provider = ScriptedProvider::new(vec![Script::Reply(String::new())]);
-        loom_core::EngineOverrides::default().with_provider(Box::new(provider))
-    }));
+    let options = ServerOptions::new("scripted".into(), "test-model".into(), unique_db("unknown"))
+        .with_overrides_factory(Arc::new(|| {
+            let provider = ScriptedProvider::new(vec![Script::Reply(String::new())]);
+            loom_core::EngineOverrides::default().with_provider(Box::new(provider))
+        }));
     tokio::spawn(async move {
         if let Err(error) = serve(agent_end, AcpState::new(options)).await {
             eprintln!("test server ended: {error}");
@@ -365,15 +371,14 @@ async fn unknown_session_prompt_is_an_error() {
 async fn cancel_resolves_the_prompt_as_cancelled() {
     let (client_end, agent_end) = Channel::duplex();
     let workspace = workspace();
-    let options = ServerOptions::new(
-        "scripted".into(),
-        "test-model".into(),
-        std::env::temp_dir().join(format!("loom-acp-cancel-{}.db", std::process::id())),
-    )
-    .with_overrides_factory(Arc::new(|| {
-        let provider = ScriptedProvider::new(vec![Script::Hanging]);
-        loom_core::EngineOverrides::default().with_provider(Box::new(provider))
-    }));
+    let capture = Capture::default();
+    let factory_capture = capture.clone();
+    let options = ServerOptions::new("scripted".into(), "test-model".into(), unique_db("cancel"))
+        .with_overrides_factory(Arc::new(move || {
+            let provider =
+                ScriptedProvider::with_capture(vec![Script::Hanging], factory_capture.clone());
+            loom_core::EngineOverrides::default().with_provider(Box::new(provider))
+        }));
     tokio::spawn(async move {
         if let Err(error) = serve(agent_end, AcpState::new(options)).await {
             eprintln!("test server ended: {error}");
@@ -399,9 +404,8 @@ async fn cancel_resolves_the_prompt_as_cancelled() {
                 session.session_id.clone(),
                 vec![text_content("stall forever")],
             ));
-            // Let the prompt reach the hanging model request, then
-            // cancel the session.
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            // Cancel only after the prompt reaches the hanging provider.
+            await_request(&capture).await;
             cx.send_notification(acp::CancelNotification::new(session.session_id.clone()))
                 .expect("cancel sent");
             let response = prompt.block_task().await.expect("prompt resolves");
@@ -410,6 +414,73 @@ async fn cancel_resolves_the_prompt_as_cancelled() {
                 "cancel must resolve the prompt as cancelled, got {:?}",
                 response.stop_reason
             );
+            Ok(())
+        })
+        .await;
+    assert!(result.is_ok(), "client connection failed: {result:?}");
+}
+
+#[tokio::test]
+async fn concurrent_prompt_for_one_session_is_rejected() {
+    let (client_end, agent_end) = Channel::duplex();
+    let workspace = workspace();
+    let capture = Capture::default();
+    let factory_capture = capture.clone();
+    let options = ServerOptions::new(
+        "scripted".into(),
+        "test-model".into(),
+        unique_db("concurrent-prompt"),
+    )
+    .with_overrides_factory(Arc::new(move || {
+        let provider =
+            ScriptedProvider::with_capture(vec![Script::Hanging], factory_capture.clone());
+        loom_core::EngineOverrides::default().with_provider(Box::new(provider))
+    }));
+    tokio::spawn(async move {
+        if let Err(error) = serve(agent_end, AcpState::new(options)).await {
+            eprintln!("test server ended: {error}");
+        }
+    });
+
+    let result = Client
+        .v1()
+        .connect_with(client_end, async move |cx| {
+            let _ = cx
+                .send_request(acp::InitializeRequest::new(
+                    agent_client_protocol::schema::ProtocolVersion::V1,
+                ))
+                .block_task()
+                .await
+                .expect("initialize");
+            let session = cx
+                .send_request(acp::NewSessionRequest::new(workspace))
+                .block_task()
+                .await
+                .expect("new session");
+
+            let prompt = cx.send_request(acp::PromptRequest::new(
+                session.session_id.clone(),
+                vec![text_content("stall forever")],
+            ));
+            // Request dispatch reserves the session synchronously, before
+            // its handler task can wait on the session mutex.
+            await_request(&capture).await;
+            let concurrent = cx
+                .send_request(acp::PromptRequest::new(
+                    session.session_id.clone(),
+                    vec![text_content("must be rejected")],
+                ))
+                .block_task()
+                .await;
+            assert!(
+                concurrent.is_err(),
+                "a second prompt must not queue behind the active prompt"
+            );
+
+            cx.send_notification(acp::CancelNotification::new(session.session_id.clone()))
+                .expect("cancel sent");
+            let response = prompt.block_task().await.expect("first prompt resolves");
+            assert!(matches!(response.stop_reason, acp::StopReason::Cancelled));
             Ok(())
         })
         .await;
@@ -426,16 +497,18 @@ async fn cancel_resolves_the_prompt_as_cancelled() {
 async fn cancel_does_not_poison_the_next_prompt() {
     let (client_end, agent_end) = Channel::duplex();
     let workspace = workspace();
+    let capture = Capture::default();
+    let factory_capture = capture.clone();
     let options = ServerOptions::new(
         "scripted".into(),
         "test-model".into(),
-        std::env::temp_dir().join(format!("loom-acp-recancel-{}.db", std::process::id())),
+        unique_db("recancel"),
     )
     .with_overrides_factory(Arc::new(move || {
-        let provider = ScriptedProvider::new(vec![
-            Script::Hanging,
-            Script::Reply("after the cancel".into()),
-        ]);
+        let provider = ScriptedProvider::with_capture(
+            vec![Script::Hanging, Script::Reply("after the cancel".into())],
+            factory_capture.clone(),
+        );
         loom_core::EngineOverrides::default().with_provider(Box::new(provider))
     }));
     tokio::spawn(async move {
@@ -463,7 +536,7 @@ async fn cancel_does_not_poison_the_next_prompt() {
                 session.session_id.clone(),
                 vec![text_content("stall forever")],
             ));
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            await_request(&capture).await;
             cx.send_notification(acp::CancelNotification::new(session.session_id.clone()))
                 .expect("cancel sent");
             let response = prompt.block_task().await.expect("prompt resolves");
@@ -520,7 +593,7 @@ async fn an_unanswered_permission_request_times_out_and_denies() {
     let mut options = ServerOptions::new(
         "scripted".into(),
         "test-model".into(),
-        std::env::temp_dir().join(format!("loom-acp-asktimeout-{}.db", std::process::id())),
+        unique_db("asktimeout"),
     )
     .with_overrides_factory(Arc::new(move || {
         loom_core::EngineOverrides::default().with_provider(Box::new(provider_for_factory.clone()))
@@ -535,8 +608,7 @@ async fn an_unanswered_permission_request_times_out_and_denies() {
     });
 
     // The client receives the permission request and never answers —
-    // an editor with a wedged dialog. Every arriving request is
-    // recorded so the test proves the dialog actually happened.
+    // an editor with a wedged dialog. Record its unique request id.
     let asked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let asked_capture = Arc::clone(&asked);
     let started = std::time::Instant::now();
@@ -546,11 +618,9 @@ async fn an_unanswered_permission_request_times_out_and_denies() {
             move |request: acp::RequestPermissionRequest, responder, _cx| {
                 let captured = asked_capture.clone();
                 async move {
-                    // The server mints the id from the program name.
-                    let program = request.tool_call.tool_call_id.0.to_string();
-                    if let Ok(mut seen) = captured.lock() {
-                        seen.push(program);
-                    }
+                    // The server assigns each approval request a unique id.
+                    let request_id = request.tool_call.tool_call_id.0.to_string();
+                    lock_or_recover(&captured).push(request_id);
                     // Hold the responder in a detached task: the
                     // dialog hangs without blocking the client's
                     // dispatch loop (a pending handler would wedge
@@ -592,10 +662,7 @@ async fn an_unanswered_permission_request_times_out_and_denies() {
         .await;
     assert!(result.is_ok(), "client connection failed: {result:?}");
     // The dialog happened and was denied by timeout, not answered.
-    assert!(
-        asked.lock().map(|seen| seen.len() == 1).unwrap_or(false),
-        "expected exactly one permission request"
-    );
+    assert_eq!(lock_or_recover(&asked).len(), 1, "one permission request");
     assert!(
         started.elapsed() < Duration::from_secs(10),
         "the prompt must resolve at the timeout, not hang"
@@ -608,13 +675,18 @@ async fn an_unanswered_permission_request_times_out_and_denies() {
 async fn cancel_while_idle_does_not_affect_the_next_prompt() {
     let (client_end, agent_end) = Channel::duplex();
     let workspace = workspace();
+    let capture = Capture::default();
+    let factory_capture = capture.clone();
     let options = ServerOptions::new(
         "scripted".into(),
         "test-model".into(),
-        std::env::temp_dir().join(format!("loom-acp-idlecancel-{}.db", std::process::id())),
+        unique_db("idle-cancel"),
     )
     .with_overrides_factory(Arc::new(move || {
-        let provider = ScriptedProvider::new(vec![Script::Reply("unaffected".into())]);
+        let provider = ScriptedProvider::with_capture(
+            vec![Script::Reply("unaffected".into())],
+            factory_capture.clone(),
+        );
         loom_core::EngineOverrides::default().with_provider(Box::new(provider))
     }));
     tokio::spawn(async move {
@@ -641,15 +713,12 @@ async fn cancel_while_idle_does_not_affect_the_next_prompt() {
             // Cancel with nothing running.
             cx.send_notification(acp::CancelNotification::new(session.session_id.clone()))
                 .expect("cancel sent");
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let response = cx
-                .send_request(acp::PromptRequest::new(
-                    session.session_id.clone(),
-                    vec![text_content("hello")],
-                ))
-                .block_task()
-                .await
-                .expect("prompt resolves");
+            let prompt = cx.send_request(acp::PromptRequest::new(
+                session.session_id.clone(),
+                vec![text_content("hello")],
+            ));
+            await_request(&capture).await;
+            let response = prompt.block_task().await.expect("prompt resolves");
             assert!(
                 matches!(response.stop_reason, acp::StopReason::EndTurn),
                 "a prompt after an idle cancel must complete normally, got {:?}",
@@ -672,16 +741,105 @@ fn load_options(db: &std::path::Path, provider: &ScriptedProvider) -> ServerOpti
 }
 
 fn unique_db(name: &str) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "loom-acp-{name}-{}-{}.db",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0),
-    ));
-    let _ = std::fs::remove_file(&path);
-    path
+    std::env::temp_dir().join(format!("loom-acp-{name}-{}.db", uuid::Uuid::now_v7()))
+}
+
+#[tokio::test]
+async fn concurrent_load_of_the_same_session_id_is_rejected() {
+    let workspace = workspace();
+    let db = unique_db("concurrent-load-create");
+    let provider = ScriptedProvider::new(vec![Script::Reply("persist me".into())]);
+    let (session_id_tx, session_id_rx) = tokio::sync::oneshot::channel();
+    let server_db = db.clone();
+    let create_workspace = workspace.clone();
+    let (client_end, agent_end) = Channel::duplex();
+    tokio::spawn(async move {
+        if let Err(error) = serve(
+            agent_end,
+            AcpState::new(load_options(&server_db, &provider)),
+        )
+        .await
+        {
+            eprintln!("test server ended: {error}");
+        }
+    });
+
+    let result = Client
+        .v1()
+        .connect_with(client_end, async move |cx| {
+            let _ = cx
+                .send_request(acp::InitializeRequest::new(
+                    agent_client_protocol::schema::ProtocolVersion::V1,
+                ))
+                .block_task()
+                .await
+                .expect("initialize");
+            let created = cx
+                .send_request(acp::NewSessionRequest::new(create_workspace))
+                .block_task()
+                .await
+                .expect("new session");
+            session_id_tx
+                .send(created.session_id.clone())
+                .expect("session id receiver remains open");
+            cx.send_request(acp::PromptRequest::new(
+                created.session_id.clone(),
+                vec![text_content("persist me")],
+            ))
+            .block_task()
+            .await
+            .expect("persist session");
+            Ok(())
+        })
+        .await;
+    assert!(
+        result.is_ok(),
+        "session creation connection failed: {result:?}"
+    );
+
+    let session_id = session_id_rx
+        .await
+        .expect("session id was returned by the creation connection");
+    let (client_end, agent_end) = Channel::duplex();
+    let load_provider = ScriptedProvider::new(Vec::new());
+    tokio::spawn(async move {
+        if let Err(error) = serve(agent_end, AcpState::new(load_options(&db, &load_provider))).await
+        {
+            eprintln!("test server ended: {error}");
+        }
+    });
+
+    let result = Client
+        .v1()
+        .connect_with(client_end, async move |cx| {
+            let _ = cx
+                .send_request(acp::InitializeRequest::new(
+                    agent_client_protocol::schema::ProtocolVersion::V1,
+                ))
+                .block_task()
+                .await
+                .expect("initialize");
+            let load = cx.send_request(acp::LoadSessionRequest::new(
+                session_id.clone(),
+                workspace.clone(),
+            ));
+            let duplicate = cx
+                .send_request(acp::LoadSessionRequest::new(session_id, workspace))
+                .block_task()
+                .await;
+            let first = load.block_task().await;
+            assert_ne!(
+                first.is_ok(),
+                duplicate.is_ok(),
+                "exactly one concurrent load succeeds"
+            );
+            Ok(())
+        })
+        .await;
+    assert!(
+        result.is_ok(),
+        "session loading connection failed: {result:?}"
+    );
 }
 
 #[tokio::test]
@@ -693,7 +851,7 @@ async fn session_load_resumes_a_persisted_session_across_connections() {
         Script::Reply("two".into()),
     ]);
     let capture = provider.capture();
-    let shared_id: Arc<Mutex<Option<acp::SessionId>>> = Arc::new(Mutex::new(None));
+    let (session_id_tx, session_id_rx) = tokio::sync::oneshot::channel();
 
     // Connection 1: create the session, run one turn, keep the id.
     let (client_end, agent_end) = Channel::duplex();
@@ -704,7 +862,6 @@ async fn session_load_resumes_a_persisted_session_across_connections() {
         }
     });
     let first_workspace = workspace.clone();
-    let set_id = shared_id.clone();
     let result = Client
         .v1()
         .connect_with(client_end, async move |cx| {
@@ -731,19 +888,17 @@ async fn session_load_resumes_a_persisted_session_across_connections() {
             assert!(matches!(response.stop_reason, acp::StopReason::EndTurn));
             // The id doubles as the kernel session id: a valid UUID.
             assert!(uuid::Uuid::parse_str(&session.session_id.0).is_ok());
-            if let Ok(mut slot) = set_id.lock() {
-                *slot = Some(session.session_id.clone());
-            }
+            session_id_tx
+                .send(session.session_id.clone())
+                .expect("session id receiver remains open");
             Ok(())
         })
         .await;
     assert!(result.is_ok(), "first connection failed: {result:?}");
 
-    let resumed_id = shared_id
-        .lock()
-        .ok()
-        .and_then(|slot| slot.clone())
-        .expect("session id captured");
+    let resumed_id = session_id_rx
+        .await
+        .expect("session id was returned by the first connection");
 
     // Connection 2: same db, same workspace — load and continue.
     let (client_end, agent_end) = Channel::duplex();
@@ -989,9 +1144,7 @@ async fn forwarded_mcp_servers_attach_and_run_when_allowed() {
                     session: notification.session_id.clone(),
                     update: notification.update.clone(),
                 };
-                if let Ok(mut seen) = capture_updates.lock() {
-                    seen.push(captured);
-                }
+                lock_or_recover(&capture_updates).push(captured);
                 async { Ok(()) }
             },
             agent_client_protocol::on_receive_notification!(),

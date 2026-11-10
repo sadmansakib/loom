@@ -11,7 +11,7 @@
 //!   only.
 //! * One engine per ACP session: `session/new` opens an
 //!   [`Engine`] on the session's `cwd` and keeps one kernel
-//!   [`Session`] plus one [`TaskControl`] per ACP session id.
+//!   [`Session`] per ACP session id and one [`TaskControl`] per active prompt.
 //! * `session/prompt` runs one task to completion, forwarding engine
 //!   events as `session/update` notifications in emission order; the
 //!   task outcome maps onto the ACP [`StopReason`].
@@ -49,7 +49,7 @@
 //! [`TaskControl::cancel`]: loom_core::kernel::agent::TaskControl::cancel
 //! [`StopReason`]: agent_client_protocol::v1::schema::StopReason
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::role::acp::{Agent, Client};
@@ -143,8 +143,8 @@ impl ServerOptions {
 }
 
 /// The engine side of one ACP session. Guarded by a tokio mutex so a
-/// prompt can hold it across the task future while `session/cancel`
-/// reaches the control slot without contending with the prompt.
+/// prompt can hold it across the task future while cancellation reaches
+/// the separate control slot without waiting for that task.
 struct SessionCore {
     engine: Arc<Engine>,
     session: Session,
@@ -156,28 +156,49 @@ struct SessionCore {
 #[derive(Clone)]
 struct SessionHandle {
     core: Arc<AsyncMutex<SessionCore>>,
-    control: Arc<Mutex<TaskControl>>,
+    active_prompt: Arc<Mutex<Option<TaskControl>>>,
 }
 
 impl SessionHandle {
-    /// A handle over a freshly minted (idle) control slot.
     fn new(core: Arc<AsyncMutex<SessionCore>>) -> Self {
         Self {
             core,
-            control: Arc::new(Mutex::new(TaskControl::new())),
+            active_prompt: Arc::new(Mutex::new(None)),
         }
     }
+}
 
-    /// Swaps in a fresh control for the prompt about to run and
-    /// returns it. `TaskControl::cancel` is permanent, so a control
-    /// cancelled for one prompt can never serve the next; storing the
-    /// current one lets `session/cancel` reach the in-flight task,
-    /// while a cancel while idle lands on a control nobody reads.
-    fn fresh_control(&self) -> TaskControl {
-        let control = TaskControl::new();
-        *lock_or_recover(&self.control) = control.clone();
-        control
+fn begin_prompt(slot: &Arc<Mutex<Option<TaskControl>>>) -> Option<(TaskControl, ActivePrompt)> {
+    let mut active = lock_or_recover(slot);
+    if active.is_some() {
+        return None;
     }
+    let control = TaskControl::new();
+    *active = Some(control.clone());
+    Some((
+        control,
+        ActivePrompt {
+            slot: Arc::clone(slot),
+        },
+    ))
+}
+
+/// Clears a prompt's cancellation slot on every return path, including
+/// cancellation or unwinding of its spawned task.
+struct ActivePrompt {
+    slot: Arc<Mutex<Option<TaskControl>>>,
+}
+
+impl Drop for ActivePrompt {
+    fn drop(&mut self) {
+        lock_or_recover(&self.slot).take();
+    }
+}
+
+#[derive(Default)]
+struct SessionRegistry {
+    sessions: HashMap<acp::SessionId, SessionHandle>,
+    loading: HashSet<acp::SessionId>,
 }
 
 /// Shared state behind every handler: the options and the live
@@ -185,7 +206,7 @@ impl SessionHandle {
 #[derive(Clone)]
 pub struct AcpState {
     options: Arc<ServerOptions>,
-    sessions: Arc<Mutex<HashMap<acp::SessionId, SessionHandle>>>,
+    sessions: Arc<Mutex<SessionRegistry>>,
 }
 
 impl AcpState {
@@ -194,7 +215,7 @@ impl AcpState {
     pub fn new(options: ServerOptions) -> Self {
         Self {
             options: Arc::new(options),
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(SessionRegistry::default())),
         }
     }
 }
@@ -243,20 +264,24 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// The engine-event → ACP-update bridge. `EventSink::emit` is sync and
-/// runs inside the task future; each update lands on an unbounded
-/// channel that a per-prompt forwarder drains onto the wire, so
-/// emission order survives without blocking the engine.
+/// runs inside the task future; updates use a bounded channel so a slow
+/// client cannot cause unbounded memory growth. If the client falls
+/// behind, cancel the task rather than continuing without a complete
+/// update stream.
 struct SessionUpdateSink {
-    tx: mpsc::UnboundedSender<acp::SessionUpdate>,
+    tx: mpsc::Sender<acp::SessionUpdate>,
+    control: TaskControl,
 }
 
 impl EventSink for SessionUpdateSink {
     fn emit(&self, _task_id: TaskId, kind: EventKind) {
         for update in updates_for(&kind) {
-            if self.tx.send(update).is_err() {
-                // Forwarder gone (prompt aborted): drop the update;
-                // the prompt response carries the outcome.
-                break;
+            if self.tx.try_send(update).is_err() {
+                // A closed receiver means the peer disconnected; a full
+                // queue means it cannot keep up. In either case, stop
+                // work whose protocol updates cannot be delivered.
+                self.control.cancel();
+                return;
             }
         }
     }
@@ -336,8 +361,24 @@ where
                 // responds from inside; this handler returns at once.
                 let state = prompt_state.clone();
                 let task_cx = cx.clone();
+                let prompt = reserve_prompt(&state, &request.session_id);
                 async move {
-                    cx.spawn(async move { handle_prompt(state, request, responder, task_cx).await })
+                    match prompt {
+                        Ok((handle, control, active_prompt)) => cx.spawn(async move {
+                            handle_prompt(
+                                request,
+                                responder,
+                                task_cx,
+                                handle,
+                                control,
+                                active_prompt,
+                            )
+                            .await
+                        }),
+                        Err(message) => {
+                            responder.respond_with_error(Error::invalid_request().data(message))
+                        }
+                    }
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -345,15 +386,14 @@ where
         .on_receive_notification(
             move |notification: acp::CancelNotification,
                   _cx: agent_client_protocol::v1::ConnectionTo<Client>| {
-                if let Some(handle) = lock_or_recover(&cancel_state.sessions)
+                let handle = lock_or_recover(&cancel_state.sessions)
+                    .sessions
                     .get(&notification.session_id)
-                    .cloned()
-                {
-                    // Cancels the in-flight prompt's control. Each
-                    // prompt mints a fresh control, so this never
-                    // poisons a later prompt; while idle it cancels a
-                    // control nobody reads.
-                    lock_or_recover(&handle.control).cancel();
+                    .cloned();
+                let control =
+                    handle.and_then(|handle| lock_or_recover(&handle.active_prompt).clone());
+                if let Some(control) = control {
+                    control.cancel();
                 }
                 async { Ok(()) }
             },
@@ -379,6 +419,10 @@ async fn handle_new_session(
     // strings either way.
     let kernel = KernelSessionId::new();
     let acp_session_id = acp::SessionId::new(kernel.as_uuid().to_string());
+    let Some(reservation) = SessionReservation::reserve(&state.sessions, acp_session_id.clone())
+    else {
+        return responder.respond_with_internal_error("generated a duplicate session id");
+    };
     // The ask bridge: a policy `Ask` becomes the client's
     // `session/request_permission`. Fails closed on any transport
     // failure or non-allow outcome, matching the engine's no-resolver
@@ -420,7 +464,7 @@ async fn handle_new_session(
         engine: Arc::new(engine),
         session: Session::new(kernel),
     }));
-    lock_or_recover(&state.sessions).insert(acp_session_id.clone(), SessionHandle::new(core));
+    reservation.install(SessionHandle::new(core));
     responder.respond(acp::NewSessionResponse::new(acp_session_id))
 }
 
@@ -460,13 +504,53 @@ fn forwarded_decls(
     for server in servers {
         let (name, command, env) = match server {
             acp::McpServer::Stdio(stdio) => {
-                let mut command = vec![stdio.command.to_string_lossy().into_owned()];
+                if stdio.name.trim().is_empty() || stdio.name.contains('\0') {
+                    return Err(
+                        "forwarded MCP server name must be non-empty and contain no NUL".to_owned(),
+                    );
+                }
+                let command_name = stdio
+                    .command
+                    .to_str()
+                    .filter(|command| {
+                        !command.is_empty()
+                            && !command.contains('\0')
+                            && stdio.command.is_absolute()
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "forwarded MCP server `{}` must have an absolute UTF-8 command",
+                            stdio.name
+                        )
+                    })?;
+                if stdio.args.iter().any(|argument| argument.contains('\0')) {
+                    return Err(format!(
+                        "forwarded MCP server `{}` has a command argument containing NUL",
+                        stdio.name
+                    ));
+                }
+                let mut command = vec![command_name.to_owned()];
                 command.extend(stdio.args.iter().cloned());
-                let env = stdio
-                    .env
-                    .iter()
-                    .map(|variable| (variable.name.clone(), variable.value.clone()))
-                    .collect();
+                let mut env = std::collections::BTreeMap::new();
+                for variable in &stdio.env {
+                    if variable.name.is_empty()
+                        || variable.name.contains('=')
+                        || variable.name.contains('\0')
+                        || variable.value.contains('\0')
+                    {
+                        return Err(format!(
+                            "forwarded MCP server `{}` has an invalid environment variable",
+                            stdio.name
+                        ));
+                    }
+                    if has_env_key(&env, &variable.name) {
+                        return Err(format!(
+                            "forwarded MCP server `{}` repeats environment variable `{}`",
+                            stdio.name, variable.name
+                        ));
+                    }
+                    env.insert(variable.name.clone(), variable.value.clone());
+                }
                 (stdio.name.clone(), command, env)
             }
             acp::McpServer::Http(http) => {
@@ -490,31 +574,62 @@ fn forwarded_decls(
                 );
             }
         };
-        decls.insert(
-            name,
-            loom_core::tools::mcp::McpServerDecl {
-                command,
-                env,
-                // Admission is the grant: ACP carries no per-server
-                // network field, so an admitted server gets network.
-                network: true,
-                // Eager-only attach (`attach_forwarded`): no pins.
-                always_load: Vec::new(),
-                policy: Default::default(),
-            },
-        );
+        let declaration = loom_core::tools::mcp::McpServerDecl {
+            command,
+            env,
+            // Admission is the grant: ACP carries no per-server
+            // network field, so an admitted server gets network.
+            network: true,
+            // Eager-only attach (`attach_forwarded`): no pins.
+            always_load: Vec::new(),
+            policy: Default::default(),
+        };
+        if decls.insert(name.clone(), declaration).is_some() {
+            return Err(format!(
+                "forwarded MCP server `{name}` is declared more than once"
+            ));
+        }
     }
     Ok(decls)
+}
+
+fn has_env_key(env: &std::collections::BTreeMap<String, String>, name: &str) -> bool {
+    #[cfg(windows)]
+    {
+        env.keys()
+            .any(|existing| existing.eq_ignore_ascii_case(name))
+    }
+
+    #[cfg(not(windows))]
+    {
+        env.contains_key(name)
+    }
 }
 
 /// Parses an ACP session id back into the kernel id it was minted
 /// from: a UUIDv7 string. Everything else never named a loom session.
 fn kernel_session_id(acp_id: &acp::SessionId) -> Result<KernelSessionId, String> {
-    uuid::Uuid::parse_str(&acp_id.0)
+    let error = "session ids must be canonical UUIDv7 values minted by session/new";
+    let uuid = uuid::Uuid::parse_str(&acp_id.0)
         .ok()
         .filter(|uuid| uuid.get_version_num() == 7)
-        .and_then(|uuid| KernelSessionId::try_from(uuid).ok())
-        .ok_or_else(|| "session ids are UUIDv7 values minted by session/new".to_string())
+        .filter(|uuid| uuid.to_string() == acp_id.0)
+        .ok_or_else(|| error.to_owned())?;
+    KernelSessionId::try_from(uuid).map_err(|_| error.to_owned())
+}
+
+fn reserve_prompt(
+    state: &AcpState,
+    session_id: &acp::SessionId,
+) -> Result<(SessionHandle, TaskControl, ActivePrompt), &'static str> {
+    let handle = lock_or_recover(&state.sessions)
+        .sessions
+        .get(session_id)
+        .cloned()
+        .ok_or("unknown session")?;
+    let (control, active_prompt) = begin_prompt(&handle.active_prompt)
+        .ok_or("a prompt is already running for this session")?;
+    Ok((handle, control, active_prompt))
 }
 
 /// `session/load`: resume a persisted kernel session under the ACP id
@@ -535,11 +650,14 @@ async fn handle_load_session(
             return responder.respond_with_error(Error::invalid_request().data(message));
         }
     };
-    if lock_or_recover(&state.sessions).contains_key(&request.session_id) {
+    let Some(reservation) =
+        SessionReservation::reserve(&state.sessions, request.session_id.clone())
+    else {
         return responder.respond_with_error(
-            Error::invalid_request().data("session already active on this connection"),
+            Error::invalid_request()
+                .data("session is already active or loading on this connection"),
         );
-    }
+    };
     let options = state.options.clone();
     let config = engine_config(&options, request.cwd.clone());
     let engine = match Engine::open_async_with(config, (options.overrides_factory)()).await {
@@ -560,10 +678,51 @@ async fn handle_load_session(
         engine: Arc::new(engine),
         session,
     }));
-    lock_or_recover(&state.sessions).insert(request.session_id.clone(), SessionHandle::new(core));
+    reservation.install(SessionHandle::new(core));
     // The loaded session keeps its id: response and request agree by
     // construction, and modes/config options stay per-connection.
     responder.respond(acp::LoadSessionResponse::new())
+}
+
+/// Reserves a session id while its engine is being opened, then atomically
+/// replaces the reservation with a live handle. Dropping an uncommitted
+/// reservation makes failed or cancelled opens retryable.
+struct SessionReservation {
+    registry: Arc<Mutex<SessionRegistry>>,
+    id: acp::SessionId,
+    committed: bool,
+}
+
+impl SessionReservation {
+    /// Atomically reserves an ID unless it is active or already being opened.
+    fn reserve(registry: &Arc<Mutex<SessionRegistry>>, id: acp::SessionId) -> Option<Self> {
+        let mut registry_guard = lock_or_recover(registry);
+        if registry_guard.sessions.contains_key(&id) || !registry_guard.loading.insert(id.clone()) {
+            return None;
+        }
+        Some(Self {
+            registry: Arc::clone(registry),
+            id,
+            committed: false,
+        })
+    }
+
+    fn install(mut self, handle: SessionHandle) {
+        {
+            let mut registry = lock_or_recover(&self.registry);
+            registry.loading.remove(&self.id);
+            registry.sessions.insert(self.id.clone(), handle);
+        }
+        self.committed = true;
+    }
+}
+
+impl Drop for SessionReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            lock_or_recover(&self.registry).loading.remove(&self.id);
+        }
+    }
 }
 
 /// Sends one `session/request_permission` for a blocked command and
@@ -585,7 +744,10 @@ async fn ask_permission(
     fields.title = Some(title);
     fields.kind = Some(acp::ToolKind::Execute);
     fields.status = Some(acp::ToolCallStatus::InProgress);
-    let tool_call = acp::ToolCallUpdate::new(acp::ToolCallId::new(program.clone()), fields);
+    let tool_call = acp::ToolCallUpdate::new(
+        acp::ToolCallId::new(uuid::Uuid::now_v7().to_string()),
+        fields,
+    );
     let request = acp::RequestPermissionRequest::new(
         session,
         tool_call,
@@ -619,7 +781,7 @@ async fn ask_permission(
             false
         }
         Ok(Ok(response)) => match response.outcome {
-            acp::RequestPermissionOutcome::Selected(selected) => *selected.option_id.0 == *"allow",
+            acp::RequestPermissionOutcome::Selected(selected) => selected.option_id.0 == "allow",
             // Cancelled, or a future outcome kind: fail closed.
             _ => false,
         },
@@ -631,36 +793,36 @@ async fn ask_permission(
 /// `session/prompt`: run one task to completion, forwarding updates,
 /// then answer with the mapped stop reason.
 async fn handle_prompt(
-    state: AcpState,
     request: acp::PromptRequest,
     responder: agent_client_protocol::v1::Responder<acp::PromptResponse>,
-    _cx: agent_client_protocol::v1::ConnectionTo<Client>,
+    cx: agent_client_protocol::v1::ConnectionTo<Client>,
+    handle: SessionHandle,
+    control: TaskControl,
+    _active_prompt: ActivePrompt,
 ) -> Result<(), Error> {
-    let Some(handle) = lock_or_recover(&state.sessions)
-        .get(&request.session_id)
-        .cloned()
-    else {
-        return responder.respond_with_error(Error::invalid_request().data("unknown session"));
-    };
     let prompt = prompt_text(&request.prompt);
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let sink = SessionUpdateSink { tx };
+    const UPDATE_BUFFER: usize = 128;
+    let (tx, mut rx) = mpsc::channel(UPDATE_BUFFER);
+    let sink = SessionUpdateSink {
+        tx,
+        control: control.clone(),
+    };
     let forward_session = request.session_id.clone();
-    let forward_cx = _cx.clone();
+    let forward_cx = cx;
+    let forward_control = control.clone();
     let forwarder = tokio::spawn(async move {
         while let Some(update) = rx.recv().await {
             let notification = acp::SessionNotification::new(forward_session.clone(), update);
             if forward_cx.send_notification(notification).is_err() {
+                // The peer is gone; stop the engine task instead of
+                // continuing work whose updates can no longer be read.
+                forward_control.cancel();
                 break;
             }
         }
     });
     let mut core = handle.core.lock().await;
     let engine = core.engine.clone();
-    // A fresh control per prompt (see `SessionHandle::fresh_control`):
-    // reusing the session's first control would answer every prompt
-    // after one cancel with `Cancelled`.
-    let control = handle.fresh_control();
     let outcome = engine
         .run_task(&mut core.session, prompt, &sink, &control)
         .await;
@@ -733,13 +895,18 @@ fn updates_for(kind: &EventKind) -> Vec<acp::SessionUpdate> {
             name,
             call_id,
             arguments,
-        } => vec![acp::SessionUpdate::ToolCall(
-            acp::ToolCall::new(acp::ToolCallId::new(call_id.to_string()), name.clone())
-                .name(name.clone())
-                .kind(tool_kind(name))
-                .status(acp::ToolCallStatus::InProgress)
-                .raw_input(serde_json::Value::String(arguments.clone())),
-        )],
+        } => {
+            let input = serde_json::from_str(arguments)
+                .ok()
+                .filter(serde_json::Value::is_object);
+            vec![acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new(acp::ToolCallId::new(call_id.to_string()), name.clone())
+                    .name(name.clone())
+                    .kind(tool_kind(name))
+                    .status(acp::ToolCallStatus::InProgress)
+                    .raw_input(input),
+            )]
+        }
         EventKind::ToolCompleted {
             name,
             call_id,
@@ -859,6 +1026,11 @@ mod tests {
         assert_eq!(call.title, "run_command");
         assert!(matches!(call.kind, acp::ToolKind::Execute));
         assert!(matches!(call.status, acp::ToolCallStatus::InProgress));
+        assert_eq!(
+            call.raw_input,
+            Some(serde_json::json!({"program": "cargo"})),
+            "tool arguments are structured ACP input, not a JSON-encoded string"
+        );
 
         let completed = updates_for(&EventKind::ToolCompleted {
             name: "run_command".into(),
@@ -885,6 +1057,46 @@ mod tests {
             },
             other => panic!("must be content, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn malformed_or_truncated_tool_arguments_are_omitted() {
+        let call_id = loom_core::kernel::transcript::ToolCallId::try_from("call-2".to_owned())
+            .expect("valid call id");
+        let updates = updates_for(&EventKind::ToolStarted {
+            name: "run_command".into(),
+            call_id,
+            arguments: "{\"program\":".into(),
+        });
+        let acp::SessionUpdate::ToolCall(call) = &updates[0] else {
+            panic!("must be a tool call");
+        };
+        assert!(call.raw_input.is_none());
+    }
+
+    #[test]
+    fn prompt_reservation_is_exclusive_and_released() {
+        let slot = Arc::new(Mutex::new(None));
+        let Some((_, active)) = begin_prompt(&slot) else {
+            panic!("first prompt reserves an idle session");
+        };
+        assert!(begin_prompt(&slot).is_none(), "concurrent prompt rejected");
+        drop(active);
+        assert!(
+            begin_prompt(&slot).is_some(),
+            "completed prompt releases slot"
+        );
+    }
+
+    #[test]
+    fn failed_session_load_releases_its_reservation() {
+        let id = acp::SessionId::new("01900000-0000-7000-8000-000000000000");
+        let registry = Arc::new(Mutex::new(SessionRegistry::default()));
+        let reservation =
+            SessionReservation::reserve(&registry, id.clone()).expect("first open reserves the id");
+        assert!(SessionReservation::reserve(&registry, id.clone()).is_none());
+        drop(reservation);
+        assert!(SessionReservation::reserve(&registry, id).is_some());
     }
 
     #[test]
@@ -998,13 +1210,19 @@ mod tests {
 
     #[test]
     fn forwarded_stdio_servers_map_to_decls() {
-        let server = acp::McpServerStdio::new("mock", "/usr/bin/mock-mcp")
+        let server = acp::McpServerStdio::new("mock", mock_command())
             .args(vec!["--serve".into()])
             .env(vec![acp::EnvVariable::new("KEY", "value")]);
         let decls =
             forwarded_decls(&[acp::McpServer::Stdio(server)]).expect("stdio servers are supported");
         let decl = &decls["mock"];
-        assert_eq!(decl.command, ["/usr/bin/mock-mcp", "--serve"]);
+        assert_eq!(
+            decl.command,
+            [
+                mock_command().to_string_lossy().into_owned(),
+                "--serve".into()
+            ]
+        );
         assert_eq!(
             decl.env.get("KEY").map(String::as_str),
             Some("value"),
@@ -1012,6 +1230,54 @@ mod tests {
         );
         assert!(decl.network, "the operator grant implies network");
         assert!(decl.always_load.is_empty());
+    }
+
+    #[test]
+    fn forwarded_mcp_rejects_duplicate_names_and_environment_keys() {
+        let first = acp::McpServer::Stdio(acp::McpServerStdio::new("mock", mock_command()));
+        let second = acp::McpServer::Stdio(acp::McpServerStdio::new("mock", mock_command()));
+        assert!(forwarded_decls(&[first, second]).is_err());
+
+        let duplicate_env =
+            acp::McpServer::Stdio(acp::McpServerStdio::new("mock", mock_command()).env(vec![
+                acp::EnvVariable::new("KEY", "one"),
+                acp::EnvVariable::new("KEY", "two"),
+            ]));
+        assert!(forwarded_decls(&[duplicate_env]).is_err());
+    }
+
+    #[test]
+    fn forwarded_mcp_rejects_invalid_commands_and_environment() {
+        let relative_command = acp::McpServer::Stdio(acp::McpServerStdio::new("mock", "mock-mcp"));
+        assert!(forwarded_decls(&[relative_command]).is_err());
+
+        for name in ["", "=BAD", "BAD\0NAME"] {
+            let invalid_env = acp::McpServer::Stdio(
+                acp::McpServerStdio::new("mock", mock_command())
+                    .env(vec![acp::EnvVariable::new(name, "value")]),
+            );
+            assert!(forwarded_decls(&[invalid_env]).is_err());
+        }
+
+        let nul_value = acp::McpServer::Stdio(
+            acp::McpServerStdio::new("mock", mock_command())
+                .env(vec![acp::EnvVariable::new("KEY", "bad\0value")]),
+        );
+        assert!(forwarded_decls(&[nul_value]).is_err());
+    }
+
+    #[test]
+    fn forwarded_mcp_rejects_platform_equivalent_environment_keys() {
+        let server =
+            acp::McpServer::Stdio(acp::McpServerStdio::new("mock", mock_command()).env(vec![
+                acp::EnvVariable::new("PATH", "first"),
+                acp::EnvVariable::new("Path", "second"),
+            ]));
+        assert_eq!(
+            forwarded_decls(&[server]).is_err(),
+            cfg!(windows),
+            "environment names are case-insensitive only on Windows"
+        );
     }
 
     #[test]
@@ -1037,6 +1303,11 @@ mod tests {
             kernel_session_id(&acp::SessionId::new("not-a-uuid")).is_err(),
             "garbage is rejected"
         );
+        let uppercase = acp::SessionId::new(kernel.as_uuid().to_string().to_uppercase());
+        assert!(
+            kernel_session_id(&uppercase).is_err(),
+            "non-canonical spellings cannot alias a live session"
+        );
         // A v4 id parses as a UUID but fails the v7 rule.
         let v4 = acp::SessionId::new("00000000-0000-4000-8000-000000000000");
         assert!(kernel_session_id(&v4).is_err(), "non-v7 ids are rejected");
@@ -1044,5 +1315,13 @@ mod tests {
 
     fn text_content(text: &str) -> acp::ContentBlock {
         acp::ContentBlock::Text(acp::TextContent::new(text.to_owned()))
+    }
+
+    fn mock_command() -> std::path::PathBuf {
+        if cfg!(windows) {
+            std::path::PathBuf::from(r"C:\mock-mcp.exe")
+        } else {
+            std::path::PathBuf::from("/usr/bin/mock-mcp")
+        }
     }
 }

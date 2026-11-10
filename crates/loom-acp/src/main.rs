@@ -18,8 +18,6 @@
 //! the provider's environment variable); the database location is the
 //! shared loom one.
 
-use std::process::ExitCode;
-
 use clap::Parser;
 use loom_acp::{AcpState, ServerOptions, serve};
 
@@ -55,7 +53,7 @@ struct Args {
     allow_client_mcp: bool,
 }
 
-fn main() -> anyhow::Result<ExitCode> {
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     // Stderr only: stdout is the protocol stream (ACP spec, Transports).
     tracing_subscriber::fmt()
@@ -71,22 +69,12 @@ fn main() -> anyhow::Result<ExitCode> {
     let options = ServerOptions::new(args.provider, args.model, loom_core::paths::db_path())
         .with_base_url(args.base_url)
         .with_allow_client_mcp(args.allow_client_mcp);
-    let options = if args.max_turns != loom_core::kernel::agent::DEFAULT_MAX_TURNS {
-        ServerOptions {
-            max_turns: args.max_turns,
-            ..options
-        }
-    } else {
-        options
+    let options = ServerOptions {
+        max_turns: args.max_turns,
+        ..options
     };
-    let exit = runtime.block_on(async move {
-        match serve(agent_client_protocol::Stdio::new(), AcpState::new(options)).await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("loom-acp: connection ended: {error}");
-                ExitCode::FAILURE
-            }
-        }
-    });
-    Ok(exit)
+    runtime.block_on(serve(
+        agent_client_protocol::Stdio::new(),
+        AcpState::new(options),
+    ))
 }
