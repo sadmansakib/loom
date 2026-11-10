@@ -74,7 +74,9 @@ pub struct GcReport {
 pub fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_millis() as u64)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// Collects the ids every stored session's transcript still references.

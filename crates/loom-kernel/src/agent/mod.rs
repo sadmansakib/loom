@@ -15,11 +15,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
+use crate::artifact_gc::now_millis;
 use crate::context::{
     AgentConfig, CompiledContext, ContextBudget, ContextCensus, ContextCompiler, ContextError,
     ContextInput, FactsSource, NoFacts, PruneCheckpoint,
@@ -3137,15 +3138,6 @@ fn stop_reason_token(reason: StopReason) -> &'static str {
         StopReason::ContextLimit => "context_limit",
         StopReason::ContentFilter => "content_filter",
     }
-}
-
-/// Milliseconds since the Unix epoch, saturating rather than panicking on a
-/// pre-epoch or overflowing clock.
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
 }
 
 /// A duration's whole milliseconds, saturating at `u64::MAX`.
