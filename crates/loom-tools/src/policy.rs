@@ -38,7 +38,12 @@
 //!
 //! A program with a rule is always admitted (the rule *is* the
 //! operator's explicit consent); a deny entry for a ruled program is a
-//! manifest error, so neither silently shadows the other.
+//! manifest error, so neither silently shadows the other. The one
+//! exception is the shipped `cargo` rule: `[[deny]]
+//! program = "cargo"` removes it, because `build.rs` and
+//! proc-macros execute arbitrary code even inside the sandbox and a
+//! strict workspace must be able to lock the build driver out
+//! entirely (re-ruling `cargo` afterwards is still an error).
 //!
 //! Each rule carries the three per-command limits:
 //!
@@ -179,11 +184,51 @@ pub enum PolicyVerdict {
     Ask,
 }
 
+/// What the operator is asked to approve, in full (review F-13): the
+/// program *and* its arguments, plus the escalation state this call
+/// will run under. A title rendered from the program alone let `sh`
+/// hide `-c 'curl … | sh'` behind a one-word approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskRequest {
+    /// Bare executable name.
+    pub program: String,
+    /// The argv that will run, verbatim.
+    pub args: Vec<String>,
+    /// Whether this call runs inside the OS sandbox (`false` only
+    /// when a rule escalates the program out of it).
+    pub sandboxed: bool,
+    /// Whether this call holds the network grant.
+    pub network: bool,
+}
+
+impl AskRequest {
+    /// The command line the operator is approving. Arguments that
+    /// contain whitespace or quotes are wrapped in double quotes so
+    /// the rendered line cannot hide an argument boundary.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut line = self.program.clone();
+        for arg in &self.args {
+            line.push(' ');
+            if arg.is_empty()
+                || arg.chars().any(char::is_whitespace)
+                || arg.contains('\'')
+                || arg.contains('"')
+            {
+                line.push_str(&format!("{arg:?}"));
+            } else {
+                line.push_str(arg);
+            }
+        }
+        line
+    }
+}
+
 /// Operator-approval hook for [`PolicyVerdict::Ask`]: returns `true`
 /// when execution is approved. Interactive frontends supply one; the
 /// engine default is none, so `ask` fails closed.
 pub type AskResolver =
-    std::sync::Arc<dyn Fn(&str) -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
+    std::sync::Arc<dyn Fn(AskRequest) -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
 
 /// One policy rule: escalation grants and limits for a program.
 ///
@@ -395,13 +440,24 @@ impl CommandPolicy {
                 });
             }
             if policy.rule(&entry.program).is_some() {
-                return Err(PolicyError::Invalid {
-                    path: path.clone(),
-                    message: format!(
-                        "program \"{}\" is both denied and ruled; remove one",
-                        entry.program
-                    ),
-                });
+                // The one pre-ruled program is the shipped `cargo`
+                // default — and a strict workspace must be able to
+                // lock the build driver out entirely, because
+                // `build.rs` and proc-macros execute arbitrary code
+                // even inside the sandbox (review F-10). Denying it
+                // drops the shipped rule instead of erroring; a
+                // manifest that then *re-rules* cargo is still
+                // rejected by the command loop below.
+                if entry.program != "cargo" {
+                    return Err(PolicyError::Invalid {
+                        path: path.clone(),
+                        message: format!(
+                            "program \"{}\" is both denied and ruled; remove one",
+                            entry.program
+                        ),
+                    });
+                }
+                policy.rules.retain(|rule| rule.program != "cargo");
             }
             if policy.denied.contains(&entry.program) {
                 return Err(PolicyError::Invalid {
@@ -829,9 +885,29 @@ mod tests {
             error.to_string().contains("both denied and ruled"),
             "{error}"
         );
-        // Rule first (cargo), deny after — same refusal.
-        let error = CommandPolicy::parse("[[deny]]\nprogram = \"cargo\"\n")
-            .expect_err("cargo is always ruled");
+    }
+
+    #[test]
+    fn denying_cargo_drops_the_shipped_rule() {
+        // Review F-10: `build.rs` and proc-macros execute arbitrary
+        // code even inside the sandbox, so a strict workspace must be
+        // able to lock the build driver out entirely. Denying `cargo`
+        // removes the shipped rule instead of erroring.
+        let policy = CommandPolicy::parse("[[deny]]\nprogram = \"cargo\"\n").expect("parses");
+        assert_eq!(policy.verdict("cargo"), PolicyVerdict::Deny);
+        assert!(
+            policy.rule("cargo").is_none(),
+            "the shipped escalation rule is gone"
+        );
+        assert_eq!(policy.denied_names(), vec!["cargo"]);
+    }
+
+    #[test]
+    fn denying_cargo_still_forbids_re_ruling_it() {
+        let error = CommandPolicy::parse(
+            "[[deny]]\nprogram = \"cargo\"\n[[command]]\nprogram = \"cargo\"\n",
+        )
+        .expect_err("cannot re-rule a denied program");
         assert!(
             error.to_string().contains("both denied and ruled"),
             "{error}"

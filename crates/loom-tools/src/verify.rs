@@ -27,7 +27,7 @@ use crate::evidence::{
     Evidence, cargo_diagnostics, go_diagnostics, go_failures, libtest_failures, nextest_junit,
     pytest_failures, python_diagnostics,
 };
-use crate::policy::{CommandPolicy, PolicyVerdict};
+use crate::policy::{AskRequest, AskResolver, CommandPolicy, PolicyVerdict};
 use futures::future::BoxFuture;
 use loom_kernel::tool::{
     CommandEffect, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec,
@@ -103,7 +103,6 @@ impl Ecosystem {
 }
 
 /// The `verify` tool.
-#[derive(Debug, Default)]
 pub struct VerifyTool {
     /// Escalation rules for the build drivers (`cargo`, `go`, …) —
     /// drivers without a rule run inside the boxed default sandbox.
@@ -114,6 +113,27 @@ pub struct VerifyTool {
     /// fix round under a never-worse gate (roadmap item 33). Opt-in:
     /// the shipped default and every eval arm leave it off.
     autofix: bool,
+    /// Operator approval for `ask` verdicts (review F-13): consulted
+    /// with the full command line, exactly like `run_command`. The
+    /// engine default is none, so `ask` fails closed.
+    ask: Option<AskResolver>,
+}
+
+impl std::fmt::Debug for VerifyTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifyTool")
+            .field("policy", &self.policy)
+            .field("budgets", &self.budgets)
+            .field("autofix", &self.autofix)
+            .field("ask", &self.ask.as_ref().map(|_| "<resolver>"))
+            .finish()
+    }
+}
+
+impl Default for VerifyTool {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// How much verification to run.
@@ -161,6 +181,7 @@ impl VerifyTool {
             policy: CommandPolicy::cargo_only(),
             budgets: ToolBudgets::default(),
             autofix: false,
+            ask: None,
         }
     }
 
@@ -173,7 +194,16 @@ impl VerifyTool {
             policy,
             budgets: ToolBudgets::default(),
             autofix: false,
+            ask: None,
         }
+    }
+
+    /// Attaches the operator-approval hook so `ask` verdicts reach a
+    /// human (review F-13) instead of failing closed on every verify.
+    #[must_use]
+    pub fn with_ask_resolver(mut self, ask: AskResolver) -> Self {
+        self.ask = Some(ask);
+        self
     }
 
     /// Sets explicit output budgets (item 20.2) on this instance.
@@ -257,7 +287,9 @@ impl Tool for VerifyTool {
                 })?;
             let (program, args) = ecosystem.command(input.scope)?;
             // The verdict layer gates drivers exactly like run_command
-            // (fail closed: `ask` without a frontend refuses too).
+            // (review F-13: `ask` consults the same operator approval
+            // with the full command line, and still fails closed
+            // without a frontend).
             match self.policy.verdict(program) {
                 PolicyVerdict::Allow => {}
                 PolicyVerdict::Deny => {
@@ -267,10 +299,32 @@ impl Tool for VerifyTool {
                     )));
                 }
                 PolicyVerdict::Ask => {
-                    return Err(ToolError::InvalidInput(format!(
-                        "program \"{program}\" needs operator approval (policy unknown = \
-                         \"ask\"); cannot verify without an interactive frontend"
-                    )));
+                    let rule = self.policy.rule(program);
+                    let approved = match &self.ask {
+                        Some(resolver) => {
+                            resolver(AskRequest {
+                                program: program.to_owned(),
+                                args: args.to_vec(),
+                                // The driver runs the local build, which
+                                // is sandboxed unless a rule escalates it.
+                                sandboxed: rule.is_none_or(|rule| rule.sandbox),
+                                network: rule.is_some_and(|rule| rule.network),
+                            })
+                            .await
+                        }
+                        None => false,
+                    };
+                    if !approved {
+                        return Err(ToolError::InvalidInput(format!(
+                            "program \"{program}\" needs operator approval (policy unknown = \
+                             \"ask\") and was not approved{}; cannot verify here",
+                            if self.ask.is_none() {
+                                " — no interactive frontend is attached"
+                            } else {
+                                ""
+                            }
+                        )));
+                    }
                 }
             }
             // A declared container/remote runner (item 23) takes over
@@ -901,6 +955,56 @@ FAILED tests/test_math.py::TestSum::test_sum - assert 4 == 5
             denied.suite_verdict(dir.path(), &cancel).await,
             None,
             "a denied program must not run the suite"
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_verdicts_reach_the_operator_with_the_full_command_line() {
+        // Review F-13: verify consults the same operator approval as
+        // run_command, and the request carries the driver's argv plus
+        // escalation state — not just the program name.
+        let cancel = CancellationToken::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("Makefile"), "test:\n\t@exit 0\n").expect("makefile");
+        let policy = CommandPolicy::parse("[policy]\nunknown = \"ask\"\n").expect("policy parses");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured = std::sync::Arc::clone(&seen);
+        let tool = VerifyTool::with_policy(policy).with_ask_resolver(std::sync::Arc::new(
+            move |request| {
+                let request = request.clone();
+                *captured.lock().unwrap() = Some(request.clone());
+                Box::pin(async move { false }) // declined this time
+            },
+        ));
+
+        // The suite verdict fails closed on a declined approval.
+        assert_eq!(tool.suite_verdict(dir.path(), &cancel).await, None);
+        let request = seen.lock().unwrap().take().expect("resolver consulted");
+        assert_eq!(request.program, "make");
+        assert!(
+            request.args.iter().any(|arg| arg == "test"),
+            "full argv, got {:?}",
+            request.args
+        );
+        assert!(request.sandboxed, "no rule escalates make");
+        assert!(!request.network);
+
+        // A direct verify surfaces the refusal the model sees, naming
+        // the approval rather than a missing frontend.
+        let error = tool
+            .call(
+                json!({"scope": "test", "ecosystem": "make"}),
+                &ctx(dir.path().to_path_buf()),
+            )
+            .await
+            .expect_err("declined");
+        assert!(
+            matches!(&error, ToolError::InvalidInput(m) if m.contains("was not approved")),
+            "{error}"
+        );
+        assert!(
+            !error.to_string().contains("no interactive frontend"),
+            "a resolver was attached: {error}"
         );
     }
 }

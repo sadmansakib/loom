@@ -378,6 +378,7 @@ pub(crate) async fn prepare_exec(
     policy: &CommandPolicy,
     ask: Option<&AskResolver>,
     program: &str,
+    args: &[String],
     workspace_root: &std::path::Path,
 ) -> Result<PreparedExec, ToolError> {
     match policy.verdict(program) {
@@ -390,7 +391,15 @@ pub(crate) async fn prepare_exec(
         }
         PolicyVerdict::Ask => {
             let approved = match ask {
-                Some(resolver) => resolver(program).await,
+                Some(resolver) => {
+                    resolver(crate::policy::AskRequest {
+                        program: program.to_owned(),
+                        args: args.to_vec(),
+                        sandboxed: policy.rule(program).is_none_or(|rule| rule.sandbox),
+                        network: policy.rule(program).is_some_and(|rule| rule.network),
+                    })
+                    .await
+                }
                 None => false,
             };
             if !approved {
@@ -528,6 +537,7 @@ impl Tool for RunBackgroundTool {
                 &self.policy,
                 self.ask.as_ref(),
                 &input.program,
+                &input.args,
                 &ctx.workspace_root,
             )
             .await?;
@@ -703,7 +713,7 @@ mod tests {
     async fn a_job_finishes_and_reports_once() {
         let (_guard, root) = temp_root();
         let jobs = BackgroundJobs::default();
-        let prepared = prepare_exec(&CommandPolicy::allowing(["echo"]), None, "echo", &root)
+        let prepared = prepare_exec(&CommandPolicy::allowing(["echo"]), None, "echo", &[], &root)
             .await
             .expect("prepared");
         let id = jobs.spawn_job(
@@ -738,7 +748,7 @@ mod tests {
             .expect("ok");
         assert_eq!(empty.content, "no background jobs");
 
-        let prepared = prepare_exec(&CommandPolicy::allowing(["echo"]), None, "echo", &root)
+        let prepared = prepare_exec(&CommandPolicy::allowing(["echo"]), None, "echo", &[], &root)
             .await
             .expect("prepared");
         let id = jobs.spawn_job("echo", vec!["hi".to_owned()], root.clone(), None, prepared);
@@ -837,9 +847,15 @@ mod tests {
     async fn dropping_the_registry_kills_running_jobs() {
         let (_guard, root) = temp_root();
         let jobs = BackgroundJobs::default();
-        let prepared = prepare_exec(&CommandPolicy::allowing(["sleep"]), None, "sleep", &root)
-            .await
-            .expect("prepared");
+        let prepared = prepare_exec(
+            &CommandPolicy::allowing(["sleep"]),
+            None,
+            "sleep",
+            &[],
+            &root,
+        )
+        .await
+        .expect("prepared");
         jobs.spawn_job("sleep", vec!["30".to_owned()], root.clone(), None, prepared);
         // Drop every clone, then poll: the abort lands asynchronously
         // (the scheduler must reap the cancelled task before its

@@ -1799,18 +1799,15 @@ fn build_registry(
         ),
     )?;
     let mut run_command = RunCommandTool::with_policy(policy.clone()).with_budgets(budgets);
-    if let Some(ask) = ask {
-        run_command = run_command.with_ask_resolver(ask);
+    let mut verify = VerifyTool::with_policy(policy.clone())
+        .with_budgets(budgets)
+        .with_autofix(autofix);
+    if let Some(ask) = &ask {
+        run_command = run_command.with_ask_resolver(Arc::clone(ask));
+        verify = verify.with_ask_resolver(Arc::clone(ask));
     }
     register("run_command", Box::new(run_command))?;
-    register(
-        "verify",
-        Box::new(
-            VerifyTool::with_policy(policy.clone())
-                .with_budgets(budgets)
-                .with_autofix(autofix),
-        ),
-    )?;
+    register("verify", Box::new(verify))?;
     register("todo", Box::new(loom_kernel::tool::TodoTool::new()))?;
     Ok(registry)
 }

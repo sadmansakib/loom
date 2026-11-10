@@ -49,7 +49,7 @@ use serde_json::Value;
 
 use crate::budget::{self, ToolBudgets};
 use crate::evidence::{Evidence, cargo_diagnostics, libtest_failures, nextest_junit};
-use crate::policy::{AskResolver, CommandPolicy, PolicyVerdict};
+use crate::policy::{AskRequest, AskResolver, CommandPolicy, PolicyVerdict};
 use crate::reduce;
 
 /// Runs a program in the workspace root inside an OS sandbox and
@@ -418,8 +418,20 @@ impl Tool for RunCommandTool {
                     )));
                 }
                 PolicyVerdict::Ask => {
+                    // Full-argv approval (review F-13): the operator
+                    // sees exactly what will run and under which
+                    // escalation, not just the program name.
+                    let rule = self.policy.rule(&input.program);
                     let approved = match &self.ask {
-                        Some(resolver) => resolver(&input.program).await,
+                        Some(resolver) => {
+                            resolver(AskRequest {
+                                program: input.program.clone(),
+                                args: input.args.clone(),
+                                sandboxed: rule.is_none_or(|rule| rule.sandbox),
+                                network: rule.is_some_and(|rule| rule.network),
+                            })
+                            .await
+                        }
                         None => false,
                     };
                     if !approved {
@@ -1666,10 +1678,12 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured
         let (_guard, root) = temp_root();
         let policy = CommandPolicy::parse("[policy]\nunknown = \"ask\"\n").expect("policy");
         // Approve only `echo`; everything else is declined by the
-        // operator, which the model sees as a refusal.
-        let tool = RunCommandTool::with_policy(policy).with_ask_resolver(Arc::new(|program| {
-            let program = program.to_owned();
-            Box::pin(async move { program == "echo" })
+        // operator, which the model sees as a refusal. The resolver
+        // sees the full request (review F-13), so pin that too.
+        let tool = RunCommandTool::with_policy(policy).with_ask_resolver(Arc::new(|request| {
+            let approved = request.program == "echo";
+            let seen_full_argv = request.args == ["yes"];
+            Box::pin(async move { approved && seen_full_argv })
         }));
         let approved = run(&tool, &root, json!({"program": "echo", "args": ["yes"]}))
             .await

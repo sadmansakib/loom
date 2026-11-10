@@ -3,6 +3,23 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Adversarial review round 2: policy semantics (PR10)
+
+- `fix(tools)`: the shipped `cargo` rule is deniable (review F-10).
+  `[[deny]] program = "cargo"` in `.loom/commands.toml` now drops the
+  shipped rule instead of erroring, so a strict workspace can lock
+  the build driver out entirely — `build.rs` and proc-macros execute
+  arbitrary code even inside the sandbox. Re-ruling `cargo` after
+  denying it remains a manifest error.
+- `fix(tools,acp)`: operator approvals show the full command line
+  (review F-13). The ask resolver now receives
+  `AskRequest { program, args, sandboxed, network }`, and the ACP
+  permission title renders the argv (arguments containing whitespace
+  or quotes are quoted), so `sh` can no longer hide `-c 'curl … |
+  sh'` behind a one-word `Run `sh`` approval. `verify` consults the
+  same resolver for `ask` verdicts instead of failing closed on
+  every driver approval.
+
 ## 2026-11 — Adversarial review round 2: provider wire hardening (PR9)
 
 - `fix(providers)`: `Retry-After` in HTTP-date form

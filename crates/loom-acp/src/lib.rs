@@ -384,10 +384,15 @@ async fn handle_new_session(
     let ask_session = acp_session_id.clone();
     let ask_timeout = state.options.permission_timeout;
     let mut overrides = (options.overrides_factory)();
-    overrides.ask = Some(Arc::new(move |program| {
+    overrides.ask = Some(Arc::new(move |request| {
         let cx = ask_cx.clone();
         let session = ask_session.clone();
-        let permission = ask_permission(cx, session, program.to_string(), ask_timeout);
+        // Full-argv approval (review F-13): the operator sees the
+        // exact command line, not just the program name — `sh` can no
+        // longer hide `-c 'curl … | sh'` behind a one-word title.
+        let program = request.program.clone();
+        let line = request.render();
+        let permission = ask_permission(cx, session, program, line, ask_timeout);
         Box::pin(permission)
     }));
     // Editor-forwarded servers (item 37 tail): stdio-only, admitted
@@ -586,7 +591,7 @@ async fn handle_load_session(
     responder.respond(acp::LoadSessionResponse::new())
 }
 
-/// Sends one `session/request_permission` for a blocked program and
+/// Sends one `session/request_permission` for a blocked command and
 /// resolves `true` only for an explicit allow.
 ///
 /// The round-trip is bounded: an editor that never answers (dialog
@@ -597,9 +602,10 @@ async fn ask_permission(
     cx: agent_client_protocol::v1::ConnectionTo<Client>,
     session: acp::SessionId,
     program: String,
+    line: String,
     timeout: std::time::Duration,
 ) -> bool {
-    let title = format!("Run `{program}`");
+    let title = format!("Run `{line}`");
     let mut fields = acp::ToolCallUpdateFields::new();
     fields.title = Some(title);
     fields.kind = Some(acp::ToolKind::Execute);
