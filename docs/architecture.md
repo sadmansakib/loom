@@ -112,7 +112,13 @@ Invariants the session layer enforces (and tests):
 
 **Events** (`event.rs`) are the observation stream: `EventEnvelope`
 (`schema_version: 8`, per-sink monotonically increasing `sequence`,
-snake_case `type` tag). Version 2 adds `Usage.cost_usd`, the
+snake_case `type` tag). The persisting sink (`PersistingEventSink`)
+stores every kind *except* the per-token streams — `TextDelta` and
+`ReasoningDelta` forward live but are never written (review S4: they
+were ~65% of all rows at one synchronous INSERT per provider chunk;
+`ModelCompleted` and the transcript already hold the same content
+durably), so stored sequences stay contiguous from zero. Version 2
+adds `Usage.cost_usd`, the
 provider-reported charge; version 3 adds `ContextPruned` (prune
 attribution); version 4 adds `AwaitingInput` (engine idle marker after a
 task ends, naming the session — the signal a resume loop keys on);

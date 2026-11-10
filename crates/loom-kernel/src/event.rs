@@ -845,6 +845,12 @@ impl<S: EventSink> EventSink for StrictSink<S> {
 /// numbering, persist, and forward, so both the stored rows and the
 /// inner consumer see events in sequence order.
 ///
+/// Two kinds are exempt (review S4): [`EventKind::TextDelta`] and
+/// [`EventKind::ReasoningDelta`] forward live but are never written —
+/// the durable record holds the same content through
+/// [`EventKind::ModelCompleted`] and the transcript, and one INSERT
+/// per provider chunk dominated store write volume.
+///
 /// Persistence is best-effort (ADR-004): a store failure is counted —
 /// surfaced through [`dropped`](EventSink::dropped) alongside the inner
 /// sink's own drops — and warned once, never propagated. Observability
@@ -890,6 +896,20 @@ impl<'a> PersistingEventSink<'a> {
 
 impl EventSink for PersistingEventSink<'_> {
     fn emit(&self, task_id: TaskId, kind: EventKind) {
+        // Per-token deltas stream live but are never persisted
+        // (review S4): they were ~65% of all stored rows at one
+        // synchronous INSERT per provider chunk, and the durable
+        // record already holds the same content authoritatively —
+        // `ModelCompleted` carries the final message and the
+        // transcript stores it. Forward without numbering or storing
+        // so the persisted stream stays contiguous from zero.
+        if matches!(
+            kind,
+            EventKind::TextDelta { .. } | EventKind::ReasoningDelta { .. }
+        ) {
+            self.inner.emit(task_id, kind);
+            return;
+        }
         // The lock spans numbering, persist, and forward: both the
         // stored rows and the inner consumer observe sequence order.
         // The critical section is tiny and never held across an await.
@@ -1369,6 +1389,48 @@ mod tests {
                 response_started: false,
             }
         );
+        assert_eq!(sink.persist_failures(), 0);
+        assert_eq!(sink.dropped(), 0);
+    }
+
+    #[test]
+    fn token_deltas_stream_but_never_persist() {
+        // Review S4: TextDelta/ReasoningDelta dominated the events
+        // table (one synchronous INSERT per provider chunk). They
+        // forward live — the inner consumer must still number them —
+        // while the store only sees the durable kinds, contiguously.
+        use crate::store::{EventStore, MemoryEventStore};
+
+        let session = SessionId::new();
+        let store = std::sync::Arc::new(MemoryEventStore::with_session(session));
+        let (inner, mut receiver) = ChannelEventSink::new();
+
+        let sink = PersistingEventSink::new(store.clone(), session, &inner);
+        let task = TaskId::new();
+        sink.emit(task, EventKind::TaskStarted);
+        sink.emit(task, EventKind::TextDelta { text: "tok".into() });
+        sink.emit(
+            task,
+            EventKind::ReasoningDelta {
+                text: "thinking".into(),
+            },
+        );
+        sink.emit(task, EventKind::TaskCompleted);
+
+        // Live: all four arrive, numbered by the inner sink.
+        let mut seen = 0u64;
+        while let Ok(event) = receiver.try_recv() {
+            assert_eq!(event.sequence, seen);
+            seen += 1;
+        }
+        assert_eq!(seen, 4);
+
+        // Durable: only the two non-delta kinds, contiguous from zero.
+        let stored = store.load_events(&session).unwrap();
+        assert_eq!(stored.len(), 2, "{stored:?}");
+        assert!(matches!(stored[0].kind, EventKind::TaskStarted));
+        assert!(matches!(stored[1].kind, EventKind::TaskCompleted));
+        assert_eq!(stored[1].sequence, 1, "no sequence gaps in the store");
         assert_eq!(sink.persist_failures(), 0);
         assert_eq!(sink.dropped(), 0);
     }

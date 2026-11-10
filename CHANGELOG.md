@@ -3,6 +3,19 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Adversarial review round 2: event persistence diet (PR11)
+
+- `fix(kernel)`: per-token events no longer hit the events table
+  (review S4). `TextDelta` and `ReasoningDelta` forward to live
+  consumers exactly as before, but `PersistingEventSink` skips both
+  the numbering and the synchronous INSERT for them — they were ~65%
+  of all stored rows (36,982 of ~57k in the review's local runs),
+  one blocking SQLite write per provider chunk on a tokio worker.
+  `ModelCompleted` and the transcript already hold the same content
+  durably, and stored sequences stay contiguous from zero. Existing
+  sessions' historical delta rows are unaffected; future runs write
+  roughly a third of the rows.
+
 ## 2026-11 — Adversarial review round 2: policy semantics (PR10)
 
 - `fix(tools)`: the shipped `cargo` rule is deniable (review F-10).
