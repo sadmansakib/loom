@@ -79,7 +79,7 @@ impl SqliteStore {
         Self::open(Self::default_path()?)
     }
 
-    fn from_connection(connection: Connection) -> Result<Self, StoreError> {
+    fn from_connection(mut connection: Connection) -> Result<Self, StoreError> {
         connection.busy_timeout(BUSY_TIMEOUT).map_err(backend)?;
         // `journal_mode` reports the mode it settled on as a row; WAL is a
         // no-op that reports "memory" for an in-memory database.
@@ -92,7 +92,7 @@ impl SqliteStore {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(backend)?;
-        schema::migrate(&connection)?;
+        schema::migrate(&mut connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -598,7 +598,32 @@ impl EventStore for SqliteStore {
         let mut events = Vec::new();
         for row in rows {
             let body = row.map_err(backend)?;
-            events.push(serde_json::from_str::<EventEnvelope>(&body).map_err(corrupt)?);
+            match serde_json::from_str::<EventEnvelope>(&body) {
+                Ok(envelope) => events.push(envelope),
+                Err(parse) => {
+                    // Review S7: an envelope this build cannot parse
+                    // used to fail the whole session with an opaque
+                    // unknown-variant error. If its recorded schema
+                    // version is newer than ours, say that instead —
+                    // the session is readable by a newer loom, not
+                    // corrupt. Any other parse failure stays corrupt.
+                    let newer = serde_json::from_str::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|value| value["schema_version"].as_u64())
+                        .filter(|version| {
+                            *version > u64::from(loom_kernel::event::EVENT_SCHEMA_VERSION)
+                        });
+                    return Err(match newer {
+                        Some(version) => StoreError::Corrupt(format!(
+                            "session {session} was written by a newer loom \
+                             (event schema v{version}; this build understands \
+                             v{})",
+                            loom_kernel::event::EVENT_SCHEMA_VERSION
+                        )),
+                        None => corrupt(parse),
+                    });
+                }
+            }
         }
         Ok(events)
     }

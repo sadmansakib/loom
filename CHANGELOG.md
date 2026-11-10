@@ -3,6 +3,29 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Adversarial review round 2: residual cleanup, part 2 (S5/S6/S7/F-03)
+
+- `fix(engine)`: the auth database connection now waits up to five
+  seconds on SQLite writer contention (review S5), matching the
+  session store rather than surfacing a spurious immediate
+  `SQLITE_BUSY`.
+- `fix(store)`: the full schema migration chain and version upsert now
+  share one transaction (review S6); a crash cannot leave newer table
+  shapes recorded under an older schema version.
+- `fix(store)`: when an event envelope fails to deserialize, the
+  loader checks its recorded `schema_version` first (review S7). A
+  future schema now reports “session written by a newer loom” with
+  both versions; malformed same/older-schema data still reports
+  corruption.
+- `fix(engine,cli)`: host git now probes repository-local
+  `filter.*` entries and passes per-filter identity clean/smudge
+  overrides, disables filter processes, and clears `required`
+  (residual F-03). Repo-configured filters can no longer execute
+  during `git add`, worktree checkout, or rewind. Global operator
+  configuration remains honored; a planted-filter regression test
+  asserts both that the probe never runs and the staged blob is
+  unchanged.
+
 ## 2026-11 — Adversarial review round 2: residual cleanup, part 1 (F-09/E3/E4)
 
 - `fix(tools)`: the deny list is argv-aware (review F-09, High). It

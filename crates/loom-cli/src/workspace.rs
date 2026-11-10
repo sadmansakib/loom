@@ -40,6 +40,7 @@ use loom_core::kernel::transcript::Item;
 fn run_git(root: &Path, args: &[&str]) -> std::result::Result<String, String> {
     let output = std::process::Command::new("git")
         .args(loom_core::engine::hostgit::CONFIG_ARGS)
+        .args(loom_core::engine::hostgit::neutralize_filters(root))
         .env(
             loom_core::engine::hostgit::ENV_NOSYSTEM.0,
             loom_core::engine::hostgit::ENV_NOSYSTEM.1,

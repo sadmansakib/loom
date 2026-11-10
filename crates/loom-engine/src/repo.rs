@@ -600,6 +600,7 @@ fn git_state(root: &Path) -> GitState {
 fn run_git(root: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .args(crate::hostgit::CONFIG_ARGS)
+        .args(crate::hostgit::neutralize_filters(root))
         .env(
             crate::hostgit::ENV_NOSYSTEM.0,
             crate::hostgit::ENV_NOSYSTEM.1,
@@ -1069,6 +1070,74 @@ mod tests {
             !probe.exists(),
             "planted core.fsmonitor executed during loom's facts scan"
         );
+    }
+
+    /// The PR2 residual: repo config naming `filter.*` used to
+    /// execute on content-rewriting operations even with the other
+    /// hardening in place. The neutralizer probe turns every
+    /// repo-configured filter into an identity pass-through, so a
+    /// planted clean filter never runs — and the staged content is
+    /// the file as written.
+    #[test]
+    fn git_add_ignores_a_planted_filter() {
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("git not available; skipping");
+            return;
+        }
+        let dir = tempdir();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .expect("run git");
+            assert!(status.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        fs::write(root.join("seed.txt"), "seed\n").unwrap();
+        git(&["add", "seed.txt"]);
+        git(&["commit", "-qm", "init"]);
+
+        // Plant a clean filter whose whole job is to leave a probe
+        // behind (and rewrite content if it ever runs).
+        let probe = dir.path().join("filter-ran");
+        let filter = dir.path().join("fake-filter.sh");
+        fs::write(
+            &filter,
+            format!(
+                "#!/bin/sh\ntouch {}\nsed s/payload/PWNED/g\n",
+                probe.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        git(&[
+            "config",
+            "filter.evil.clean",
+            filter.to_str().expect("utf8 path"),
+        ]);
+        git(&["config", "filter.evil.required", "true"]);
+        fs::write(root.join(".gitattributes"), "* filter=evil\n").unwrap();
+        fs::write(root.join("payload.txt"), "payload line\n").unwrap();
+
+        // The hardened path: run_git neutralizes filter.* before the
+        // content-rewriting operation runs.
+        run_git(root, &["add", "-A"]).expect("hardened add");
+        assert!(
+            !probe.exists(),
+            "planted filter.evil.clean executed during loom's git add"
+        );
+        let staged = run_git(root, &["show", ":payload.txt"]).expect("staged blob");
+        assert_eq!(staged.trim_end(), "payload line", "content was filtered");
     }
 
     #[test]

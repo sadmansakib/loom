@@ -128,7 +128,7 @@ CREATE TABLE IF NOT EXISTS start_checkpoints (
 const STEPS: &[&str] = &[V1, V2, V3, V4];
 
 /// Brings `connection` to [`SCHEMA_VERSION`], refusing a newer file.
-pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
+pub(crate) fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
     connection.execute_batch(META).map_err(backend)?;
 
     let stored = connection
@@ -154,17 +154,23 @@ pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
         ))),
         // Fresh file, or a version older than this build: walk every
         // step (idempotent) and record the version this build writes.
+        // Review S6: the walk and the version upsert share one
+        // transaction — a crash between the last step and the upsert
+        // used to leave a fully-migrated database claiming an older
+        // version, re-running migrations against newer-shape tables.
         _ => {
+            let transaction = connection.transaction().map_err(backend)?;
             for step in STEPS {
-                connection.execute_batch(step).map_err(backend)?;
+                transaction.execute_batch(step).map_err(backend)?;
             }
-            connection
+            transaction
                 .execute(
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?1) \
                      ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     params![SCHEMA_VERSION.to_string()],
                 )
                 .map_err(backend)?;
+            transaction.commit().map_err(backend)?;
             Ok(())
         }
     }

@@ -313,6 +313,13 @@ impl SqliteAuthStore {
     }
 
     fn from_connection(connection: Connection) -> Result<Self, AuthError> {
+        // Review S5: without a busy timeout, any concurrent writer
+        // (the session store, another loom process) surfaces as an
+        // immediate spurious SQLITE_BUSY. Wait briefly instead — the
+        // auth store's transactions are tiny.
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| AuthError::Store(error.to_string()))?;
         connection
             .execute_batch(
                 "PRAGMA foreign_keys = ON;

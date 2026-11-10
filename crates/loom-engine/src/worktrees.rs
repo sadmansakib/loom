@@ -190,6 +190,7 @@ impl WorktreeError {
 async fn git_raw(dir: &Path, args: &[&str]) -> Result<String, WorktreeError> {
     let output = tokio::process::Command::new("git")
         .args(crate::hostgit::CONFIG_ARGS)
+        .args(crate::hostgit::neutralize_filters(dir))
         .env(
             crate::hostgit::ENV_NOSYSTEM.0,
             crate::hostgit::ENV_NOSYSTEM.1,
@@ -223,6 +224,7 @@ async fn git_with_stdin(dir: &Path, args: &[&str], stdin: &str) -> Result<String
     use tokio::io::AsyncWriteExt;
     let mut child = tokio::process::Command::new("git")
         .args(crate::hostgit::CONFIG_ARGS)
+        .args(crate::hostgit::neutralize_filters(dir))
         .env(
             crate::hostgit::ENV_NOSYSTEM.0,
             crate::hostgit::ENV_NOSYSTEM.1,

@@ -387,6 +387,84 @@ fn events_round_trip_and_survive_reopening_the_file() {
     assert_eq!(loaded, stream, "envelopes survive a full serde round-trip");
 }
 
+/// Review S7: an envelope this build cannot parse used to surface as
+/// an opaque unknown-variant Corrupt error. When the recorded schema
+/// version is newer, the message must name the version gap — the
+/// session belongs to a newer loom, it is not damaged.
+#[test]
+fn a_newer_schema_stream_names_the_version_not_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("loom.db");
+    let id = SessionId::new();
+    let task = TaskId::new();
+
+    {
+        let store = SqliteStore::open(&path).unwrap();
+        store.ensure_session(&id).unwrap();
+        store
+            .append_event(&id, &envelope(0, task, EventKind::TaskStarted))
+            .unwrap();
+    }
+    // A newer loom appends a kind this build has never heard of.
+    let future = serde_json::json!({
+        "schema_version": EVENT_SCHEMA_VERSION + 1,
+        "sequence": 1,
+        "task_id": task.to_string(),
+        "kind": {"type": "kind_from_the_future", "payload": {}},
+    })
+    .to_string();
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO events (session_id, task_id, body_json) VALUES (?1, ?2, ?3)",
+            rusqlite::params![id.to_string(), task.to_string(), future],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = SqliteStore::open(&path).unwrap();
+    let error = store.load_events(&id).unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("newer loom"), "{text}");
+    assert!(
+        text.contains(&format!("v{}", EVENT_SCHEMA_VERSION + 1)),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("v{EVENT_SCHEMA_VERSION}")),
+        "the message also names what this build understands: {text}"
+    );
+
+    // Same session, no version escape hatch: a genuinely malformed
+    // row stays a plain corruption error.
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "DELETE FROM events WHERE body_json LIKE '%kind_from_the_future%'",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO events (session_id, task_id, body_json) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                id.to_string(),
+                task.to_string(),
+                serde_json::json!({
+                    "schema_version": 1,
+                    "sequence": 1,
+                    "task_id": "x",
+                    "kind": "not-an-object",
+                })
+                .to_string()
+            ],
+        )
+        .unwrap();
+    drop(connection);
+    let error = store.load_events(&id).unwrap_err();
+    assert!(!error.to_string().contains("newer loom"), "{error}");
+}
+
 #[test]
 fn a_session_without_events_still_loads_and_reads_empty() {
     let store = SqliteStore::open_in_memory().unwrap();
