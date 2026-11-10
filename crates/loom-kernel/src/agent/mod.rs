@@ -31,7 +31,7 @@ use crate::model::{
     ModelRequest, ModelResponse, StopReason, Usage,
 };
 use crate::session::{PlannedTurn, Session, TaskRecord, TerminalTaskStatus};
-use crate::store::{ArtifactStore, SessionStore, StoreError};
+use crate::store::{ArtifactStore, Lease, SessionStore, StoreError};
 use crate::tool::{ToolContext, ToolRegistry};
 use crate::tool_cache::ToolCache;
 use crate::transcript::{
@@ -282,6 +282,17 @@ pub enum TaskError {
     /// on top of a store that did not accept it.
     #[error("session store failed: {0}")]
     Persistence(String),
+    /// Another writer holds the session's single-writer lease (ADR-008):
+    /// a second loom process is driving this session (or a crashed one's
+    /// lease has not expired yet). Nothing was persisted — the task
+    /// refused before its first write rather than interleaving.
+    #[error("session is leased by another writer ({owner}); lease expires at {expires_at_millis}")]
+    SessionLeased {
+        /// The lease holder that won.
+        owner: String,
+        /// When that lease lapses, if not renewed (Unix millis).
+        expires_at_millis: u64,
+    },
     /// The configured model is unknown to the provider, so its capabilities
     /// could not be resolved. The task fails before its first request
     /// (§6.4).
@@ -320,6 +331,7 @@ impl TaskError {
             TaskError::Paused => "paused",
             TaskError::UnrecoverableStop { stop_reason } => stop_reason,
             TaskError::Persistence(_) => "persistence",
+            TaskError::SessionLeased { .. } => "session_leased",
             TaskError::UnknownModel { .. } => "unknown_model",
         }
     }
@@ -420,6 +432,51 @@ impl From<CancellationToken> for TaskControl {
 /// Maps a store failure to the task-level persistence error (ADR-012).
 fn persistence(error: StoreError) -> TaskError {
     TaskError::Persistence(error.to_string())
+}
+
+/// How long a session's single-writer lease survives without renewal
+/// (ADR-008). The loop renews every turn, so a live task holds its lease
+/// for its whole run; a crashed writer blocks resumption for at most
+/// this long.
+const LEASE_TTL_MILLIS: u64 = 5 * 60 * 1000;
+
+/// Identifies one lease holder. The pid alone would let a second handle
+/// in the same process re-acquire as the "same" owner and silently
+/// interleave, so each acquisition gets a unique sequence suffix.
+fn lease_owner_id() -> String {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("pid-{}-{}", std::process::id(), sequence)
+}
+
+/// Releases the session lease when the run leaves `run_task`, whatever
+/// the path out — success, error, cancellation, or panic. A failed
+/// release is best-effort: the lease still expires by TTL.
+struct LeaseGuard<'a> {
+    store: &'a dyn SessionStore,
+    lease: Lease,
+}
+
+impl Drop for LeaseGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .store
+            .release_lease(self.lease.session(), self.lease.owner());
+    }
+}
+
+/// The `(owner, expires_at_millis)` an error message should name when
+/// the lease was denied, or a placeholder when the store cannot say.
+fn lease_holder_for(store: &dyn SessionStore, session: &SessionId) -> TaskError {
+    let (owner, expires_at_millis) = store
+        .lease_holder(session)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| ("another writer".to_owned(), 0));
+    TaskError::SessionLeased {
+        owner,
+        expires_at_millis,
+    }
 }
 
 /// Efficiency accounting for one completed task (§14).
@@ -863,6 +920,34 @@ impl Agent {
         }
     }
 
+    /// Acquires the session's single-writer lease (ADR-008): the
+    /// returned guard releases it when dropped. `Ok(None)` when no
+    /// store is attached — nothing durable to guard.
+    ///
+    /// A denied lease is [`TaskError::SessionLeased`]: another process
+    /// is driving this session (or a crashed writer's lease has not
+    /// expired). Nothing has been persisted at that point.
+    fn acquire_session_lease(
+        &self,
+        session: &SessionId,
+    ) -> Result<Option<LeaseGuard<'_>>, TaskError> {
+        let Some(store) = &self.store else {
+            return Ok(None);
+        };
+        // The lease lives on the session row, so make sure the row
+        // exists before acquiring (idempotent): a brand-new session is
+        // leased before its first item is persisted.
+        store.ensure_session(session).map_err(persistence)?;
+        match store.acquire_lease(session, &lease_owner_id(), LEASE_TTL_MILLIS) {
+            Ok(Some(lease)) => Ok(Some(LeaseGuard {
+                store: store.as_ref(),
+                lease,
+            })),
+            Ok(None) => Err(lease_holder_for(store.as_ref(), session)),
+            Err(error) => Err(persistence(error)),
+        }
+    }
+
     /// Runs one task against `session`, appending its input and committing
     /// each turn as it completes.
     ///
@@ -882,6 +967,13 @@ impl Agent {
         control: &TaskControl,
     ) -> Result<TaskSummary, TaskError> {
         let started = Instant::now();
+
+        // 0. The single-writer lease (ADR-008): everything this run
+        //    persists happens under it, and it releases when the run
+        //    ends — so a second process driving the same session fails
+        //    fast below instead of interleaving transcript writes.
+        //    Held through the epilogue by the guard's drop.
+        let lease = self.acquire_session_lease(&session.id)?;
 
         // 1. The input becomes the transcript's next user item. Persisted to
         //    the store *before* the in-memory push (ADR-012,
@@ -910,7 +1002,15 @@ impl Agent {
         // 3. The turn loop; the epilogue below always finalizes the record.
         let mut accounting = Accounting::default();
         let outcome = self
-            .run_turns(session, task_id, sink, control, &mut accounting, started)
+            .run_turns(
+                session,
+                task_id,
+                sink,
+                control,
+                &mut accounting,
+                started,
+                lease.as_ref(),
+            )
             .await;
 
         // 4. Finalize and summarize.
@@ -937,6 +1037,10 @@ impl Agent {
         sink: &dyn EventSink,
     ) -> Result<TaskSummary, TaskError> {
         let started = Instant::now();
+
+        // 0. Same single-writer discipline as `run_task`: the whole
+        //    recording happens under the session's lease.
+        let _lease = self.acquire_session_lease(&session.id)?;
 
         // 1. The input becomes the transcript's next user item,
         //    persist-then-commit, exactly as `run_task` does.
@@ -1097,6 +1201,7 @@ impl Agent {
 
     /// The turn loop proper (§13). Returns the final compiled request's
     /// census on `EndTurn`, or the error that ended the task.
+    #[allow(clippy::too_many_arguments)] // the loop's full state; one call site
     async fn run_turns(
         &self,
         session: &mut Session,
@@ -1105,6 +1210,7 @@ impl Agent {
         control: &TaskControl,
         accounting: &mut Accounting,
         started: Instant,
+        lease: Option<&LeaseGuard<'_>>,
     ) -> Result<ContextCensus, TaskError> {
         // Capabilities are resolved once: in Iteration 1 the model is fixed
         // for the task (§6.4). An unknown model fails before the first
@@ -1185,6 +1291,19 @@ impl Agent {
         let mut mutations_at_grant: u64 = completion.mutations;
 
         for turn in 1..=self.max_turns {
+            // Single-writer lease (ADR-008): renew before spending the
+            // turn, so a task longer than the TTL stays covered. A lost
+            // renewal (expired and taken over) ends the task rather than
+            // interleaving two writers' turns.
+            if let (Some(store), Some(guard)) = (&self.store, lease) {
+                let held = store
+                    .renew_lease(&session.id, guard.lease.owner(), LEASE_TTL_MILLIS)
+                    .map_err(persistence)?;
+                if !held {
+                    return Err(lease_holder_for(store.as_ref(), &session.id));
+                }
+            }
+
             // A pause requested before the task or during the previous
             // turn's tool batch stops here: the in-flight turn has fully
             // committed, nothing is dropped, and the session is

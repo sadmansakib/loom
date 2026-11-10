@@ -2864,6 +2864,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_second_writer_cannot_drive_a_leased_session() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let workspace = rename_fixture(base.path());
+        let mut config = test_config();
+        config.workspace = workspace;
+        config.db_path = base.path().join("loom.db");
+        config.persist = true;
+        let engine = Engine::open_with(
+            config,
+            EngineOverrides {
+                provider: Some(Box::new(FakeProvider::scripted(vec![
+                    FakeProvider::end_turn_script("done"),
+                    FakeProvider::end_turn_script("done again"),
+                ]))),
+                ..EngineOverrides::default()
+            },
+        )
+        .expect("engine");
+
+        let (sink, _receiver) = loom_kernel::event::ChannelEventSink::new();
+        let mut session = engine.new_session();
+        engine
+            .run_task(&mut session, "Say hello.", &sink, &Default::default())
+            .await
+            .expect("first task");
+
+        // A foreign writer holds the session's lease (ADR-008): the
+        // next run must refuse before persisting anything.
+        let store = loom_store::SqliteStore::open(base.path().join("loom.db")).expect("store");
+        let lease = store
+            .acquire_lease(&session.id, "another-process", 60_000)
+            .expect("lease")
+            .expect("granted");
+        assert_eq!(lease.owner(), "another-process");
+
+        let continuation = engine
+            .continue_session(&session.id, "Interloper.", &sink, &Default::default())
+            .await
+            .expect("continue returns the outcome, not an error");
+        let error = continuation.outcome.expect_err("leased session refuses");
+        match &error {
+            loom_kernel::agent::TaskError::SessionLeased { owner, .. } => {
+                assert_eq!(owner, "another-process");
+            }
+            other => panic!("expected SessionLeased, got {other:?}"),
+        }
+
+        // The refused run persisted nothing: the transcript tip is
+        // still the first task's.
+        let reloaded = engine
+            .load_session(&session.id)
+            .expect("load")
+            .expect("known");
+        assert_eq!(
+            reloaded.transcript.len(),
+            session.transcript.len(),
+            "no items from the refused run"
+        );
+
+        // Released, the session accepts input again.
+        assert!(
+            store
+                .release_lease(&session.id, "another-process")
+                .expect("release")
+        );
+        engine
+            .continue_session(&session.id, "Back for real.", &sink, &Default::default())
+            .await
+            .expect("continue")
+            .outcome
+            .expect("second task after release");
+    }
+
+    #[tokio::test]
     async fn capability_resolution_surfaces_once_per_engine() {
         let base = tempfile::tempdir().expect("tempdir");
         let workspace = rename_fixture(base.path());

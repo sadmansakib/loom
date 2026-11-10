@@ -172,6 +172,112 @@ pub trait SessionStore: Send + Sync {
     /// never run through a frontend that records one — a tier-0
     /// refusal for `--restore-workspace`, never a guess.
     fn start_checkpoint(&self, session: &SessionId) -> Result<Option<StartCheckpoint>, StoreError>;
+
+    /// Acquires the single-writer lease over `session` (ADR-008),
+    /// before the caller persists anything to it.
+    ///
+    /// Succeeds when the session is unleased or the previous lease
+    /// expired, returning the held [`Lease`]. Returns `Ok(None)` when
+    /// another live writer holds it; the caller must then leave the
+    /// session alone rather than race it. `ttl_millis` bounds how long
+    /// the lease survives a crashed writer.
+    ///
+    /// The default grants trivially: stores without cross-process
+    /// visibility (in-memory) cannot be raced by a second process and
+    /// need no lock.
+    fn acquire_lease(
+        &self,
+        session: &SessionId,
+        owner: &str,
+        ttl_millis: u64,
+    ) -> Result<Option<Lease>, StoreError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or_default();
+        let expires_at_millis = now.saturating_add(ttl_millis);
+        Ok(Some(Lease::new(
+            *session,
+            owner.to_owned(),
+            expires_at_millis,
+        )))
+    }
+
+    /// Extends a held lease by `ttl_millis`. Returns `false` when
+    /// `owner` no longer holds it (expired and stolen, or released).
+    ///
+    /// The default reports success: nothing can steal a trivially
+    /// granted lease.
+    fn renew_lease(
+        &self,
+        _session: &SessionId,
+        _owner: &str,
+        _ttl_millis: u64,
+    ) -> Result<bool, StoreError> {
+        Ok(true)
+    }
+
+    /// Releases a held lease. Returns `false` when `owner` did not
+    /// hold it.
+    ///
+    /// The default reports success, matching the trivial grant.
+    fn release_lease(&self, _session: &SessionId, _owner: &str) -> Result<bool, StoreError> {
+        Ok(true)
+    }
+
+    /// The live lease holder for `session`, if any:
+    /// `(owner, expires_at_millis)`.
+    ///
+    /// Diagnostic only — the truth is whatever [`SessionStore::acquire_lease`]
+    /// returns; this just fills the refusal message. The default cannot
+    /// say (`None`).
+    fn lease_holder(&self, _session: &SessionId) -> Result<Option<(String, u64)>, StoreError> {
+        Ok(None)
+    }
+}
+
+/// A held single-writer lease over one session (ADR-008).
+///
+/// The task loop acquires one before its first persist of a run and
+/// drops it when the run ends, so a second process driving the same
+/// session fails fast instead of interleaving writes. The TTL bounds
+/// how long a crashed writer's lease blocks resumption; renewal keeps
+/// long tasks covered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lease {
+    session: SessionId,
+    owner: String,
+    expires_at_millis: u64,
+}
+
+impl Lease {
+    /// A lease held by `owner` over `session` until `expires_at_millis`.
+    #[must_use]
+    pub fn new(session: SessionId, owner: String, expires_at_millis: u64) -> Self {
+        Self {
+            session,
+            owner,
+            expires_at_millis,
+        }
+    }
+
+    /// The session this lease guards.
+    #[must_use]
+    pub fn session(&self) -> &SessionId {
+        &self.session
+    }
+
+    /// The owner that acquired it.
+    #[must_use]
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    /// When the lease lapses if not renewed (Unix millis).
+    #[must_use]
+    pub fn expires_at_millis(&self) -> u64 {
+        self.expires_at_millis
+    }
 }
 
 /// A stored artifact body with its metadata (§ 2D consumes this; ADR-012).

@@ -144,11 +144,7 @@ impl SqliteStore {
             }
             return Ok(None);
         }
-        Ok(Some(Lease {
-            session: *session,
-            owner,
-            expires_at_millis: expires,
-        }))
+        Ok(Some(Lease::new(*session, owner, expires)))
     }
 
     /// Extends a held lease. Returns `false` if `owner` no longer holds it.
@@ -184,29 +180,10 @@ impl SqliteStore {
 }
 
 /// A held single-writer lease over one session (ADR-008).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Lease {
-    session: SessionId,
-    owner: String,
-    expires_at_millis: u64,
-}
-
-impl Lease {
-    /// The session this lease guards.
-    pub fn session(&self) -> &SessionId {
-        &self.session
-    }
-
-    /// The owner that acquired it.
-    pub fn owner(&self) -> &str {
-        &self.owner
-    }
-
-    /// When the lease lapses if not renewed (Unix millis).
-    pub fn expires_at_millis(&self) -> u64 {
-        self.expires_at_millis
-    }
-}
+///
+/// Re-exported from the kernel: the trait's default implementations
+/// and the SQLite implementation share one shape.
+pub use loom_kernel::store::Lease;
 
 impl SessionStore for SqliteStore {
     fn ensure_session(&self, session: &SessionId) -> Result<(), StoreError> {
@@ -478,6 +455,44 @@ impl SessionStore for SqliteStore {
             workspace: workspace.into(),
             head,
             reason,
+        }))
+    }
+
+    fn acquire_lease(
+        &self,
+        session: &SessionId,
+        owner: &str,
+        ttl_millis: u64,
+    ) -> Result<Option<Lease>, StoreError> {
+        // The inherent method takes `impl Into<String>`; delegate.
+        SqliteStore::acquire_lease(self, session, owner, ttl_millis)
+    }
+
+    fn renew_lease(
+        &self,
+        session: &SessionId,
+        owner: &str,
+        ttl_millis: u64,
+    ) -> Result<bool, StoreError> {
+        SqliteStore::renew_lease(self, session, owner, ttl_millis)
+    }
+
+    fn release_lease(&self, session: &SessionId, owner: &str) -> Result<bool, StoreError> {
+        SqliteStore::release_lease(self, session, owner)
+    }
+
+    fn lease_holder(&self, session: &SessionId) -> Result<Option<(String, u64)>, StoreError> {
+        let connection = self.lock()?;
+        let row = connection
+            .query_row(
+                "SELECT lease_owner, lease_until FROM sessions WHERE id = ?1",
+                [session.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(backend)?;
+        Ok(row.and_then(|(owner, until)| {
+            (until > now_millis() as i64).then_some((owner, until.max(0) as u64))
         }))
     }
 

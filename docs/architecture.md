@@ -602,7 +602,12 @@ schema.
   history.
 - **Leases** support exclusive task execution (acquire / renew / release
   with expiry; renewing a lease nobody holds fails; an expired lease can
-  be acquired by a new owner).
+  be acquired by a new owner). The task loop now takes one at the top of
+  every persisted run and renews it each turn (ADR-008): a second
+  process driving the same session fails fast with
+  `TaskError::SessionLeased` instead of interleaving transcript writes,
+  a crashed writer's lease expires within the 5-minute TTL, and the
+  guard releases on every path out of the run.
 
 ## 8. Credentials (`loom-engine/auth.rs`)
 

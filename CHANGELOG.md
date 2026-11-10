@@ -3,6 +3,19 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — Adversarial review round 2: session single-writer lease (PR8)
+
+- `fix(kernel,store,engine)`: the session lease (ADR-008) is no longer
+  dead code (review S3). The lease columns and `acquire/renew/release`
+  existed, but nothing acquired one — two loom processes could drive
+  the same session and interleave transcript writes. The task loop now
+  acquires the lease before a run's first persist (renewed every turn,
+  released by a drop guard on every exit path; in-memory stores get
+  trivial grants through new `SessionStore` trait defaults), and a
+  second writer fails fast with `TaskError::SessionLeased` naming the
+  holder. A crashed writer blocks resumption for at most the 5-minute
+  TTL.
+
 ## 2026-11 — Adversarial review round 2: rewind + artifact integrity (PR7)
 
 - `fix(cli)`: a tier-2 boundary restore no longer writes through
