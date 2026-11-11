@@ -216,9 +216,10 @@ digest-checks the artifact's dataset sha256 against the cached
 dataset file this sweep actually runs and refuses on mismatch (flags
 about another suite are worse than no flags); an audit whose weak set
 misses the sweep entirely warns but proceeds. The `unconfirmed` label
-is the honesty rule: until the spend-gated mutant re-grade runs, a
-headline reading this block cites structural hypotheses, not
-verdicts. Without the flag, provenance is byte-identical to before.
+is the honesty rule: until the completed mutant re-grade verdicts are
+wired into this provenance block, a headline reading this block cites
+structural hypotheses, not verdicts. Without the flag, provenance is
+byte-identical to before.
 
 **Trajectory integrity (review round 2, F-05).** Two mechanical
 guards now bracket every run. Before the agent starts, the container
@@ -306,11 +307,19 @@ with the number in `multilingual-sweep-<model>.json`.
 
 Related open tails, recorded here so they stop living in prose:
 
-- **Item 1 remainder (frozen-subset audit):** 259 single-hunk-dropped
-  mutants are staged under `target/eval/suite-audit-v3-100/` (45
-  predictions files); the outstanding step is the docker re-grade —
-  ~259 scorer runs, a one-off on a linux box — to confirm or refute
-  the 36 weak-suite hypotheses, then re-gate any flipped headline.
+- **Item 1 remainder (frozen-subset audit):** the 259 single-hunk-dropped
+  mutants under `target/eval/suite-audit-v3-100/` (45 prediction files)
+  were graded with the official Docker harness. All 51 multi-hunk
+  instances have a decisive audit outcome: zero were weak-confirmed and
+  all 51 were weak-refuted (each has at least one dropped-hunk mutant
+  that did not resolve). Of the 36 structurally weak flags, 16 multi-hunk hypotheses
+  were refuted; the other 20 are single-hunk patches and unmutable by
+  this method. Aggregate: ignored artifact
+  `target/eval/suite-audit-v3-100/mutant-results.json`. One mutant-0
+  Sphinx run timed out and its retry stalled while copying the eval
+  script, so it was stopped. That instance remains weak-refuted by its
+  other unresolved mutant. No frozen-subset headline flips: there are
+  no weak-confirmed instances to exclude, so no re-gating is triggered.
 - **Verified 500:** a plan-only doc (no live sweep) describing what a
   full-set run would take — wall time, image storage, cost at the
   pilot-measured rate — so the step from subset to full set is a

@@ -836,15 +836,30 @@ adds four more framing findings and backlog items 26–31 below.
      the frozen 100 — 36/100 weak by suite shape (small or testless),
      49/100 unmutable (single-hunk gold), 259 single-hunk-dropped
      mutants staged as 45 predictions files under
-     `target/eval/suite-audit-v3-100/` (artifact provenance: dataset
-     sha256 + selection rule + method v1). Remaining: the docker
-     mutant re-grade (~259 scorer runs, one-off, linux box) to
-     confirm/refute the 36 hypotheses; then any flipped headline is
-     re-gated. The wiring half shipped 2026-11-07:
-     `swebench-run --suite-audit <path>` embeds the flags in the
-     sweep report's `provenance.suite_audit` — digest-bound to the
-     artifact and the dataset, intersected with the sweep's
-     instances, labeled `unconfirmed: true` until the re-grade runs
+      `target/eval/suite-audit-v3-100/` (artifact provenance: dataset
+      sha256 + selection rule + method v1). Docker mutant re-grade
+      completed 2026-11-11 with the official SWE-bench harness: all 45
+      files / 259 dropped-hunk mutant rows covered the 51 multi-hunk
+      instances, except the retry of one mutant timed out and stalled
+      after patch application; its verdict was already weak-refuted by
+      another mutant. The aggregate is a complete result for the audit
+      decision: zero were weak-confirmed; all 51 were weak-refuted
+      because at least one dropped-hunk mutant per instance did not
+      resolve. Of the 36 structural weak flags, 16 multi-hunk
+      hypotheses were refuted; 20 single-hunk cases remain unmutable by
+      this method. The aggregate is
+      `target/eval/suite-audit-v3-100/mutant-results.json` (ignored
+      local artifact). One mutant-0 Sphinx run timed out; its retry
+      stalled while copying the eval script and was stopped. That
+      instance is already weak-refuted by another unresolved mutant. No
+      frozen-subset headline flips because no instances were
+      weak-confirmed, so no re-gate is triggered. The wiring half
+      shipped 2026-11-07:
+      `swebench-run --suite-audit <path>` embeds the flags in the
+      sweep report's `provenance.suite_audit` — digest-bound to the
+      artifact and the dataset, intersected with the sweep's
+      instances, labeled `unconfirmed: true` pending wiring of the
+      completed re-grade verdicts
      (`loom_eval::suite_audit::sweep_weak_suite`; docs/eval.md §
      suite audit).
    Seam: the live eval reports and the event stream.
