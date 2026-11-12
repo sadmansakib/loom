@@ -4,6 +4,10 @@
  
 # OS noise
 .DS_Store
+.idea/
+
+# caches
+.ruff_cache/
 
 traces/
 graphify-out/

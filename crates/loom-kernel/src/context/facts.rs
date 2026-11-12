@@ -1,5 +1,5 @@
 //! KnownFacts: the deterministic repository-facts layer (Iteration 2, step 2E;
-//! `iteration-2.md` §11, ADR-015).
+//! see `docs/architecture.md` §5.2 on the repository facts scan).
 //!
 //! Loom answers structural questions — "what kind of project is this?", "what
 //! changed?" — from observable repository state, not from a model turn. This
