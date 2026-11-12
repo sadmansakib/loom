@@ -1530,8 +1530,11 @@ adds four more framing findings and backlog items 26–31 below.
     ready: `loom-core` roots a stable surface (driving API + `TaskControl`/
     `EventSink`/`EventKind`/`Session`/ids) with a documented semver split
     from the rolling crate aliases (ADR-021), and `examples/frontend.rs`
-    shows the full drive loop — open, subscribe, steer, summarize. Resume +
-    steering are both shipped, so a frontend is purely additive.
+    shows the full drive loop — open, subscribe, steer, summarize. An
+    additive Ratatui/Crossterm example (`crates/loom-core/examples/tui.rs`)
+    now renders events and supports interactive steering, pause, and cancel;
+    UI crates remain dev-dependencies, outside the facade's runtime surface.
+    Resume + steering are both shipped, so richer frontends remain additive.
 23. **Distributed verification.** Remote or containerized `verify`
     runners with the same evidence contract. **Shipped 2026-10-23** —
     `.loom/verify.toml` declares the runner argv (docker, ssh, …) with
