@@ -1,0 +1,22 @@
+[package]
+name = "loom-tui"
+description = "Official terminal user interface for Loom."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "loom-tui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+crossterm = "0.29"
+loom-core = { workspace = true }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+tokio = { workspace = true, features = ["rt", "time"] }
+loom-kernel = { workspace = true }
+
+[lints]
+workspace = true

@@ -7,6 +7,7 @@ members = [
     "crates/loom-tools",
     "crates/loom-engine",
     "crates/loom-core",
+    "crates/loom-tui",
     "crates/loom-eval",
     "crates/loom-acp",
     "crates/loom-cli",
@@ -37,6 +38,7 @@ loom-providers = { path = "crates/loom-providers", version = "0.1.0" }
 loom-tools = { path = "crates/loom-tools", version = "0.1.0" }
 loom-engine = { path = "crates/loom-engine", version = "0.1.0" }
 loom-core = { path = "crates/loom-core", version = "0.1.0" }
+loom-tui = { path = "crates/loom-tui", version = "0.1.0" }
 
 # async runtime (research.md §2: tokio 1.x + tokio-util CancellationToken).
 # Version pinned here only — crates add the features they need, so the

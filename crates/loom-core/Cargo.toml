@@ -17,9 +17,5 @@ loom-tools = { workspace = true }
 workspace = true
 
 [dev-dependencies]
-# Frontend examples exercise the facade without adding UI dependencies to
-# loom-core's public/runtime dependency surface.
 anyhow = { workspace = true }
-crossterm = "0.29"
-ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 tokio = { workspace = true, features = ["rt"] }

@@ -1531,10 +1531,9 @@ adds four more framing findings and backlog items 26–31 below.
     `EventSink`/`EventKind`/`Session`/ids) with a documented semver split
     from the rolling crate aliases (ADR-021), and `examples/frontend.rs`
     shows the full drive loop — open, subscribe, steer, summarize. An
-    additive Ratatui/Crossterm example (`crates/loom-core/examples/tui.rs`)
-    now renders events and supports interactive steering, pause, and cancel;
-    UI crates remain dev-dependencies, outside the facade's runtime surface.
-    Resume + steering are both shipped, so richer frontends remain additive.
+    official `loom-tui` crate (`crates/loom-tui`) now renders events and
+    supports interactive steering, pause, and cancel; UI crates are isolated
+    from the facade's dependency surface. Resume + steering are both shipped.
 23. **Distributed verification.** Remote or containerized `verify`
     runners with the same evidence contract. **Shipped 2026-10-23** —
     `.loom/verify.toml` declares the runner argv (docker, ssh, …) with

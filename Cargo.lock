@@ -1796,13 +1796,11 @@ name = "loom-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "crossterm",
  "loom-engine",
  "loom-kernel",
  "loom-providers",
  "loom-store",
  "loom-tools",
- "ratatui",
  "tokio",
 ]
 
@@ -1915,6 +1913,18 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+]
+
+[[package]]
+name = "loom-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "loom-core",
+ "loom-kernel",
+ "ratatui",
+ "tokio",
 ]
 
 [[package]]
