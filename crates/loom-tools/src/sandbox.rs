@@ -1410,7 +1410,7 @@ mod tests {
                 temp: base.path(),
             },
             &[],
-            &[absent.clone()],
+            std::slice::from_ref(&absent),
             false,
             Some(base.path().to_str().unwrap()),
         );

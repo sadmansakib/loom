@@ -10,6 +10,9 @@
 //!     --provider deepseek --model deepseek-chat "add a hello function"
 //! ```
 
+// A demo example's product is its terminal narration.
+#![allow(clippy::print_stdout)]
+
 use std::time::Duration;
 
 use loom_core::kernel::event::{ChannelEventSink, EventKind};

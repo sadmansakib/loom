@@ -97,9 +97,13 @@ impl ScriptedProvider {
         }
     }
 
+    #[allow(clippy::expect_used)] // not a #[test] fn, so Clippy.toml's test
+    // exemption does not apply; a missing script must fail the test
     fn next_script(&self) -> Script {
         lock_or_recover(&self.scripts)
             .pop_front()
+            // A missing script means the kernel issued a request the test
+            // did not script: failing the test here is the correct response.
             .expect("scripted provider received an unexpected extra request")
     }
 

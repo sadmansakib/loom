@@ -17,6 +17,9 @@
 //! Cost columns appear only when all three per-million prices are
 //! given: `(input − cached)·in + cached·cache + output·out`.
 
+// Terminal output is this harness's product; the workspace-wide
+// `clippy::print_stdout`/`print_stderr` denies target library crates.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 

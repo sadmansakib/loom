@@ -9,6 +9,9 @@
 //! its first JSON line cannot land on the same line as libtest progress
 //! text; non-JSON stdin lines are ignored.
 
+// Terminal output is this harness's product; the workspace-wide
+// `clippy::print_stdout`/`print_stderr` denies target library crates.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::io::{BufRead, Write};

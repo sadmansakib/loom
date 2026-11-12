@@ -4,6 +4,10 @@
 //! stderr tracing subscriber (`RUST_LOG`, default `warn`), keep stdout for
 //! results only, and translate the command outcome into a process exit code.
 
+// A CLI's product is its terminal output; the workspace-wide
+// `clippy::print_stdout`/`print_stderr` denies target library crates.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use std::process::ExitCode;
 
 use clap::Parser;

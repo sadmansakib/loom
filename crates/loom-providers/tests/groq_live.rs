@@ -17,6 +17,10 @@
 //! usually means the plan changed, not that the adapter regressed. Never
 //! commit keys or secret-bearing output.
 
+// Live diagnostics: these tests are run with `--nocapture` precisely so
+// their observations are printed for manual verification.
+#![allow(clippy::print_stdout)]
+
 use futures::StreamExt;
 use loom_kernel::model::{
     Message, ModelError, ModelEvent, ModelProvider, ModelRequest, ModelResponse,

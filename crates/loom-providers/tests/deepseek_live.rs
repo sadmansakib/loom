@@ -15,6 +15,10 @@
 //! never commit API keys or recorded output containing secrets. Never
 //! point these at the GLM Coding Plan endpoint.
 
+// Live diagnostics: these tests are run with `--nocapture` precisely so
+// their observations are printed for manual verification.
+#![allow(clippy::print_stdout)]
+
 use futures::StreamExt;
 use loom_kernel::model::{
     Message, ModelError, ModelEvent, ModelProvider, ModelRequest, ModelResponse, StopReason,

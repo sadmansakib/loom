@@ -613,7 +613,7 @@ fn kernel_session_id(acp_id: &acp::SessionId) -> Result<KernelSessionId, String>
     let uuid = uuid::Uuid::parse_str(&acp_id.0)
         .ok()
         .filter(|uuid| uuid.get_version_num() == 7)
-        .filter(|uuid| uuid.to_string() == acp_id.0)
+        .filter(|uuid| *uuid.to_string() == *acp_id.0)
         .ok_or_else(|| error.to_owned())?;
     KernelSessionId::try_from(uuid).map_err(|_| error.to_owned())
 }
@@ -781,7 +781,7 @@ async fn ask_permission(
             false
         }
         Ok(Ok(response)) => match response.outcome {
-            acp::RequestPermissionOutcome::Selected(selected) => selected.option_id.0 == "allow",
+            acp::RequestPermissionOutcome::Selected(selected) => &*selected.option_id.0 == "allow",
             // Cancelled, or a future outcome kind: fail closed.
             _ => false,
         },

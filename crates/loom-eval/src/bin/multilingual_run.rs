@@ -24,6 +24,10 @@
 
 // A harness binary: panicking on a setup failure is the intended
 // behavior.
+
+// Terminal output is this harness's product; the workspace-wide
+// `clippy::print_stdout`/`print_stderr` denies target library crates.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::{Path, PathBuf};

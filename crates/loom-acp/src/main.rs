@@ -76,5 +76,6 @@ fn main() -> anyhow::Result<()> {
     runtime.block_on(serve(
         agent_client_protocol::Stdio::new(),
         AcpState::new(options),
-    ))
+    ))?;
+    Ok(())
 }

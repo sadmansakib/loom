@@ -136,6 +136,13 @@ missing_docs = "warn"
 [workspace.lints.clippy]
 unwrap_used = "warn"
 expect_used = "warn"
+# Guardrails: these must never ship. If a lint fires, fix the code, do
+# not add an allow.
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
 
 [profile.release]
 lto = "thin"

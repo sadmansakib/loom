@@ -370,7 +370,9 @@ pub fn sweep_weak_suite_with_results(
                 })
                 .collect::<Result<_, _>>()?;
             if result_structural_ids.len()
-                != results["structural_weak_ids"].as_array().unwrap().len()
+                != results["structural_weak_ids"]
+                    .as_array()
+                    .map_or(0, Vec::len)
             {
                 return Err("suite audit results contain duplicate structural weak IDs".to_owned());
             }

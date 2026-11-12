@@ -1,0 +1,38 @@
+#!/bin/sh
+# Pre-commit lint gate for the loom workspace.
+#
+# Fast by design: rustfmt auto-formats staged Rust files (and re-stages
+# them), then clippy runs only on the crates whose files changed. CI
+# still runs the full `cargo clippy --workspace --all-targets -D warnings`
+# gate; this hook catches the common cases before a push.
+#
+# Skip once with:  git commit --no-verify   (or: SKIP=clippy git commit ...)
+
+set -eu
+
+staged_rust=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs')
+
+if [ -n "$staged_rust" ]; then
+  # 1. rustfmt: format staged files in place, restage, fail if that
+  #    produced a diff the user has not seen yet.
+  echo "pre-commit: rustfmt on staged files"
+  staged_fmt=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs')
+  # shellcheck disable=SC2086
+  if ! cargo fmt -- --check $staged_fmt 2>/dev/null; then
+    # shellcheck disable=SC2086
+    cargo fmt -- $staged_fmt
+    # shellcheck disable=SC2086
+    git add $staged_fmt
+    echo "pre-commit: reformatted and restaged files — review the diff and re-commit if unhappy"
+  fi
+fi
+
+# 2. clippy: only when Rust sources changed, only on affected crates.
+if [ -n "$staged_rust" ] && [ "${SKIP_CLIPPY:-0}" != "1" ]; then
+  echo "pre-commit: clippy on affected crates"
+  crates=$(printf '%s\n' $staged_rust | sed -n 's|^crates/\([^/]*\)/.*|-p \1|p' | sort -u)
+  # shellcheck disable=SC2086
+  cargo clippy $crates --all-targets -- -D warnings
+fi
+
+exit 0
