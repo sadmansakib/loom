@@ -373,8 +373,8 @@ pub fn api_key_envs(provider: &str) -> Vec<String> {
 /// is removed before the diff so it never leaks into `model_patch`.
 ///
 /// Anti-cheat (review F-05): before the agent starts, the testbed's
-/// git history is destroyed — every ref except `HEAD` deleted,
-/// reflogs expired, unreachable objects pruned — so the fix commit
+/// auxiliary refs are deleted while the active `refs/heads/master` base
+/// is preserved, reflogs expired, unreachable objects pruned — so the fix commit
 /// (which exists in upstream history up to `base_commit` in some
 /// testbeds) cannot be recovered locally with `git log`/`show`/`fsck`.
 /// The scorer compares patches, so a refless worktree scores
@@ -410,7 +410,7 @@ sandbox = false
 program = "git"
 sandbox = false
 EOF
-git -C /testbed for-each-ref --format='%(refname)' | grep -v '^HEAD$' | while read -r ref; do git -C /testbed update-ref -d "$ref" 2>/dev/null || true; done; git -C /testbed reflog expire --expire=now --all 2>/dev/null || true; git -C /testbed gc --prune=now --quiet 2>/dev/null || true
+git -C /testbed for-each-ref --format='%(refname)' | grep -v '^HEAD$' | grep -v '^refs/heads/master$' | while read -r ref; do git -C /testbed update-ref -d "$ref" 2>/dev/null || true; done; git -C /testbed reflog expire --expire=now --all 2>/dev/null || true; git -C /testbed gc --prune=now --quiet 2>/dev/null || true
 if [ -n "${LOOM_BASE_URL:-}" ]; then set -- --base-url "$LOOM_BASE_URL"; else set --; fi; timeout "$LOOM_TIMEOUT_SECS" /loom/loom run --json --no-save --provider "$LOOM_PROVIDER" --model "$LOOM_MODEL" "$@" --max-turns "$LOOM_MAX_TURNS" --workspace /testbed "$(cat /prompt.txt)" > /out/run.json 2> /out/run.err; status=$?; rm -rf /testbed/.loom; cd /testbed && git add -A && git diff --cached > /out/patch.diff 2> /out/patch.err; exit $status"#;
 
 /// Which agent the container runs. `Loom` is the product under test;
@@ -528,6 +528,10 @@ pub struct ContainerSpec<'a> {
     /// here rather than silently shadowing the run's own provider or
     /// budget.
     pub extra_env: &'a [(String, String)],
+    /// Extra Docker run arguments for benchmark-specific execution. Keep
+    /// empty for generic SWE-bench and selfopt; the Rust pilot uses its
+    /// own task-container setup for nested bubblewrap namespaces.
+    pub docker_args: &'a [&'a str],
     /// Unique container name (`--name`), e.g. `loom-<slug>-run1`.
     pub container_name: &'a str,
 }
@@ -596,6 +600,7 @@ pub fn docker_run_argv(spec: &ContainerSpec<'_>) -> Vec<String> {
     for (name, value) in spec.extra_env {
         argv.extend(["-e".into(), format!("{name}={value}")]);
     }
+    argv.extend(spec.docker_args.iter().map(|arg| (*arg).to_owned()));
     argv.extend([
         "-e".into(),
         "LOOM_SKIP_SANDBOX_PREFLIGHT=1".into(),
@@ -1330,6 +1335,7 @@ fn docker_argv_mounts_and_env_without_a_shell() {
         max_turns: 60,
         bare: false,
         extra_env: &[],
+        docker_args: &[],
         container_name: "loom-org-one-1-run1",
     };
     let argv = docker_run_argv(&spec);
@@ -1340,9 +1346,9 @@ fn docker_argv_mounts_and_env_without_a_shell() {
     assert!(joined.contains("-e\nLOOM_PROVIDER=deepseek\n-e\nLOOM_MODEL=deepseek-flash"));
     // Full arm: no LOOM_BARE is forwarded.
     assert!(!joined.contains("LOOM_BARE"));
-    // The container is the isolation boundary; the in-container bwrap
-    // probe would fail (no bubblewrap in testbed images).
+    // Generic SWE-bench runs do not receive extra container privileges.
     assert!(joined.contains("-e\nLOOM_SKIP_SANDBOX_PREFLIGHT=1"));
+    assert!(!joined.contains("--cap-add"));
     assert!(joined.contains("-e\nLOOM_TIMEOUT_SECS=3600\n"));
     assert!(joined.contains("-e\nLOOM_MAX_TURNS=60\n"));
     assert!(joined.contains("-e\nDEEPSEEK_API_KEY=sk-test\n"));
@@ -1381,12 +1387,14 @@ fn docker_argv_mounts_and_env_without_a_shell() {
         model: "nano-model",
         api_key_env: "CUSTOM_API_KEY",
         api_key: "nano-test",
+        docker_args: &["--cap-add=SYS_ADMIN"],
         ..spec
     };
     let argv = docker_run_argv(&gateway);
     let joined = argv.join("\n");
     assert!(joined.contains("-e\nLOOM_BASE_URL=https://free.empexaura.com/v1"));
     assert!(joined.contains("-e\nCUSTOM_API_KEY=nano-test"));
+    assert!(joined.contains("--cap-add=SYS_ADMIN"));
 
     // The bare-loop arm (roadmap item 1): one env var, and the frozen
     // container script stays byte-identical — the binary consumes the
@@ -1411,6 +1419,7 @@ fn docker_argv_mounts_and_env_without_a_shell() {
         agent: AgentKind::Loom,
         script_override: None,
         extra_env: &overlay,
+        docker_args: &[],
         container_name: "loom-org-one-1-selfopt-p1",
         ..bare_arm
     };
@@ -1439,6 +1448,7 @@ fn docker_argv_mounts_and_env_without_a_shell() {
     for reserved in RESERVED_CONTAINER_ENV {
         let collision = ContainerSpec {
             extra_env: &[(reserved.to_owned(), "1".to_owned())],
+            docker_args: &[],
             ..overlaid
         };
         let result = std::panic::catch_unwind(|| docker_run_argv(&collision));
@@ -1446,6 +1456,7 @@ fn docker_argv_mounts_and_env_without_a_shell() {
     }
     let key_collision = ContainerSpec {
         extra_env: &[("CUSTOM_API_KEY".to_owned(), "x".to_owned())],
+        docker_args: &[],
         ..overlaid
     };
     assert!(std::panic::catch_unwind(|| docker_run_argv(&key_collision)).is_err());
@@ -1582,9 +1593,10 @@ fn integrity_flags_catch_retrieval_routes() {
 
 #[test]
 fn container_script_strips_the_testbed_history_before_the_agent_runs() {
-    // F-05's other half: refs deleted, reflogs expired, objects
+    // F-05's other half: auxiliary refs deleted, reflogs expired, objects
     // pruned — all before /loom/loom starts, so no in-run git command
-    // can reach the fix commit.
+    // can reach the fix commit. Preserve the active master ref so git's
+    // checkout retains the intended base tree while the history is stripped.
     let strip = CONTAINER_SCRIPT
         .split("if [ -n")
         .next()
@@ -1592,6 +1604,7 @@ fn container_script_strips_the_testbed_history_before_the_agent_runs() {
     assert!(strip.contains("for-each-ref --format='%(refname)'"));
     assert!(strip.contains("update-ref -d"));
     assert!(strip.contains("reflog expire --expire=now --all"));
+    assert!(strip.contains("grep -v '^refs/heads/master$'"));
     assert!(strip.contains("gc --prune=now"));
     assert!(
         strip.contains("git -C /testbed for-each-ref"),
@@ -1857,6 +1870,7 @@ fn mini_agent_arm_selects_its_script_and_opens_the_openai_dialect() {
         max_turns: 60,
         bare: false,
         extra_env: &[],
+        docker_args: &[],
         container_name: "mini-org-one-1-run1",
     };
     let argv = docker_run_argv(&spec);

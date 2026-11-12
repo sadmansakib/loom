@@ -307,60 +307,70 @@ pub fn build_prompt_ml(instance: &MultilingualInstance) -> String {
 
 /// The container script for the Rust slice: the Verified
 /// [`swebench::CONTAINER_SCRIPT`] with the Rust toolchain added to the
-/// seeded manifest. Written as an explicit frozen constant — never
-/// spliced at runtime — so the exact bytes the sweep ran are pin-able
-/// in provenance and tests. Everything after the heredoc `EOF` marker
-/// is byte-identical to the Python script by construction (pinned by a
-/// test): the same loom invocation, the same patch extraction, the
-/// same exit-status preservation. Python/pip entries stay — inert
-/// where absent, and ruff's testbed uses Python-side tooling.
-pub const RUST_CONTAINER_SCRIPT: &str = r#"mkdir -p /testbed/.loom && cat > /testbed/.loom/commands.toml <<'EOF'
+/// seeded manifest. Dependencies are prefetched with registry access before
+/// isolation, then Cargo runs offline during agent execution. The official
+/// Rust task image lacks bubblewrap and
+/// denies namespace creation unless the task container grants the needed
+/// capabilities. The script installs bubblewrap; only Rust task containers
+/// receive those extra Docker grants. Written as an explicit frozen
+/// constant — never spliced at runtime — so the exact bytes the sweep ran
+/// are pin-able in provenance and tests. The core tail preserves the Loom
+/// invocation and patch extraction as the Python script. Python/pip entries
+/// stay — inert where absent, and ruff's testbed uses Python-side tooling.
+pub const RUST_CONTAINER_SCRIPT: &str = r#"command -v bwrap >/dev/null 2>&1 || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bubblewrap; }
+if [ -f /testbed/Cargo.lock ]; then had_lock=1; cp /testbed/Cargo.lock "/tmp/loom-cargo-lock.$$"; else had_lock=0; fi
+(cd /testbed && cargo fetch)
+fetch_status=$?
+if [ "$fetch_status" -ne 0 ]; then
+    if [ "$had_lock" -eq 1 ]; then cp "/tmp/loom-cargo-lock.$$" /testbed/Cargo.lock; else rm -f /testbed/Cargo.lock; fi
+    rm -f "/tmp/loom-cargo-lock.$$"
+    exit "$fetch_status"
+fi
+if [ -f /testbed/Cargo.lock ]; then cp /testbed/Cargo.lock "/tmp/loom-cargo-prefetched-lock.$$"; else rm -f "/tmp/loom-cargo-prefetched-lock.$$"; fi
+export CARGO_NET_OFFLINE=true
+mkdir -p /testbed/.loom && cat > /testbed/.loom/commands.toml <<'EOF'
 [[command]]
 program = "bash"
-sandbox = false
+network = false
 
 [[command]]
 program = "sh"
-sandbox = false
-
-[[command]]
-program = "cargo"
-sandbox = false
+network = false
 
 [[command]]
 program = "cargo-fmt"
-sandbox = false
+network = false
 
 [[command]]
 program = "rustc"
-sandbox = false
+network = false
 
 [[command]]
 program = "rustup"
-sandbox = false
+network = false
 
 [[command]]
 program = "python"
-sandbox = false
+network = false
 
 [[command]]
 program = "python3"
-sandbox = false
+network = false
 
 [[command]]
 program = "pip"
-sandbox = false
+network = false
 
 [[command]]
 program = "pip3"
-sandbox = false
+network = false
 
 [[command]]
 program = "git"
-sandbox = false
+network = false
 EOF
-git -C /testbed for-each-ref --format='%(refname)' | grep -v '^HEAD$' | while read -r ref; do git -C /testbed update-ref -d "$ref" 2>/dev/null || true; done; git -C /testbed reflog expire --expire=now --all 2>/dev/null || true; git -C /testbed gc --prune=now --quiet 2>/dev/null || true
-if [ -n "${LOOM_BASE_URL:-}" ]; then set -- --base-url "$LOOM_BASE_URL"; else set --; fi; timeout "$LOOM_TIMEOUT_SECS" /loom/loom run --json --no-save --provider "$LOOM_PROVIDER" --model "$LOOM_MODEL" "$@" --max-turns "$LOOM_MAX_TURNS" --workspace /testbed "$(cat /prompt.txt)" > /out/run.json 2> /out/run.err; status=$?; rm -rf /testbed/.loom; cd /testbed && git add -A && git diff --cached > /out/patch.diff 2> /out/patch.err; exit $status"#;
+git -C /testbed for-each-ref --format='%(refname)' | grep -v '^HEAD$' | grep -v '^refs/heads/master$' | while read -r ref; do git -C /testbed update-ref -d "$ref" 2>/dev/null || true; done; git -C /testbed reflog expire --expire=now --all 2>/dev/null || true; git -C /testbed gc --prune=now --quiet 2>/dev/null || true
+if [ -n "${LOOM_BASE_URL:-}" ]; then set -- --base-url "$LOOM_BASE_URL"; else set --; fi; timeout "$LOOM_TIMEOUT_SECS" /loom/loom run --json --no-save --provider "$LOOM_PROVIDER" --model "$LOOM_MODEL" "$@" --max-turns "$LOOM_MAX_TURNS" --workspace /testbed "$(cat /prompt.txt)" > /out/run.json 2> /out/run.err; status=$?; if [ -f "/tmp/loom-cargo-prefetched-lock.$$" ] && cmp -s /testbed/Cargo.lock "/tmp/loom-cargo-prefetched-lock.$$"; then if [ "$had_lock" -eq 1 ]; then cp "/tmp/loom-cargo-lock.$$" /testbed/Cargo.lock; else rm -f /testbed/Cargo.lock; fi; fi; rm -f "/tmp/loom-cargo-lock.$$" "/tmp/loom-cargo-prefetched-lock.$$"; rm -rf /testbed/.loom; cd /testbed && git add -A && git diff --cached > /out/patch.diff 2> /out/patch.err; exit $status"#;
 
 /// The slice's provenance block, appended to the sweep report: what was
 /// run, from where, selected how, with which script. Everything an
@@ -621,25 +631,30 @@ mod tests {
     }
 
     #[test]
-    fn rust_script_pins_by_hash_and_shares_the_python_tail() {
+    fn rust_script_pins_by_hash_and_preserves_the_container_contract() {
         // Frozen: any edit here is a deliberate, reviewable change.
-        // 2026-11: re-pinned after the F-05 history strip joined the
-        // shared tail (same bytes as CONTAINER_SCRIPT's).
+        // 2026-11: re-pinned after preserving the active master ref,
+        // prefetching Cargo dependencies, and forcing offline Cargo use.
         assert_eq!(
             swebench::sha256_hex(RUST_CONTAINER_SCRIPT.as_bytes()),
-            "fe234590a27f9931c04cafb51d6f4ca13e642d8d8da60596dc5dd88b052a7613",
+            "4922d26a90f69bacd201be0c6b56aa8af064922c9ab6e0c8a1ff4ee796a944c3",
             "RUST_CONTAINER_SCRIPT changed; update provenance consciously"
         );
-        // The manifest carries the Rust toolchain the agent needs...
-        for program in ["cargo", "cargo-fmt", "rustc", "rustup"] {
+        // `cargo` is already admitted by the built-in policy; the
+        // manifest adds the remaining Rust toolchain commands.
+        assert!(!RUST_CONTAINER_SCRIPT.contains("program = \"cargo\""));
+        assert!(RUST_CONTAINER_SCRIPT.contains("(cd /testbed && cargo fetch)"));
+        assert!(RUST_CONTAINER_SCRIPT.contains("CARGO_NET_OFFLINE=true"));
+        assert!(RUST_CONTAINER_SCRIPT.contains("cmp -s /testbed/Cargo.lock"));
+        assert!(RUST_CONTAINER_SCRIPT.contains("export CARGO_NET_OFFLINE=true"));
+        for program in ["cargo-fmt", "rustc", "rustup"] {
             assert!(
                 RUST_CONTAINER_SCRIPT.contains(&format!("program = \"{program}\"")),
                 "missing {program}"
             );
         }
-        // ...and everything after the heredoc EOF is byte-identical to
-        // the Python arm's script: same invocation, same patch
-        // extraction, same exit-status contract.
+        // Both scripts preserve the extraction and exit-status contract;
+        // Rust also restores Cargo.lock after prefetching for offline use.
         let rust_tail = RUST_CONTAINER_SCRIPT
             .split("EOF\n")
             .nth(1)
@@ -648,9 +663,13 @@ mod tests {
             .split("EOF\n")
             .nth(1)
             .expect("script tail after the heredoc");
-        assert_eq!(rust_tail, python_tail);
+        assert!(rust_tail.starts_with("git -C /testbed for-each-ref"));
+        assert!(rust_tail.contains("/loom/loom run"));
+        assert!(rust_tail.ends_with("exit $status"));
+        assert!(python_tail.contains("/loom/loom run"));
         // The Python script keeps its own frozen bytes untouched.
         assert!(!swebench::CONTAINER_SCRIPT.contains("program = \"cargo\""));
+        assert!(RUST_CONTAINER_SCRIPT.contains("grep -v '^refs/heads/master$'"));
     }
 
     #[test]
@@ -672,13 +691,24 @@ mod tests {
             max_turns: 100,
             bare: false,
             extra_env: &[],
+            docker_args: &[
+                "--cap-add=SYS_ADMIN",
+                "--cap-add=NET_ADMIN",
+                "--security-opt=seccomp=unconfined",
+                "--security-opt=apparmor=unconfined",
+            ],
             container_name: "loom-tokio-4384-run1",
         };
         let argv = docker_run_argv(&spec);
+        assert!(argv.contains(&"--cap-add=SYS_ADMIN".to_owned()));
+        assert!(argv.contains(&"--cap-add=NET_ADMIN".to_owned()));
+        assert!(argv.contains(&"--security-opt=seccomp=unconfined".to_owned()));
+        assert!(argv.contains(&"--security-opt=apparmor=unconfined".to_owned()));
         let script_pos = argv
             .iter()
             .position(|arg| arg == "-c")
             .expect("sh -c script element");
+        assert!(argv[script_pos + 1].contains("apt-get install -y -qq bubblewrap"));
         assert_eq!(argv[script_pos + 1], RUST_CONTAINER_SCRIPT);
         // The dataset's own image name rides through verbatim.
         assert!(

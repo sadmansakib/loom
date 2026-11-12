@@ -394,6 +394,13 @@ fn bubblewrap_argv(
             "--ro-bind-try",
             "/usr",
             "/usr",
+            // Rustup toolchains and cargo/rustup shims are commonly
+            // installed under /usr/local (including SWE-bench images).
+            // Keep the installation visible but read-only; Cargo's
+            // configured home is mounted separately as writable below.
+            "--ro-bind-try",
+            "/usr/local",
+            "/usr/local",
             "--ro-bind-try",
             "/lib",
             "/lib",
@@ -470,12 +477,24 @@ fn bubblewrap_argv(
                 .map(|s| (*s).to_owned()),
         );
     }
-    // Home secrets (`secrets`) are masked with an empty tmpfs (F-11):
-    // the home dir is already readable, so `~/.ssh` et al. need their
-    // own mount shadow to read empty instead of credential material.
+    // Home secrets (`secrets`) are masked (F-11): the home dir is already
+    // readable, so existing secret directories need their own tmpfs mount
+    // and secret files are covered with /dev/null. Missing paths must be
+    // skipped: bwrap cannot create a mountpoint below the read-only home
+    // bind, and there is no credential material at a path that does not
+    // exist.
     for path in secrets {
-        let path = path.to_string_lossy().into_owned();
-        wrapped.extend(["--tmpfs", &path].iter().map(|s| (*s).to_owned()));
+        if path.is_dir() {
+            let path = path.to_string_lossy().into_owned();
+            wrapped.extend(["--tmpfs", &path].iter().map(|s| (*s).to_owned()));
+        } else if path.is_file() {
+            let path = path.to_string_lossy().into_owned();
+            wrapped.extend(
+                ["--ro-bind", "/dev/null", &path]
+                    .iter()
+                    .map(|s| (*s).to_owned()),
+            );
+        }
     }
     wrapped.extend(["--chdir", &workspace].iter().map(|s| (*s).to_owned()));
     wrapped.push(program.to_owned());
@@ -1251,6 +1270,38 @@ mod tests {
     }
 
     #[test]
+    fn bubblewrap_exposes_local_toolchains_read_only() {
+        let argv = bwrap_argv(false, Some("/usr/local/cargo"));
+        let read_only = bind_pairs(&argv, "--ro-bind-try");
+        assert!(
+            read_only.contains(&["/usr/local".to_owned(), "/usr/local".to_owned()]),
+            "/usr/local toolchain directory not exposed read-only in {argv:?}"
+        );
+        let writable = bind_pairs(&argv, "--bind-try");
+        assert!(
+            writable.contains(&["/usr/local/cargo".to_owned(), "/usr/local/cargo".to_owned()]),
+            "configured cargo home should remain writable in {argv:?}"
+        );
+    }
+
+    #[test]
+    fn bubblewrap_writable_local_cargo_home_shadows_read_only_toolchain_mount() {
+        let argv = bwrap_argv(false, Some("/usr/local/cargo"));
+        let read_only_index = argv
+            .windows(3)
+            .position(|window| window == ["--ro-bind-try", "/usr/local", "/usr/local"])
+            .expect("read-only /usr/local mount");
+        let writable_index = argv
+            .windows(3)
+            .position(|window| window == ["--bind-try", "/usr/local/cargo", "/usr/local/cargo"])
+            .expect("writable Cargo home mount");
+        assert!(
+            read_only_index < writable_index,
+            "writable Cargo home must shadow the broader read-only toolchain bind: {argv:?}"
+        );
+    }
+
+    #[test]
     fn bubblewrap_tolerates_an_absent_cargo_home() {
         // No cargo home, no grants: the only strict bind left is the
         // workspace, so a host without `~/.cargo` still gets a sandbox.
@@ -1321,12 +1372,54 @@ mod tests {
             home.join(".config/loom"),
             home.join(".local/share/loom"),
         ] {
-            assert!(
-                tmpfs.contains(&secret.to_string_lossy().into_owned()),
-                "{} not masked by a tmpfs in {argv:?}",
-                secret.display()
-            );
+            if secret.is_dir() {
+                assert!(
+                    tmpfs.contains(&secret.to_string_lossy().into_owned()),
+                    "{} not masked by a tmpfs in {argv:?}",
+                    secret.display()
+                );
+            } else if secret.is_file() {
+                let mounts = bind_pairs(&argv, "--ro-bind");
+                assert!(
+                    mounts.contains(&[
+                        "/dev/null".to_owned(),
+                        secret.to_string_lossy().into_owned()
+                    ]),
+                    "{} not masked with /dev/null in {argv:?}",
+                    secret.display()
+                );
+            } else {
+                assert!(
+                    !tmpfs.contains(&secret.to_string_lossy().into_owned()),
+                    "missing secret path unexpectedly mounted in {argv:?}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn bubblewrap_skips_missing_home_secrets() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let absent = base.path().join(".ssh");
+        let argv = bubblewrap_argv(
+            "true",
+            &[],
+            &BubblewrapWritable {
+                workspace: base.path(),
+                optional: &[],
+                temp: base.path(),
+            },
+            &[],
+            &[absent.clone()],
+            false,
+            Some(base.path().to_str().unwrap()),
+        );
+        assert!(
+            !argv
+                .windows(2)
+                .any(|window| window == ["--tmpfs", absent.to_str().unwrap()]),
+            "missing secret path was mounted in {argv:?}"
+        );
     }
 
     #[test]

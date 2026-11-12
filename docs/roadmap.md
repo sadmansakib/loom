@@ -1892,18 +1892,28 @@ model tier under them (arXiv 2607.06906).
    (loom-only arm; mini installs via pip and only ruff's testbed is
    known to carry Python, so a mini arm would measure infrastructure).
    The frozen v5 prompt is shared byte-identical via `prompt_text`
-   (pinned by a test against the Verified builder); `RUST_CONTAINER_SCRIPT`
-   is the Python script plus cargo/cargo-fmt/rustc/rustup manifest
-   entries, frozen explicit bytes, sha256-pinned together with the
-   Python script; slice integrity gates (300/43/parse_log_cargo/image
-   shape) abort before any spend; provenance records dataset sha256,
+    (pinned by a test against the Verified builder). `RUST_CONTAINER_SCRIPT`
+    prefetches Cargo dependencies before the sandboxed agent run and
+    forces offline Cargo there; both scripts preserve the same extraction
+    and exit-status contract, with frozen bytes sha256-pinned in tests.
+    The Rust task alone receives Bubblewrap namespace grants and exposes
+    the toolchain read-only while keeping Cargo's home writable. The
+    Verified Python script and its argv remain unchanged. Slice integrity
+    gates (300/43/parse_log_cargo/image
+    shape) abort before any spend; provenance records dataset sha256,
    selection rule `rust-repos-v1`, script and prompt hashes; scoring
    is official-scorer-only (`swebench eval multilingual`). The
    Verified runner's frozen bytes are untouched (a `script_override:
    None` default keeps its argv byte-identical). Runbook — pilot
-   gates, gold validation, measured-cost anchors, the item-1
-   frozen-subset audit remainder, and the plan-only full-Verified doc
-   — in docs/eval.md §Multilingual Rust slice. No live sweep was run.
+    gates, gold validation, measured-cost anchors, the item-1
+    frozen-subset audit, and plan-only full-Verified doc — in
+    docs/eval.md §Multilingual Rust slice. Pilot run 2026-11-12:
+    gold validation 1/1 resolved; bKash GPT 6 Luna agent made 35 requests,
+    `cargo check` passed offline, but official scoring was 0/1 resolved.
+    The injected scorer test checks TCP and Unix types beyond the reported
+    UdpSocket issue, so item 35 remains gated; do not widen until that
+    test-scope mismatch is resolved. Artifacts remain ignored under
+    `target/eval/multilingual-rust-pilot-bkash-cargo-cache/`.
    Design: [docs/rust-bench-design.md](rust-bench-design.md).
 
 

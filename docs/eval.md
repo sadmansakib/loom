@@ -247,10 +247,10 @@ with the same isolation model as the Verified sweep: one container per
 (instance, run), the frozen v5 prompt byte-identical, the row's own
 prebuilt image (the dataset's `image` field names it — pulled images
 are scoring-ready with no retag), and a Rust-toolchain variant of the
-frozen container script (`program = "cargo"|"cargo-fmt"|"rustc"|"rustup"`
-added to the seeded manifest; everything after the heredoc is
-byte-identical to the Python script and both are pinned by sha256 in
-tests). The dataset has no language column, so the slice is the
+frozen container script. It fetches Cargo dependencies before the agent
+starts, then runs Cargo offline inside the sandbox; both scripts preserve
+the same patch-extraction and exit-status contract and are pinned by
+sha256 in tests. The dataset has no language column, so the slice is the
 seven-repo constant plus integrity gates (300 rows, 43 tasks,
 `parse_log_cargo`, well-formed image names) that abort before any
 spend. Design and measured facts: `docs/rust-bench-design.md`.
@@ -262,7 +262,7 @@ cargo test -p loom-eval   # selection, integrity gates, script pinning
 # 1. validate the scoring pipeline on gold patches first (as with Verified)
 swebench eval multilingual --gold -i tokio-rs__tokio-4384 --run-id validate-ml-gold
 
-# 2. pilot: ONE instance, one run — the go/no-go gate before any spend
+# 2. pilot: ONE instance, one run — the go/no-go gate before widening
 cargo run -p loom-eval --bin multilingual-run -- \
   --instances tokio-rs__tokio-4384 --jobs 1 --runs 1
 
@@ -291,14 +291,23 @@ Wall time and cost — measured anchors, not estimates:
 
 Go/no-go gates before widening beyond the pilot: (a) the gold-patch
 validation resolves; (b) the pilot container ran the agent loop and
-produced a patch file (empty patch is an honest result, an infra
-failure is not); (c) `cargo` runs inside the testbed without registry
-network access — if the first `cargo test` inside the container needs
-to download crates, the image set is insufficient and the sweep stops
-there (the images were validated by the dataset authors, so this is
-expected to pass); (d) the scorer accepts the predictions file and
-reports per-instance verdicts. Any gate failing = no sweep, diagnose
-first.
+produced a patch file; (c) `cargo` runs inside the testbed without
+registry access during agent execution; and (d) the official scorer
+returns a resolved per-instance verdict. A no-patch or unresolved
+result is a valid measurement, but does not pass the widening gate.
+
+Pilot result (2026-11-12): gold validation passed (1/1). The bKash
+GPT 6 Luna run on `tokio-rs__tokio-4384` made 35 model requests and
+produced a patch. Setup-time `cargo fetch` populated the cache, and
+`cargo check` passed with Cargo offline. The injected
+`net_types_unwind` scorer test failed to compile because the patch
+implemented unwind-safety only for `UdpSocket`, while that test also
+requires TCP and Unix network types. Official score: 0/1 resolved,
+1/1 unresolved, with no infrastructure or scorer errors. This is a valid
+failed pilot result, not an infrastructure failure; **do not widen to
+the 43-task slice**. The scorer's broader test expectation does not
+match the issue's singular `UdpSocket` request, so resolve that scope
+question before another paid run.
 
 Scoring is official-scorer-only, same rule as Verified: the headline
 is the `resolved` rate from `swebench eval multilingual`, subset

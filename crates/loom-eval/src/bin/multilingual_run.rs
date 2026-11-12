@@ -531,6 +531,15 @@ fn main() {
                     max_turns: args.max_turns,
                     bare: args.arm == "bare",
                     extra_env: &[],
+                    docker_args: &[
+                        "--cap-add=SYS_ADMIN",
+                        "--cap-add=NET_ADMIN",
+                        "--security-opt=seccomp=unconfined",
+                        "--security-opt=apparmor=unconfined",
+                    ],
+                    // Bubblewrap needs namespace setup inside this
+                    // Linux SWE-bench task container. Other eval arms
+                    // keep Docker's default security profile.
                     container_name: &container_name,
                 };
                 println!("run {slug} #{run} (attempt {attempt}) in {image}…");

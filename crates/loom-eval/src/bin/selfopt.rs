@@ -302,6 +302,7 @@ fn probe_run(
             max_turns: args.max_turns,
             bare: false,
             extra_env: &extra,
+            docker_args: &[],
             container_name: &container_name,
         };
         println!("  probe {label} {slug} run {run} (attempt {attempt})…");

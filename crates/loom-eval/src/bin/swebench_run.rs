@@ -630,6 +630,7 @@ fn main() {
                     max_turns: args.max_turns,
                     bare: args.arm == "bare",
                     extra_env: &extra_env,
+                    docker_args: &[],
                     container_name: &container_name,
                 };
                 println!("run {slug} #{run} (attempt {attempt}) in {image}…");
