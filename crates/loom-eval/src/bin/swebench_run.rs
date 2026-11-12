@@ -49,10 +49,11 @@ struct Args {
     /// (`AgentKind`).
     agent: String,
     eval_dir: PathBuf,
-    /// Optional `suite_audit.json` artifact: its weak-suite flags ride
-    /// the sweep report's provenance (roadmap item 1's offline
-    /// remainder), digest-checked against this sweep's dataset.
+    /// Optional structural suite-audit artifact. Can be paired with
+    /// --suite-audit-results to embed official mutant verdicts.
     suite_audit: Option<PathBuf>,
+    /// Optional official mutant-result aggregate for --suite-audit.
+    suite_audit_results: Option<PathBuf>,
     /// Per-turn reasoning-effort policy forwarded to the in-container
     /// loom (roadmap item 9): `fixed` (default) or `progressive`.
     /// Recorded in sweep provenance and forwarded as
@@ -114,10 +115,10 @@ fn usage() -> ! {
                        baseline. The container script is identical in both
                        arms; run each arm in its own --eval-dir
   --eval-dir <path>    artifacts root (default $LOOM_EVAL_DIR or <cwd>/target/eval)
-  --suite-audit <path> optional suite_audit.json artifact: embeds its weak-suite
-                       flags in the sweep report's provenance, digest-checked
-                       against this sweep's dataset (the flags are structural
-                       hypotheses, labeled unconfirmed until the mutant re-grade)
+  --suite-audit <path> structural suite_audit.json: embeds weak flags in provenance
+  --suite-audit-results <path>
+                        optional official mutant-results.json aggregate; verdicts
+                        are validated and digest-bound into provenance
   --reasoning-schedule <fixed|progressive>
                        per-turn reasoning-effort policy for the in-container
                        loom (default $LOOM_EVAL_REASONING_SCHEDULE or fixed):
@@ -166,6 +167,7 @@ fn parse_args() -> (Args, Vec<(String, String)>) {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("target/eval")),
         suite_audit: None,
+        suite_audit_results: None,
         reasoning_schedule: std::env::var("LOOM_EVAL_REASONING_SCHEDULE")
             .unwrap_or_else(|_| "fixed".into()),
         reasoning_open_turns: std::env::var("LOOM_EVAL_REASONING_OPEN_TURNS")
@@ -195,6 +197,7 @@ fn parse_args() -> (Args, Vec<(String, String)>) {
             "--agent" => args.agent = value(),
             "--eval-dir" => args.eval_dir = PathBuf::from(value()),
             "--suite-audit" => args.suite_audit = Some(PathBuf::from(value())),
+            "--suite-audit-results" => args.suite_audit_results = Some(PathBuf::from(value())),
             "--reasoning-schedule" => args.reasoning_schedule = value(),
             "--reasoning-open-turns" => {
                 args.reasoning_open_turns = value().parse().unwrap_or_else(|_| usage());
@@ -394,6 +397,10 @@ fn ensure_image(
 
 fn main() {
     let (args, registry_headers) = parse_args();
+    if args.suite_audit_results.is_some() && args.suite_audit.is_none() {
+        eprintln!("--suite-audit-results requires --suite-audit");
+        std::process::exit(2);
+    }
     let base = args.eval_dir.join("swebench");
     std::fs::create_dir_all(base.join("instances")).unwrap();
 
@@ -447,6 +454,53 @@ fn main() {
         eprintln!("no instances selected (filters too tight?)");
         std::process::exit(2);
     }
+
+    // Validate optional suite-audit inputs before pulling images or spending
+    // on model runs. Their provenance is embedded in the final sweep report.
+    let suite_audit_block = args.suite_audit.as_ref().map(|path| {
+        let bytes =
+            std::fs::read(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let sweep_ids: Vec<String> = selected
+            .iter()
+            .map(|instance| instance.instance_id.clone())
+            .collect();
+        let results_bytes = args.suite_audit_results.as_ref().map(|results_path| {
+            std::fs::read(results_path)
+                .unwrap_or_else(|error| panic!("{}: {error}", results_path.display()))
+        });
+        let weak = loom_eval::suite_audit::sweep_weak_suite_with_results(
+            &bytes,
+            results_bytes.as_deref(),
+            &sweep_ids,
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let dataset_digest = std::fs::read(dataset_cache_path(&args.eval_dir))
+            .map(|body| swebench::sha256_hex(&body))
+            .unwrap_or_default();
+        if dataset_digest != weak.dataset_sha256 {
+            eprintln!(
+                "refusing to run: {path} audited dataset {digest}, but this\n\
+                 sweep runs {actual} — the weak flags would describe another suite.",
+                path = path.display(),
+                digest = weak.dataset_sha256,
+                actual = if dataset_digest.is_empty() {
+                    "an uncached (overridden?) dataset".to_owned()
+                } else {
+                    dataset_digest
+                }
+            );
+            std::process::exit(2);
+        }
+        if weak.weak_ids.is_empty() && weak.weak_total > 0 {
+            eprintln!(
+                "warning: the audit flags {total} weak instances, none of them in\n\
+                 this sweep's {n} instance(s) — is this the right audit artifact?",
+                total = weak.weak_total,
+                n = sweep_ids.len()
+            );
+        }
+        weak
+    });
 
     let (key_env, key_value) = resolve_api_key(&args.provider);
     // mini-swe-agent authenticates through litellm, which only reads
@@ -756,48 +810,6 @@ fn main() {
             prediction_paths.last().unwrap().display()
         );
     }
-
-    // Roadmap item 1's offline remainder: when the operator points at
-    // a suite-audit artifact, its weak-suite flags ride the sweep
-    // report's provenance — digest-bound to the audit file and to the
-    // dataset this sweep actually ran, labeled unconfirmed (the mutant
-    // re-grade that would confirm them is spend-gated).
-    let suite_audit_block = args.suite_audit.as_ref().map(|path| {
-        let bytes =
-            std::fs::read(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-        let sweep_ids: Vec<String> = selected
-            .iter()
-            .map(|instance| instance.instance_id.clone())
-            .collect();
-        let weak = loom_eval::suite_audit::sweep_weak_suite(&bytes, &sweep_ids)
-            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-        let dataset_digest = std::fs::read(dataset_cache_path(&args.eval_dir))
-            .map(|body| swebench::sha256_hex(&body))
-            .unwrap_or_default();
-        if dataset_digest != weak.dataset_sha256 {
-            eprintln!(
-                "refusing to run: {path} audited dataset {digest}, but this\n\
-                 sweep runs {actual} — the weak flags would describe another suite.",
-                path = path.display(),
-                digest = weak.dataset_sha256,
-                actual = if dataset_digest.is_empty() {
-                    "an uncached (overridden?) dataset".to_owned()
-                } else {
-                    dataset_digest
-                }
-            );
-            std::process::exit(2);
-        }
-        if weak.weak_ids.is_empty() && weak.weak_total > 0 {
-            eprintln!(
-                "warning: the audit flags {total} weak instances, none of them in\n\
-                 this sweep's {n} instance(s) — is this the right audit artifact?",
-                total = weak.weak_total,
-                n = sweep_ids.len()
-            );
-        }
-        weak
-    });
 
     let mut provenance_json = serde_json::json!({
         "loom_sha256": provenance.loom_sha256,

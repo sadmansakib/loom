@@ -261,9 +261,9 @@ pub fn audit_dataset(instances: &[&SweInstance], provenance: SuiteAuditProvenanc
 /// The weak-suite slice a sweep report's provenance embeds (roadmap
 /// item 1's offline remainder): the structural audit's flags for
 /// exactly the instances the sweep ran, hashed to the artifact they
-/// came from. Labeled unconfirmed — the docker mutant re-grade that
-/// would confirm or refute the flags is spend-gated, so a headline
-/// reading this block knows it cites a hypothesis, not a verdict.
+/// came from. An optional official mutant re-grade aggregate supplies
+/// confirmed/refuted/inconclusive verdicts; absent verdicts remain
+/// explicitly unassessed rather than being inferred from structure.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct SweepWeakSuite {
     /// sha256 of the audit artifact file, hex — the flags are citable
@@ -281,8 +281,23 @@ pub struct SweepWeakSuite {
     pub weak_ids: Vec<String>,
     /// Per weak-in-sweep instance: the structural signals that fired.
     pub weak_reasons: std::collections::BTreeMap<String, Vec<&'static str>>,
-    /// Always true today: these are structural hypotheses; the
-    /// ~259-run mutant re-grade remains spend-gated.
+    /// Weak hypotheses with an official mutant result confirming them.
+    #[serde(default)]
+    pub weak_confirmed_ids: Vec<String>,
+    /// Weak hypotheses refuted by at least one unresolved dropped-hunk mutant.
+    #[serde(default)]
+    pub weak_refuted_ids: Vec<String>,
+    /// Weak hypotheses whose mutant outcomes did not yield a decisive verdict.
+    #[serde(default)]
+    pub weak_inconclusive_ids: Vec<String>,
+    /// Weak hypotheses without a mutant result (for example, single-hunk gold).
+    #[serde(default)]
+    pub weak_unassessed_ids: Vec<String>,
+    /// SHA-256 of the official re-grade aggregate, when supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub results_sha256: Option<String>,
+    /// True when any structural weak hypothesis in the sweep lacks a decisive
+    /// official mutant verdict.
     pub unconfirmed: bool,
 }
 
@@ -292,6 +307,17 @@ pub struct SweepWeakSuite {
 /// silent absence would be the dishonest failure.
 pub fn sweep_weak_suite(
     audit_bytes: &[u8],
+    sweep_ids: &[String],
+) -> Result<SweepWeakSuite, String> {
+    sweep_weak_suite_with_results(audit_bytes, None, sweep_ids)
+}
+
+/// Intersects structural flags with an optional official mutant re-grade
+/// aggregate. The aggregate must identify the same method and dataset as the
+/// structural artifact and report complete mutant-file / multi-hunk coverage.
+pub fn sweep_weak_suite_with_results(
+    audit_bytes: &[u8],
+    results_bytes: Option<&[u8]>,
     sweep_ids: &[String],
 ) -> Result<SweepWeakSuite, String> {
     let audit: SuiteAudit = serde_json::from_slice(audit_bytes)
@@ -313,6 +339,160 @@ pub fn sweep_weak_suite(
         weak_reasons.insert(row.instance_id.clone(), reasons);
         weak_ids.push(row.instance_id.clone());
     }
+    let (confirmed, refuted, inconclusive, unassessed, results_sha256) =
+        if let Some(results_bytes) = results_bytes {
+            let results: serde_json::Value = serde_json::from_slice(results_bytes)
+                .map_err(|error| format!("suite audit results are not readable: {error}"))?;
+            let result_provenance = results
+                .get("audit_provenance")
+                .ok_or_else(|| "suite audit results lack audit_provenance".to_owned())?;
+            if result_provenance
+                .get("method_version")
+                .and_then(|v| v.as_str())
+                != Some(audit.provenance.method_version.as_str())
+                || result_provenance
+                    .get("dataset_sha256")
+                    .and_then(|v| v.as_str())
+                    != Some(audit.provenance.dataset_sha256.as_str())
+            {
+                return Err("suite audit results do not match audit method/dataset".to_owned());
+            }
+            let result_structural_ids = results
+                .get("structural_weak_ids")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| "suite audit results lack structural_weak_ids".to_owned())?;
+            let result_structural_ids: std::collections::BTreeSet<&str> = result_structural_ids
+                .iter()
+                .map(|id| {
+                    id.as_str().ok_or_else(|| {
+                        "suite audit results contain invalid structural_weak_ids".to_owned()
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            if result_structural_ids.len()
+                != results["structural_weak_ids"].as_array().unwrap().len()
+            {
+                return Err("suite audit results contain duplicate structural weak IDs".to_owned());
+            }
+            let audit_structural_ids: std::collections::BTreeSet<&str> =
+                audit.weak_ids.iter().map(String::as_str).collect();
+            if result_structural_ids != audit_structural_ids {
+                return Err("suite audit results do not match structural weak IDs".to_owned());
+            }
+            for (expected, actual, label) in [
+                (
+                    "mutant_files_expected",
+                    "mutant_reports_found",
+                    "mutant reports",
+                ),
+                (
+                    "multihunk_instances_expected",
+                    "multihunk_instances_scored",
+                    "multi-hunk coverage",
+                ),
+            ] {
+                let expected = results.get(expected).and_then(|v| v.as_u64());
+                let actual = results.get(actual).and_then(|v| v.as_u64());
+                if expected.is_none() || expected != actual {
+                    return Err(format!("suite audit results have incomplete {label}"));
+                }
+            }
+            let problems = results
+                .get("problems")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| "suite audit results lack problems list".to_owned())?;
+            if !problems.is_empty() {
+                return Err("suite audit results report validation problems".to_owned());
+            }
+            let scoped_ids = |key: &str| -> Result<std::collections::BTreeSet<String>, String> {
+                let ids = results
+                    .get(key)
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| format!("suite audit results lack {key}"))?;
+                let parsed: std::collections::BTreeSet<String> = ids
+                    .iter()
+                    .map(|id| {
+                        id.as_str()
+                            .map(str::to_owned)
+                            .ok_or_else(|| format!("suite audit results contain invalid {key}"))
+                    })
+                    .collect::<Result<_, _>>()?;
+                if parsed.len() != ids.len() {
+                    return Err(format!("suite audit results contain duplicate {key}"));
+                }
+                Ok(parsed)
+            };
+            let confirmed = scoped_ids("structural_weak_confirmed_ids")?;
+            let refuted = scoped_ids("structural_weak_refuted_ids")?;
+            let inconclusive = scoped_ids("structural_weak_inconclusive_ids")?;
+            if confirmed
+                .iter()
+                .chain(&refuted)
+                .chain(&inconclusive)
+                .any(|id| !audit.weak_ids.contains(id))
+            {
+                return Err("suite audit results contain verdicts for non-weak IDs".to_owned());
+            }
+            if !confirmed.is_disjoint(&refuted)
+                || !confirmed.is_disjoint(&inconclusive)
+                || !refuted.is_disjoint(&inconclusive)
+            {
+                return Err("suite audit results contain conflicting verdicts".to_owned());
+            }
+            for row in audit.rows.iter().filter(|row| row.weak()) {
+                let verdict_count = usize::from(confirmed.contains(&row.instance_id))
+                    + usize::from(refuted.contains(&row.instance_id))
+                    + usize::from(inconclusive.contains(&row.instance_id));
+                if row.single_hunk {
+                    if verdict_count != 0 {
+                        return Err(format!(
+                            "suite audit results classify unmutable single-hunk ID {}",
+                            row.instance_id
+                        ));
+                    }
+                    continue;
+                }
+                if !row.single_hunk && verdict_count != 1 {
+                    return Err(format!(
+                        "suite audit results do not have exactly one verdict for {}",
+                        row.instance_id
+                    ));
+                }
+            }
+            let weak_set: std::collections::BTreeSet<&str> =
+                audit.weak_ids.iter().map(String::as_str).collect();
+            let intersect = |source: &std::collections::BTreeSet<String>| {
+                weak_ids
+                    .iter()
+                    .filter(|id| source.contains(*id) && weak_set.contains(id.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            let confirmed_ids = intersect(&confirmed);
+            let refuted_ids = intersect(&refuted);
+            let inconclusive_ids = intersect(&inconclusive);
+            let classified: std::collections::BTreeSet<&str> = confirmed_ids
+                .iter()
+                .chain(&refuted_ids)
+                .chain(&inconclusive_ids)
+                .map(String::as_str)
+                .collect();
+            let unassessed_ids = weak_ids
+                .iter()
+                .filter(|id| weak_set.contains(id.as_str()) && !classified.contains(id.as_str()))
+                .cloned()
+                .collect();
+            (
+                confirmed_ids,
+                refuted_ids,
+                inconclusive_ids,
+                unassessed_ids,
+                Some(crate::swebench::sha256_hex(results_bytes)),
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), weak_ids.clone(), None)
+        };
+    let unconfirmed = !inconclusive.is_empty() || !unassessed.is_empty();
     Ok(SweepWeakSuite {
         audit_sha256: crate::swebench::sha256_hex(audit_bytes),
         method_version: audit.provenance.method_version.clone(),
@@ -320,7 +500,12 @@ pub fn sweep_weak_suite(
         weak_total: audit.weak_ids.len(),
         weak_ids,
         weak_reasons,
-        unconfirmed: true,
+        weak_confirmed_ids: confirmed,
+        weak_refuted_ids: refuted,
+        weak_inconclusive_ids: inconclusive,
+        weak_unassessed_ids: unassessed,
+        results_sha256,
+        unconfirmed,
     })
 }
 
@@ -432,17 +617,17 @@ index 333..444 100644
     /// A serialized `SuiteAudit` artifact with three rows: one weak and
     /// in the sweep, one healthy, one weak but outside the sweep.
     fn audit_artifact_json() -> String {
-        let row = |id: &str, suite_small: bool, no_new_tests: bool| {
+        let row = |id: &str, suite_small: bool, no_new_tests: bool, single_hunk: bool| {
             serde_json::json!({
                 "instance_id": id,
                 "repo": "org/repo",
                 "f2p": if suite_small { 1 } else { 3 },
                 "p2p": if suite_small { 0 } else { 5 },
-                "gold_hunks": 2,
+                "gold_hunks": if single_hunk { 1 } else { 2 },
                 "added_test_lines": if no_new_tests { 0 } else { 4 },
                 "suite_small": suite_small,
                 "no_new_tests": no_new_tests,
-                "single_hunk": false,
+                "single_hunk": single_hunk,
             })
         };
         serde_json::json!({
@@ -454,13 +639,32 @@ index 333..444 100644
                 "runner_version": "0.1.0",
             },
             "rows": [
-                row("org/one-1", true, true),
-                row("org/two-2", false, false),
-                row("org/three-3", false, true),
+                row("org/one-1", true, true, false),
+                row("org/two-2", false, false, false),
+                row("org/three-3", false, true, true),
             ],
             "weak_ids": ["org/one-1", "org/three-3"],
-            "mutant_runs": 0,
-            "unmutable_ids": [],
+            "mutant_runs": 1,
+            "unmutable_ids": ["org/three-3"],
+        })
+        .to_string()
+    }
+
+    fn audit_results_json() -> String {
+        serde_json::json!({
+            "audit_provenance": {
+                "method_version": "1",
+                "dataset_sha256": "0".repeat(64),
+            },
+            "mutant_files_expected": 1,
+            "mutant_reports_found": 1,
+            "multihunk_instances_expected": 1,
+            "multihunk_instances_scored": 1,
+            "structural_weak_ids": ["org/one-1", "org/three-3"],
+            "problems": [],
+            "structural_weak_confirmed_ids": [],
+            "structural_weak_refuted_ids": ["org/one-1"],
+            "structural_weak_inconclusive_ids": [],
         })
         .to_string()
     }
@@ -469,7 +673,7 @@ index 333..444 100644
     fn sweep_weak_suite_intersects_reasons_and_labels() {
         // Roadmap item 1 remainder: a sweep report's provenance carries
         // the audit's weak flags for exactly its own instances, hashed
-        // to the artifact, labeled unconfirmed.
+        // to the artifact; without re-grade results it remains unconfirmed.
         let bytes = audit_artifact_json();
         let sweep_ids = vec!["org/one-1".to_owned(), "org/two-2".to_owned()];
         let weak = sweep_weak_suite(bytes.as_bytes(), &sweep_ids).expect("audit artifact readable");
@@ -480,12 +684,83 @@ index 333..444 100644
             Some(["suite_small", "no_new_tests"].as_slice()),
         );
         assert!(!weak.weak_reasons.contains_key("org/two-2"));
-        assert!(weak.unconfirmed, "structural hypothesis, re-grade gated");
+        assert!(weak.unconfirmed, "no official mutant verdict supplied");
+        assert_eq!(weak.weak_unassessed_ids, vec!["org/one-1".to_owned()]);
+        assert!(weak.weak_confirmed_ids.is_empty());
+        assert!(weak.weak_refuted_ids.is_empty());
         assert_eq!(weak.method_version, "1");
         assert_eq!(weak.dataset_sha256, "0".repeat(64));
         assert_eq!(
             weak.audit_sha256,
             crate::swebench::sha256_hex(bytes.as_bytes())
+        );
+    }
+
+    #[test]
+    fn sweep_weak_suite_embeds_matching_official_results() {
+        let audit = audit_artifact_json();
+        let results = audit_results_json();
+        let ids = vec!["org/one-1".to_owned(), "org/three-3".to_owned()];
+        let weak = sweep_weak_suite_with_results(audit.as_bytes(), Some(results.as_bytes()), &ids)
+            .expect("matching complete re-grade");
+        assert_eq!(weak.weak_refuted_ids, vec!["org/one-1".to_owned()]);
+        assert!(weak.weak_confirmed_ids.is_empty());
+        assert!(weak.weak_inconclusive_ids.is_empty());
+        assert_eq!(weak.weak_unassessed_ids, vec!["org/three-3".to_owned()]);
+        assert!(weak.unconfirmed, "single-hunk hypotheses are unassessed");
+        assert_eq!(
+            weak.results_sha256,
+            Some(crate::swebench::sha256_hex(results.as_bytes()))
+        );
+    }
+
+    #[test]
+    fn sweep_weak_suite_rejects_mismatched_or_incomplete_results() {
+        let audit = audit_artifact_json();
+        let ids = vec!["org/one-1".to_owned()];
+        let mut results: serde_json::Value =
+            serde_json::from_str(&audit_results_json()).expect("valid fixture");
+        results["audit_provenance"]["dataset_sha256"] = serde_json::json!("f".repeat(64));
+        assert!(
+            sweep_weak_suite_with_results(
+                audit.as_bytes(),
+                Some(results.to_string().as_bytes()),
+                &ids,
+            )
+            .is_err()
+        );
+
+        results["audit_provenance"]["dataset_sha256"] = serde_json::json!("0".repeat(64));
+        results["mutant_reports_found"] = serde_json::json!(0);
+        assert!(
+            sweep_weak_suite_with_results(
+                audit.as_bytes(),
+                Some(results.to_string().as_bytes()),
+                &ids,
+            )
+            .is_err()
+        );
+
+        results["mutant_reports_found"] = serde_json::json!(1);
+        results["problems"] = serde_json::json!(["incomplete scorer outcome"]);
+        assert!(
+            sweep_weak_suite_with_results(
+                audit.as_bytes(),
+                Some(results.to_string().as_bytes()),
+                &ids,
+            )
+            .is_err()
+        );
+
+        results["problems"] = serde_json::json!([]);
+        results["structural_weak_refuted_ids"] = serde_json::json!(["org/not-weak-4"]);
+        assert!(
+            sweep_weak_suite_with_results(
+                audit.as_bytes(),
+                Some(results.to_string().as_bytes()),
+                &ids,
+            )
+            .is_err()
         );
     }
 

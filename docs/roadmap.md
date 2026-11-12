@@ -853,15 +853,17 @@ adds four more framing findings and backlog items 26–31 below.
       stalled while copying the eval script and was stopped. That
       instance is already weak-refuted by another unresolved mutant. No
       frozen-subset headline flips because no instances were
-      weak-confirmed, so no re-gate is triggered. The wiring half
-      shipped 2026-11-07:
-      `swebench-run --suite-audit <path>` embeds the flags in the
-      sweep report's `provenance.suite_audit` — digest-bound to the
-      artifact and the dataset, intersected with the sweep's
-      instances, labeled `unconfirmed: true` pending wiring of the
-      completed re-grade verdicts
-     (`loom_eval::suite_audit::sweep_weak_suite`; docs/eval.md §
-     suite audit).
+      weak-confirmed, so no re-gate is triggered. Verdict wiring
+      shipped 2026-11-12. `swebench-run --suite-audit <path>
+      --suite-audit-results <path>` embeds official
+      confirmed/refuted/inconclusive/unassessed IDs and the results
+      digest alongside the structural flags. The loader validates
+      method, dataset, structural IDs, and complete scorer coverage;
+      missing results leave flags unassessed and `unconfirmed`. The
+      aggregate remains an ignored local artifact and is not
+      committed. See
+      `loom_eval::suite_audit::sweep_weak_suite_with_results` and
+      docs/eval.md § suite audit.
    Seam: the live eval reports and the event stream.
 2. **Sandboxed shell** (G1, G2, G3) — **shipped 2026-10-08**. Strong
    models working through a

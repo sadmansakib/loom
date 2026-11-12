@@ -206,28 +206,27 @@ when weak-confirmed instances are excluded (or re-scored against
 amplified suites) is re-gated — recorded as a new measurement with its
 own provenance, never silently restated.
 
-**Flags in live sweep provenance (item 1 remainder, shipped
-2026-11-07).** `swebench-run --suite-audit <path>` embeds the audit's
-weak flags in the sweep report's `provenance.suite_audit`: the
-artifact's sha256 and method version, the whole-dataset `weak_total`,
-the per-instance `weak_ids`/`weak_reasons` intersected with the
-sweep's own instances, and `unconfirmed: true`. The runner
-digest-checks the artifact's dataset sha256 against the cached
-dataset file this sweep actually runs and refuses on mismatch (flags
-about another suite are worse than no flags); an audit whose weak set
-misses the sweep entirely warns but proceeds. The `unconfirmed` label
-is the honesty rule: until the completed mutant re-grade verdicts are
-wired into this provenance block, a headline reading this block cites
-structural hypotheses, not verdicts. Without the flag, provenance is
-byte-identical to before.
+**Flags in live sweep provenance (item 1, verdict wiring).**
+`swebench-run --suite-audit <path>` embeds structural flags in
+`provenance.suite_audit`. Add `--suite-audit-results <path>` to include
+the completed official mutant aggregate: confirmed, refuted,
+inconclusive, and unassessed IDs, plus its SHA-256. Both inputs are
+checked against the audit method, dataset digest, and structural
+weak-ID set; mutant-report and multi-hunk coverage must be complete.
+The runner also digest-checks the audit dataset against the cached
+dataset it runs and refuses a mismatch. Without results, flagged IDs
+remain unassessed and `unconfirmed` stays true. With results,
+`unconfirmed` is true only when an intersecting hypothesis is
+inconclusive or unassessed. The aggregate is an ignored local artifact,
+so users must retain/provide it to attach these verdicts to a later
+sweep; no benchmark artifact is committed.
 
 **Trajectory integrity (review round 2, F-05).** Two mechanical
 guards now bracket every run. Before the agent starts, the container
-script destroys the testbed's git history — every ref except `HEAD`
-deleted, reflogs expired, unreachable objects pruned — so the fix
-commit (present in some testbeds' upstream history) cannot be
-recovered locally; the scorer compares patches, so a refless worktree
-scores identically. After the run, `swebench-run` scans the
+script preserves the active `refs/heads/master` base ref and deletes
+other refs, expires reflogs, and prunes unreachable objects. This
+prevents retrieving the fix from other refs while keeping the checkout
+usable; the scorer compares patches. After the run, `swebench-run` scans the
 trajectory for network-retrieval routes — `git fetch`/`clone`/`pull`,
 any `github.com` URL in tool arguments or output, `pip
 install`/`download` — and writes hits to that run row's
