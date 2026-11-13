@@ -183,6 +183,7 @@ async fn run_interactive(
                 && let Event::Key(key) = event::read()?
             {
                 match key.code {
+                    code if navigate_picker(&mut picker_state, code) => {}
                     KeyCode::Esc if picker_state.searching => {
                         picker_state.searching = false;
                         picker_state.set_query(String::new());
@@ -204,12 +205,6 @@ async fn run_interactive(
                     {
                         picker_state.search_query.push(ch);
                         picker_state.refresh_filter_selection();
-                    }
-                    KeyCode::Up | KeyCode::Char('k') if !picker_state.searching => {
-                        picker_state.move_model(-1);
-                    }
-                    KeyCode::Down | KeyCode::Char('j') if !picker_state.searching => {
-                        picker_state.move_model(1);
                     }
                     KeyCode::Tab if picker_state.has_supported_effort() => {
                         picker_state.next_effort();
@@ -443,6 +438,44 @@ pub(crate) struct PickerState {
     catalogs: std::collections::HashMap<String, loom_core::providers::ProviderCatalog>,
     pub(crate) effort: ReasoningEffort,
     pub(crate) notice: Option<String>,
+}
+
+fn navigate_picker(picker: &mut PickerState, code: KeyCode) -> bool {
+    let delta = match code {
+        KeyCode::Up => Some(-1),
+        KeyCode::Down => Some(1),
+        KeyCode::Char('k') if !picker.searching => Some(-1),
+        KeyCode::Char('j') if !picker.searching => Some(1),
+        KeyCode::Backspace
+        | KeyCode::Enter
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Tab
+        | KeyCode::BackTab
+        | KeyCode::Delete
+        | KeyCode::Insert
+        | KeyCode::F(_)
+        | KeyCode::Char(_)
+        | KeyCode::Null
+        | KeyCode::Esc
+        | KeyCode::CapsLock
+        | KeyCode::ScrollLock
+        | KeyCode::NumLock
+        | KeyCode::PrintScreen
+        | KeyCode::Pause
+        | KeyCode::Menu
+        | KeyCode::KeypadBegin
+        | KeyCode::Media(_)
+        | KeyCode::Modifier(_) => return false,
+    };
+    if let Some(delta) = delta {
+        picker.move_model(delta);
+    }
+    true
 }
 
 impl PickerState {
@@ -1404,6 +1437,30 @@ mod tests {
         assert_eq!(picker.selected().provider, "deepseek");
         picker.move_model(1);
         assert_eq!(picker.selected().provider, "openrouter");
+    }
+
+    #[test]
+    fn picker_search_results_remain_navigable_while_searching() {
+        let mut picker = picker_with_models();
+        picker.searching = true;
+        picker.set_query("deepseek".into());
+
+        assert!(navigate_picker(&mut picker, KeyCode::Down));
+        assert_eq!(picker.selected().provider, "openrouter");
+        assert!(navigate_picker(&mut picker, KeyCode::Up));
+        assert_eq!(picker.selected().provider, "deepseek");
+    }
+
+    #[test]
+    fn picker_navigation_shortcuts_do_not_edit_search_query() {
+        let mut picker = picker_with_models();
+        picker.searching = true;
+        picker.set_query("deepseek".into());
+
+        assert!(!navigate_picker(&mut picker, KeyCode::Char('j')));
+        assert!(!navigate_picker(&mut picker, KeyCode::Char('k')));
+        assert_eq!(picker.search_query, "deepseek");
+        assert_eq!(picker.selected().provider, "deepseek");
     }
 
     #[test]
