@@ -30,6 +30,7 @@ pub struct ArtifactReadTool {
 impl ArtifactReadTool {
     /// Builds the tool under explicit output budgets (the engine's
     /// entry point).
+    #[must_use]
     pub fn with_budgets(mut self, budgets: ToolBudgets) -> Self {
         self.budgets = budgets;
         self

@@ -106,12 +106,13 @@ impl ToolOutput {
     }
 
     /// The call's recorded side effects.
+    #[must_use]
     pub fn effects(&self) -> &ToolEffects {
         &self.effects
     }
 }
 
-/// Why a [`Tool`](super::Tool)::call failed.
+/// Why a [`Tool`](super::Tool)`::call` failed.
 ///
 /// Only the two tool-side failure modes exist here. The engine maps them
 /// to `ToolStatus::Error(InvalidInput)` and `ToolStatus::Error(Execution)`

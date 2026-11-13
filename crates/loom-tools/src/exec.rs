@@ -197,13 +197,6 @@ pub(crate) async fn run_bounded(
     // (it belongs to this command), then one final bounded wait for a
     // holder that escaped the group entirely. Never a hang; the status is
     // already in hand.
-    async fn join_readers(
-        a: &mut tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
-        b: &mut tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
-    ) -> (std::io::Result<Vec<u8>>, std::io::Result<Vec<u8>>) {
-        let (stdout, stderr) = futures::future::join(&mut *a, &mut *b).await;
-        (flatten_read(stdout), flatten_read(stderr))
-    }
     let (stdout, stderr): (std::io::Result<Vec<u8>>, std::io::Result<Vec<u8>>);
     let mut pipe_hold_truncated = false;
     match tokio::time::timeout(
@@ -262,6 +255,16 @@ pub(crate) async fn run_bounded(
         },
         pipe_hold_truncated,
     })
+}
+
+/// Joins two capped reader tasks so both drain concurrently, mapping
+/// each to the unwrapped reader result.
+async fn join_readers(
+    a: &mut tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    b: &mut tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> (std::io::Result<Vec<u8>>, std::io::Result<Vec<u8>>) {
+    let (stdout, stderr) = futures::future::join(&mut *a, &mut *b).await;
+    (flatten_read(stdout), flatten_read(stderr))
 }
 
 /// Unwraps a reader task's result, mapping a panic or an I/O failure to
@@ -344,6 +347,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_stream_keeps_head_tail_and_marker() {
         let (mut writer, reader) = tokio::io::duplex(64);
+        #[allow(clippy::cast_sign_loss)] // `i % 251` is non-negative
         let payload: Vec<u8> = (0..300_000).map(|i| (i % 251) as u8).collect();
         // Produce concurrently: the duplex buffer is tiny, so a sequential
         // write-then-read would deadlock on a full pipe.
@@ -354,6 +358,7 @@ mod tests {
             .await
             .unwrap();
         producer.await.unwrap();
+        #[allow(clippy::cast_sign_loss)] // `i % 251` is non-negative
         let payload: Vec<u8> = (0..300_000).map(|i| (i % 251) as u8).collect();
         let marker = b"... [";
         let cut = kept
@@ -430,8 +435,7 @@ mod tests {
                 .arg("-f")
                 .arg(MARKER)
                 .output()
-                .map(|out| out.status.success() && !out.stdout.is_empty())
-                .unwrap_or(false)
+                .is_ok_and(|out| out.status.success() && !out.stdout.is_empty())
         };
         // Hold the future briefly so the group is up, then drop it: the
         // group must die, orphans included.

@@ -45,6 +45,89 @@ pub struct CommandPolicy {
     restricted_manifest: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Manifest {
+    #[serde(default)]
+    command: Vec<ManifestCommand>,
+    #[serde(default)]
+    deny: Vec<ManifestDeny>,
+    policy: Option<ManifestPolicy>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestDeny {
+    program: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestPolicy {
+    unknown: PolicyVerdict,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+struct ManifestCommand {
+    program: String,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    #[serde(default)]
+    max_output_bytes: Option<usize>,
+    #[serde(default)]
+    env_scrub: Vec<String>,
+    #[serde(default)]
+    env_allow: Vec<String>,
+    #[serde(default)]
+    network: bool,
+    #[serde(default = "default_sandbox")]
+    sandbox: bool,
+    #[serde(default)]
+    extra_writable: Vec<String>,
+}
+
+fn default_sandbox() -> bool {
+    true
+}
+
+/// Validates one manifest `[[command]]` rule and appends it; refuses
+/// duplicate declarations and deny/rule conflicts.
+fn insert_rule(
+    policy: &mut CommandPolicy,
+    path: &str,
+    entry: ManifestCommand,
+) -> Result<(), PolicyError> {
+    let rule = CommandRule {
+        program: entry.program,
+        timeout_secs: entry.timeout_secs,
+        max_output_bytes: entry.max_output_bytes,
+        env_scrub: entry.env_scrub,
+        env_allow: entry.env_allow,
+        network: entry.network,
+        sandbox: entry.sandbox,
+        extra_writable: entry.extra_writable,
+    };
+    validate(&rule, path)?;
+    if policy.rule(&rule.program).is_some() {
+        return Err(PolicyError::Invalid {
+            path: path.to_owned(),
+            message: format!("program \"{}\" is declared twice", rule.program),
+        });
+    }
+    if policy.denied.contains(&rule.program) {
+        return Err(PolicyError::Invalid {
+            path: path.to_owned(),
+            message: format!(
+                "program \"{}\" is both denied and ruled; remove one",
+                rule.program
+            ),
+        });
+    }
+    policy.rules.push(rule);
+    Ok(())
+}
+
 impl CommandPolicy {
     /// The shipped policy: `cargo` only, shipped-default limits.
     #[must_use]
@@ -125,7 +208,7 @@ impl CommandPolicy {
         }
         let direct = args
             .iter()
-            .map(|arg| arg.as_ref())
+            .map(<S as AsRef<str>>::as_ref)
             .filter(|arg| !arg.starts_with('-'))
             .find_map(|arg| {
                 self.denied
@@ -190,53 +273,17 @@ impl CommandPolicy {
     ///
     /// Exposed for tests and callers that already hold the manifest
     /// text; [`Self::from_manifest`] is the filesystem entry point.
+    ///
+    /// # Errors
+    /// Fails when the TOML is malformed, contains unknown fields, or
+    /// re-declares a shipped rule (`PolicyError::Invalid` carries the
+    /// reason); a rule may only add programs, never shadow one.
     pub fn parse(text: &str) -> Result<Self, PolicyError> {
         let path = MANIFEST_RELATIVE_PATH.to_owned();
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Manifest {
-            #[serde(default)]
-            command: Vec<ManifestCommand>,
-            #[serde(default)]
-            deny: Vec<ManifestDeny>,
-            policy: Option<ManifestPolicy>,
-        }
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct ManifestDeny {
-            program: String,
-        }
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct ManifestPolicy {
-            unknown: PolicyVerdict,
-        }
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields, rename_all = "snake_case")]
-        struct ManifestCommand {
-            program: String,
-            #[serde(default)]
-            timeout_secs: Option<u64>,
-            #[serde(default)]
-            max_output_bytes: Option<usize>,
-            #[serde(default)]
-            env_scrub: Vec<String>,
-            #[serde(default)]
-            env_allow: Vec<String>,
-            #[serde(default)]
-            network: bool,
-            #[serde(default = "default_sandbox")]
-            sandbox: bool,
-            #[serde(default)]
-            extra_writable: Vec<String>,
-        }
         let manifest: Manifest = toml::from_str(text).map_err(|error| PolicyError::Invalid {
             path: path.clone(),
             message: error.to_string(),
         })?;
-        fn default_sandbox() -> bool {
-            true
-        }
         let mut policy = Self::cargo_only();
         if let Some(section) = manifest.policy {
             policy.unknown = section.unknown;
@@ -244,7 +291,7 @@ impl CommandPolicy {
         for entry in manifest.deny {
             if !bare_name(&entry.program) {
                 return Err(PolicyError::Invalid {
-                    path: path.clone(),
+                    path,
                     message: format!(
                         "denied program \"{}\" must be a bare executable name",
                         entry.program
@@ -262,7 +309,7 @@ impl CommandPolicy {
                 // rejected by the command loop below.
                 if entry.program != "cargo" {
                     return Err(PolicyError::Invalid {
-                        path: path.clone(),
+                        path,
                         message: format!(
                             "program \"{}\" is both denied and ruled; remove one",
                             entry.program
@@ -273,40 +320,14 @@ impl CommandPolicy {
             }
             if policy.denied.contains(&entry.program) {
                 return Err(PolicyError::Invalid {
-                    path: path.clone(),
+                    path,
                     message: format!("program \"{}\" is denied twice", entry.program),
                 });
             }
             policy.denied.push(entry.program);
         }
         for entry in manifest.command {
-            let rule = CommandRule {
-                program: entry.program,
-                timeout_secs: entry.timeout_secs,
-                max_output_bytes: entry.max_output_bytes,
-                env_scrub: entry.env_scrub,
-                env_allow: entry.env_allow,
-                network: entry.network,
-                sandbox: entry.sandbox,
-                extra_writable: entry.extra_writable,
-            };
-            validate(&rule, &path)?;
-            if policy.rule(&rule.program).is_some() {
-                return Err(PolicyError::Invalid {
-                    path,
-                    message: format!("program \"{}\" is declared twice", rule.program),
-                });
-            }
-            if policy.denied.contains(&rule.program) {
-                return Err(PolicyError::Invalid {
-                    path,
-                    message: format!(
-                        "program \"{}\" is both denied and ruled; remove one",
-                        rule.program
-                    ),
-                });
-            }
-            policy.rules.push(rule);
+            insert_rule(&mut policy, &path, entry)?;
         }
         Ok(policy)
     }
@@ -323,6 +344,10 @@ impl CommandPolicy {
     /// deny list, but every escalation field — `sandbox = false`,
     /// `network = true`, `extra_writable`, `env_allow` — is stripped.
     /// `loom trust` pins the reviewed manifest and restores it.
+    ///
+    /// # Errors
+    /// Fails when the manifest cannot be read from `root` (errors
+    /// other than not-found) or when [`Self::parse`] rejects it.
     pub fn from_manifest(root: &Path) -> Result<Self, PolicyError> {
         let path = root.join(MANIFEST_RELATIVE_PATH);
         let text = match std::fs::read_to_string(&path) {
@@ -337,6 +362,8 @@ impl CommandPolicy {
                 });
             }
         };
+        // PolicyError is #[non_exhaustive]: the wildcard arm is required.
+        #[allow(clippy::wildcard_enum_match_arm)]
         let policy = Self::parse(&text).map_err(|error| match error {
             PolicyError::Invalid { message, .. } => PolicyError::Invalid {
                 path: path.display().to_string(),

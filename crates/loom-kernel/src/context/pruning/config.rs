@@ -27,7 +27,7 @@ pub struct PruneConfig {
     /// the writing phase (a trailing assistant turn wrote or deleted a
     /// file), stub successful read-only results older than this many
     /// assistant turns even below the `age_mask_turns` window —
-    /// TokenPilot's lifecycle finding that exploration reads lose
+    /// `TokenPilot`'s lifecycle finding that exploration reads lose
     /// value fastest once editing starts. `None` (the default) keeps
     /// the shipped behavior; selfopt-gated like every other stub
     /// class.
@@ -45,7 +45,7 @@ pub struct PruneConfig {
     /// Reasoning-elision window: assistant reasoning traces older than
     /// this many assistant turns are dropped from the projection
     /// (`reasoning = None`). `None` (the default) disables it —
-    /// replaying reasoning is a provider contract on the OpenAI wire,
+    /// replaying reasoning is a provider contract on the `OpenAI` wire,
     /// so only the engine's provider gate should turn this on.
     pub elide_reasoning: Option<usize>,
     /// Assistant-text elision window (roadmap item 12, last-resort

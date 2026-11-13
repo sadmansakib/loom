@@ -49,6 +49,7 @@ use std::path::Path;
 /// moved it) — loom's git runs need none of it.
 pub const ENV_NOSYSTEM: (&str, &str) = ("GIT_CONFIG_NOSYSTEM", "1");
 
+#[must_use]
 /// Turns the stdout of `git config --local --get-regexp ^filter\.`
 /// into `-c` overrides that neutralize every repo-configured filter:
 /// `clean`/`smudge` become `cat`, `process` is emptied so git falls
@@ -90,6 +91,7 @@ pub fn filter_neutralizer_args(config_regexp_output: &str) -> Vec<String> {
     args
 }
 
+#[must_use]
 /// The filter neutralizers for `dir`'s repo config: probes
 /// `filter.*` with the same hardened invocation shape the callers
 /// use, then maps the result through [`filter_neutralizer_args`]. A

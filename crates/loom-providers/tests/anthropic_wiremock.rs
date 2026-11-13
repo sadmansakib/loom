@@ -5,6 +5,9 @@
 //! shape (including the stable-prefix cache breakpoint), SSE assembly,
 //! usage accounting, and error classification.
 
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use futures::StreamExt;
 use loom_kernel::model::{
     ContextEditingHint, Message, ModelEvent, ModelProvider, ModelRequest, ModelStream, StopReason,
@@ -79,7 +82,7 @@ async fn collect(
 }
 
 fn expect_completed(
-    events: Vec<Result<ModelEvent, loom_kernel::model::ModelError>>,
+    events: &[Result<ModelEvent, loom_kernel::model::ModelError>],
 ) -> loom_kernel::model::ModelResponse {
     let Some(Ok(ModelEvent::Completed(response))) = events.last() else {
         panic!("expected a completed response, got {events:?}");
@@ -115,7 +118,7 @@ async fn streamed_text_completes_with_usage() {
     let events = collect(provider.stream(&plain_request("claude-sonnet-4-5"))).await;
 
     assert_eq!(joined_text(&events), "Hello from Anthropic");
-    let response = expect_completed(events);
+    let response = expect_completed(&events);
     assert_eq!(response.message.stop_reason, StopReason::EndTurn);
     // 100 uncached input tokens + 40 cache reads: the kernel total
     // is the full prompt (the OpenAI wire's prompt_tokens meaning).
@@ -155,7 +158,7 @@ async fn events_after_message_stop_are_not_ingested() {
     let events = collect(provider.stream(&plain_request("claude-sonnet-4-5"))).await;
 
     assert_eq!(joined_text(&events), "clean");
-    let response = expect_completed(events);
+    let response = expect_completed(&events);
     assert_eq!(response.message.stop_reason, StopReason::EndTurn);
     assert_eq!(response.message.content, "clean");
 }
@@ -340,7 +343,7 @@ async fn a_55_thinking_stream_accounts_thinking_and_cache_writes() {
     let provider = provider_at(&server.uri());
     let events = collect(provider.stream(&plain_request("claude-opus-5-5"))).await;
 
-    let response = expect_completed(events);
+    let response = expect_completed(&events);
     assert_eq!(response.message.content, "Done");
     assert_eq!(
         response.message.reasoning.as_ref().map(|r| r.text.as_str()),
@@ -396,7 +399,7 @@ async fn tool_call_streams_assemble_into_tool_calls() {
     let provider = provider_at(&server.uri());
     let events = collect(provider.stream(&plain_request("claude-sonnet-4-5"))).await;
 
-    let response = expect_completed(events);
+    let response = expect_completed(&events);
     assert_eq!(response.message.stop_reason, StopReason::ToolCalls);
     let expected = vec![ToolCall {
         id: ToolCallId::try_from("toolu_1".to_owned()).expect("valid id"),
@@ -487,7 +490,7 @@ async fn a_truncated_stream_reports_length_without_calls() {
     let provider = provider_at(&server.uri());
     let events = collect(provider.stream(&plain_request("claude-sonnet-4-5"))).await;
 
-    let response = expect_completed(events);
+    let response = expect_completed(&events);
     assert_eq!(response.message.stop_reason, StopReason::MaxTokens);
     assert!(response.message.tool_calls.is_empty());
     assert_eq!(response.usage.output_tokens, 8);

@@ -100,6 +100,7 @@ pub struct FastPathAttempt {
 
 impl FastPathAttempt {
     /// A failed attempt with its reason.
+    #[must_use]
     pub fn declined(reason: &'static str) -> Self {
         Self {
             outcome: None,
@@ -148,7 +149,7 @@ pub async fn try_fast_path(
             Err(reason) => return FastPathAttempt::declined(reason),
         },
         Intent::Constant { name, from, to } => {
-            apply_constant(workspace, policy, name, from, to).await
+            apply_constant(workspace, policy, name, from.as_ref(), to).await
         }
         Intent::DependencyUpdate {
             crate_name,

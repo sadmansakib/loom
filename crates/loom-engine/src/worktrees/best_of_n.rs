@@ -30,6 +30,13 @@ pub(super) async fn clean_worktrees(repo_root: &Path, root: &Path, count: usize)
 /// from `config` — the production counterpart to the scripted test
 /// factories. Catalog-driven adapters need `config.catalog` set first;
 /// call [`Engine::resolve_catalog`] before this.
+///
+/// # Errors
+///
+/// Returns [`EngineError::Store`] when the account store cannot be opened
+/// and [`EngineError::Auth`] when no credential resolves. Provider
+/// construction failures surface later, when the returned factory is
+/// invoked per rollout.
 pub fn provider_factory(config: &EngineConfig) -> Result<ProviderFactory, EngineError> {
     let store = crate::auth::SqliteAuthStore::open(&config.db_path).map_err(EngineError::Store)?;
     let secrets = crate::auth::KeychainBackend::default();
@@ -54,6 +61,13 @@ pub fn provider_factory(config: &EngineConfig) -> Result<ProviderFactory, Engine
 /// applied to the repository root. On success worktrees are cleaned up
 /// unless [`BestOfNConfig::keep_worktrees`] is set or the patch failed to
 /// apply — in both cases the trees stay for inspection.
+///
+/// # Errors
+///
+/// Returns [`WorktreeError`] when the workspace is not a git repository,
+/// a worktree cannot be created, or the shared-prefix seeding fails.
+/// Worktrees created before the failure are cleaned up.
+#[allow(clippy::too_many_lines)] // fixed setup→rollout→cleanup ordering; extraction would hide the sequencing
 pub async fn best_of_n(
     mut config: EngineConfig,
     provider_factory: ProviderFactory,
@@ -67,8 +81,8 @@ pub async fn best_of_n(
         .await
         .map_err(|_| {
             WorktreeError::new(format!(
-                "workspace {:?} is not inside a git repository; parallel rollouts need one HEAD to branch from",
-                config.workspace
+                "workspace {} is not inside a git repository; parallel rollouts need one HEAD to branch from",
+                config.workspace.display()
             ))
         })?;
     let repo_root = PathBuf::from(repo_root);
@@ -205,8 +219,7 @@ pub async fn best_of_n(
             let key = runs
                 .iter()
                 .find(|run| run.index == won)
-                .map(rank_key)
-                .unwrap_or((true, u64::MAX, u32::MAX, u32::MAX));
+                .map_or((true, u64::MAX, u32::MAX, u32::MAX), rank_key);
             let ties = runs
                 .iter()
                 .filter(|run| {

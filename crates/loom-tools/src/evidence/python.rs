@@ -34,7 +34,7 @@ pub fn pytest_failures(output: &str) -> Vec<TestFailure> {
         };
         if let Some(detail) = pytest_detail(line) {
             if failure.message.is_empty() {
-                failure.message = detail.to_owned();
+                detail.clone_into(&mut failure.message);
             } else {
                 failure.message.push(' ');
                 failure.message.push_str(detail);
@@ -119,7 +119,7 @@ fn pytest_detail(line: &str) -> Option<&str> {
     let detail = rest.trim_start();
     (rest.starts_with(char::is_whitespace) && !detail.is_empty())
         .then_some(detail)
-        .filter(|detail| !detail.starts_with("_"))
+        .filter(|detail| !detail.starts_with('_'))
 }
 
 /// A pytest traceback anchor: `<file>.py:<line>: <whatever>`.

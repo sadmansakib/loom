@@ -44,6 +44,9 @@ pub struct ChatArgs {
 }
 
 /// The engine-configuration flags shared by `loom run` and `loom chat`.
+// One bool per CLI toggle is the point of a flags struct; the fields
+// are independent options, not state dimensions.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Args)]
 pub struct RunFlags {
     /// Emit one NDJSON event per line instead of human-readable output.
@@ -120,7 +123,7 @@ pub struct RunFlags {
     pub bg_commands: bool,
 
     /// Reasoning effort, sent explicitly on every request by providers
-    /// that accept one (DeepSeek); ignored elsewhere.
+    /// that accept one (`DeepSeek`); ignored elsewhere.
     #[arg(long, default_value = "high")]
     pub reasoning_effort: ReasoningEffort,
 
@@ -173,7 +176,7 @@ pub struct RunFlags {
 
     /// Escalation target for the scout (multi-model cascade): when the
     /// cheap model's answer looks weak (timeout, failure, empty, missing
-    /// file:line pointers, truncated), the question is retried once on
+    /// `file:line` pointers, truncated), the question is retried once on
     /// this stronger provider and both answers are returned, labeled.
     /// Requires `--scout`/`--scout-model`.
     #[arg(long, value_name = "PROVIDER")]

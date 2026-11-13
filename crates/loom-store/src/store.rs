@@ -33,6 +33,12 @@ pub struct SqliteStore {
 impl SqliteStore {
     /// Opens (creating if needed) the database at `path`, applying pragmas and
     /// migrations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] when the parent directory cannot be
+    /// created, SQLite cannot open the file, a `PRAGMA` is rejected, or a
+    /// schema migration fails.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
         if let Some(parent) = path.parent()
@@ -45,6 +51,11 @@ impl SqliteStore {
     }
 
     /// Opens an anonymous in-memory database (tests).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] when SQLite cannot create the
+    /// in-memory connection or a schema migration fails.
     pub fn open_in_memory() -> Result<Self, StoreError> {
         Self::from_connection(Connection::open_in_memory().map_err(backend)?)
     }
@@ -54,6 +65,11 @@ impl SqliteStore {
     ///
     /// Never inside the workspace (ADR-008): a database in the repo would be
     /// committed, cleaned, or shadowed by a worktree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] when neither `XDG_DATA_HOME` nor
+    /// `HOME` is set, so no default location can be derived.
     pub fn default_path() -> Result<PathBuf, StoreError> {
         if let Some(explicit) = std::env::var_os("LOOM_DB")
             && !explicit.is_empty()
@@ -75,6 +91,12 @@ impl SqliteStore {
     }
 
     /// Opens the database at [`SqliteStore::default_path`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`SqliteStore::default_path`] and
+    /// [`SqliteStore::open`] (missing environment, unusable file,
+    /// rejected `PRAGMA`, failed migration).
     pub fn open_default() -> Result<Self, StoreError> {
         Self::open(Self::default_path()?)
     }
@@ -110,6 +132,13 @@ impl SqliteStore {
     /// the previous lease expired. Returns `None` when another owner holds a
     /// live lease; the caller must then leave that session alone rather than
     /// race it. `ttl_millis` bounds how long the lease survives a crash.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Corrupt`] when `session` names no stored
+    /// session, [`StoreError::Backend`] when the store lock is poisoned or
+    /// SQLite rejects the write/read, and surfaces any lease-row read
+    /// failure while distinguishing those cases.
     pub fn acquire_lease(
         &self,
         session: &SessionId,
@@ -125,7 +154,12 @@ impl SqliteStore {
                 "UPDATE sessions SET lease_owner = ?1, lease_until = ?2 \
                  WHERE id = ?3 \
                    AND (lease_owner IS NULL OR lease_owner = ?1 OR lease_until <= ?4)",
-                params![owner, expires as i64, session.to_string(), now as i64],
+                params![
+                    owner,
+                    store_u64(expires),
+                    session.to_string(),
+                    store_u64(now)
+                ],
             )
             .map_err(backend)?;
         if changed == 0 {
@@ -148,6 +182,11 @@ impl SqliteStore {
     }
 
     /// Extends a held lease. Returns `false` if `owner` no longer holds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] when the store lock is poisoned or
+    /// SQLite rejects the update.
     pub fn renew_lease(
         &self,
         session: &SessionId,
@@ -159,13 +198,18 @@ impl SqliteStore {
         let changed = connection
             .execute(
                 "UPDATE sessions SET lease_until = ?1 WHERE id = ?2 AND lease_owner = ?3",
-                params![expires as i64, session.to_string(), owner],
+                params![store_u64(expires), session.to_string(), owner],
             )
             .map_err(backend)?;
         Ok(changed > 0)
     }
 
     /// Releases a held lease. Returns `false` if `owner` did not hold it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] when the store lock is poisoned or
+    /// SQLite rejects the update.
     pub fn release_lease(&self, session: &SessionId, owner: &str) -> Result<bool, StoreError> {
         let connection = self.lock()?;
         let changed = connection
@@ -192,7 +236,7 @@ impl SessionStore for SqliteStore {
             .execute(
                 "INSERT OR IGNORE INTO sessions (id, created_at, lease_owner, lease_until) \
                  VALUES (?1, ?2, NULL, NULL)",
-                params![session.to_string(), now_millis() as i64],
+                params![session.to_string(), store_u64(now_millis())],
             )
             .map_err(backend)?;
         Ok(())
@@ -263,7 +307,7 @@ impl SessionStore for SqliteStore {
         let Some((lease_owner, lease_until)) = lease else {
             return Err(StoreError::Corrupt(format!("unknown session {source}")));
         };
-        if lease_until.is_some_and(|until| until > now as i64) {
+        if lease_until.is_some_and(|until| until > store_u64(now)) {
             return Err(StoreError::Leased {
                 session: *source,
                 owner: lease_owner.unwrap_or_else(|| "?".to_owned()),
@@ -303,7 +347,7 @@ impl SessionStore for SqliteStore {
             .execute(
                 "INSERT INTO sessions (id, created_at, lease_owner, lease_until) \
                  VALUES (?1, ?2, NULL, NULL)",
-                params![new_id.to_string(), now as i64],
+                params![new_id.to_string(), store_u64(now)],
             )
             .map_err(backend)?;
         // Copies keep their `idx` values: references made against the
@@ -324,7 +368,7 @@ impl SessionStore for SqliteStore {
                     new_id.to_string(),
                     source.to_string(),
                     boundary_index,
-                    now as i64
+                    store_u64(now)
                 ],
             )
             .map_err(backend)?;
@@ -395,7 +439,7 @@ impl SessionStore for SqliteStore {
                     checkpoint.workspace.to_string_lossy(),
                     checkpoint.head,
                     checkpoint.reason,
-                    now_millis() as i64
+                    store_u64(now_millis())
                 ],
             )
             .map_err(backend)?;
@@ -459,7 +503,7 @@ impl SessionStore for SqliteStore {
             .optional()
             .map_err(backend)?;
         Ok(row.and_then(|(owner, until)| {
-            (until > now_millis() as i64).then_some((owner, until.max(0) as u64))
+            (until > store_u64(now_millis())).then_some((owner, until.max(0).unsigned_abs()))
         }))
     }
 
@@ -594,8 +638,8 @@ impl ArtifactStore for SqliteStore {
                     artifact.id.to_string(),
                     &artifact.sha256,
                     &artifact.kind,
-                    artifact.bytes as i64,
-                    now_millis() as i64,
+                    store_u64(artifact.bytes),
+                    store_u64(now_millis()),
                     &artifact.body,
                 ],
             )
@@ -697,8 +741,17 @@ impl ArtifactStore for SqliteStore {
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or_default())
         .unwrap_or_default()
+}
+
+/// Stores a `u64` column value (unix milliseconds, byte counts) in a SQLite
+/// `INTEGER` column, which is i64-wide. Reads recover the value bit-exactly
+/// with `i64::unsigned_abs`; clock- and file-derived inputs never approach
+/// `i64::MAX`.
+#[allow(clippy::cast_possible_wrap)] // SQLite INTEGER is i64; round-trips via unsigned_abs
+fn store_u64(value: u64) -> i64 {
+    value as i64
 }
 
 /// Serializes an item once for both its denormalized kind and authoritative

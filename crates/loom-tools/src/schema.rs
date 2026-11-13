@@ -107,7 +107,10 @@ fn resolve_refs(
                 resolve_refs(item, definition_key, definitions);
             }
         }
-        _ => {}
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
     }
 }
 
@@ -139,7 +142,14 @@ fn compact(value: &mut serde_json::Value) {
             if let Some(bound) = map.get("minimum").and_then(serde_json::Value::as_f64)
                 && bound.fract() == 0.0
             {
-                map.insert("minimum".to_owned(), serde_json::Value::from(bound as i64));
+                let minimum = {
+                    // `fract() == 0.0` above guarantees an integral
+                    // bound within JSON's numeric range.
+                    #[allow(clippy::cast_possible_truncation)]
+                    let minimum = bound as i64;
+                    minimum
+                };
+                map.insert("minimum".to_owned(), serde_json::Value::from(minimum));
             }
             for child in map.values_mut() {
                 compact(child);
@@ -161,7 +171,10 @@ fn compact(value: &mut serde_json::Value) {
                 compact(item);
             }
         }
-        _ => {}
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
     }
 }
 
@@ -188,7 +201,10 @@ fn remove_nested_enum_descriptions(value: &mut serde_json::Value, is_root: bool)
                 remove_nested_enum_descriptions(item, false);
             }
         }
-        _ => {}
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
     }
 }
 
@@ -294,7 +310,7 @@ pub(crate) mod agreement {
             );
         }
         // `additionalProperties: false` really means the parser rejects extras.
-        let mut unknown = valid.clone();
+        let mut unknown = valid;
         unknown
             .as_object_mut()
             .expect("object sample")

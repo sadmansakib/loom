@@ -46,6 +46,13 @@ pub struct Baseline {
 /// are read from `instances/<slug>/run-<n>/run.json` next to the
 /// report (best-effort: a missing stream reads as 0 turns, the same
 /// convention [`swebench::run_turns`] applies).
+///
+/// # Errors
+///
+/// Returns the `std::io::Error` of [`std::fs::read_to_string`] or
+/// [`serde_json::from_str`] when the sweep report itself cannot be
+/// read or parsed; missing per-run `run.json` streams are tolerated
+/// (0 turns), per the convention above.
 pub fn load_baseline(sweep_json: &Path) -> std::io::Result<Baseline> {
     let body = std::fs::read_to_string(sweep_json)?;
     let value: serde_json::Value = serde_json::from_str(&body)?;

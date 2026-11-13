@@ -30,6 +30,7 @@ pub struct ReplaceSymbolTool {
 impl ReplaceSymbolTool {
     /// Builds the tool under explicit output budgets (the engine's
     /// registration path; item 20.2).
+    #[must_use]
     pub fn with_budgets(mut self, budgets: ToolBudgets) -> Self {
         self.budgets = budgets;
         self
@@ -106,7 +107,7 @@ impl Tool for ReplaceSymbolTool {
             let artifacts = ctx.artifacts.clone();
             let (relative, new_text, replaced, matches, before_images) =
                 tokio::task::spawn_blocking(move || {
-                    replace_symbol(&root, &display, &name_path, &body, artifacts)
+                    replace_symbol(&root, &display, &name_path, &body, artifacts.as_ref())
                 })
                 .await
                 .map_err(|err| ToolError::Execution(format!("replace task failed: {err}")))??;
@@ -136,7 +137,7 @@ fn replace_symbol(
     display_path: &str,
     name_path: &str,
     body: &str,
-    artifacts: Option<std::sync::Arc<dyn loom_kernel::store::ArtifactStore>>,
+    artifacts: Option<&std::sync::Arc<dyn loom_kernel::store::ArtifactStore>>,
 ) -> Result<(String, String, String, Symbol, Vec<BeforeImage>), ToolError> {
     let path = resolve_within(root, display_path)?;
     // Symbol splicing mutates the file, so control state is off-limits
@@ -156,7 +157,7 @@ fn replace_symbol(
         .iter()
         .filter(|symbol| name_path_matches(name_path, &symbol.path))
         .collect();
-    let matched = match matches.as_slice() {
+    let hit = match matches.as_slice() {
         [] => {
             let available: Vec<String> = flat
                 .iter()
@@ -181,11 +182,11 @@ fn replace_symbol(
         }
     };
 
-    let replaced = source[matched.start_byte..matched.end_byte].to_owned();
+    let replaced = source[hit.start_byte..hit.end_byte].to_owned();
     let mut new_text = String::with_capacity(source.len() - replaced.len() + body.len());
-    new_text.push_str(&source[..matched.start_byte]);
+    new_text.push_str(&source[..hit.start_byte]);
     new_text.push_str(body);
-    new_text.push_str(&source[matched.end_byte..]);
+    new_text.push_str(&source[hit.end_byte..]);
 
     // Same gate as edit_file: refuse a candidate that introduces a
     // parse error the original did not have.
@@ -199,7 +200,7 @@ fn replace_symbol(
     // Tier-2 rewind capture (roadmap gap 1): the loaded original is
     // exactly the pre-image of the touched file.
     let before_images = crate::pre_image::capture_before_image(
-        artifacts.as_deref(),
+        artifacts.map(|arc| &**arc),
         &relative,
         Some(source.as_bytes()),
     )
@@ -217,7 +218,7 @@ fn replace_symbol(
         relative,
         new_text,
         replaced,
-        symbol_from_flat(matched),
+        symbol_from_flat(hit),
         before_images,
     ))
 }

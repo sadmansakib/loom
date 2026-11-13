@@ -38,16 +38,16 @@ where
                 Value::String(text) => Ok(text),
                 Value::Number(number) => Ok(number.to_string()),
                 Value::Bool(flag) => Ok(flag.to_string()),
-                other => Err(D::Error::custom(format!(
+                Value::Null | Value::Array(_) | Value::Object(_) => Err(D::Error::custom(format!(
                     "args entries must be strings, got {}",
-                    json_kind(&other)
+                    json_kind(&item)
                 ))),
             })
             .collect(),
         Value::String(text) => Ok(split_args_lenient(&text)),
-        other => Err(D::Error::custom(format!(
+        Value::Bool(_) | Value::Number(_) | Value::Object(_) => Err(D::Error::custom(format!(
             "args must be an array of strings, got {}",
-            json_kind(&other)
+            json_kind(&value)
         ))),
     }
 }
@@ -75,7 +75,7 @@ fn json_kind(value: &Value) -> &'static str {
 fn split_args_lenient(text: &str) -> Vec<String> {
     let trimmed = text.trim().trim_start_matches('=').trim();
     if let Some((items, remainder)) = parse_array_prefix(trimmed) {
-        return fold_remainder(items, remainder);
+        return fold_remainder(items, &remainder);
     }
     if let Some(inner) = trimmed
         .strip_prefix('[')
@@ -110,7 +110,7 @@ fn parse_array_prefix(text: &str) -> Option<(Vec<String>, String)> {
 /// the program is a shell — append it there so `sh -c "grep … | head"`
 /// runs as intended. Anything else after `]` is unreadable: refuse with
 /// the shape explained, which is cheaper than a garbage execution.
-fn fold_remainder(mut items: Vec<String>, remainder: String) -> Vec<String> {
+fn fold_remainder(mut items: Vec<String>, remainder: &str) -> Vec<String> {
     let rest = remainder.trim();
     if rest.is_empty() {
         return items;

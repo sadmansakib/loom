@@ -40,6 +40,7 @@ use crate::ReasoningEffort;
 
 /// Run configuration recorded into the manifest, supplied by the
 /// frontend that drove the task.
+#[derive(Clone, Copy)]
 pub struct TraceMeta<'a> {
     /// Provider adapter name (`deepseek`, `anthropic`, `openrouter`).
     pub provider: &'a str,
@@ -63,7 +64,7 @@ pub enum Outcome {
     Ended {
         /// Coarse terminal bucket.
         status: &'static str,
-        /// Stable snake_case cause token.
+        /// Stable `snake_case` cause token.
         end_reason: String,
     },
 }
@@ -126,6 +127,8 @@ impl From<&TaskSummary> for SummarySnapshot {
             cached_input_tokens: summary.cached_input_tokens,
             successful_tool_calls: summary.successful_tool_calls,
             failed_tool_calls: summary.failed_tool_calls,
+            // snapshot fields are u64; millis fit until the year ~584 million
+            #[allow(clippy::cast_possible_truncation)]
             wall_time_millis: summary.wall_time.as_millis() as u64,
             events_dropped: summary.events_dropped,
             last_context_census: CensusSnapshot::from(&summary.last_context_census),
@@ -177,6 +180,7 @@ pub struct TraceWriter {
 }
 
 impl TraceWriter {
+    #[must_use]
     /// Creates a writer rooted at `base`; nothing touches disk yet.
     pub fn new(base: PathBuf) -> Self {
         Self {
@@ -218,9 +222,10 @@ impl TraceWriter {
                     .map(BufWriter::new)
                     .ok();
                 self.events = opened;
-                match self.events.is_some() {
-                    true => self.task_id = Some(envelope.task_id),
-                    false => self.events_write_failures += 1,
+                if self.events.is_some() {
+                    self.task_id = Some(envelope.task_id);
+                } else {
+                    self.events_write_failures += 1;
                 }
             }
             Some(task) if task != envelope.task_id => {
@@ -233,12 +238,13 @@ impl TraceWriter {
             self.events_write_failures += 1;
             return;
         };
-        let appended = serde_json::to_string(envelope)
-            .map(|line| file.write_all(line.as_bytes()).is_ok() && file.write_all(b"\n").is_ok())
-            .unwrap_or(false);
-        match appended {
-            true => self.events_written += 1,
-            false => self.events_write_failures += 1,
+        let appended = serde_json::to_string(envelope).is_ok_and(|line| {
+            file.write_all(line.as_bytes()).is_ok() && file.write_all(b"\n").is_ok()
+        });
+        if appended {
+            self.events_written += 1;
+        } else {
+            self.events_write_failures += 1;
         }
     }
 
@@ -249,6 +255,12 @@ impl TraceWriter {
     /// written for a failed or cancelled run beyond the outcome block.
     /// Returns the task directory, or `None` when no event ever arrived
     /// (nothing was created and there is nothing to export).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`std::io::Error`] when the task directory, manifest, or
+    /// event log cannot be written.
+    #[allow(clippy::needless_pass_by_value)] // pub API: loom-cli hands over an owned `Outcome` (not `Copy`)
     pub fn finish(
         mut self,
         session: &Session,
@@ -275,6 +287,14 @@ impl TraceWriter {
     }
 }
 
+/// Millis since the epoch as `u64`.
+#[allow(clippy::cast_possible_truncation)] // u128 millis fit u64 until the year ~584 million
+fn epoch_millis_u64() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 /// Builds the manifest body.
 fn manifest(
     writer: &TraceWriter,
@@ -290,10 +310,7 @@ fn manifest(
     let mut body = json!({
         "loom_version": env!("CARGO_PKG_VERSION"),
         "event_schema_version": EVENT_SCHEMA_VERSION,
-        "exported_at_millis": SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0),
+        "exported_at_millis": epoch_millis_u64(),
         "session_id": session.id.to_string(),
         "task_id": writer.task_id.map(|id| id.to_string()),
         "harness": {
@@ -323,7 +340,11 @@ fn transcript(session: &Session) -> std::io::Result<String> {
         .transcript
         .iter()
         .enumerate()
-        .map(|(index, item)| json!({ "index": index as u32, "item": item }))
+        .map(|(index, item)| {
+            #[allow(clippy::cast_possible_truncation)] // transcript lengths stay far below u32::MAX
+            let index = index as u32;
+            json!({ "index": index, "item": item })
+        })
         .collect();
     let tasks = &session.tasks;
     let body = json!({

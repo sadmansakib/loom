@@ -161,7 +161,7 @@ pub(crate) fn build_tier_agents(
         )?;
         match tier {
             crate::routing::Tier::Easy => easy = Some(routed),
-            _ => hard = Some(routed),
+            crate::routing::Tier::Medium | crate::routing::Tier::Hard => hard = Some(routed),
         }
     }
     Ok((easy, hard))
@@ -258,7 +258,7 @@ pub(crate) fn build_registry(
     policy: &CommandPolicy,
     budgets: ToolBudgets,
     autofix: bool,
-    ask: Option<AskResolver>,
+    ask: Option<&AskResolver>,
 ) -> Result<ToolRegistry, EngineError> {
     let mut registry = ToolRegistry::new();
     let mut register = |name: &'static str, tool: Box<dyn loom_kernel::tool::Tool>| {
@@ -300,7 +300,7 @@ pub(crate) fn build_registry(
     let mut verify = VerifyTool::with_policy(policy.clone())
         .with_budgets(budgets)
         .with_autofix(autofix);
-    if let Some(ask) = &ask {
+    if let Some(ask) = ask {
         run_command = run_command.with_ask_resolver(Arc::clone(ask));
         verify = verify.with_ask_resolver(Arc::clone(ask));
     }
@@ -343,6 +343,7 @@ pub(crate) fn replay_registry() -> Result<ToolRegistry, EngineError> {
     )
 }
 
+#[must_use]
 /// The built-in instruction; overridable with `--system-prompt`.
 /// The default system prompt: what a frontend that passes no
 /// `system_prompt` runs with, and the one the eval harness must measure

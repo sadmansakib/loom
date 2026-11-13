@@ -45,11 +45,10 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.subsec_nanos())
-            .unwrap_or(0);
+            .map_or(0, |since| since.subsec_nanos());
         let temp = parent.join(format!(".loom-tmp-{}-{seq}-{nanos}", std::process::id()));
         match write_temp(&temp, path, bytes) {
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             other => {
                 let result = other.and_then(|()| {
                     if let Err(error) = std::fs::rename(&temp, path) {

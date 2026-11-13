@@ -37,6 +37,11 @@ impl Engine {
     /// account store, and the OS keychain (and, for `auth login`, the
     /// credential command) — so a frontend that runs an event loop should call
     /// it off its render thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] under the same conditions as
+    /// [`Engine::open_with`].
     pub fn open(config: EngineConfig) -> Result<Self, EngineError> {
         Self::open_with(config, EngineOverrides::default())
     }
@@ -46,6 +51,11 @@ impl Engine {
     /// hook, a custom tool registry, or a custom context compiler. Every
     /// `None` field keeps the production choice; see the overrides type
     /// for the exact semantics of each.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] under the same conditions as
+    /// [`Engine::open_with_extra_tools`].
     pub fn open_with(
         config: EngineConfig,
         overrides: EngineOverrides,
@@ -68,8 +78,23 @@ impl Engine {
     /// loom-acp's editor-forwarded servers (roadmap item 37 tail)
     /// attach here after running them through the same hygiene
     /// pipeline (`loom_tools::mcp::attach_forwarded`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Workspace`] when the workspace cannot be
+    /// canonicalized, [`EngineError::Store`] or [`EngineError::Auth`] when
+    /// credentials cannot be resolved, [`EngineError::UnknownProvider`],
+    /// [`EngineError::CatalogMissing`], or [`EngineError::MissingBaseUrl`]
+    /// when the provider selection is incomplete, [`EngineError::Provider`],
+    /// [`EngineError::UnknownModel`], [`EngineError::ModelWindowTooSmall`],
+    /// or [`EngineError::ModelWithoutReasoning`] when the provider/model
+    /// fails loud validation, [`EngineError::CommandPolicy`] when the
+    /// command-policy manifest is invalid, [`EngineError::RegisterTool`]
+    /// when a built-in tool cannot register, and [`EngineError::Session`]
+    /// when the session store cannot be opened.
+    #[allow(clippy::too_many_lines)] // linear, order-sensitive construction; splitting hides the sequencing
     pub fn open_with_extra_tools(
-        config: EngineConfig,
+        mut config: EngineConfig,
         overrides: EngineOverrides,
         mcp: loom_tools::mcp::McpAttachment,
         lsp: loom_tools::lsp::LspAttachment,
@@ -87,33 +112,31 @@ impl Engine {
         // entirely (offline replay needs no secret); a hook then wraps
         // whichever provider resulted, so traffic capture composes with
         // both paths.
-        let provider: Box<dyn ModelProvider> = match overrides.provider {
-            Some(provider) => provider,
-            None => {
-                // Credential resolution: --account → active saved account →
-                // env (§18.3). The secret never leaves a `SecretString`.
-                let store = SqliteAuthStore::open(&config.db_path).map_err(EngineError::Store)?;
-                let secrets = KeychainBackend::default();
-                let credential = auth::resolve(
-                    &store,
-                    &secrets,
-                    &config.provider,
-                    config.account.as_deref(),
-                    |name| std::env::var(name).ok(),
-                )?;
-                tracing::debug!(
-                    source = credential.source.as_str(),
-                    account = credential
-                        .account
-                        .as_ref()
-                        .map(|account| account.label.as_str())
-                        .unwrap_or("-"),
-                    "credential resolved"
-                );
-                // Provider construction and loud capability validation: all
-                // adapter-specific knowledge lives in `provider`.
-                crate::provider::build(&config, credential.secret.expose())?.provider
-            }
+        let provider: Box<dyn ModelProvider> = if let Some(provider) = overrides.provider {
+            provider
+        } else {
+            // Credential resolution: --account → active saved account →
+            // env (§18.3). The secret never leaves a `SecretString`.
+            let store = SqliteAuthStore::open(&config.db_path).map_err(EngineError::Store)?;
+            let secrets = KeychainBackend::default();
+            let credential = auth::resolve(
+                &store,
+                &secrets,
+                &config.provider,
+                config.account.as_deref(),
+                |name| std::env::var(name).ok(),
+            )?;
+            tracing::debug!(
+                source = credential.source.as_str(),
+                account = credential
+                    .account
+                    .as_ref()
+                    .map_or("-", |account| account.label.as_str()),
+                "credential resolved"
+            );
+            // Provider construction and loud capability validation: all
+            // adapter-specific knowledge lives in `provider`.
+            crate::provider::build(&config, credential.secret.expose())?.provider
         };
         let provider = match overrides.provider_hook {
             Some(hook) => hook(provider),
@@ -127,25 +150,24 @@ impl Engine {
         // One policy drives both the tool registry and the fast paths'
         // verification runs, so a manifest rule changes them together.
         let policy = CommandPolicy::from_manifest(&workspace)?;
-        let registry = match overrides.registry {
-            Some(registry) => registry,
-            None => {
-                let built = build_registry(
-                    &policy,
-                    config.budgets,
-                    config.autofix,
-                    overrides.ask.clone(),
-                )?;
-                // The bare-loop arm keeps the primitive tool set only
-                // (read/list/write/edit/shell); a search index, the
-                // artifact re-fetch, the fused verify, and the
-                // kernel-owned todo list are harness levers the baseline
-                // must run without.
-                if overrides.bare_loop {
-                    bare_registry(built)
-                } else {
-                    built
-                }
+        let registry = if let Some(registry) = overrides.registry {
+            registry
+        } else {
+            let built = build_registry(
+                &policy,
+                config.budgets,
+                config.autofix,
+                overrides.ask.as_ref(),
+            )?;
+            // The bare-loop arm keeps the primitive tool set only
+            // (read/list/write/edit/shell); a search index, the
+            // artifact re-fetch, the fused verify, and the
+            // kernel-owned todo list are harness levers the baseline
+            // must run without.
+            if overrides.bare_loop {
+                bare_registry(built)
+            } else {
+                built
             }
         };
         // Roadmap item 19: the read-only scout. Opt-in via
@@ -164,7 +186,7 @@ impl Engine {
         let mut registry = registry;
         if let Some(agent) = scout_agent {
             let cfg = config.scout.as_ref();
-            let timeout = cfg.map(|cfg| cfg.timeout_secs).unwrap_or(120);
+            let timeout = cfg.map_or(120, |cfg| cfg.timeout_secs);
             let mut tool = ScoutTool::new(agent, timeout);
             if let Some(cfg) = cfg {
                 tool = tool.with_model_label(cfg.model.clone());
@@ -319,7 +341,7 @@ impl Engine {
         }
         let system_prompt = config
             .system_prompt
-            .clone()
+            .take()
             .unwrap_or_else(default_system_prompt);
         // Stage-1 repository facts (2E, ADR-015): the composition root owns the
         // I/O; the loop scans once per task through this source. The
@@ -332,32 +354,31 @@ impl Engine {
                 .with_mcp_menu(mcp.menu.clone())
                 .with_lsp_menu(lsp.menu.clone())
         });
-        let compiler: Box<dyn ContextCompiler> = match overrides.compiler {
-            Some(compiler) => compiler,
-            None => {
-                // Token estimates use a real tokenizer — the same estimator
-                // feeds the census, the budget check, and the pruning math.
-                // The family follows the provider: Anthropic counts tokens
-                // differently from the OpenAI-vocabulary backends, and its
-                // 1M window only holds if the estimate errs high.
-                let estimator: Arc<dyn loom_kernel::context::TokenEstimator> =
-                    crate::estimate::estimator_for(&config.provider);
-                // The bare-loop arm compiles plain append-only context —
-                // no pruning, no checkpoints — so a bare run measures the
-                // levers the full chain adds.
-                if overrides.bare_loop {
-                    Box::new(DefaultContextCompiler::with_estimator(estimator))
-                } else {
-                    Box::new(
-                        PruningContextCompiler::new(
-                            Box::new(DefaultContextCompiler::with_estimator(estimator.clone())),
-                            config
-                                .prune
-                                .unwrap_or_else(|| prune_config_for(&config.provider)),
-                        )
-                        .with_estimator(estimator),
+        let compiler: Box<dyn ContextCompiler> = if let Some(compiler) = overrides.compiler {
+            compiler
+        } else {
+            // Token estimates use a real tokenizer — the same estimator
+            // feeds the census, the budget check, and the pruning math.
+            // The family follows the provider: Anthropic counts tokens
+            // differently from the OpenAI-vocabulary backends, and its
+            // 1M window only holds if the estimate errs high.
+            let estimator: Arc<dyn loom_kernel::context::TokenEstimator> =
+                crate::estimate::estimator_for(&config.provider);
+            // The bare-loop arm compiles plain append-only context —
+            // no pruning, no checkpoints — so a bare run measures the
+            // levers the full chain adds.
+            if overrides.bare_loop {
+                Box::new(DefaultContextCompiler::with_estimator(estimator))
+            } else {
+                Box::new(
+                    PruningContextCompiler::new(
+                        Box::new(DefaultContextCompiler::with_estimator(estimator.clone())),
+                        config
+                            .prune
+                            .unwrap_or_else(|| prune_config_for(&config.provider)),
                     )
-                }
+                    .with_estimator(estimator),
+                )
             }
         };
         // The bare-loop arm also disarms the LLM handoff: the plain
@@ -369,7 +390,7 @@ impl Engine {
         }
         // Roadmap item 12: the operator's context-editing hint rides
         // the agent config verbatim (default None sends nothing).
-        agent_config.context_editing = config.context_editing.clone();
+        agent_config.context_editing = config.context_editing.take();
         // Roadmap item 9: per-turn reasoning effort. The fixed level
         // maps from the operator's provider-level flag; the schedule
         // is env-seamed so funded sweeps vary it without touching the
@@ -394,15 +415,17 @@ impl Engine {
                             easy = Some(RoutedAgent {
                                 model: label,
                                 agent,
-                            })
+                            });
                         }
                         crate::routing::Tier::Hard if hard.is_none() => {
                             hard = Some(RoutedAgent {
                                 model: label,
                                 agent,
-                            })
+                            });
                         }
-                        _ => {}
+                        crate::routing::Tier::Easy
+                        | crate::routing::Tier::Medium
+                        | crate::routing::Tier::Hard => {}
                     }
                 }
                 (easy, hard)
@@ -418,7 +441,7 @@ impl Engine {
         // agent — same registry, same agent config, one model. The
         // bare-loop arm is a baseline and never carries escalation.
         let stall_escalation = match overrides.stall_escalation {
-            Some((model, agent)) => Some(RoutedAgent { model, agent }),
+            Some((model, agent)) => Some(RoutedAgent { agent, model }),
             None => match config.stall_escalation_model.as_deref() {
                 Some(model) if !overrides.bare_loop => Some(build_stall_escalation_agent(
                     model,
@@ -445,14 +468,13 @@ impl Engine {
         // run in memory only, so nothing spills and `artifact_read` has no
         // store.
         if config.persist {
-            let store = SqliteStore::open(config.db_path.clone()).map_err(EngineError::Session)?;
-            let artifacts =
-                SqliteStore::open(config.db_path.clone()).map_err(EngineError::Session)?;
+            let store = SqliteStore::open(&config.db_path).map_err(EngineError::Session)?;
+            let artifacts = SqliteStore::open(&config.db_path).map_err(EngineError::Session)?;
             // The event-stream persistence seam shares the database
             // (schema v2's `events` table) and the same write cadence
             // as the transcript: append-on-emit, best-effort — a store
             // failure counts drops and never fails the task.
-            let events = SqliteStore::open(config.db_path.clone()).map_err(EngineError::Session)?;
+            let events = SqliteStore::open(&config.db_path).map_err(EngineError::Session)?;
 
             // The lifecycle pass (roadmap 2.17), best-effort at open: the
             // transcript scan marks the live set, then only unreferenced
@@ -517,6 +539,11 @@ impl Engine {
     /// worktree orchestrator, which opens N engines from one config) should
     /// reuse instead of re-implementing. A config that already carries a
     /// catalog, or names a provider that needs none, skips the network.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] when a catalog-driven provider's catalog
+    /// cannot be fetched or parsed.
     pub async fn resolve_catalog(config: EngineConfig) -> Result<EngineConfig, EngineError> {
         // `custom` is described entirely by user-supplied URLs: the
         // chat base URL is mandatory and the catalog comes from the
@@ -528,7 +555,7 @@ impl Engine {
             // registry name (`loom provider add`) carries them in the
             // registry instead, with explicit flags winning over both.
             let registry = crate::registry::ProviderRegistry::load(&config.db_path);
-            let named = registry.get(&config.provider).cloned();
+            let named = registry.get(&config.provider);
             let is_custom = config.provider == CUSTOM_PROVIDER_NAME
                 || named.is_some()
                 || config.base_url.is_some();
@@ -536,7 +563,7 @@ impl Engine {
                 let Some(base_url) = config
                     .base_url
                     .clone()
-                    .or_else(|| named.as_ref().map(|entry| entry.base_url.clone()))
+                    .or_else(|| named.map(|entry| entry.base_url.clone()))
                 else {
                     return Err(EngineError::MissingBaseUrl {
                         provider: config.provider.clone(),
@@ -545,7 +572,7 @@ impl Engine {
                 let models_url = config
                     .models_url
                     .clone()
-                    .or_else(|| named.as_ref().and_then(|entry| entry.models_url.clone()))
+                    .or_else(|| named.and_then(|entry| entry.models_url.clone()))
                     .unwrap_or_else(|| format!("{}/models", base_url.trim_end_matches('/')));
                 let catalog = crate::catalog::load_custom(
                     &config.db_path,
@@ -601,7 +628,7 @@ impl Engine {
     }
 }
 impl Engine {
-    /// Opens the engine, fetching the OpenRouter catalog first when one is
+    /// Opens the engine, fetching the `OpenRouter` catalog first when one is
     /// needed and not already supplied.
     ///
     /// The asynchronous counterpart of [`Engine::open`]: capabilities are
@@ -615,6 +642,11 @@ impl Engine {
     ///
     /// Await this from the frontend's async context; everything after the
     /// optional fetch is the same blocking work [`Engine::open`] documents.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] under the same conditions as
+    /// [`Engine::open_with`].
     pub async fn open_async(config: EngineConfig) -> Result<Self, EngineError> {
         Self::open_async_with(config, EngineOverrides::default()).await
     }
@@ -622,6 +654,12 @@ impl Engine {
     /// [`Engine::open_async`] with embedder overrides
     /// ([`EngineOverrides`]) — the catalog sequencing of the async open
     /// composed with the substitution points of [`Engine::open_with`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] when catalog resolution fails (see
+    /// [`Engine::resolve_catalog`]) or under the conditions of
+    /// [`Engine::open_with_extra_tools`].
     pub async fn open_async_with(
         config: EngineConfig,
         overrides: EngineOverrides,
@@ -664,6 +702,12 @@ impl Engine {
     /// never replace, the manifest attachment. A caller is expected to
     /// gate this on an explicit operator choice; the engine does not
     /// second-guess the list it is handed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] when catalog resolution fails (see
+    /// [`Engine::resolve_catalog`]) or under the conditions of
+    /// [`Engine::open_with_extra_tools`].
     pub async fn open_async_with_forwarded_mcp(
         config: EngineConfig,
         overrides: EngineOverrides,

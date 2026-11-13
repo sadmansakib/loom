@@ -45,7 +45,7 @@ fn closed_receiver_drops_are_counted() {
     assert_eq!(sink.dropped(), 3);
 }
 
-/// Schema v3: `ContextPruned` serializes with the snake_case tag and
+/// Schema v3: `ContextPruned` serializes with the `snake_case` tag and
 /// a fully-nested report, so an NDJSON consumer can attribute
 /// savings per mechanism without kernel types.
 #[test]
@@ -80,7 +80,7 @@ fn context_pruned_serializes_the_nested_report() {
     assert_eq!(round, envelope);
 }
 
-/// Schema v4: `AwaitingInput` serializes with the snake_case tag and
+/// Schema v4: `AwaitingInput` serializes with the `snake_case` tag and
 /// the idle session's id, so a stream-only consumer can key its resume
 /// loop on the marker alone.
 #[test]
@@ -102,7 +102,7 @@ fn awaiting_input_serializes_the_session_id() {
     assert_eq!(round, envelope);
 }
 
-/// Schema v5: `TaskPaused` serializes under the snake_case tag so a
+/// Schema v5: `TaskPaused` serializes under the `snake_case` tag so a
 /// paused (resumable) ending is distinguishable from a mid-flight
 /// cancellation on the event stream alone.
 #[test]
@@ -120,7 +120,7 @@ fn task_paused_serializes_with_its_tag() {
 }
 
 /// Schema v8: the surfaced-decision kinds serialize under their
-/// snake_case tags and round-trip, so NDJSON consumers can read
+/// `snake_case` tags and round-trip, so NDJSON consumers can read
 /// harness decisions straight off the event stream.
 #[test]
 fn surfaced_decisions_serialize_and_round_trip() {
@@ -788,7 +788,7 @@ fn status_snapshot_survives_a_json_round_trip() {
     assert_eq!(round, snapshot);
 }
 
-/// Schema v9: `TodoUpdated` serializes with the snake_case tag and
+/// Schema v9: `TodoUpdated` serializes with the `snake_case` tag and
 /// the complete item list, so an NDJSON consumer can reconstruct the
 /// session's todo state without kernel types beyond serde.
 #[test]
@@ -816,8 +816,8 @@ fn todo_updated_serializes_the_full_list() {
 }
 
 /// Roadmap item 8 phase B, replay: folding a task's `TodoUpdated`
-/// Schema v12: `TurnBudgetExtended` serializes with the snake_case
-/// tag and a snake_case reason, so an NDJSON consumer can count
+/// Schema v12: `TurnBudgetExtended` serializes with the `snake_case`
+/// tag and a `snake_case` reason, so an NDJSON consumer can count
 /// extensions and their evidence without kernel types.
 #[test]
 fn turn_budget_extended_serializes_snake_case() {

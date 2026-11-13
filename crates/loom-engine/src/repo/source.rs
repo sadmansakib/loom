@@ -87,8 +87,8 @@ impl FactsSource for FsFactsSource {
         if self.lessons {
             facts.lessons = scan_lessons(&self.root);
         }
-        facts.mcp_menu = self.mcp_menu.clone();
-        facts.lsp_menu = self.lsp_menu.clone();
+        facts.mcp_menu.clone_from(&self.mcp_menu);
+        facts.lsp_menu.clone_from(&self.lsp_menu);
         facts
     }
 }

@@ -138,6 +138,101 @@ impl VerifyTool {
     }
 }
 
+/// The verdict layer gates verify drivers exactly like `run_command`
+/// (review F-13): `ask` consults the operator with the full command
+/// line and fails closed without a frontend.
+async fn gate_driver(
+    policy: &CommandPolicy,
+    ask: Option<&AskResolver>,
+    program: &str,
+    args: &[String],
+) -> Result<(), ToolError> {
+    match policy.verdict(program) {
+        PolicyVerdict::Allow => {}
+        PolicyVerdict::Deny => {
+            return Err(ToolError::InvalidInput(format!(
+                "program \"{program}\" is denied by workspace policy \
+                 (.loom/commands.toml); cannot verify here"
+            )));
+        }
+        PolicyVerdict::Ask => {
+            let rule = policy.rule(program);
+            let approved = match ask {
+                Some(resolver) => {
+                    resolver(AskRequest {
+                        program: program.to_string(),
+                        args: args.to_vec(),
+                        // The driver runs the local build, which
+                        // is sandboxed unless a rule escalates it.
+                        sandboxed: rule.is_none_or(|rule| rule.sandbox),
+                        network: rule.is_some_and(|rule| rule.network),
+                    })
+                    .await
+                }
+                None => false,
+            };
+            if !approved {
+                return Err(ToolError::InvalidInput(format!(
+                    "program \"{program}\" needs operator approval (policy unknown = \
+                     \"ask\") and was not approved{}; cannot verify here",
+                    if ask.is_none() {
+                        " — no interactive frontend is attached"
+                    } else {
+                        ""
+                    }
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Runs the verify command through a declared container/remote
+/// runner (item 23) when one is configured; a present-but-broken
+/// manifest fails closed. The evidence contract is shared with local
+/// execution: the substrate moves, the rendered output does not.
+/// Returns `None` when no runner is declared.
+async fn run_via_runner(
+    ctx: &ToolContext,
+    ecosystem: Ecosystem,
+    program: &str,
+    args: &[String],
+    budgets: &ToolBudgets,
+) -> Result<Option<ToolOutput>, ToolError> {
+    let Some(runner) =
+        crate::verify_runner::runner_for(&ctx.workspace_root).map_err(ToolError::Execution)?
+    else {
+        return Ok(None);
+    };
+    let (outcome, notice) = runner.run(ctx, program, args).await?;
+    let effects = ToolEffects::none().with_command(CommandEffect::new(
+        &outcome.runner_program,
+        outcome.runner_args.clone(),
+        outcome.output.status.code(),
+    ));
+    let recent_changes = ctx.recent_changes();
+    let mut rendered = render(
+        ecosystem,
+        &outcome.runner_program,
+        &outcome.runner_args,
+        &outcome.output,
+        &recent_changes,
+        budgets,
+    )
+    .with_effects(effects)
+    .with_notice(notice);
+    if outcome.pipe_hold_truncated {
+        rendered = rendered.with_notice(loom_kernel::tool::ToolNotice::new(
+            "stream.truncated",
+            format!(
+                "\"{}\" (verify) output truncated: a descendant held the pipes after exit",
+                outcome.runner_program
+            ),
+        ));
+    }
+    Ok(Some(rendered))
+}
+
 impl Tool for VerifyTool {
     fn spec(&self) -> &ToolSpec {
         static SPEC: OnceLock<ToolSpec> = OnceLock::new();
@@ -176,79 +271,15 @@ impl Tool for VerifyTool {
                 })?;
             let (program, args) = ecosystem.command(input.scope)?;
             // The verdict layer gates drivers exactly like run_command
-            // (review F-13: `ask` consults the same operator approval
-            // with the full command line, and still fails closed
-            // without a frontend).
-            match self.policy.verdict(program) {
-                PolicyVerdict::Allow => {}
-                PolicyVerdict::Deny => {
-                    return Err(ToolError::InvalidInput(format!(
-                        "program \"{program}\" is denied by workspace policy \
-                         (.loom/commands.toml); cannot verify here"
-                    )));
-                }
-                PolicyVerdict::Ask => {
-                    let rule = self.policy.rule(program);
-                    let approved = match &self.ask {
-                        Some(resolver) => {
-                            resolver(AskRequest {
-                                program: program.to_owned(),
-                                args: args.to_vec(),
-                                // The driver runs the local build, which
-                                // is sandboxed unless a rule escalates it.
-                                sandboxed: rule.is_none_or(|rule| rule.sandbox),
-                                network: rule.is_some_and(|rule| rule.network),
-                            })
-                            .await
-                        }
-                        None => false,
-                    };
-                    if !approved {
-                        return Err(ToolError::InvalidInput(format!(
-                            "program \"{program}\" needs operator approval (policy unknown = \
-                             \"ask\") and was not approved{}; cannot verify here",
-                            if self.ask.is_none() {
-                                " — no interactive frontend is attached"
-                            } else {
-                                ""
-                            }
-                        )));
-                    }
-                }
-            }
+            // (see `gate_driver`); fails closed without a frontend.
+            gate_driver(&self.policy, self.ask.as_ref(), program, &args).await?;
             // A declared container/remote runner (item 23) takes over
             // execution: same command table, same budgets, same
             // evidence contract — and a present-but-broken manifest
             // fails closed instead of silently verifying locally.
-            if let Some(runner) = crate::verify_runner::runner_for(&ctx.workspace_root)
-                .map_err(ToolError::Execution)?
+            if let Some(rendered) =
+                run_via_runner(ctx, ecosystem, program, &args, &self.budgets).await?
             {
-                let (outcome, notice) = runner.run(ctx, program, &args).await?;
-                let effects = ToolEffects::none().with_command(CommandEffect::new(
-                    &outcome.runner_program,
-                    outcome.runner_args.clone(),
-                    outcome.output.status.code(),
-                ));
-                let recent_changes = ctx.recent_changes();
-                let mut rendered = render(
-                    ecosystem,
-                    &outcome.runner_program,
-                    &outcome.runner_args,
-                    &outcome.output,
-                    &recent_changes,
-                    &self.budgets,
-                )
-                .with_effects(effects)
-                .with_notice(notice);
-                if outcome.pipe_hold_truncated {
-                    rendered = rendered.with_notice(loom_kernel::tool::ToolNotice::new(
-                        "stream.truncated",
-                        format!(
-                            "\"{}\" (verify) output truncated: a descendant held the pipes after exit",
-                            outcome.runner_program
-                        ),
-                    ));
-                }
                 return Ok(rendered);
             }
             // Drivers escalate through the same policy rules as

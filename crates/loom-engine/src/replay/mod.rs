@@ -111,7 +111,7 @@ mod tests {
     }
 
     impl ModelProvider for ScriptedProvider {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "scripted"
         }
 
@@ -125,11 +125,11 @@ mod tests {
         }
     }
 
+    #[allow(clippy::cast_possible_truncation)] // u128 millis fit u64 until the year ~584 million
     fn now_millis() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or(0)
+            .map_or(0, |duration| duration.as_millis() as u64)
     }
 
     /// A workspace with a ~30 KB text file: ~10K heuristic tokens, enough
@@ -213,9 +213,10 @@ mod tests {
         let options = replay_options(&workspace);
         let replay = replay_session(&session, session.tasks.last().unwrap(), &options, config)
             .expect("replay runs");
+        #[allow(clippy::cast_possible_truncation)] // turn counts stay far below u32::MAX
+        let replay_turns = replay.turns.len() as u32;
         assert_eq!(
-            replay.turns.len() as u32,
-            summary.turns,
+            replay_turns, summary.turns,
             "one compile per live model turn"
         );
         let last = replay.turns.last().expect("turns exist");
@@ -464,7 +465,7 @@ mod tests {
         let replay = replay_session(&session, &task, &options, PruneConfig::default()).unwrap();
         let trace = TraceInput {
             session: session.clone(),
-            task: task.clone(),
+            task,
             provider: "scripted".into(),
             model: "m".into(),
             schema_version: loom_kernel::event::EVENT_SCHEMA_VERSION,
@@ -505,12 +506,12 @@ mod tests {
             )
             .expect("smoke trace replays");
             if let Some(summary) = &trace.summary {
+                #[allow(clippy::cast_possible_truncation)]
+                // recorded values are loom-written counts
                 let recorded = summary["turns"].as_u64().unwrap_or_default() as u32;
-                assert_eq!(
-                    replay.turns.len() as u32,
-                    recorded,
-                    "smoke trace turns must line up"
-                );
+                #[allow(clippy::cast_possible_truncation)] // turn counts stay far below u32::MAX
+                let replay_turns = replay.turns.len() as u32;
+                assert_eq!(replay_turns, recorded, "smoke trace turns must line up");
             }
             let validity = ValidityReport::check(&trace, &replay);
             if validity.schema_skew.is_some() {

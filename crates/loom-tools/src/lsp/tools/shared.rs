@@ -117,8 +117,7 @@ pub(super) fn loc_line(label: &str, loc: &lsp_types::Location) -> String {
     let file = loc
         .uri
         .to_file_path()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| loc.uri.to_string());
+        .map_or_else(|()| loc.uri.to_string(), |p| p.display().to_string());
     format!("{label} {file}:{}", render_position(loc.range.start))
 }
 
@@ -131,7 +130,7 @@ pub(super) fn marked_string(ms: &lsp_types::MarkedString) -> String {
     }
 }
 
-pub(super) fn finish(server: &LspServer, mut body: String) -> Result<ToolOutput, ToolError> {
+pub(super) fn finish(server: &LspServer, mut body: String) -> ToolOutput {
     if body.is_empty() {
         body = "(no results)".to_string();
     }
@@ -144,7 +143,7 @@ pub(super) fn finish(server: &LspServer, mut body: String) -> Result<ToolOutput,
     if cut {
         out = out.with_truncated();
     }
-    Ok(out)
+    out
 }
 
 pub(super) fn spec_of(

@@ -51,6 +51,12 @@ pub struct LedgerEntry {
 }
 
 /// Reads the ledger; a missing file is an empty ledger (first run).
+///
+/// # Errors
+///
+/// Returns the `std::io::Error` of [`std::fs::read_to_string`] when the
+/// ledger exists but cannot be read, and an `InvalidData` error when
+/// its contents are not valid ledger JSON.
 pub fn load_ledger(path: &Path) -> std::io::Result<Vec<LedgerEntry>> {
     let Ok(body) = std::fs::read_to_string(path) else {
         return Ok(Vec::new());
@@ -65,6 +71,12 @@ pub fn load_ledger(path: &Path) -> std::io::Result<Vec<LedgerEntry>> {
 
 /// Appends one entry, rewriting the whole ledger atomically (write to
 /// a sibling temp file, rename over) so a crash never truncates it.
+///
+/// # Errors
+///
+/// Returns the `std::io::Error` of [`load_ledger`], of JSON
+/// serialization, or of the temp-file write/rename when the ledger
+/// cannot be updated.
 pub fn append_ledger(path: &Path, entry: &LedgerEntry) -> std::io::Result<()> {
     let mut entries = load_ledger(path)?;
     entries.push(entry.clone());

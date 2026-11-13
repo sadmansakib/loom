@@ -26,7 +26,7 @@
 //!   no ask resolver attached.
 //!
 //! `session/load` is served: the ACP session id *is* the kernel
-//! session id in string form (UUIDv7), and loading rehydrates the
+//! session id in string form (`UUIDv7`), and loading rehydrates the
 //! durable transcript from the shared database — the same id resumes
 //! across connections and process restarts. The client's forwarded
 //! `mcp_servers` in `session/new` attach only under the explicit

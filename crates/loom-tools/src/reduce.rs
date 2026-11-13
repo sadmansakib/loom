@@ -197,9 +197,10 @@ mod tests {
 
     #[test]
     fn git_log_one_line_format_caps_by_line() {
-        let raw: String = (0..40)
-            .map(|index| format!("{index:040x} subject {index}\n"))
-            .collect();
+        let mut raw = String::new();
+        for index in 0..40 {
+            let _ = writeln!(raw, "{index:040x} subject {index}");
+        }
         let reduction = reduce("git", &["log".to_owned()], &raw).expect("reduced");
         assert!(reduction.text.contains("subject 24"));
         assert!(reduction.text.contains("[... 15 more commits omitted]"));
@@ -207,7 +208,10 @@ mod tests {
 
     #[test]
     fn git_diff_caps_at_line_boundaries() {
-        let raw: String = (0..250).map(|_| "a line of diff\n").collect();
+        let mut raw = String::new();
+        for _ in 0..250 {
+            raw.push_str("a line of diff\n");
+        }
         let reduction = reduce("git", &["diff".to_owned()], &raw).expect("reduced");
         assert_eq!(reduction.text.lines().count(), 201); // 200 + marker
         assert!(reduction.text.contains("[... 50 more diff lines omitted]"));
@@ -215,9 +219,10 @@ mod tests {
 
     #[test]
     fn grep_keeps_a_head_of_matches() {
-        let raw: String = (0..100)
-            .map(|i| format!("src/a.rs:{i}: found it\n"))
-            .collect();
+        let mut raw = String::new();
+        for i in 0..100 {
+            let _ = writeln!(raw, "src/a.rs:{i}: found it");
+        }
         let reduction = reduce("grep", &[], &raw).expect("reduced");
         assert!(reduction.text.contains("src/a.rs:59"));
         assert!(!reduction.text.contains("src/a.rs:60:"));
@@ -226,7 +231,10 @@ mod tests {
 
     #[test]
     fn ls_keeps_a_head_of_entries() {
-        let raw: String = (0..150).map(|i| format!("entry-{i}\n")).collect();
+        let mut raw = String::new();
+        for i in 0..150 {
+            let _ = writeln!(raw, "entry-{i}");
+        }
         let reduction = reduce("ls", &[], &raw).expect("reduced");
         assert!(reduction.text.contains("[... 50 more entries omitted]"));
     }
@@ -277,7 +285,10 @@ mod tests {
     #[test]
     fn small_savings_are_not_worth_an_artifact() {
         // 10 grep matches is well under the byte floor.
-        let raw: String = (0..10).map(|i| format!("m{i}\n")).collect();
+        let mut raw = String::new();
+        for i in 0..10 {
+            let _ = writeln!(raw, "m{i}\n");
+        }
         assert!(reduce("grep", &[], &raw).is_none());
     }
 

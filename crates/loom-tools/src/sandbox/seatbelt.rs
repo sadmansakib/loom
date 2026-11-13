@@ -1,5 +1,6 @@
 #[cfg(target_os = "macos")]
 use super::Sandbox;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "macos")]
@@ -66,7 +67,7 @@ pub(crate) fn seatbelt_profile(
             if index > 0 {
                 profile.push(' ');
             }
-            profile.push_str(&format!("(subpath \"{}\")", escape_seatbelt_path(dir)));
+            let _ = write!(profile, "(subpath \"{}\")", escape_seatbelt_path(dir));
         }
         profile.push_str(")\n");
     }
@@ -79,7 +80,7 @@ pub(crate) fn seatbelt_profile(
     if !protected.is_empty() {
         profile.push_str("(deny file-write*");
         for dir in protected {
-            profile.push_str(&format!(" (subpath \"{}\")", escape_seatbelt_path(dir)));
+            let _ = write!(profile, " (subpath \"{}\")", escape_seatbelt_path(dir));
         }
         profile.push_str(")\n");
     }
@@ -88,7 +89,7 @@ pub(crate) fn seatbelt_profile(
     if !secrets.is_empty() {
         profile.push_str("(deny file-read*");
         for path in secrets {
-            profile.push_str(&format!(" (subpath \"{}\")", escape_seatbelt_path(path)));
+            let _ = write!(profile, " (subpath \"{}\")", escape_seatbelt_path(path));
         }
         profile.push_str(")\n");
     }

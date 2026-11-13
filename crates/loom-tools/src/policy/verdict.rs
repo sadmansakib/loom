@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 
 /// Why a command policy could not be loaded.
 #[non_exhaustive]
@@ -75,7 +76,7 @@ impl AskRequest {
                 || arg.contains('\'')
                 || arg.contains('"')
             {
-                line.push_str(&format!("{arg:?}"));
+                let _ = write!(line, "{arg:?}");
             } else {
                 line.push_str(arg);
             }

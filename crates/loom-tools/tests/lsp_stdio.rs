@@ -13,7 +13,9 @@
 //! char↔utf-16 conversion end to end (a surrogate-pair emoji makes
 //! pass-through bugs visible).
 
-#![allow(clippy::unwrap_used)]
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -53,7 +55,7 @@ fn ws_root() -> String {
 }
 
 fn file_uri(path: &str) -> String {
-    format!("file://{}", path)
+    format!("file://{path}")
 }
 
 fn write_frame(out: &mut impl Write, body: &str) {
@@ -61,21 +63,21 @@ fn write_frame(out: &mut impl Write, body: &str) {
     let _ = out.flush();
 }
 
-fn send_response(out: &mut impl Write, id: serde_json::Value, result: serde_json::Value) {
+fn send_response(out: &mut impl Write, id: &serde_json::Value, result: &serde_json::Value) {
     write_frame(
         out,
         &format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{result}}}"#),
     );
 }
 
-fn send_notification(out: &mut impl Write, method: &str, params: serde_json::Value) {
+fn send_notification(out: &mut impl Write, method: &str, params: &serde_json::Value) {
     write_frame(
         out,
         &format!(r#"{{"jsonrpc":"2.0","method":"{method}","params":{params}}}"#),
     );
 }
 
-fn send_request(out: &mut impl Write, id: u64, method: &str, params: serde_json::Value) {
+fn send_request(out: &mut impl Write, id: u64, method: &str, params: &serde_json::Value) {
     write_frame(
         out,
         &format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{params}}}"#),
@@ -88,14 +90,13 @@ fn read_frame(stdin: &mut impl Read) -> Option<serde_json::Value> {
     let mut byte = [0u8; 1];
     loop {
         match stdin.read(&mut byte) {
-            Ok(0) => return None,
+            Ok(0) | Err(_) => return None,
             Ok(_) => {
                 header.push(byte[0]);
                 if header.ends_with(b"\r\n\r\n") {
                     break;
                 }
             }
-            Err(_) => return None,
         }
     }
     let header = String::from_utf8_lossy(&header);
@@ -123,6 +124,9 @@ fn nested<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json:
 /// The mock server main loop. Deterministic responses; the definition
 /// handler echoes the request position so the client's encoding
 /// conversion is observable.
+// One dispatch arm per LSP method: the mock is a wire-protocol table,
+// and splitting the arms would hide the request/response shape.
+#[allow(clippy::too_many_lines)]
 fn mock_server_loop() -> ! {
     let no_pull = std::env::var("LOOM_LSP_NO_PULL").is_ok();
     let no_rename = std::env::var("LOOM_LSP_NO_RENAME").is_ok();
@@ -171,7 +175,7 @@ fn mock_server_loop() -> ! {
                     "serverInfo": {"name": "loom-mock"}
                 });
                 if let Some(id) = id {
-                    send_response(&mut out, id, result);
+                    send_response(&mut out, &id, &result);
                 }
             }
             "initialized" => {
@@ -183,13 +187,13 @@ fn mock_server_loop() -> ! {
                         &mut out,
                         9001,
                         "workspace/configuration",
-                        serde_json::json!({"items": [{"section": null}]}),
+                        &serde_json::json!({"items": [{"section": null}]}),
                     );
                     // Other traffic (didOpen, notifications) may
                     // interleave; wait for OUR response by id.
                     let mut served = String::from("missing");
                     while let Some(frame) = read_frame(&mut stdin) {
-                        if frame.get("id").and_then(|i| i.as_u64()) == Some(9001)
+                        if frame.get("id").and_then(serde_json::Value::as_u64) == Some(9001)
                             && frame.get("result").is_some()
                         {
                             served = frame
@@ -206,7 +210,7 @@ fn mock_server_loop() -> ! {
                     send_notification(
                         &mut out,
                         "textDocument/publishDiagnostics",
-                        serde_json::json!({
+                        &serde_json::json!({
                             "uri": uri,
                             "diagnostics": [{
                                 "range": {
@@ -226,7 +230,7 @@ fn mock_server_loop() -> ! {
                 send_notification(
                     &mut out,
                     "textDocument/publishDiagnostics",
-                    serde_json::json!({
+                    &serde_json::json!({
                         "uri": uri,
                         "diagnostics": [{
                             "range": {
@@ -245,10 +249,10 @@ fn mock_server_loop() -> ! {
                     .unwrap_or_default()
                     .to_string();
                 let line = nested(&msg, &["params", "position", "line"])
-                    .and_then(|l| l.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0);
                 let character = nested(&msg, &["params", "position", "character"])
-                    .and_then(|c| c.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0);
                 let pos = serde_json::json!({"line": line, "character": character});
                 let result = serde_json::json!([{
@@ -256,7 +260,7 @@ fn mock_server_loop() -> ! {
                     "range": {"start": pos, "end": pos}
                 }]);
                 if let Some(id) = id {
-                    send_response(&mut out, id, result);
+                    send_response(&mut out, &id, &result);
                 }
             }
             "textDocument/references" => {
@@ -270,7 +274,7 @@ fn mock_server_loop() -> ! {
                     {"uri": other, "range": {"start": {"line": 9, "character": 2}, "end": {"line": 9, "character": 5}}}
                 ]);
                 if let Some(id) = id {
-                    send_response(&mut out, id, result);
+                    send_response(&mut out, &id, &result);
                 }
             }
             "textDocument/documentSymbol" => {
@@ -288,7 +292,7 @@ fn mock_server_loop() -> ! {
                     }]
                 }]);
                 if let Some(id) = id {
-                    send_response(&mut out, id, result);
+                    send_response(&mut out, &id, &result);
                 }
             }
             "workspace/symbol" => {
@@ -303,7 +307,7 @@ fn mock_server_loop() -> ! {
                     "containerName": null
                 }]);
                 if let Some(id) = id {
-                    send_response(&mut out, id, result);
+                    send_response(&mut out, &id, &result);
                 }
             }
             "textDocument/hover" => {
@@ -311,7 +315,7 @@ fn mock_server_loop() -> ! {
                     "contents": {"kind": "markdown", "value": "fn median(&[i64]) -> i64"}
                 });
                 if let Some(id) = id {
-                    send_response(&mut out, id, result);
+                    send_response(&mut out, &id, &result);
                 }
             }
             "textDocument/diagnostic" => {
@@ -327,7 +331,7 @@ fn mock_server_loop() -> ! {
                     }]
                 });
                 if let Some(id) = id {
-                    send_response(&mut out, id, result);
+                    send_response(&mut out, &id, &result);
                 }
             }
             "textDocument/prepareCallHierarchy" => {
@@ -346,7 +350,7 @@ fn mock_server_loop() -> ! {
                     }
                 }]);
                 if let Some(id) = id {
-                    send_response(&mut out, id, result);
+                    send_response(&mut out, &id, &result);
                 }
             }
             "callHierarchy/incomingCalls" => {
@@ -371,7 +375,7 @@ fn mock_server_loop() -> ! {
                     }]
                 }]);
                 if let Some(id) = id {
-                    send_response(&mut out, id, result);
+                    send_response(&mut out, &id, &result);
                 }
             }
             "callHierarchy/outgoingCalls" => {
@@ -396,7 +400,7 @@ fn mock_server_loop() -> ! {
                     }]
                 }]);
                 if let Some(id) = id {
-                    send_response(&mut out, id, result);
+                    send_response(&mut out, &id, &result);
                 }
             }
             "textDocument/rename" => {
@@ -426,7 +430,7 @@ fn mock_server_loop() -> ! {
                     ]
                 });
                 if let Some(id) = id {
-                    send_response(&mut out, id, result);
+                    send_response(&mut out, &id, &result);
                 }
             }
             "textDocument/formatting" => {
@@ -440,18 +444,18 @@ fn mock_server_loop() -> ! {
                     "newText": "fn third() {}\n"
                 }]);
                 if let Some(id) = id {
-                    send_response(&mut out, id, result);
+                    send_response(&mut out, &id, &result);
                 }
             }
             "shutdown" => {
                 if let Some(id) = id {
-                    send_response(&mut out, id, serde_json::Value::Null);
+                    send_response(&mut out, &id, &serde_json::Value::Null);
                 }
                 std::process::exit(0);
             }
             _ => {
                 if let Some(id) = id {
-                    send_response(&mut out, id, serde_json::Value::Null);
+                    send_response(&mut out, &id, &serde_json::Value::Null);
                 }
             }
         }
@@ -527,11 +531,10 @@ fn context(dir: &Path) -> ToolContext {
 }
 
 fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> &'a dyn Tool {
-    tools
-        .iter()
-        .find(|t| t.spec().name == name)
-        .map(|t| t.as_ref())
-        .unwrap_or_else(|| panic!("tool {name} not attached"))
+    tools.iter().find(|t| t.spec().name == name).map_or_else(
+        || panic!("tool {name} not attached"),
+        std::convert::AsRef::as_ref,
+    )
 }
 
 // --------------------------------------------------------------- tests
@@ -767,6 +770,8 @@ fn unowned_suffix_is_rejected_with_guidance() {
     let err = rt
         .block_on(tool.call(serde_json::json!({"path": "data.txt", "line": 1}), &ctx))
         .expect_err("txt not owned");
+    // ToolError is #[non_exhaustive]: the wildcard arm is required.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match err {
         loom_kernel::tool::ToolError::InvalidInput(msg) => {
             assert!(

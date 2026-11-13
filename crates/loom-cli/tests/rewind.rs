@@ -1,7 +1,9 @@
 //! `loom rewind` end to end: the binary reads a store it did not create,
 //! lists conversation-valid boundaries, and forks at one — leaving the
 //! source intact and the lineage visible in `loom sessions`.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::process::Command;
 
@@ -538,6 +540,9 @@ fn rewind_restores_the_workspace_to_a_boundary_from_pre_images() {
 
     // The recovery snapshot kept what the restore discarded (§5),
     // including the file that no longer exists.
+    // Snapshot dirs are named `<turn>.files` by contract; the suffix
+    // comparison is case-sensitive on purpose.
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
     let snapshots: Vec<_> = std::fs::read_dir(work.path().join(".loom").join("rewind"))
         .unwrap()
         .map(|entry| entry.unwrap().path())

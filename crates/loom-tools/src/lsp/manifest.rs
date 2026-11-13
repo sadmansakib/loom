@@ -1,4 +1,4 @@
-//! KNOWN_SERVERS table + `.loom/lsp.toml` manifest (docs/lsp-design.md §1).
+//! `KNOWN_SERVERS` table + `.loom/lsp.toml` manifest (docs/lsp-design.md §1).
 //!
 //! Breadth comes from data, not per-language code: a generic client plus
 //! a table of well-known servers (the nvim-lspconfig lesson). The
@@ -118,12 +118,21 @@ pub struct LspManifest {
 impl LspManifest {
     /// Parses manifest text. Invalid content is an error — attach fails
     /// closed rather than silently running local-only (MCP semantics).
+    ///
+    /// # Errors
+    ///
+    /// Fails when the text is not valid TOML or does not match the
+    /// manifest schema.
     pub fn parse(text: &str) -> Result<Self, String> {
         toml::from_str(text).map_err(|e| format!("invalid {MANIFEST_RELATIVE_PATH}: {e}"))
     }
 }
 
 /// Loads the manifest from `root/.loom/lsp.toml` if present.
+///
+/// # Errors
+///
+/// Fails when the manifest cannot be read or fails to parse.
 pub fn manifest_for(root: &Path) -> Result<Option<LspManifest>, String> {
     let path = root.join(MANIFEST_RELATIVE_PATH);
     match std::fs::read_to_string(&path) {
@@ -135,6 +144,7 @@ pub fn manifest_for(root: &Path) -> Result<Option<LspManifest>, String> {
 
 /// True when `argv[0]` resolves on PATH. Servers that are not installed
 /// are skipped with a warning, never fatal (LSP is an accelerator).
+#[must_use]
 pub fn binary_available(argv: &[String]) -> bool {
     let Some(program) = argv.first() else {
         return false;
@@ -154,7 +164,7 @@ pub fn binary_available(argv: &[String]) -> bool {
 /// A resolved candidate after table + manifest merge.
 #[derive(Debug, Clone)]
 pub struct ServerCandidate {
-    /// Table entry when this came from KNOWN_SERVERS, else None.
+    /// Table entry when this came from `KNOWN_SERVERS`, else None.
     pub known: Option<&'static KnownServer>,
     /// Final name (manifest key or table name).
     pub name: String,
@@ -166,7 +176,7 @@ pub struct ServerCandidate {
     pub network: bool,
 }
 
-/// Merges the KNOWN_SERVERS table with the manifest and the workspace's
+/// Merges the `KNOWN_SERVERS` table with the manifest and the workspace's
 /// language markers into the attach candidate list.
 ///
 /// Rules (docs/lsp-design.md §1): manifest entries always attach when
@@ -201,7 +211,8 @@ pub fn candidates_for(root: &Path, manifest: &LspManifest) -> Vec<ServerCandidat
         let command = server
             .command
             .iter()
-            .map(|s| s.to_string())
+            .copied()
+            .map(str::to_owned)
             .collect::<Vec<String>>();
         if !binary_available(&command) {
             tracing::warn!(

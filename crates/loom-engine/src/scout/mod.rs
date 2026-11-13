@@ -66,7 +66,7 @@ mod tests {
     }
 
     impl ModelProvider for AnsweringProvider {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "answering"
         }
 
@@ -80,7 +80,9 @@ mod tests {
                 .iter()
                 .filter_map(|m| match m {
                     loom_kernel::model::Message::User { text } => Some(text.clone()),
-                    _ => None,
+                    loom_kernel::model::Message::System { .. }
+                    | loom_kernel::model::Message::Assistant(_)
+                    | loom_kernel::model::Message::ToolResult(_) => None,
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -103,7 +105,7 @@ mod tests {
     struct HangingProvider;
 
     impl ModelProvider for HangingProvider {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "hanging"
         }
 

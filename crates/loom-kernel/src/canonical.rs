@@ -16,7 +16,7 @@ use serde_json::Value;
 /// recursively.
 ///
 /// Byte-identical to `serde_json::to_string` for any value whose maps
-/// serde_json itself keeps sorted (default builds), and identical for
+/// `serde_json` itself keeps sorted (default builds), and identical for
 /// two values that differ only in object key insertion order.
 pub(crate) fn canonical_json(value: &Value) -> String {
     // `serde_json::to_writer` writes to `io::Write`; use one shared

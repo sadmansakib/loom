@@ -52,7 +52,7 @@ pub(crate) struct ServerState {
 pub struct LspServer {
     /// Final server name (menu label).
     pub name: String,
-    /// Table entry when this server came from KNOWN_SERVERS.
+    /// Table entry when this server came from `KNOWN_SERVERS`.
     pub known: Option<&'static KnownServer>,
     /// The server's declared capabilities (from initialize).
     pub capabilities: lsp_types::ServerCapabilities,
@@ -125,6 +125,10 @@ impl LspServer {
     }
 
     /// The document URI for a tool-supplied path.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the resolved path cannot be expressed as a `file:` URI.
     pub fn document_uri(&self, path: &str) -> Result<lsp_types::Url, String> {
         url_for(&resolve(&self.root, path))
     }
@@ -143,7 +147,7 @@ impl LspServer {
     }
 
     /// Workspace root — the confinement boundary for every
-    /// server-supplied file path (WorkspaceEdit application).
+    /// server-supplied file path (`WorkspaceEdit` application).
     pub(crate) fn workspace_root(&self) -> &std::path::Path {
         &self.root
     }
@@ -161,8 +165,8 @@ impl LspServer {
     /// Informs the server that loom itself wrote `path` (E2): open
     /// files get a full-text didChange with a bumped version so
     /// subsequent server computations see loom's writes; files not
-    /// open are left alone (the next ensure_open reads disk truth).
-    pub(crate) async fn note_local_write(&self, path: &str, text: String) {
+    /// open are left alone (the next `ensure_open` reads disk truth).
+    pub(crate) fn note_local_write(&self, path: &str, text: String) {
         use lsp_types::notification::DidChangeTextDocument;
         let key = self.open_key(path);
         let next = match self.open_files.lock() {
@@ -210,7 +214,7 @@ fn resolve(root: &Path, path: &str) -> std::path::PathBuf {
 
 fn url_for(path: &Path) -> Result<lsp_types::Url, String> {
     lsp_types::Url::from_file_path(path)
-        .map_err(|_| format!("cannot express {path:?} as a file URI"))
+        .map_err(|()| format!("cannot express {} as a file URI", path.display()))
 }
 
 fn line_at(text: &str, line_1based: u32) -> String {
@@ -274,64 +278,54 @@ impl LspServer {
         for path in changed_paths {
             let full = resolve(&self.root, path);
             let key = self.open_key(path);
-            let is_open = self
-                .open_files
-                .lock()
-                .map(|m| m.contains_key(&key))
-                .unwrap_or(false);
+            let is_open = self.open_files.lock().is_ok_and(|m| m.contains_key(&key));
             let version = if is_open {
-                self.open_files
-                    .lock()
-                    .map(|mut m| {
-                        let v = m.get(&key).copied().unwrap_or(0).saturating_add(1);
-                        m.insert(key.clone(), v);
-                        v
-                    })
-                    .unwrap_or(1)
+                self.open_files.lock().map_or(1, |mut m| {
+                    let v = m.get(&key).copied().unwrap_or(0).saturating_add(1);
+                    m.insert(key.clone(), v);
+                    v
+                })
             } else {
                 0
             };
             if is_open {
-                match tokio::fs::read_to_string(&full).await {
-                    Ok(text) => {
-                        let uri = match url_for(&full) {
-                            Ok(u) => u,
-                            Err(e) => {
-                                tracing::warn!(server = %self.name, "{e}");
-                                continue;
-                            }
-                        };
-                        if let Err(e) = self.socket.notify::<DidChangeTextDocument>(
-                            lsp_types::DidChangeTextDocumentParams {
-                                text_document: lsp_types::VersionedTextDocumentIdentifier {
+                if let Ok(text) = tokio::fs::read_to_string(&full).await {
+                    let uri = match url_for(&full) {
+                        Ok(u) => u,
+                        Err(e) => {
+                            tracing::warn!(server = %self.name, "{e}");
+                            continue;
+                        }
+                    };
+                    if let Err(e) = self.socket.notify::<DidChangeTextDocument>(
+                        lsp_types::DidChangeTextDocumentParams {
+                            text_document: lsp_types::VersionedTextDocumentIdentifier {
+                                uri,
+                                version: i32::try_from(version).unwrap_or(1),
+                            },
+                            content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
+                                range: None,
+                                range_length: None,
+                                text,
+                            }],
+                        },
+                    ) {
+                        tracing::warn!(server = %self.name, "didChange failed: {e}");
+                    }
+                } else {
+                    // Deleted on disk: fall through to a watched-file event.
+                    if let Ok(uri) = url_for(&full) {
+                        let _ = self.socket.notify::<DidChangeWatchedFiles>(
+                            lsp_types::DidChangeWatchedFilesParams {
+                                changes: vec![lsp_types::FileEvent {
                                     uri,
-                                    version: i32::try_from(version).unwrap_or(1),
-                                },
-                                content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
-                                    range: None,
-                                    range_length: None,
-                                    text,
+                                    typ: lsp_types::FileChangeType::DELETED,
                                 }],
                             },
-                        ) {
-                            tracing::warn!(server = %self.name, "didChange failed: {e}");
-                        }
+                        );
                     }
-                    Err(_) => {
-                        // Deleted on disk: fall through to a watched-file event.
-                        if let Ok(uri) = url_for(&full) {
-                            let _ = self.socket.notify::<DidChangeWatchedFiles>(
-                                lsp_types::DidChangeWatchedFilesParams {
-                                    changes: vec![lsp_types::FileEvent {
-                                        uri,
-                                        typ: lsp_types::FileChangeType::DELETED,
-                                    }],
-                                },
-                            );
-                        }
-                        if let Ok(mut open) = self.open_files.lock() {
-                            open.remove(&key);
-                        }
+                    if let Ok(mut open) = self.open_files.lock() {
+                        open.remove(&key);
                     }
                 }
             } else if let Ok(uri) = url_for(&full) {
@@ -541,7 +535,8 @@ impl<R: futures::AsyncRead + Unpin> futures::AsyncRead for PreambleSkip<R> {
                 this.prefix.drain(..n);
                 Poll::Ready(Ok(n))
             }
-            other => other,
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -616,10 +611,10 @@ pub(crate) async fn spawn_server(
     });
 
     let root_uri = url_for(workspace)?;
-    let folder_name = workspace
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "workspace".to_string());
+    let folder_name = workspace.file_name().map_or_else(
+        || "workspace".to_string(),
+        |n| n.to_string_lossy().to_string(),
+    );
     #[allow(deprecated)] // root_uri still reached by older servers; folders are primary
     let params = lsp_types::InitializeParams {
         capabilities: client_capabilities(),
@@ -708,11 +703,10 @@ fn build_router(state: Arc<ServerState>) -> Router<Arc<ServerState>> {
             move |_state: &mut Arc<ServerState>,
                   params: lsp_types::PublishDiagnosticsParams|
                   -> std::ops::ControlFlow<Result<(), async_lsp::Error>> {
-                let path = params
-                    .uri
-                    .to_file_path()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| params.uri.to_string());
+                let path = params.uri.to_file_path().map_or_else(
+                    |()| params.uri.to_string(),
+                    |p| p.to_string_lossy().to_string(),
+                );
                 if let Ok(mut cache) = diagnostics_state.diagnostics.lock() {
                     if params.diagnostics.is_empty() {
                         cache.remove(&path);

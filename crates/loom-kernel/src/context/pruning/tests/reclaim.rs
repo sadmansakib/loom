@@ -43,7 +43,7 @@ fn an_age_mask_checkpoint_freezes_the_projection() {
     let first = compiler(PruneConfig::default())
         .compile(input(&session, None))
         .expect("compiles");
-    let checkpoint = first.prune_checkpoint.clone().expect("fired");
+    let checkpoint = first.prune_checkpoint.expect("fired");
     items.push(assistant_text("one more turn"));
     let session = session_with(items);
     let second = compiler(PruneConfig::default())
@@ -444,7 +444,7 @@ fn frozen_stubs_stay_byte_stable_across_appends() {
     let first = compiler(firing())
         .compile(input(&session, None))
         .expect("compiles");
-    let checkpoint = first.prune_checkpoint.clone().expect("triggered");
+    let checkpoint = first.prune_checkpoint.expect("triggered");
 
     // Append turns; pass the checkpoint back in (as the loop does).
     items.push(assistant_calls("more", vec![read_call("late", "src/b.rs")]));

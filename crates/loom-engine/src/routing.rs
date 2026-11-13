@@ -50,11 +50,13 @@ pub struct RoutingConfig {
 }
 
 impl RoutingConfig {
+    #[must_use]
     /// Whether any tier is wired.
     pub fn active(&self) -> bool {
         self.easy.is_some() || self.hard.is_some()
     }
 
+    #[must_use]
     /// The model a tier maps to. Medium always maps to the run's own
     /// model, so the config stores nothing for it.
     pub fn model_for(&self, tier: Tier) -> Option<&str> {
@@ -67,11 +69,13 @@ impl RoutingConfig {
 }
 
 impl Tier {
+    #[must_use]
     /// Whether this tier is the run's own model.
     pub fn is_medium(self) -> bool {
         self == Tier::Medium
     }
 
+    #[must_use]
     /// The tier name as written in notices and traces.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -103,6 +107,7 @@ const TOOL_VERBS: [&str; 12] = [
     "update", "install",
 ];
 
+#[must_use]
 /// Classifies a task into a tier. Pure function of the text.
 pub fn classify(task: &str) -> Tier {
     let text = task.trim();

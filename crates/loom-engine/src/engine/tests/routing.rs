@@ -53,7 +53,7 @@ async fn routing_picks_the_tier_agent_and_surfaces_the_choice() {
             &mut session,
             "what does this repo do?",
             &sink,
-            &Default::default(),
+            &crate::TaskControl::default(),
         )
         .await
         .expect("easy task");
@@ -65,7 +65,9 @@ async fn routing_picks_the_tier_agent_and_surfaces_the_choice() {
         .rev()
         .find_map(|item| match item {
             loom_kernel::transcript::Item::Assistant(message) => Some(message.content.clone()),
-            _ => None,
+            loom_kernel::transcript::Item::User { .. }
+            | loom_kernel::transcript::Item::ToolResult(_)
+            | _ => None,
         })
         .unwrap_or_default();
     assert_eq!(last_assistant, "the cheap model answered");
@@ -82,7 +84,7 @@ async fn routing_picks_the_tier_agent_and_surfaces_the_choice() {
             &mut session,
             "Fix the failing timeout test in the runner",
             &sink,
-            &Default::default(),
+            &crate::TaskControl::default(),
         )
         .await
         .expect("medium task");
@@ -92,7 +94,9 @@ async fn routing_picks_the_tier_agent_and_surfaces_the_choice() {
         .rev()
         .find_map(|item| match item {
             loom_kernel::transcript::Item::Assistant(message) => Some(message.content.clone()),
-            _ => None,
+            loom_kernel::transcript::Item::User { .. }
+            | loom_kernel::transcript::Item::ToolResult(_)
+            | _ => None,
         })
         .unwrap_or_default();
     assert_eq!(last_assistant, "the run model answered");

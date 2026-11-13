@@ -9,6 +9,7 @@ use std::path::Path;
 /// with the id lowercased and `/`/`:` folded to `_`; on arm64 the
 /// local build (`swebench images build SWE-bench/swe-bench-tasks
 /// --dataset verified -i <id>`) produces exactly this tag.
+#[must_use]
 pub fn testbed_image(instance_id: &str) -> String {
     format!(
         "sweb.eval.x86_64.{}:latest",
@@ -23,6 +24,7 @@ pub fn testbed_image(instance_id: &str) -> String {
 /// the plain tag, so scoring needs a one-time
 /// `docker tag <testbed_image> <scored_image>` alias per instance —
 /// otherwise the harness tries to pull from Docker Hub and 404s.
+#[must_use]
 pub fn scored_image(instance_id: &str) -> String {
     format!(
         "swebench/sweb.eval.x86_64.{}:latest",
@@ -33,6 +35,7 @@ pub fn scored_image(instance_id: &str) -> String {
 /// Env vars that may carry the provider's API key, mirroring the
 /// engine's auth table (`loom-engine` `provider_env_names`). The first
 /// one set on the host is forwarded into the container.
+#[must_use]
 pub fn api_key_envs(provider: &str) -> Vec<String> {
     match provider {
         "deepseek" => vec!["DEEPSEEK_API_KEY".into()],
@@ -112,14 +115,14 @@ pub enum AgentKind {
     /// The staged loom binary (`CONTAINER_SCRIPT`).
     #[default]
     Loom,
-    /// mini-swe-agent from PyPI (`MINI_CONTAINER_SCRIPT`).
+    /// mini-swe-agent from `PyPI` (`MINI_CONTAINER_SCRIPT`).
     Mini,
 }
 
 /// The script for the [`AgentKind::Mini`] baseline arm. Same contract
 /// as [`CONTAINER_SCRIPT`]: env in, `patch.diff` + `run.err` out, the
 /// patch extracted even when the agent fails or times out — partial
-/// work still scores. The agent runs through litellm's OpenAI
+/// work still scores. The agent runs through `litellm`'s `OpenAI`
 /// provider, so the model becomes `openai/<name>` and the endpoint is
 /// `OPENAI_BASE_URL`/`OPENAI_API_BASE`; the key arrives as
 /// `OPENAI_API_KEY` (the runner renames the provider key to match).
@@ -129,7 +132,8 @@ pub enum AgentKind {
 /// and step limit ARE the baseline being measured.
 /// mini-swe-agent, run headless inside the testbed we already provide.
 ///
-/// Recipe per their v2 docs (docs/advanced/v2_migration.md, environments.md):
+/// Recipe per their v2 docs (`docs/advanced/v2_migration.md`,
+/// `environments.md`):
 /// `-c swebench.yaml` loads their published SWE-bench protocol (prompts,
 /// 250-step limit, tool-calling); `-c environment.environment_class=local`
 /// overrides their docker backend because this container IS the testbed
@@ -143,6 +147,7 @@ pub const MINI_CONTAINER_SCRIPT: &str = r#"python -m pip install -q mini-swe-age
 
 impl AgentKind {
     /// Parses the `--agent` flag value (`loom` / `mini`).
+    #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "loom" => Some(Self::Loom),
@@ -153,6 +158,7 @@ impl AgentKind {
 }
 
 /// The container script for an agent kind.
+#[must_use]
 pub fn container_script(agent: AgentKind) -> &'static str {
     match agent {
         AgentKind::Loom => CONTAINER_SCRIPT,
@@ -241,6 +247,7 @@ pub const RESERVED_CONTAINER_ENV: [&str; 7] = [
 /// `K=V` pairs, re-parsed by the in-container CLI's `--header` (which
 /// splits on the same delimiter). Pair values must therefore be
 /// comma-free — the eval runner's are (instance ids, attempt numbers).
+#[must_use]
 pub fn headers_env_value(pairs: &[(String, String)]) -> String {
     pairs
         .iter()
@@ -251,6 +258,15 @@ pub fn headers_env_value(pairs: &[(String, String)]) -> String {
 
 /// Assembles the `docker run` argv for one container run. Pure argv —
 /// no host shell — so paths and values survive verbatim.
+///
+/// # Panics
+///
+/// Panics (via `assert!`) when an [`ContainerSpec::extra_env`] name
+/// collides with [`RESERVED_CONTAINER_ENV`] or with
+/// [`ContainerSpec::api_key_env`]: a collision would silently shadow
+/// the run's own provider, model, or budget.
+#[must_use]
+#[allow(clippy::too_many_lines)] // linear assembly of the frozen docker argv; splitting would obscure the byte-exact invocation
 pub fn docker_run_argv(spec: &ContainerSpec<'_>) -> Vec<String> {
     for (name, _) in spec.extra_env {
         assert!(
@@ -377,6 +393,7 @@ fn api_key_envs_mirror_the_engine_auth_table() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // one exhaustive assertion over the frozen docker argv
 fn docker_argv_mounts_and_env_without_a_shell() {
     let spec = ContainerSpec {
         agent: AgentKind::Loom,

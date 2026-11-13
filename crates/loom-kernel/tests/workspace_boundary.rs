@@ -40,6 +40,10 @@
 //! cargo's cycle detection: a dev-dep cycle is legal to cargo and still an
 //! inversion here.
 
+// Integration tests are outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); panicking on a broken invariant is correct here.
+#![allow(clippy::panic)]
+
 use std::fs;
 use std::path::PathBuf;
 
@@ -81,10 +85,7 @@ fn workspace_deps(crate_name: &str) -> Vec<&'static str> {
         .map(str::trim_start)
         .filter(|line| line.starts_with("loom-"))
         .filter_map(|line| {
-            let name = line
-                .split_once(['=', ' '])
-                .map(|(name, _)| name)
-                .unwrap_or(line);
+            let name = line.split_once(['=', ' ']).map_or(line, |(name, _)| name);
             WORKSPACE_CRATES
                 .iter()
                 .copied()
@@ -99,12 +100,10 @@ fn assert_no_workspace_deps(crate_name: &str, allowed: &[&str]) {
 
     assert!(
         offenders.is_empty(),
-        "{crate_name} must not depend on {:?}; found {:?}. \
+        "{crate_name} must not depend on {allowed:?}; found {offenders:?}. \
          Dependencies point strictly downward (architecture §1). Where cargo \
          would also reject this as a cycle, the failure here is still the \
-         better one: it names the rule instead of a four-hop cycle path.",
-        allowed,
-        offenders
+         better one: it names the rule instead of a four-hop cycle path."
     );
 }
 

@@ -139,7 +139,10 @@ pub struct GroqProvider {
 impl GroqProvider {
     /// Creates a provider with a connection-pooled HTTP client.
     ///
-    /// Fails only when the TLS backend cannot be initialized.
+    /// # Errors
+    ///
+    /// Returns [`reqwest::Error`] when the TLS backend cannot be
+    /// initialized.
     pub fn new(config: GroqConfig) -> Result<Self, reqwest::Error> {
         let client = build_client(&config.timeouts)?;
         Ok(Self {
@@ -172,6 +175,7 @@ impl GroqProvider {
 /// single-language rows (`allam-2-7b`, `canopylabs/orpheus-*`) — none
 /// speak the chat-completions tool protocol this adapter needs, and a
 /// row that resolves would promise capabilities the model lacks.
+#[must_use]
 pub fn model_capabilities(model: &str) -> Option<ModelCapabilities> {
     let limits = match model {
         // gpt-oss: reasoning models with tools, but one call per turn
@@ -276,9 +280,8 @@ impl WireEndpoint for GroqProvider {
             401 | 403 => ModelErrorKind::Auth,
             402 | 429 => ModelErrorKind::RateLimited,
             408 => ModelErrorKind::Transport,
-            498 => ModelErrorKind::Overloaded,
+            498 | 503 => ModelErrorKind::Overloaded,
             499 => ModelErrorKind::Cancelled,
-            503 => ModelErrorKind::Overloaded,
             _ if status.is_client_error() => ModelErrorKind::InvalidRequest,
             _ => ModelErrorKind::Server,
         };

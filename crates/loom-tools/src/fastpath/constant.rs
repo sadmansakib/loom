@@ -9,7 +9,7 @@ pub(super) async fn apply_constant(
     workspace: &Path,
     policy: &CommandPolicy,
     name: &str,
-    from: &Option<Literal>,
+    from: Option<&Literal>,
     to: &Literal,
 ) -> Option<FastPathOutcome> {
     let files = rust_files(workspace);

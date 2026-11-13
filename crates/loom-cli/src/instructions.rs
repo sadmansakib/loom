@@ -12,6 +12,7 @@
 //! `EngineConfig` — a developer's global file cannot leak into the frozen
 //! suite.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 /// Byte bound for the global instructions body, matching the repository
@@ -55,11 +56,12 @@ pub(crate) fn load_global(path: &Path) -> Option<String> {
         boundary -= 1;
     }
     let mut body = String::from_utf8_lossy(&bytes[..boundary]).into_owned();
-    body.push_str(&format!(
+    let _ = write!(
+        body,
         "\n\n[global instructions truncated: first {} of {} bytes]\n",
         boundary,
         bytes.len()
-    ));
+    );
     Some(body)
 }
 

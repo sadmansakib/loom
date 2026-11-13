@@ -8,6 +8,9 @@
 //! reproduces the exact server behavior (one event, then silence, no
 //! EOF), with no tokens spent.
 
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use futures::StreamExt;
 use loom_kernel::model::{ModelError, ModelErrorKind, ModelProvider, ModelRequest};
 use loom_providers::{

@@ -72,6 +72,7 @@ impl ChannelEventSink {
     ///
     /// The channel is unbounded (ADR-004): a slow consumer delays events
     /// in memory instead of dropping them; only a closed receiver drops.
+    #[must_use]
     pub fn new() -> (Self, mpsc::UnboundedReceiver<EventEnvelope>) {
         let (sender, receiver) = mpsc::unbounded_channel();
         (
@@ -148,12 +149,14 @@ pub struct FanoutSink {
 
 impl FanoutSink {
     /// Creates an empty fan-out, which observes nothing.
+    #[must_use]
     pub fn new() -> Self {
         Self { sinks: Vec::new() }
     }
 
     /// Adds an owned child sink, chainable:
     /// `FanoutSink::new().with(renderer_sink).with(trace_sink)`.
+    #[must_use]
     pub fn with(mut self, sink: impl EventSink + 'static) -> Self {
         self.sinks.push(Arc::new(sink));
         self
@@ -162,6 +165,7 @@ impl FanoutSink {
     /// Adds a shared child sink, for callers that keep their own
     /// handle (e.g. to poll one consumer's drop count while the task
     /// runs).
+    #[must_use]
     pub fn with_shared(mut self, sink: Arc<dyn EventSink>) -> Self {
         self.sinks.push(sink);
         self

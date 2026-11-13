@@ -15,9 +15,8 @@ async fn open_async_resolves_the_credential_before_fetching() {
     // No cached catalog and no credential: the fetch path must reach
     // credential resolution (inside `catalog::load`) and report the
     // missing credential — never a network call in tests.
-    let error = match Engine::open_async(config).await {
-        Ok(_) => panic!("open succeeded without a credential"),
-        Err(error) => error,
+    let Err(error) = Engine::open_async(config).await else {
+        panic!("open succeeded without a credential")
     };
     assert!(
         matches!(
@@ -50,7 +49,7 @@ async fn open_with_skips_credential_resolution_for_an_overridden_provider() {
     let mut session = engine.new_session();
     let (sink, _receiver) = loom_kernel::event::ChannelEventSink::new();
     let summary = engine
-        .run_task(&mut session, "task", &sink, &Default::default())
+        .run_task(&mut session, "task", &sink, &crate::TaskControl::default())
         .await
         .expect("task runs on the overridden provider");
     assert_eq!(summary.turns, 1);
@@ -84,12 +83,14 @@ async fn a_provider_hook_wraps_whichever_provider_results() {
     let mut session = engine.new_session();
     let (sink, _receiver) = loom_kernel::event::ChannelEventSink::new();
     engine
-        .run_task(&mut session, "task", &sink, &Default::default())
+        .run_task(&mut session, "task", &sink, &crate::TaskControl::default())
         .await
         .expect("task runs on the hooked provider");
     let answer = session.transcript.iter().rev().find_map(|item| match item {
         loom_kernel::transcript::Item::Assistant(message) => Some(message.content.clone()),
-        _ => None,
+        loom_kernel::transcript::Item::User { .. }
+        | loom_kernel::transcript::Item::ToolResult(_)
+        | _ => None,
     });
     assert_eq!(answer.as_deref(), Some("hooked"));
 }

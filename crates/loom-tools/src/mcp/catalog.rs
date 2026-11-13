@@ -2,6 +2,7 @@
 //! `mcp_search_tools` (deterministic scoring) and `mcp_load_tools`
 //! (queueing onto the session surface).
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -46,15 +47,13 @@ impl McpCatalog {
 pub(super) fn one_liner(desc: &str) -> String {
     let clean = desc
         .strip_prefix(IMPERATIVE_WARNING)
-        .map(str::trim_start)
-        .unwrap_or(desc);
+        .map_or(desc, str::trim_start);
     let sentence_end = clean.find(". ").map(|index| index + 1);
     let cut = sentence_end.unwrap_or(clean.len()).min(
         clean
             .char_indices()
             .nth(80)
-            .map(|(index, _)| index)
-            .unwrap_or(clean.len()),
+            .map_or(clean.len(), |(index, _)| index),
     );
     clean[..cut].trim_end().to_owned()
 }
@@ -70,13 +69,14 @@ pub(super) fn render_menu(entries: &[McpCatalogEntry]) -> String {
     );
     for (shown, entry) in entries.iter().enumerate() {
         if shown == MENU_MAX_ENTRIES {
-            out.push_str(&format!(
+            let _ = write!(
+                out,
                 "\n+ {} more tools; use mcp_search_tools to see them",
                 entries.len() - shown
-            ));
+            );
             break;
         }
-        out.push_str(&format!("\n{} — {}", entry.model_name, entry.one_liner));
+        let _ = write!(out, "\n{} — {}", entry.model_name, entry.one_liner);
     }
     out
 }
@@ -111,17 +111,14 @@ fn score_entry(entry: &McpCatalogEntry, words: &[String], query: &str) -> u32 {
     if score == 0 {
         // Subsequence: every query character appears in name order.
         let mut cursor = 0;
-        let matched = query
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .all(|c| {
-                if let Some(found) = name[cursor..].find(c) {
-                    cursor += found + c.len_utf8();
-                    true
-                } else {
-                    false
-                }
-            });
+        let matched = query.chars().filter(char::is_ascii_alphanumeric).all(|c| {
+            if let Some(found) = name[cursor..].find(c) {
+                cursor += found + c.len_utf8();
+                true
+            } else {
+                false
+            }
+        });
         if matched {
             score = 1;
         }
@@ -213,7 +210,7 @@ impl Tool for McpSearchTools {
                 scored.len().min(limit)
             );
             for (_, entry) in scored.iter().take(limit) {
-                out.push_str(&format!("\n{} — {}", entry.model_name, entry.one_liner));
+                let _ = write!(out, "\n{} — {}", entry.model_name, entry.one_liner);
             }
             Ok(ToolOutput::new(out))
         })
@@ -309,10 +306,7 @@ impl Tool for McpLoadTools {
                 loaded.join(", ")
             );
             if !skipped.is_empty() {
-                out.push_str(&format!(
-                    " Already loaded (skipped): {}.",
-                    skipped.join(", ")
-                ));
+                let _ = write!(out, " Already loaded (skipped): {}.", skipped.join(", "));
             }
             Ok(ToolOutput::new(out))
         })

@@ -54,7 +54,7 @@ pub(super) fn apply_stubs(
         let Some(reason) = by_call.get(result.call_id.as_str()) else {
             continue;
         };
-        result.content = reason.stub_text().to_owned();
+        reason.stub_text().clone_into(&mut result.content);
         result.truncated = false;
         rewritten.push(result.call_id.as_str().to_owned());
     }
@@ -85,7 +85,7 @@ pub(super) fn stubbed_session(session: &Session, decisions: &DecisionSet) -> Ses
                 let Some(reason) = by_call.get(result.call_id.as_str()) else {
                     continue;
                 };
-                result.content = reason.stub_text().to_owned();
+                reason.stub_text().clone_into(&mut result.content);
                 result.truncated = false;
             }
             Item::Assistant(assistant) => {
@@ -106,7 +106,7 @@ pub(super) fn stubbed_session(session: &Session, decisions: &DecisionSet) -> Ses
             }
             Item::User { text } => {
                 if decisions.elided_users.contains(&user_ordinal) {
-                    *text = StubReason::ElidedUser.stub_text().to_owned();
+                    StubReason::ElidedUser.stub_text().clone_into(text);
                 }
                 user_ordinal += 1;
             }
@@ -164,11 +164,11 @@ pub(super) fn apply_elisions(
             }
             Message::User { text } => {
                 if elided_users.contains(&user_ordinal) {
-                    *text = StubReason::ElidedUser.stub_text().to_owned();
+                    StubReason::ElidedUser.stub_text().clone_into(text);
                 }
                 user_ordinal += 1;
             }
-            _ => {}
+            Message::System { .. } | Message::ToolResult(_) => {}
         }
     }
 }

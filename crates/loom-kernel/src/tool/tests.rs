@@ -82,7 +82,7 @@ fn before_images_round_trip_and_default_for_old_transcripts() {
     let reference = ArtifactRef::new(ArtifactId::new(), "pre_image", 12, "deadbeefdeadbeef");
     let effects = ToolEffects::none()
         .with_file_written("a.rs")
-        .with_before_image(BeforeImage::captured("a.rs", reference.clone()))
+        .with_before_image(BeforeImage::captured("a.rs", reference))
         .with_before_image(BeforeImage::absent("b.txt"));
     let round: ToolEffects =
         serde_json::from_value(serde_json::to_value(&effects).expect("serialize"))

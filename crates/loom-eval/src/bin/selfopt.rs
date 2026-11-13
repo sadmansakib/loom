@@ -29,9 +29,10 @@
 // Terminal output is this harness's product; the workspace-wide
 // `clippy::print_stdout`/`print_stderr` denies target library crates.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -44,8 +45,13 @@ use loom_eval::selfopt::{
     Proposal, ProposalClass, RunStat,
 };
 use loom_eval::swebench::{
-    self, AgentKind, ContainerSpec, api_key_envs, docker_run_argv, testbed_image,
+    self, AgentKind, ContainerSpec, RunUsage, api_key_envs, docker_run_argv, testbed_image,
 };
+
+// Probe retry policy: the sweep applies the same rate-limit retry, and a
+// 429-killed probe is infrastructure, not a proposal's fault.
+const MAX_PROBE_ATTEMPTS: usize = 3;
+const RATE_LIMIT_COOLDOWN_SECS: u64 = 120;
 
 struct Args {
     eval_dir: PathBuf,
@@ -116,8 +122,7 @@ The API key comes from the provider's env var (e.g. DEEPSEEK_API_KEY)."
 fn parse_args() -> Args {
     let mut args = Args {
         eval_dir: std::env::var("LOOM_EVAL_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("target/eval")),
+            .map_or_else(|_| PathBuf::from("target/eval"), PathBuf::from),
         sweep: None,
         provider: None,
         model: None,
@@ -197,6 +202,10 @@ fn resolve_api_key(provider: &str) -> (String, String) {
 
 /// One model-proposer call: one-shot through the same validated
 /// adapter construction the engine uses.
+// The allow covers the whole function because clippy resolves
+// `wildcard_enum_match_arm` at the match, not per-arm: `ModelEvent`
+// is `#[non_exhaustive]` and future variants carry no prompt text.
+#[allow(clippy::wildcard_enum_match_arm)]
 fn model_proposals(
     provider: &str,
     model: &str,
@@ -234,12 +243,13 @@ fn model_proposals(
         while let Some(event) = stream.next().await {
             match event.map_err(|error| format!("model stream: {error}"))? {
                 ModelEvent::TextDelta(delta) => text.push_str(&delta),
-                ModelEvent::ReasoningDelta(_) => {}
+                // Completed is terminal and authoritative; deltas are the
+                // fallback when a provider sends no body.
                 ModelEvent::Completed(response) if response.message.content.len() > text.len() => {
-                    // Completed is terminal and authoritative; deltas
-                    // are the fallback when a provider sends no body.
                     text = response.message.content;
                 }
+                // `ModelEvent` is `#[non_exhaustive]`: reasoning deltas and
+                // non-authoritative completions carry nothing for the prompt.
                 _ => {}
             }
         }
@@ -287,9 +297,7 @@ fn probe_run(
         .iter()
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect();
-    const MAX_ATTEMPTS: usize = 3;
-    const RATE_LIMIT_COOLDOWN_SECS: u64 = 120;
-    for attempt in 1..=MAX_ATTEMPTS {
+    for attempt in 1..=MAX_PROBE_ATTEMPTS {
         let spec = ContainerSpec {
             agent: AgentKind::Loom,
             script_override: None,
@@ -322,7 +330,7 @@ fn probe_run(
         let (events, task_failed) = swebench::run_outcome(&run_json);
         if let Some(reason) = &task_failed
             && reason.contains("rate_limited")
-            && attempt < MAX_ATTEMPTS
+            && attempt < MAX_PROBE_ATTEMPTS
         {
             println!("  rate-limited; cooling down {RATE_LIMIT_COOLDOWN_SECS}s…");
             std::thread::sleep(std::time::Duration::from_secs(RATE_LIMIT_COOLDOWN_SECS));
@@ -349,7 +357,7 @@ fn failed_stat(instance: &str, run: u64, reason: &str) -> RunStat {
         run,
         events: 0,
         turns: 0,
-        usage: Default::default(),
+        usage: RunUsage::default(),
         task_failed: Some(reason.to_owned()),
     }
 }
@@ -407,6 +415,7 @@ fn probe_proposal(
     stats
 }
 
+#[allow(clippy::too_many_lines)] // one linear sweep → probe → adopt → report pipeline
 fn main() {
     let args = parse_args();
     let base = args.eval_dir.join("swebench");
@@ -712,19 +721,18 @@ fn main() {
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_else(|_| "0".to_owned());
+        .map_or_else(|_| "0".to_owned(), |d| d.as_secs().to_string());
     let entry = LedgerEntry {
         timestamp: timestamp.clone(),
         sweep: sweep_path.display().to_string(),
         provider: provider.clone(),
         model: model.clone(),
-        base_overlay: base_overlay.clone(),
+        base_overlay,
         proposals: proposals.clone(),
         decisions: decisions.clone(),
         adopted: adopted.iter().map(|p| p.label.clone()).collect(),
         promoted: promoted_labels.clone(),
-        merged: merged.clone(),
+        merged,
         lessons: new_lessons.clone(),
     };
     opt::append_ledger(&ledger_path, &entry)
@@ -733,12 +741,13 @@ fn main() {
     // Report: markdown next to the sweep artifacts, with the export
     // lines a later sweep would set.
     let mut report = String::new();
-    report.push_str(&format!(
+    let _ = writeln!(
+        report,
         "# selfopt report {timestamp}\n\nBaseline: `{}` ({provider}/{model}, {} instance(s), {} run(s)). Adoption gate: median input tokens −{ADOPT_MIN_TOKEN_IMPROVEMENT_PERCENT}% minimum, events not regressed, no new failures.\n\n## probes\n\n| proposal | origin | class | verdict | evidence |\n|---|---|---|---|---|\n",
         sweep_path.display(),
         instances.len(),
         baseline_runs.len(),
-    ));
+    );
     for (index, decision) in decisions.iter().enumerate() {
         let proposal = &proposals[index];
         let verdict = if decision.adopted {
@@ -748,54 +757,55 @@ fn main() {
         } else {
             "reject"
         };
-        report.push_str(&format!(
-            "| `{}` | {} | {:?} | {verdict} | {} |\n",
+        let _ = writeln!(
+            report,
+            "| `{}` | {} | {:?} | {verdict} | {} |",
             decision.label, proposal.origin, proposal.class, decision.reason,
-        ));
+        );
     }
     if !frontier.is_empty() {
         report.push_str("\n## tiers (Pareto frontier over input/events/failures)\n\n| overlay | input | events | failures | frontier |\n|---|---|---|---|---|\n");
         for decision in decisions.iter().filter(|d| d.adopted) {
             let on = frontier.contains(&decision.label);
-            report.push_str(&format!(
-                "| `{}` | {:+.1}% | {:+.1}% | {} | {} |\n",
+            let _ = writeln!(
+                report,
+                "| `{}` | {:+.1}% | {:+.1}% | {} | {} |",
                 decision.label,
                 decision.input_improvement_pct,
                 decision.events_improvement_pct,
                 decision.probe_failures,
                 if on { "yes" } else { "dominated" },
-            ));
+            );
         }
         report.push_str("\n`--tier` exports one verified point: lite = best single overlay, heavy = the re-probed merge.\n");
     }
     if !promoted_labels.is_empty() {
         report.push_str("\n## promoted, not deployed\n\n");
         for decision in decisions.iter().filter(|d| d.promoted) {
-            report.push_str(&format!(
-                "- **{}** — input and failure gates passed; the events trade blocked deployment ({})\n",
+            let _ = writeln!(
+                report,
+                "- **{}** — input and failure gates passed; the events trade blocked deployment ({})",
                 decision.label, decision.reason
-            ));
+            );
         }
     }
-    if !exported.is_empty() {
-        report.push_str(&format!(
-            "\n## exported overlay ({} tier)\n\n```sh\n",
+    if exported.is_empty() {
+        report.push_str("\nNo overlay adopted; the shipped defaults stand.\n");
+    } else {
+        let _ = writeln!(
+            report,
+            "\n## exported overlay ({} tier)\n\n```sh",
             args.tier
-        ));
+        );
         for (env, value) in &exported {
-            report.push_str(&format!("export {env}={value}\n"));
+            let _ = writeln!(report, "export {env}={value}");
         }
         report.push_str("```\n");
-    } else {
-        report.push_str("\nNo overlay adopted; the shipped defaults stand.\n");
     }
     if !new_lessons.is_empty() {
         report.push_str("\n## lessons (contrast-supported)\n\n");
         for lesson in &new_lessons {
-            report.push_str(&format!(
-                "- **{}** — {}\n",
-                lesson.statement, lesson.evidence
-            ));
+            let _ = writeln!(report, "- **{}** — {}", lesson.statement, lesson.evidence);
         }
     }
     let report_path = base.join(format!("selfopt-report-{timestamp}.md"));

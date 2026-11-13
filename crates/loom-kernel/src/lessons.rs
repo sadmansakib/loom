@@ -59,7 +59,7 @@ pub const MAX_LESSONS: usize = 16;
 pub struct MinedLesson {
     /// Tool the pattern was observed on (e.g. `edit_file`).
     pub tool: String,
-    /// Failure kind the pattern keyed on (serde snake_case of
+    /// Failure kind the pattern keyed on (serde `snake_case` of
     /// [`ToolFailure`], e.g. `invalid_input`).
     pub failure: String,
     /// Short procedural rule, templated from the failure kind — never
@@ -160,7 +160,7 @@ pub fn mine_lessons(sessions: &[Session]) -> Vec<MinedLesson> {
                     match &result.status {
                         ToolStatus::Success => results.push(((*tool).to_owned(), Ok(()))),
                         ToolStatus::Error(failure) => {
-                            results.push(((*tool).to_owned(), Err(*failure)))
+                            results.push(((*tool).to_owned(), Err(*failure)));
                         }
                         ToolStatus::Cancelled { .. } => {}
                     }
@@ -203,7 +203,7 @@ pub fn mine_lessons(sessions: &[Session]) -> Vec<MinedLesson> {
         .collect()
 }
 
-/// The snake_case name [`ToolFailure`] serializes to — the failure key
+/// The `snake_case` name [`ToolFailure`] serializes to — the failure key
 /// stored on disk, so the facts seam can re-validate it without the enum.
 #[must_use]
 pub fn failure_name(failure: ToolFailure) -> &'static str {
@@ -304,7 +304,7 @@ mod tests {
         )
     }
 
-    fn session_with(tools: Vec<(&str, ToolStatus)>) -> Session {
+    fn session_with(tools: &[(&str, ToolStatus)]) -> Session {
         // One assistant turn per call keeps call/result pairs explicit.
         let mut transcript = Vec::new();
         for (index, (tool, status)) in tools.iter().enumerate() {
@@ -335,7 +335,7 @@ mod tests {
     fn qualifying_sessions() -> Vec<Session> {
         (0..3)
             .map(|_| {
-                session_with(vec![
+                session_with(&[
                     ("edit_file", err(ToolFailure::InvalidInput)),
                     ("edit_file", ToolStatus::Success),
                 ])
@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn single_session_or_single_occurrence_does_not_mine() {
         // One session only: sessions threshold fails.
-        let one = vec![session_with(vec![
+        let one = vec![session_with(&[
             ("edit_file", err(ToolFailure::InvalidInput)),
             ("edit_file", ToolStatus::Success),
         ])];
@@ -371,7 +371,7 @@ mod tests {
         // Three failures but none recovered within the window.
         let unrecovered: Vec<Session> = (0..3)
             .map(|_| {
-                session_with(vec![
+                session_with(&[
                     ("edit_file", err(ToolFailure::InvalidInput)),
                     ("read_file", ToolStatus::Success),
                 ])
@@ -388,7 +388,7 @@ mod tests {
             tools.push(("read_file", ToolStatus::Success));
         }
         tools.push(("edit_file", ToolStatus::Success));
-        let sessions = vec![session_with(tools.clone()), session_with(tools)];
+        let sessions = vec![session_with(&tools), session_with(&tools)];
         let lessons = mine_lessons(&sessions);
         assert!(
             lessons.is_empty(),
@@ -401,7 +401,7 @@ mod tests {
         let mut sessions = qualifying_sessions();
         // Three read_file timeout sessions, for the second qualifying pattern.
         for _ in 0..3 {
-            sessions.push(session_with(vec![
+            sessions.push(session_with(&[
                 ("read_file", err(ToolFailure::Timeout)),
                 ("read_file", ToolStatus::Success),
             ]));
@@ -462,7 +462,7 @@ mod tests {
         dead.sessions = MIN_SESSIONS - 1;
         assert!(!dead.is_live());
         // Recoveries cannot exceed occurrences.
-        dead = lesson.clone();
+        dead = lesson;
         dead.recoveries = dead.occurrences + 1;
         assert!(!dead.is_live());
     }
@@ -470,15 +470,15 @@ mod tests {
     #[test]
     fn cancelled_calls_never_count() {
         let sessions = vec![
-            session_with(vec![
+            session_with(&[
                 ("edit_file", err(ToolFailure::InvalidInput)),
                 ("edit_file", ToolStatus::Cancelled { started: true }),
             ]),
-            session_with(vec![
+            session_with(&[
                 ("edit_file", err(ToolFailure::InvalidInput)),
                 ("edit_file", ToolStatus::Cancelled { started: false }),
             ]),
-            session_with(vec![
+            session_with(&[
                 ("edit_file", err(ToolFailure::InvalidInput)),
                 ("edit_file", ToolStatus::Cancelled { started: true }),
             ]),

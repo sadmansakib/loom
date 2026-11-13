@@ -51,6 +51,7 @@ impl ScoutConfig {
         }
     }
 
+    #[must_use]
     /// Sets the cascade/cross-check escalation target (builder).
     pub fn with_escalation(
         mut self,

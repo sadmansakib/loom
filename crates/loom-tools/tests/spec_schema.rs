@@ -5,7 +5,9 @@
 //! cannot ship a schema that is not a closed, fully described object. The
 //! schema↔parser agreement itself is checked next to each private input
 //! struct (`crate::schema::agreement`), where the parser is reachable.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use loom_kernel::tool::Tool;
 use serde_json::Value;

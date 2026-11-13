@@ -70,6 +70,7 @@ impl<'a> PersistingEventSink<'a> {
     }
 
     /// Events whose persistence failed so far.
+    #[must_use]
     pub fn persist_failures(&self) -> u64 {
         self.state.persist_failures.load(Ordering::Relaxed)
     }

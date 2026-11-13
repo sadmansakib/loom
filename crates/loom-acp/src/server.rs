@@ -237,11 +237,10 @@ async fn handle_load_session(
     };
     // `None` covers both "persistence off" and "no such id" — same
     // answer either way: the client named something we cannot resume.
-    let session = match engine.load_session(&kernel) {
-        Ok(Some(session)) => session,
-        _ => {
-            return responder.respond_with_error(Error::invalid_request().data("unknown session"));
-        }
+    // `None` covers both "persistence off" and "no such id" — same
+    // answer either way: the client named something we cannot resume.
+    let Ok(Some(session)) = engine.load_session(&kernel) else {
+        return responder.respond_with_error(Error::invalid_request().data("unknown session"));
     };
     let core = Arc::new(AsyncMutex::new(SessionCore {
         engine: Arc::new(engine),
@@ -255,6 +254,8 @@ async fn handle_load_session(
 
 /// `session/prompt`: run one task to completion, forwarding updates,
 /// then answer with the mapped stop reason.
+const UPDATE_BUFFER: usize = 128;
+
 async fn handle_prompt(
     request: acp::PromptRequest,
     responder: agent_client_protocol::v1::Responder<acp::PromptResponse>,
@@ -264,7 +265,6 @@ async fn handle_prompt(
     _active_prompt: ActivePrompt,
 ) -> Result<(), Error> {
     let prompt = prompt_text(&request.prompt);
-    const UPDATE_BUFFER: usize = 128;
     let (tx, mut rx) = mpsc::channel(UPDATE_BUFFER);
     let sink = SessionUpdateSink {
         tx,

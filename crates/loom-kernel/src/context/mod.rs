@@ -116,6 +116,11 @@ impl ContextBudget {
     /// compiler may use `max_input_tokens = max_context_tokens −
     /// reserved_output_tokens` of it (§8). Underflow (a reservation larger
     /// than the window) is a caller error, so it is rejected loudly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] when `reserved_output_tokens` exceeds
+    /// `max_context_tokens` (underflow).
     pub fn from_window(
         max_context_tokens: u32,
         reserved_output_tokens: u32,

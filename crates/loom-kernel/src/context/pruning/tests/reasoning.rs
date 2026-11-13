@@ -37,7 +37,7 @@ fn projected_reasoning_lens(request: &crate::model::ModelRequest) -> Vec<Option<
             Message::Assistant(assistant) => {
                 Some(assistant.reasoning.as_ref().map(|trace| trace.text.len()))
             }
-            _ => None,
+            Message::System { .. } | Message::User { .. } | Message::ToolResult(_) => None,
         })
         .collect()
 }
@@ -81,7 +81,7 @@ fn aged_reasoning_is_elided_when_enabled() {
 }
 
 /// The default keeps every reasoning trace — replaying reasoning is
-/// a provider contract on the OpenAI wire, so the kernel default
+/// a provider contract on the `OpenAI` wire, so the kernel default
 /// is off and only the engine's provider gate opts in.
 #[test]
 fn reasoning_elision_is_off_by_default() {

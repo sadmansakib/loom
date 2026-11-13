@@ -49,7 +49,7 @@ impl Agent {
         budget: ContextBudget,
         capabilities: &ModelCapabilities,
         facts: &crate::context::KnownFacts,
-        prune_checkpoint: &Option<PruneCheckpoint>,
+        prune_checkpoint: Option<&PruneCheckpoint>,
         turn_tools: &ToolRegistry,
     ) -> Result<CompiledContext, TaskError> {
         let task = session
@@ -67,9 +67,9 @@ impl Agent {
                 model: &self.model,
                 config: &self.config,
                 facts,
-                prune_checkpoint: prune_checkpoint.as_ref(),
+                prune_checkpoint,
             })
-            .map_err(|error| error.into())
+            .map_err(std::convert::Into::into)
     }
 
     /// The single atomic commit point of a turn (§6.1): the assistant item

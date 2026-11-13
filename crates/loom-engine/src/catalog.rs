@@ -10,7 +10,7 @@
 //! frontend that already holds a snapshot can pass it in
 //! [`EngineConfig::catalog`] and use [`Engine::open`].
 //!
-//! [`load`] serves the OpenRouter adapter; [`load_custom`] serves the
+//! [`load`] serves the `OpenRouter` adapter; [`load_custom`] serves the
 //! `custom` adapter, whose cache is keyed to the models URL it was
 //! fetched from (see [`is_custom_fresh`]) so switching endpoints never
 //! serves another gateway's model list.
@@ -61,6 +61,7 @@ where
     unreachable!("the loop returns on its final attempt")
 }
 
+#[must_use]
 /// The cache file beside the database.
 ///
 /// Kept next to `loom.db` so all durable state lives in one directory the
@@ -69,6 +70,7 @@ pub fn catalog_path(db_path: &Path) -> PathBuf {
     db_path.with_file_name("openrouter-models.json")
 }
 
+#[must_use]
 /// The `custom` adapter's cache file beside the database, one per provider
 /// name (`custom`, or a name from the provider registry) so multiple named
 /// gateways do not evict each other's catalogs.
@@ -82,6 +84,13 @@ pub fn custom_catalog_path(db_path: &Path, provider: &str) -> PathBuf {
 /// credential is resolved through the engine's account store (the same
 /// implementation the provider uses) and the catalog is fetched. A fetch
 /// failure falls back to a stale cache when one exists.
+///
+/// # Errors
+///
+/// Returns [`EngineError`] when no cache is usable: the account store
+/// cannot open or the credential cannot resolve ([`EngineError::Store`],
+/// [`EngineError::Auth`]), or the catalog fetch fails
+/// ([`EngineError::Provider`]).
 pub async fn load(
     db_path: &Path,
     provider: &str,
@@ -152,6 +161,12 @@ fn is_fresh(catalog: &OpenRouterCatalog, now: u64) -> bool {
 /// stays `Send`: the store wraps a sqlite connection that is not
 /// `Sync`, and an async fn captures its parameters for the whole
 /// body.
+///
+/// # Errors
+///
+/// Returns [`EngineError`] under the same conditions as
+/// [`load`]: store/credential failures and a failing models fetch
+/// with no usable cache.
 pub async fn load_custom(
     db_path: &Path,
     provider: &str,

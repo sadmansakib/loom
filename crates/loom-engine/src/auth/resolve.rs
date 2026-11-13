@@ -17,6 +17,7 @@ pub enum CredentialSource {
 }
 
 impl CredentialSource {
+    #[must_use]
     /// Stable token for tracing (`credential.source`).
     pub fn as_str(self) -> &'static str {
         match self {
@@ -41,6 +42,15 @@ pub struct ResolvedCredential {
 ///
 /// `requested` is the optional `--account` label/id. `get_env` is injected so
 /// resolution is testable without touching the process environment.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Store`] when the account store cannot be read,
+/// [`AuthError::NoCredential`] when no environment variable is set,
+/// [`AuthError::NoAccount`] when `requested` names a missing account,
+/// and [`AuthError::MissingSecret`], [`AuthError::Command`], or
+/// [`AuthError::CommandTimeout`] when secret retrieval or validation
+/// fails.
 pub fn resolve(
     store: &dyn AuthStore,
     secrets: &dyn SecretBackend,

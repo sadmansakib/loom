@@ -36,12 +36,22 @@ pub trait EventStore: Send + Sync {
     /// The session must already exist ([`SessionStore::ensure_session`](super::SessionStore::ensure_session));
     /// durable implementations reject an unknown session the same way
     /// [`SessionStore::append_item`](super::SessionStore::append_item) does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the backend cannot append the
+    /// envelope (including an unknown session).
     fn append_event(&self, session: &SessionId, envelope: &EventEnvelope)
     -> Result<(), StoreError>;
 
     /// Loads a session's event stream in write order; empty when the
     /// session never persisted events (every session predating this
     /// seam, and any run whose persistence was off).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the backend cannot read the event
+    /// stream.
     fn load_events(&self, session: &SessionId) -> Result<Vec<EventEnvelope>, StoreError>;
 }
 

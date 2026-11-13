@@ -2,6 +2,8 @@
 
 use super::*;
 
+use loom_kernel::store::EventStore;
+
 #[tokio::test]
 async fn a_persisted_run_also_persists_its_event_stream() {
     let base = tempfile::tempdir().expect("tempdir");
@@ -28,7 +30,7 @@ async fn a_persisted_run_also_persists_its_event_stream() {
             &mut session,
             "Say hello and stop.",
             &sink,
-            &Default::default(),
+            &crate::TaskControl::default(),
         )
         .await
         .expect("task");
@@ -38,10 +40,11 @@ async fn a_persisted_run_also_persists_its_event_stream() {
     // The durable stream carries the same run: task lifecycle,
     // authoritative completion, and the engine's idle marker, in
     // emission order with contiguous per-run sequences.
-    use loom_kernel::store::EventStore;
     let store = loom_store::SqliteStore::open(base.path().join("loom.db")).expect("store");
     let events = store.load_events(&session.id).expect("events");
     assert!(events.len() >= 4, "expected a full stream, got {events:?}");
+    // EventKind is #[non_exhaustive]; unlisted kinds are filler here
+    #[allow(clippy::wildcard_enum_match_arm)]
     let kinds: Vec<&str> = events
         .iter()
         .map(|event| match &event.kind {
@@ -87,7 +90,12 @@ async fn a_second_writer_cannot_drive_a_leased_session() {
     let (sink, _receiver) = loom_kernel::event::ChannelEventSink::new();
     let mut session = engine.new_session();
     engine
-        .run_task(&mut session, "Say hello.", &sink, &Default::default())
+        .run_task(
+            &mut session,
+            "Say hello.",
+            &sink,
+            &crate::TaskControl::default(),
+        )
         .await
         .expect("first task");
 
@@ -101,10 +109,17 @@ async fn a_second_writer_cannot_drive_a_leased_session() {
     assert_eq!(lease.owner(), "another-process");
 
     let continuation = engine
-        .continue_session(&session.id, "Interloper.", &sink, &Default::default())
+        .continue_session(
+            &session.id,
+            "Interloper.",
+            &sink,
+            &crate::TaskControl::default(),
+        )
         .await
         .expect("continue returns the outcome, not an error");
     let error = continuation.outcome.expect_err("leased session refuses");
+    // TaskError is #[non_exhaustive]; any other variant is a test failure here
+    #[allow(clippy::wildcard_enum_match_arm)]
     match &error {
         loom_kernel::agent::TaskError::SessionLeased { owner, .. } => {
             assert_eq!(owner, "another-process");
@@ -131,7 +146,12 @@ async fn a_second_writer_cannot_drive_a_leased_session() {
             .expect("release")
     );
     engine
-        .continue_session(&session.id, "Back for real.", &sink, &Default::default())
+        .continue_session(
+            &session.id,
+            "Back for real.",
+            &sink,
+            &crate::TaskControl::default(),
+        )
         .await
         .expect("continue")
         .outcome
@@ -160,11 +180,21 @@ async fn capability_resolution_surfaces_once_per_engine() {
     let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
     let mut session = engine.new_session();
     engine
-        .run_task(&mut session, "Say hello.", &sink, &Default::default())
+        .run_task(
+            &mut session,
+            "Say hello.",
+            &sink,
+            &crate::TaskControl::default(),
+        )
         .await
         .expect("first task");
     engine
-        .run_task(&mut session, "Say it again.", &sink, &Default::default())
+        .run_task(
+            &mut session,
+            "Say it again.",
+            &sink,
+            &crate::TaskControl::default(),
+        )
         .await
         .expect("second task");
 
@@ -193,14 +223,19 @@ async fn continue_session_resumes_a_persisted_session() {
             &mut session,
             "do the first thing",
             &sink,
-            &Default::default(),
+            &crate::TaskControl::default(),
         )
         .await
         .expect("first task");
 
     // Resume through the first-class flow: the id alone must suffice.
     let continuation = engine
-        .continue_session(&session.id, "now the second", &sink, &Default::default())
+        .continue_session(
+            &session.id,
+            "now the second",
+            &sink,
+            &crate::TaskControl::default(),
+        )
         .await
         .expect("continue");
 
@@ -244,7 +279,12 @@ async fn recorder_observes_the_engine_lifecycle_through_a_fanout() {
     let mut session = engine.new_session();
 
     engine
-        .run_task(&mut session, "anything", &sink, &Default::default())
+        .run_task(
+            &mut session,
+            "anything",
+            &sink,
+            &crate::TaskControl::default(),
+        )
         .await
         .expect("task completes");
 
@@ -268,7 +308,12 @@ async fn continue_session_reports_unknown_ids() {
     )]));
     let (sink, _receiver) = loom_kernel::event::ChannelEventSink::new();
     let error = engine
-        .continue_session(&SessionId::new(), "anything", &sink, &Default::default())
+        .continue_session(
+            &SessionId::new(),
+            "anything",
+            &sink,
+            &crate::TaskControl::default(),
+        )
         .await
         .unwrap_err();
     assert!(matches!(error, EngineError::SessionNotFound { .. }));
@@ -285,12 +330,12 @@ async fn continue_session_returns_the_advanced_session_on_task_failure() {
     let mut session = engine.new_session();
     let (sink, _receiver) = loom_kernel::event::ChannelEventSink::new();
     engine
-        .run_task(&mut session, "first", &sink, &Default::default())
+        .run_task(&mut session, "first", &sink, &crate::TaskControl::default())
         .await
         .expect("first task");
 
     let continuation = engine
-        .continue_session(&session.id, "second", &sink, &Default::default())
+        .continue_session(&session.id, "second", &sink, &crate::TaskControl::default())
         .await
         .expect("continuation is not a load error");
 

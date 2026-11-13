@@ -144,6 +144,8 @@ pub(super) async fn run_rollout(
     let mut nudges = 0u64;
     let mut failed_end = 0u64;
     while let Ok(envelope) = receiver.try_recv() {
+        // EventKind is #[non_exhaustive]; uninteresting future kinds stay ignored
+        #[allow(clippy::wildcard_enum_match_arm)]
         match envelope.kind {
             EventKind::LoopNudge { .. } => nudges += 1,
             EventKind::TaskFailed { .. } => failed_end += 1,

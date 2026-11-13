@@ -79,8 +79,8 @@ pub(crate) trait WireEndpoint: Clone + Send + Sync + 'static {
     /// [`WireUsage`](crate::openai_wire::WireUsage) do not claim).
     ///
     /// Defaults to none — an adapter whose usage block sticks to the
-    /// standard shapes (GLM) adds no code. DeepSeek overrides for
-    /// `prompt_cache_hit_tokens`, OpenRouter for `cost`.
+    /// standard shapes (GLM) adds no code. `DeepSeek` overrides for
+    /// `prompt_cache_hit_tokens`, `OpenRouter` for `cost`.
     fn dialect_usage(
         _extra: &serde_json::Map<String, serde_json::Value>,
     ) -> crate::openai_wire::DialectUsage {
@@ -400,6 +400,10 @@ fn ingest_chunk(
 /// One unfold step: `Ok((None, next))` transitions without emitting,
 /// `Ok((Some(event), next))` emits, `Err` ends the stream with a
 /// failure after which the state is `Done`.
+// Deliberately linear: each state arm owns one full transition and
+// the shared locals (decoder, accumulator, pending queue) stay in one
+// scope; splitting an arm would scatter the machine's invariants.
+#[allow(clippy::too_many_lines)]
 async fn step<P: WireEndpoint>(
     state: State<P>,
 ) -> Option<(Result<Option<ModelEvent>, ModelError>, State<P>)> {

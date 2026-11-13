@@ -65,7 +65,6 @@ pub(crate) fn compute_signature(workspace: &Path, reads: &[String]) -> Option<Ve
                     hash: Some(hash_file(&full).ok()?),
                 });
             }
-            Ok(_) => return None,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 signature.push(FileSignature {
                     relative: relative.clone(),
@@ -74,7 +73,10 @@ pub(crate) fn compute_signature(workspace: &Path, reads: &[String]) -> Option<Ve
                     hash: None,
                 });
             }
-            Err(_) => return None,
+            // Ok/Err patterns are disjoint, so ordering against the
+            // NotFound arm above is irrelevant; any other outcome
+            // (unreadable, wrong kind) invalidates the entry.
+            Ok(_) | Err(_) => return None,
         }
     }
     Some(signature)
@@ -162,15 +164,15 @@ impl ToolCache {
         &mut self,
         tool: &str,
         args: &Value,
-        current: Option<Vec<FileSignature>>,
+        current: Option<&[FileSignature]>,
     ) -> Option<(ToolOutput, String)> {
         let key = (tool.to_owned(), args.to_string());
         if !self.entries.contains_key(&key) {
             self.misses += 1;
             return None;
         }
-        let hit = match (&current, self.entries.get(&key)) {
-            (Some(current), Some(entry)) => *current == entry.signature,
+        let hit = match (current, self.entries.get(&key)) {
+            (Some(current), Some(entry)) => current == entry.signature.as_slice(),
             _ => false,
         };
         if hit {
@@ -286,7 +288,7 @@ mod tests {
             "call-1",
             &output("fn a() {}"),
         );
-        let hit = cache.lookup("read_file", &args, sig(&dir, &reads));
+        let hit = cache.lookup("read_file", &args, sig(&dir, &reads).as_deref());
         assert_eq!(
             hit.map(|(out, _)| out.content),
             Some("fn a() {}".to_owned())
@@ -310,7 +312,7 @@ mod tests {
             "toolu_1",
             &output("fn a() {}"),
         );
-        let hit = cache.lookup("read_file", &args, sig(&dir, &reads));
+        let hit = cache.lookup("read_file", &args, sig(&dir, &reads).as_deref());
         assert_eq!(
             hit.map(|(_, id)| id),
             Some("toolu_1".to_owned()),
@@ -337,7 +339,7 @@ mod tests {
         write(&dir, "src/a.rs", "fn b() {}");
         assert!(
             cache
-                .lookup("read_file", &args, sig(&dir, &reads))
+                .lookup("read_file", &args, sig(&dir, &reads).as_deref())
                 .is_none()
         );
         assert!(cache.is_empty());
@@ -359,13 +361,13 @@ mod tests {
         );
         assert!(
             cache
-                .lookup("read_file", &args, sig(&dir, &reads))
+                .lookup("read_file", &args, sig(&dir, &reads).as_deref())
                 .is_some()
         );
         write(&dir, "src/new.rs", "fn new() {}");
         assert!(
             cache
-                .lookup("read_file", &args, sig(&dir, &reads))
+                .lookup("read_file", &args, sig(&dir, &reads).as_deref())
                 .is_none()
         );
     }
@@ -386,7 +388,11 @@ mod tests {
             &output("a.rs"),
         );
         assert!(cache.is_empty());
-        assert!(cache.lookup("list_dir", &args, sig(&dir, &reads)).is_none());
+        assert!(
+            cache
+                .lookup("list_dir", &args, sig(&dir, &reads).as_deref())
+                .is_none()
+        );
     }
 
     #[test]
@@ -440,12 +446,12 @@ mod tests {
         assert_eq!(cache.len(), 1);
         assert!(
             cache
-                .lookup("read_file", &args_a, sig(&dir, &reads_a))
+                .lookup("read_file", &args_a, sig(&dir, &reads_a).as_deref())
                 .is_none()
         );
         assert!(
             cache
-                .lookup("read_file", &args_b, sig(&dir, &reads_b))
+                .lookup("read_file", &args_b, sig(&dir, &reads_b).as_deref())
                 .is_some()
         );
     }

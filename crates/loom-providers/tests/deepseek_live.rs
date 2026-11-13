@@ -1,4 +1,4 @@
-//! Live DeepSeek API verification (pinned by the live tests in this file).
+//! Live `DeepSeek` API verification (pinned by the live tests in this file).
 //!
 //! These tests hit `https://api.deepseek.com` and spend real tokens
 //! (bounded by small `max_tokens`). Every test is `#[ignore]`d, so the
@@ -17,6 +17,9 @@
 
 // Live diagnostics: these tests are run with `--nocapture` precisely so
 // their observations are printed for manual verification.
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![allow(clippy::print_stdout)]
 
 use futures::StreamExt;
@@ -55,12 +58,18 @@ async fn collect(
 
 /// The single authoritative `Completed` event of a successful request.
 #[expect(clippy::unwrap_used)]
+// `ModelEvent` is #[non_exhaustive] in loom-kernel: the wildcard arm
+// is required — enumeration cannot exhaust the match.
+#[allow(clippy::wildcard_enum_match_arm)]
 fn expect_completed(events: Vec<Result<ModelEvent, ModelError>>) -> ModelResponse {
     let completed = events
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(Result::ok)
         .find_map(|e| match e {
             ModelEvent::Completed(response) => Some(response),
+            // `ModelEvent` is #[non_exhaustive] in loom-kernel: a
+            // wildcard arm is required, enumeration cannot exhaust it.
+            #[allow(clippy::wildcard_enum_match_arm)]
             _ => None,
         })
         .unwrap();
@@ -354,7 +363,7 @@ async fn invalid_model_error_body() {
     let events = collect(provider.stream(&request)).await;
     let error = events
         .into_iter()
-        .find_map(|e| e.err())
+        .find_map(Result::err)
         .expect("invalid model must fail");
     println!("kind:    {:?}", error.kind);
     println!("message: {}", error.message);
@@ -370,7 +379,7 @@ async fn bad_api_key_error_body() {
     let events = collect(provider.stream(&request)).await;
     let error = events
         .into_iter()
-        .find_map(|e| e.err())
+        .find_map(Result::err)
         .expect("invalid key must fail");
     println!("kind:    {:?}", error.kind);
     println!("message: {}", error.message);

@@ -13,21 +13,21 @@
 //!   suite-audit --dataset <verified.jsonl> --out <dir>
 //!
 //! The binary never runs docker itself. It writes, under `<out>`:
-//!   suite_audit.json               — structural rows + flags
-//!   mutants/mutant-<k>/predictions.jsonl — hunk-<k>-dropped gold patches
-//!   README.md                      — the scorer loop + weak-confirm rule
+//!   `suite_audit.json`                    — structural rows + flags
+//!   `mutants/mutant-<k>/predictions.jsonl` — hunk-<k>-dropped gold patches
+//!   `README.md`                            — the scorer loop + weak-confirm rule
 //!
 //! shortcut: the mutant pass writes every mutant of every instance into
 //! shared per-hunk-index files, so one docker run per file covers all
 //! instances; upgrade to per-instance fan-out only if scorer cost bites.
 
 // A harness binary: panicking on a setup failure is the intended
-// behavior.
+// behavior, as are the `unwrap`/`expect` calls in pure setup code.
 
 // Terminal output is this harness's product; the workspace-wide
 // `clippy::print_stdout`/`print_stderr` denies target library crates.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 
@@ -74,14 +74,16 @@ fn parse_args() -> Args {
                     value()
                         .parse()
                         .unwrap_or_else(|_| panic!("--per-repo needs a number")),
-                )
+                );
             }
             other => panic!("unknown flag: {other}"),
         }
     }
-    if per_repo.is_some() && repos.is_empty() {
-        panic!("--per-repo needs --repos (which repos to stratify over?)");
-    }
+    // `assert!` over negation: same abort, no `if`-then-`panic!` shape.
+    assert!(
+        !(per_repo.is_some() && repos.is_empty()),
+        "--per-repo needs --repos (which repos to stratify over?)"
+    );
     Args {
         dataset: dataset.expect("--dataset <verified.jsonl> is required"),
         out: out.expect("--out <dir> is required"),

@@ -170,8 +170,8 @@ fn input_with<'a>(
     prune: Option<&'a PruneCheckpoint>,
     budget: ContextBudget,
 ) -> ContextInput<'a> {
-    shared();
     static FACTS: std::sync::OnceLock<crate::context::KnownFacts> = std::sync::OnceLock::new();
+    shared();
     let facts = FACTS.get_or_init(crate::context::KnownFacts::default);
     ContextInput {
         session,

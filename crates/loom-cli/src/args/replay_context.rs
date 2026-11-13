@@ -12,10 +12,10 @@ pub struct ReplayContextArgs {
 
     /// Overlay one prune knob for the counterfactual arm, e.g.
     /// `--set prune_trigger_percent=50`. Repeatable. Known keys:
-    /// prune_trigger_percent, prune_floor_tokens,
-    /// prune_min_reclaim_tokens, prune_tail_tokens,
-    /// phase_mask_turns, age_mask_turns, elide_turns, elide_reasoning,
-    /// elide_assistant_text (`off` disables an optional knob).
+    /// `prune_trigger_percent`, `prune_floor_tokens`,
+    /// `prune_min_reclaim_tokens`, `prune_tail_tokens`,
+    /// `phase_mask_turns`, `age_mask_turns`, `elide_turns`, `elide_reasoning`,
+    /// `elide_assistant_text` (`off` disables an optional knob).
     #[arg(long = "set", value_name = "KEY=VAL")]
     pub set: Vec<String>,
 

@@ -135,12 +135,15 @@ pub(crate) fn plain_http_to_non_local(base_url: &str) -> bool {
         .strip_prefix('[')
         .and_then(|bracketed| bracketed.split(']').next())
         .unwrap_or_else(|| host_port.split(':').next().unwrap_or_default());
+    // The allow is a false positive: `host` was lowercased with the
+    // URL above, so these suffix checks are already case-insensitive.
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+    let suffix_local =
+        host.ends_with(".localhost") || host.ends_with(".local") || host.ends_with(".internal");
     let local = matches!(host, "localhost" | "::1" | "0.0.0.0" | "" | "[::1]")
         || host.starts_with("127.")
         || host.starts_with("169.254.")
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-        || host.ends_with(".internal");
+        || suffix_local;
     !local
 }
 

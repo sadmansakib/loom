@@ -162,7 +162,7 @@ impl FailureLedger {
 /// Identity of a call for the failure ledger: tool name plus canonical
 /// argument JSON. Object keys are byte-sorted by
 /// [`crate::canonical::canonical_json`], so equality does not depend on
-/// serde_json's map iteration order — which the build graph can flip to
+/// `serde_json`'s map iteration order — which the build graph can flip to
 /// insertion order when any package (agent-client-protocol does)
 /// enables the `preserve_order` feature. Without this, two calls
 /// differing only in key order would key differently and evade the
@@ -200,7 +200,7 @@ impl EditStalls {
         }
     }
 
-    /// The first path at or past [`EDIT_STALL_TURNS`], if any. BTreeMap
+    /// The first path at or past [`EDIT_STALL_TURNS`], if any. `BTreeMap`
     /// order makes the pick deterministic when several files stall.
     pub(super) fn stalled_file(&self) -> Option<(String, u32)> {
         self.consecutive_failures
@@ -238,6 +238,9 @@ pub(super) fn edit_target(call: &ToolCall) -> Option<String> {
 /// `exit status: 0` line), covering `verify`, `run_command`, and the fused
 /// edit check alike. The refusal loops until green, capped by
 /// [`COMPLETION_REFUSAL_CAP`].
+// Each bool is an independently-set gate flag checked directly against
+// the transcript; a state-machine encoding would obscure those checks.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 pub(super) struct CompletionGate {
     /// Mutation epoch: bumped on every committed file write or delete.
@@ -247,8 +250,8 @@ pub(super) struct CompletionGate {
     /// The epoch that had a green run of the FULL suite (bare runner,
     /// no file filters). A narrow green (`pytest one_file.py`) passes
     /// while an untouched regression fails elsewhere — the exact
-    /// pytest-7490 hard-mix loss (2026-10-31 N=20): FAIL_TO_PASS 2/2
-    /// green, one PASS_TO_PASS regressed.
+    /// pytest-7490 hard-mix loss (2026-10-31 N=20): `FAIL_TO_PASS` 2/2
+    /// green, one `PASS_TO_PASS` regressed.
     pub(super) suite_green_at: Option<u64>,
     /// How many unverified-mutation refusals fired (capped by
     /// [`COMPLETION_REFUSAL_CAP`]: the gate loops until green, but a
@@ -391,7 +394,7 @@ pub(super) fn command_runs_tests(content: &str) -> bool {
 /// test runner invoked bare (env prefixes allowed) with at most
 /// directory arguments — no file filters, no `-k`, no node ids. This
 /// is the settle condition for [`CompletionGate`]: `pytest
-/// testing/test_skipping.py` passing while an untouched PASS_TO_PASS
+/// testing/test_skipping.py` passing while an untouched `PASS_TO_PASS`
 /// test regresses is the exact pytest-7490 miss (2026-10-31 N=20).
 /// Whole-directory arguments (`pytest tests/`) still count as full.
 pub(super) fn runs_full_suite(content: &str) -> bool {
@@ -416,11 +419,10 @@ pub(super) fn runs_full_suite(content: &str) -> bool {
         .any(|line| {
             let tokens: Vec<&str> = line[2..].split_whitespace().collect();
             // Skip leading env assignments (`FOO=1 pytest …`).
-            let rest = tokens
+            let rest: &[&str] = tokens
                 .iter()
                 .position(|token| !token.contains('='))
-                .map(|start| &tokens[start..])
-                .unwrap_or(&[]);
+                .map_or(&[], |start| &tokens[start..]);
             let runner = RUNNERS.iter().copied().find(|head| rest.starts_with(head));
             match runner {
                 // Every remaining argument must be a whole directory —
@@ -440,7 +442,7 @@ pub(super) fn completion_refusal(session: &Session, attempt: u8) -> String {
         .iter()
         .find_map(|item| match item {
             Item::User { text } => Some(text.as_str()),
-            _ => None,
+            Item::Assistant(_) | Item::ToolResult(_) => None,
         })
         .unwrap_or_default();
     let instruction_head = instruction.chars().take(800).collect::<String>();
@@ -475,7 +477,7 @@ pub(super) fn test_consultation_refusal(session: &Session) -> String {
         .iter()
         .find_map(|item| match item {
             Item::User { text } => Some(text.as_str()),
-            _ => None,
+            Item::Assistant(_) | Item::ToolResult(_) => None,
         })
         .unwrap_or_default();
     let instruction_head = instruction.chars().take(800).collect::<String>();
@@ -505,7 +507,7 @@ pub(super) fn acceptance_oracle_refusal(session: &Session) -> String {
         .iter()
         .find_map(|item| match item {
             Item::User { text } => Some(text.as_str()),
-            _ => None,
+            Item::Assistant(_) | Item::ToolResult(_) => None,
         })
         .unwrap_or_default();
     let instruction_head = instruction.chars().take(800).collect::<String>();
@@ -546,7 +548,9 @@ pub(super) fn recent_changes(session: &Session) -> Vec<String> {
             .iter()
             .chain(result.effects.files_deleted.iter())
         {
-            if seen.insert(path.clone()) {
+            // Dedupe on a borrow of the transcript path; only the
+            // returned list owns a copy.
+            if seen.insert(path.as_str()) {
                 paths.push(path.clone());
             }
         }

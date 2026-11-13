@@ -26,12 +26,15 @@ pub(crate) struct RenameInput {
     pub new_name: String,
 }
 
-/// Counts the document operations in a WorkspaceEdit for output text.
+/// Counts the document operations in a `WorkspaceEdit` for output text.
 pub(crate) fn edit_op_count(edit: &lsp_types::WorkspaceEdit) -> usize {
     match &edit.document_changes {
         Some(lsp_types::DocumentChanges::Operations(ops)) => ops.len(),
         Some(lsp_types::DocumentChanges::Edits(edits)) => edits.len(),
-        None => edit.changes.as_ref().map_or(0, |m| m.len()),
+        None => edit
+            .changes
+            .as_ref()
+            .map_or(0, std::collections::HashMap::len),
     }
 }
 
@@ -79,7 +82,7 @@ impl Tool for LspRenameTool {
             let server = inner.pick_server(&input.path)?;
             let supported = matches!(
                 &server.capabilities.rename_provider,
-                Some(lsp_types::OneOf::Left(true)) | Some(lsp_types::OneOf::Right(_))
+                Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
             );
             if !supported {
                 return Err(ToolError::Execution(
@@ -94,7 +97,7 @@ impl Tool for LspRenameTool {
                         path: input.path.clone(),
                         line: input.line,
                         column: input.column,
-                        symbol: input.symbol.clone(),
+                        symbol: input.symbol,
                     },
                 )
                 .await?;
@@ -106,7 +109,7 @@ impl Tool for LspRenameTool {
                     position,
                 },
                 new_name: input.new_name.clone(),
-                work_done_progress_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
             };
             let edit = server
                 .request::<Rename>(params)
@@ -186,7 +189,7 @@ impl Tool for LspFormatTool {
             let server = inner.pick_server(&input.path)?;
             let supported = matches!(
                 &server.capabilities.document_formatting_provider,
-                Some(lsp_types::OneOf::Left(true)) | Some(lsp_types::OneOf::Right(_))
+                Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
             );
             if !supported {
                 return Err(ToolError::Execution(
@@ -207,7 +210,7 @@ impl Tool for LspFormatTool {
                     insert_spaces: input.insert_spaces.unwrap_or(true),
                     ..Default::default()
                 },
-                work_done_progress_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
             };
             let edits = server
                 .request::<Formatting>(params)

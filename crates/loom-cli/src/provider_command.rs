@@ -14,7 +14,10 @@ pub fn run(command: ProviderCommand) -> Result<()> {
             models_url,
             headers,
         } => add(&name, &base_url, models_url, &headers),
-        ProviderCommand::List => list(),
+        ProviderCommand::List => {
+            list();
+            Ok(())
+        }
         ProviderCommand::Remove { name } => remove(&name),
     }
 }
@@ -52,12 +55,12 @@ fn add(
     Ok(())
 }
 
-fn list() -> Result<()> {
+fn list() {
     let registry = ProviderRegistry::load(&loom_core::paths::db_path());
     let mut entries = registry.entries().peekable();
     if entries.peek().is_none() {
         println!("no named providers registered");
-        return Ok(());
+        return;
     }
     for (name, entry) in entries {
         let headers = if entry.headers.is_empty() {
@@ -70,7 +73,6 @@ fn list() -> Result<()> {
             None => println!("{name}  {}{headers}", entry.base_url),
         }
     }
-    Ok(())
 }
 
 fn remove(name: &str) -> Result<()> {

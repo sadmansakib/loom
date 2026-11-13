@@ -6,6 +6,7 @@ use loom_kernel::transcript::Item;
 
 use super::config::ANSWER_BUDGET_BYTES;
 
+#[must_use]
 /// The capsule task the child receives: goal, scope, constraints, and
 /// the output contract — everything a bounded delegation needs.
 pub fn capsule(question: &str, focus: Option<&str>) -> String {
@@ -27,6 +28,7 @@ pub fn capsule(question: &str, focus: Option<&str>) -> String {
     )
 }
 
+#[must_use]
 /// The scout's answer: the last committed assistant text, truncated to
 /// the byte budget on a char boundary with an explicit marker so a
 /// clipped answer is always legible as clipped.
@@ -37,7 +39,7 @@ pub fn final_answer(session: &Session) -> String {
         .rev()
         .find_map(|item| match item {
             Item::Assistant(message) => Some(message.content.as_str()),
-            _ => None,
+            Item::User { .. } | Item::ToolResult(_) | _ => None,
         })
         .unwrap_or_default();
     truncate_answer(text)

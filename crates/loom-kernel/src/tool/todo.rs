@@ -152,7 +152,7 @@ impl Tool for TodoTool {
                     ToolError::Execution("todo state is not attached to this call".to_owned())
                 })?
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             match input.op.as_str() {
                 "create" => {
                     let items = input.items.unwrap_or_default();

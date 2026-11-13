@@ -8,6 +8,9 @@
 //! task on the other channel end. A notification handler on the
 //! client captures every `session/update` in wire order.
 
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -57,7 +60,7 @@ struct Capture {
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Capture {
@@ -114,7 +117,7 @@ impl ScriptedProvider {
 }
 
 impl ModelProvider for ScriptedProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "scripted"
     }
 
@@ -129,7 +132,9 @@ impl ModelProvider for ScriptedProvider {
         })
     }
 
-    fn stream<'a>(&'a self, request: &'a ModelRequest) -> ModelStream<'a> {
+    fn stream(&self, request: &ModelRequest) -> ModelStream<'_> {
+        // only user messages feed the script
+        #[allow(clippy::wildcard_enum_match_arm)]
         let user_texts = request
             .messages
             .iter()
@@ -271,7 +276,7 @@ async fn initialize_new_session_and_prompt_run_end_to_end() {
                   _cx: agent_client_protocol::v1::ConnectionTo<Agent>| {
                 let captured = CapturedUpdate {
                     session: notification.session_id.clone(),
-                    update: notification.update.clone(),
+                    update: notification.update,
                 };
                 lock_or_recover(&capture).push(captured);
                 async { Ok(()) }
@@ -311,6 +316,9 @@ async fn initialize_new_session_and_prompt_run_end_to_end() {
             assert!(matches!(response.stop_reason, acp::StopReason::EndTurn));
 
             let expected_session = session.session_id.clone();
+            // SessionUpdate/ContentBlock are #[non_exhaustive]; any
+            // other shape must not satisfy the expectation.
+            #[allow(clippy::wildcard_enum_match_arm)]
             await_updates(&wait_for, |seen| {
                 seen.iter().any(|captured| {
                     captured.session == expected_session
@@ -1038,10 +1046,10 @@ fn mcp_mock_server() {
     // Test-binary re-entry: the forwarded-server spec points at this
     // executable with `--exact mcp_mock_server`; the child becomes a
     // one-tool MCP stdio server when the mode variable is set.
+    use std::io::{BufRead, Write};
     if std::env::var("LOOM_MCP_MOCK_MODE").is_err() {
         return;
     }
-    use std::io::{BufRead, Write};
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     // libtest progress text has no trailing newline; start clean.
@@ -1049,10 +1057,7 @@ fn mcp_mock_server() {
     let _ = out.flush();
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(_) => continue,
-        };
+        let Ok(line) = line else { continue };
         let message: serde_json::Value = match serde_json::from_str(&line) {
             Ok(value) => value,
             Err(_) => continue,
@@ -1108,6 +1113,7 @@ fn mock_stdio_server() -> acp::McpServer {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // end-to-end MCP attach flow; splitting hides sequencing
 async fn forwarded_mcp_servers_attach_and_run_when_allowed() {
     let workspace = workspace();
     let updates: Arc<Mutex<Vec<CapturedUpdate>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1146,7 +1152,7 @@ async fn forwarded_mcp_servers_attach_and_run_when_allowed() {
                   _cx: agent_client_protocol::v1::ConnectionTo<Agent>| {
                 let captured = CapturedUpdate {
                     session: notification.session_id.clone(),
-                    update: notification.update.clone(),
+                    update: notification.update,
                 };
                 lock_or_recover(&capture_updates).push(captured);
                 async { Ok(()) }
@@ -1179,7 +1185,10 @@ async fn forwarded_mcp_servers_attach_and_run_when_allowed() {
             assert!(matches!(response.stop_reason, acp::StopReason::EndTurn));
 
             // The forwarded tool ran: the mock's answer reached the
-            // editor as tool-call content.
+            // editor as tool-call content. SessionUpdate and the
+            // content enums are #[non_exhaustive]; any other shape
+            // must not satisfy the expectation.
+            #[allow(clippy::wildcard_enum_match_arm)]
             await_updates(&wait_for, |seen| {
                 seen.iter().any(|captured| {
                     matches!(
@@ -1189,7 +1198,7 @@ async fn forwarded_mcp_servers_attach_and_run_when_allowed() {
                                 .fields
                                 .content
                                 .as_ref()
-                                .map(|blocks| {
+                                .is_some_and(|blocks| {
                                     blocks.iter().any(|block| match block {
                                         acp::ToolCallContent::Content(content) => match &content.content {
                                             acp::ContentBlock::Text(text) => {
@@ -1200,7 +1209,6 @@ async fn forwarded_mcp_servers_attach_and_run_when_allowed() {
                                         _ => false,
                                     })
                                 })
-                                .unwrap_or(false)
                     )
                 })
             })

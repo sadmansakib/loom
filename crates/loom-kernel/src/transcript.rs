@@ -39,6 +39,7 @@ pub struct ItemIndex(u32);
 
 impl ItemIndex {
     /// Returns the index as a `u32` (the persistence `idx` column).
+    #[must_use]
     pub fn as_u32(self) -> u32 {
         self.0
     }
@@ -187,6 +188,7 @@ pub struct ToolCallId(String);
 
 impl ToolCallId {
     /// Returns the id as a string slice (tracing, persistence).
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -289,6 +291,7 @@ impl ToolArguments {
     /// bounded so a runaway fragment cannot bloat the transcript, and
     /// the cut backs off to a UTF-8 char boundary — the raw text is
     /// model-controlled, so a naive byte slice could panic.
+    #[must_use]
     pub fn malformed(raw: &str) -> Self {
         let head = crate::event::head_bytes(raw, MALFORMED_ARGUMENTS_EXCERPT);
         let excerpt = if head.len() < raw.len() {
@@ -357,6 +360,7 @@ impl ToolCall {
     /// placeholder ([`MALFORMED_ARGUMENTS_KEY`]) rather than real,
     /// model-intended arguments. Such calls are committed for history
     /// fidelity but never executed.
+    #[must_use]
     pub fn arguments_are_malformed(&self) -> bool {
         self.arguments.get(MALFORMED_ARGUMENTS_KEY).is_some()
     }

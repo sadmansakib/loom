@@ -86,7 +86,7 @@ async fn background_completions_steer_into_the_next_task() {
             &mut session,
             "start something long",
             &sink,
-            &Default::default(),
+            &crate::TaskControl::default(),
         )
         .await
         .expect("detach task");
@@ -100,7 +100,12 @@ async fn background_completions_steer_into_the_next_task() {
     // queue applies it before turn 1's compile, and the same
     // registry answers `command_status`.
     engine
-        .run_task(&mut session, "check on it", &sink, &Default::default())
+        .run_task(
+            &mut session,
+            "check on it",
+            &sink,
+            &crate::TaskControl::default(),
+        )
         .await
         .expect("status task");
     let kinds = drain(&mut receiver);

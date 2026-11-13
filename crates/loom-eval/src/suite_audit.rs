@@ -1,6 +1,6 @@
 //! Frozen-subset suite audit (roadmap item 1's 2026-11 tail, lit-review
-//! shortlist #8): UTBoost (arXiv 2506.09289) found 345 erroneously-passing
-//! SWE-bench patches — the official PASS_TO_PASS / FAIL_TO_PASS suites
+//! shortlist #8): `UTBoost` (`arXiv` 2506.09289) found 345 erroneously-passing
+//! `SWE-bench` patches — the official `PASS_TO_PASS` / `FAIL_TO_PASS` suites
 //! under-discriminate for a nontrivial share of instances, so the frozen
 //! subset's verdicts are hypotheses, not ground truth.
 //!
@@ -10,7 +10,7 @@
 //!    F2P/P2P counts, gold-patch hunk count, whether the test patch adds
 //!    test-looking lines — flagging instances whose suite is small or
 //!    adds no tests (`suite_small`, `no_new_tests`). These flags are
-//!    *hypotheses*, the same signal class UTBoost amplified.
+//!    *hypotheses*, the same signal class `UTBoost` amplified.
 //! 2. **Mutant re-grade** (docker, one-off): for every gold patch with
 //!    more than one hunk, [`mutant_patches`] emits one single-hunk-dropped
 //!    mutant per hunk. Run through the official scorer, an instance whose
@@ -53,6 +53,7 @@ pub struct SuiteAuditRow {
 
 impl SuiteAuditRow {
     /// The weak-suite hypothesis flag: either structural signal fired.
+    #[must_use]
     pub fn weak(&self) -> bool {
         self.suite_small || self.no_new_tests
     }
@@ -96,6 +97,7 @@ pub struct SuiteAudit {
 }
 
 /// Counts the hunks in a unified diff (`@@` headers).
+#[must_use]
 pub fn count_hunks(diff: &str) -> usize {
     diff.lines().filter(|line| line.starts_with("@@")).count()
 }
@@ -137,7 +139,7 @@ fn split_sections(diff: &str) -> Vec<FileSection> {
                     current = Some(FileSection {
                         header: Vec::new(),
                         hunks: vec![vec![line.to_owned()]],
-                    })
+                    });
                 }
             }
         } else if let Some(section) = current.as_mut() {
@@ -157,6 +159,7 @@ fn split_sections(diff: &str) -> Vec<FileSection> {
 /// `None` when the index is out of range. File sections left without
 /// hunks are dropped entirely — an empty `diff --git` block is not a
 /// patch the scorer would accept.
+#[must_use]
 pub fn drop_hunk(diff: &str, index: usize) -> Option<String> {
     if index >= count_hunks(diff) {
         return None;
@@ -190,6 +193,7 @@ pub fn drop_hunk(diff: &str, index: usize) -> Option<String> {
 /// Every single-hunk-dropped mutant of a gold patch, one per hunk, in
 /// hunk order. A one-hunk (or empty) patch yields no mutants — there
 /// is nothing to cripple.
+#[must_use]
 pub fn mutant_patches(patch: &str) -> Vec<String> {
     (0..count_hunks(patch))
         .filter_map(|index| drop_hunk(patch, index))
@@ -202,6 +206,7 @@ pub const SUITE_AUDIT_METHOD_VERSION: &str = "1";
 
 /// Builds the audit's provenance block from the dataset bytes and the
 /// selection rule (the bin owns both; `audit_dataset` stays pure).
+#[must_use]
 pub fn suite_audit_provenance(
     dataset_bytes: &[u8],
     dataset_rows: usize,
@@ -217,6 +222,7 @@ pub fn suite_audit_provenance(
 }
 
 /// Runs the structural audit over the (frozen) dataset.
+#[must_use]
 pub fn audit_dataset(instances: &[&SweInstance], provenance: SuiteAuditProvenance) -> SuiteAudit {
     let rows: Vec<SuiteAuditRow> = instances
         .iter()
@@ -305,6 +311,12 @@ pub struct SweepWeakSuite {
 /// `suite-audit` bin) with a sweep's instance ids. Errors on an
 /// unreadable artifact — the operator asked for the wiring, so a
 /// silent absence would be the dishonest failure.
+///
+/// # Errors
+///
+/// Returns the reason as a `String` when the audit artifact is not
+/// valid JSON (via [`sweep_weak_suite_with_results`], which also
+/// validates the optional re-grade aggregate).
 pub fn sweep_weak_suite(
     audit_bytes: &[u8],
     sweep_ids: &[String],
@@ -315,6 +327,16 @@ pub fn sweep_weak_suite(
 /// Intersects structural flags with an optional official mutant re-grade
 /// aggregate. The aggregate must identify the same method and dataset as the
 /// structural artifact and report complete mutant-file / multi-hunk coverage.
+///
+/// # Errors
+///
+/// Returns the reason as a `String` when either input is not valid
+/// JSON, when the aggregate lacks `audit_provenance` or
+/// `structural_weak_ids` (or holds invalid ids), when aggregate
+/// method/dataset digests disagree with the structural artifact, or
+/// when the aggregate's coverage does not span every mutant file or
+/// multi-hunk instance.
+#[allow(clippy::too_many_lines)] // one linear JSON-validation pipeline per clause; splitting hides the contract
 pub fn sweep_weak_suite_with_results(
     audit_bytes: &[u8],
     results_bytes: Option<&[u8]>,
@@ -348,18 +370,18 @@ pub fn sweep_weak_suite_with_results(
                 .ok_or_else(|| "suite audit results lack audit_provenance".to_owned())?;
             if result_provenance
                 .get("method_version")
-                .and_then(|v| v.as_str())
+                .and_then(serde_json::Value::as_str)
                 != Some(audit.provenance.method_version.as_str())
                 || result_provenance
                     .get("dataset_sha256")
-                    .and_then(|v| v.as_str())
+                    .and_then(serde_json::Value::as_str)
                     != Some(audit.provenance.dataset_sha256.as_str())
             {
                 return Err("suite audit results do not match audit method/dataset".to_owned());
             }
             let result_structural_ids = results
                 .get("structural_weak_ids")
-                .and_then(|v| v.as_array())
+                .and_then(serde_json::Value::as_array)
                 .ok_or_else(|| "suite audit results lack structural_weak_ids".to_owned())?;
             let result_structural_ids: std::collections::BTreeSet<&str> = result_structural_ids
                 .iter()
@@ -393,15 +415,15 @@ pub fn sweep_weak_suite_with_results(
                     "multi-hunk coverage",
                 ),
             ] {
-                let expected = results.get(expected).and_then(|v| v.as_u64());
-                let actual = results.get(actual).and_then(|v| v.as_u64());
+                let expected = results.get(expected).and_then(serde_json::Value::as_u64);
+                let actual = results.get(actual).and_then(serde_json::Value::as_u64);
                 if expected.is_none() || expected != actual {
                     return Err(format!("suite audit results have incomplete {label}"));
                 }
             }
             let problems = results
                 .get("problems")
-                .and_then(|v| v.as_array())
+                .and_then(serde_json::Value::as_array)
                 .ok_or_else(|| "suite audit results lack problems list".to_owned())?;
             if !problems.is_empty() {
                 return Err("suite audit results report validation problems".to_owned());
@@ -409,7 +431,7 @@ pub fn sweep_weak_suite_with_results(
             let scoped_ids = |key: &str| -> Result<std::collections::BTreeSet<String>, String> {
                 let ids = results
                     .get(key)
-                    .and_then(|v| v.as_array())
+                    .and_then(serde_json::Value::as_array)
                     .ok_or_else(|| format!("suite audit results lack {key}"))?;
                 let parsed: std::collections::BTreeSet<String> = ids
                     .iter()

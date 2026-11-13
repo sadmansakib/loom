@@ -107,7 +107,7 @@ fn merge_headers(
         .collect();
     for (name, value) in explicit {
         match headers.iter_mut().find(|(existing, _)| existing == name) {
-            Some(slot) => slot.1 = value.clone(),
+            Some(slot) => slot.1.clone_from(value),
             None => headers.push((name.clone(), value.clone())),
         }
     }
@@ -118,6 +118,15 @@ fn merge_headers(
 ///
 /// `api_key` is the resolved credential; the provider wraps it
 /// immediately, so it never travels further in the clear.
+///
+/// # Errors
+///
+/// Returns [`EngineError::UnknownProvider`], [`EngineError::CatalogMissing`],
+/// or [`EngineError::MissingBaseUrl`] for an unusable provider selection,
+/// [`EngineError::Provider`] when the client cannot be constructed, and
+/// [`EngineError::UnknownModel`], [`EngineError::ModelWindowTooSmall`], or
+/// [`EngineError::ModelWithoutReasoning`] when the model fails loud
+/// capability validation.
 pub fn build(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, EngineError> {
     match config.provider.as_str() {
         DEEPSEEK_PROVIDER_NAME => build_deepseek(config, api_key),
@@ -158,9 +167,9 @@ pub fn build(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, Eng
     }
 }
 
-/// Builds the DeepSeek adapter.
+/// Builds the `DeepSeek` adapter.
 ///
-/// DeepSeek serves no capability document, so the adapter's table is the
+/// `DeepSeek` serves no capability document, so the adapter's table is the
 /// authority. Reasoning is required: the adapter always sends
 /// `reasoning_effort`, and a model without reasoning support would
 /// silently ignore it.
@@ -190,7 +199,7 @@ fn build_deepseek(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle
 ///
 /// The static table in the adapter is the authority (no capability
 /// document exists to reduce). No reasoning requirement: unlike
-/// DeepSeek, this adapter never sends a reasoning parameter, so a model
+/// `DeepSeek`, this adapter never sends a reasoning parameter, so a model
 /// that ignores thinking costs nothing. `reasoning_effort` is likewise
 /// ignored — Anthropic takes `effort`, which this adapter does not send.
 fn build_anthropic(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, EngineError> {
@@ -211,7 +220,7 @@ fn build_anthropic(config: &EngineConfig, api_key: &str) -> Result<ProviderHandl
 
 /// Builds the GLM adapter for Z.ai's metered API.
 ///
-/// Like DeepSeek, the adapter always sends a `thinking` parameter, so
+/// Like `DeepSeek`, the adapter always sends a `thinking` parameter, so
 /// reasoning-capable models are required (every row in its table is
 /// reasoning-capable anyway).
 fn build_glm(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, EngineError> {
@@ -263,7 +272,7 @@ fn build_nvidia(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, 
     })
 }
 
-/// Builds the Groq adapter for GroqCloud inference.
+/// Builds the Groq adapter for `GroqCloud` inference.
 ///
 /// Sends a top-level `reasoning_effort` on every request, so
 /// reasoning-capable models are required (every row in its table is
@@ -290,12 +299,12 @@ fn build_groq(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, En
     })
 }
 
-/// Builds the OpenRouter adapter from the frontend-supplied catalog.
+/// Builds the `OpenRouter` adapter from the frontend-supplied catalog.
 ///
 /// The catalog is the authority for capabilities and pricing; without
 /// one the adapter cannot resolve the model, and guessing a window would
 /// be worse than failing. No reasoning requirement: the adapter speaks
-/// the plain OpenAI wire and does not send provider-specific reasoning
+/// the plain `OpenAI` wire and does not send provider-specific reasoning
 /// fields.
 fn build_openrouter(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, EngineError> {
     let catalog = match &config.catalog {
@@ -329,7 +338,7 @@ fn build_openrouter(config: &EngineConfig, api_key: &str) -> Result<ProviderHand
 /// to), the catalog lists the models. Capabilities come from the
 /// catalog entry; an id it does not list fails loudly rather than
 /// guessing, while fields the entry omits use the adapter's safe
-/// defaults. No reasoning requirement: the plain OpenAI wire sends no
+/// defaults. No reasoning requirement: the plain `OpenAI` wire sends no
 /// reasoning fields either way.
 fn build_custom(config: &EngineConfig, api_key: &str) -> Result<ProviderHandle, EngineError> {
     let catalog = match &config.catalog {
@@ -381,6 +390,12 @@ fn unknown_model(config: &EngineConfig) -> EngineError {
 /// [`EngineError::CatalogMissing`] — they cannot resolve capabilities
 /// from data this helper does not take. Table-driven adapters
 /// (`deepseek`, `anthropic`, `glm`, `nvidia`, `groq`) work as-is.
+///
+/// # Errors
+///
+/// Returns [`EngineError::CatalogMissing`] for catalog-driven adapters
+/// without a catalog and [`EngineError::MissingBaseUrl`] /
+/// [`EngineError::Provider`] when the adapter cannot be constructed.
 pub fn one_shot_provider(
     provider: &str,
     model: &str,

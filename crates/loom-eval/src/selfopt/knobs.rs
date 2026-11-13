@@ -189,6 +189,7 @@ pub const KNOBS: &[Knob] = &[
 ];
 
 /// Looks a knob up by its env var name.
+#[must_use]
 pub fn knob_by_env(env: &str) -> Option<&'static Knob> {
     KNOBS.iter().find(|knob| knob.env == env)
 }
@@ -199,6 +200,12 @@ pub type Overlay = BTreeMap<String, String>;
 
 /// Validates an overlay against the knob table: every key must be a
 /// known seam, every value an integer inside the knob's bounds.
+///
+/// # Errors
+///
+/// Returns the reason as a `String` when a key is not a known knob env
+/// var, when a value is not an integer, or when a value falls outside
+/// the knob's `[floor, ceiling]` bounds.
 pub fn validate_overlay(overlay: &Overlay) -> Result<(), String> {
     for (env, value) in overlay {
         let knob = knob_by_env(env).ok_or_else(|| format!("unknown knob: {env}"))?;
@@ -219,6 +226,7 @@ pub fn validate_overlay(overlay: &Overlay) -> Result<(), String> {
 /// short names and values, joined: `prune_trigger_percent-70` or
 /// `prune_trigger_percent-70+read_head_bytes-32768`. Used for probe
 /// directories and report rows.
+#[must_use]
 pub fn overlay_label(overlay: &Overlay) -> String {
     if overlay.is_empty() {
         return "baseline".to_owned();
@@ -226,7 +234,7 @@ pub fn overlay_label(overlay: &Overlay) -> String {
     let mut parts: Vec<String> = overlay
         .iter()
         .map(|(env, value)| {
-            let name = knob_by_env(env).map(|knob| knob.name).unwrap_or("knob");
+            let name = knob_by_env(env).map_or("knob", |knob: &Knob| knob.name);
             format!("{name}-{value}")
         })
         .collect();

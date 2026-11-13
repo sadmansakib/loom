@@ -21,6 +21,7 @@
 // `clippy::print_stdout`/`print_stderr` denies target library crates.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use loom_eval::swebench::{RunMetrics, run_metrics, scorer_outcomes};
@@ -45,7 +46,7 @@ fn usage() -> ! {
 }
 
 fn parse_args() -> Args {
-    let argv = std::env::args().skip(1);
+    let raw = std::env::args().skip(1);
     let mut args = Args {
         a: PathBuf::new(),
         b: PathBuf::new(),
@@ -56,10 +57,10 @@ fn parse_args() -> Args {
         output_per_m: None,
     };
     let mut flag = String::new();
-    for arg in argv {
+    for arg in raw {
         match arg.as_str() {
-            "--a" | "--b" | "--dir-a" | "--dir-b" => flag = arg,
-            "--input-per-m" | "--cache-per-m" | "--output-per-m" => flag = arg,
+            "--a" | "--b" | "--dir-a" | "--dir-b" | "--input-per-m" | "--cache-per-m"
+            | "--output-per-m" => flag = arg,
             "-h" | "--help" => usage(),
             _ => {
                 let value = arg;
@@ -90,6 +91,7 @@ fn parse_args() -> Args {
 
 /// Dollar cost of one usage record at per-million prices, when all
 /// three are known; `None` keeps the report cost-free by default.
+#[allow(clippy::cast_precision_loss)] // token counters sit far below f64's exact-integer range (2^53)
 fn cost(metrics: &RunMetrics, args: &Args) -> Option<f64> {
     let (in_p, cache_p, out_p) = (args.input_per_m?, args.cache_per_m?, args.output_per_m?);
     let usage = &metrics.usage;
@@ -116,6 +118,7 @@ fn metrics_for(dir: Option<&Path>, id: &str) -> Option<RunMetrics> {
     path.is_file().then(|| run_metrics(&path))
 }
 
+#[allow(clippy::too_many_lines)] // linear honesty-check → parity-check → render pipeline
 fn main() {
     let args = parse_args();
     // Honesty rule: one headline, one engine build. The contrast is a
@@ -214,17 +217,17 @@ fn main() {
             ((Some(_), n), _) if n > 1 => {
                 eprintln!(
                     "warning: eval dir A mixes multiple provider/model pairs; the contrast headline is not single-model"
-                )
+                );
             }
             (_, (Some(_), n)) if n > 1 => {
                 eprintln!(
                     "warning: eval dir B mixes multiple provider/model pairs; the contrast headline is not single-model"
-                )
+                );
             }
             _ => {
                 eprintln!(
                     "warning: provider/model not recorded in both eval dirs; model parity unverified"
-                )
+                );
             }
         }
     }
@@ -249,23 +252,27 @@ fn main() {
         args.dir_a.as_deref(),
         args.dir_b.as_deref(),
         &args,
-        args.a.display().to_string(),
-        args.b.display().to_string(),
+        &args.a.display().to_string(),
+        &args.b.display().to_string(),
     );
     print!("{report}");
 }
 
 /// The whole report as markdown. Pure: every input is data, so the
 /// unit test drives it with synthetic outcome vectors.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines, // one linear markdown assembly; splitting hides the column logic
+    clippy::cast_possible_wrap // u64 counters; deltas are meaningful far below i64::MAX
+)]
 fn render(
     a: &[(String, bool)],
     b: &[(String, bool)],
     dir_a: Option<&Path>,
     dir_b: Option<&Path>,
     args: &Args,
-    label_a: String,
-    label_b: String,
+    label_a: &str,
+    label_b: &str,
 ) -> String {
     let map_a: HashMap<&str, bool> = a.iter().map(|(id, r)| (id.as_str(), *r)).collect();
     let map_b: HashMap<&str, bool> = b.iter().map(|(id, r)| (id.as_str(), *r)).collect();
@@ -274,7 +281,7 @@ fn render(
         .filter(|id| map_b.contains_key(*id))
         .copied()
         .collect();
-    shared.sort();
+    shared.sort_unstable();
 
     let priced =
         args.input_per_m.is_some() && args.cache_per_m.is_some() && args.output_per_m.is_some();
@@ -282,19 +289,20 @@ fn render(
 
     let mut out = String::new();
     out.push_str("# Paired contrast\n\n");
-    out.push_str(&format!("- A: `{label_a}`\n- B: `{label_b}`\n"));
-    out.push_str(&format!(
-        "- Instances: {} shared, {} A-only, {} B-only\n",
+    let _ = writeln!(out, "- A: `{label_a}`\n- B: `{label_b}`");
+    let _ = writeln!(
+        out,
+        "- Instances: {} shared, {} A-only, {} B-only",
         shared.len(),
         map_a.len() - shared.len(),
         map_b.len() - shared.len()
-    ));
+    );
 
     let (mut a_res, mut b_res, mut wins, mut losses, mut ties) = (0u32, 0u32, 0u32, 0u32, 0u32);
     let mut rows = String::new();
     let (mut turns_da, mut in_da, mut out_da, mut req_da, mut cost_da) =
         (0i64, 0i64, 0i64, 0i64, 0.0f64);
-    let (mut ma_sum, mut mb_sum) = (RunMetrics::default(), RunMetrics::default());
+    let (mut totals_a, mut totals_b) = (RunMetrics::default(), RunMetrics::default());
 
     for id in &shared {
         let (ra, rb) = (map_a[*id], map_b[*id]);
@@ -309,38 +317,35 @@ fn render(
         if with_metrics {
             let ma = metrics_for(dir_a, id);
             let mb = metrics_for(dir_b, id);
-            match (&ma, &mb) {
-                (Some(ma), Some(mb)) => {
-                    let d_turns = mb.turns as i64 - ma.turns as i64;
-                    let d_in = mb.usage.input_tokens as i64 - ma.usage.input_tokens as i64;
-                    let d_out = mb.usage.output_tokens as i64 - ma.usage.output_tokens as i64;
-                    let d_req = mb.usage.model_requests as i64 - ma.usage.model_requests as i64;
-                    turns_da += d_turns;
-                    in_da += d_in;
-                    out_da += d_out;
-                    req_da += d_req;
-                    ma_sum.turns += ma.turns;
-                    ma_sum.usage.merge(ma.usage);
-                    mb_sum.turns += mb.turns;
-                    mb_sum.usage.merge(mb.usage);
-                    cells.push(format!("{d_turns:+}"));
-                    cells.push(format!("{d_in:+}"));
-                    cells.push(format!("{d_out:+}"));
-                    cells.push(format!("{d_req:+}"));
-                    if priced {
-                        let d_cost = cost(mb, args).unwrap_or(0.0) - cost(ma, args).unwrap_or(0.0);
-                        cost_da += d_cost;
-                        cells.push(format!("{d_cost:+.4}"));
-                    }
+            if let (Some(ma), Some(mb)) = (&ma, &mb) {
+                let d_turns = mb.turns as i64 - ma.turns as i64;
+                let d_in = mb.usage.input_tokens as i64 - ma.usage.input_tokens as i64;
+                let d_out = mb.usage.output_tokens as i64 - ma.usage.output_tokens as i64;
+                let d_req = mb.usage.model_requests as i64 - ma.usage.model_requests as i64;
+                turns_da += d_turns;
+                in_da += d_in;
+                out_da += d_out;
+                req_da += d_req;
+                totals_a.turns += ma.turns;
+                totals_a.usage.merge(ma.usage);
+                totals_b.turns += mb.turns;
+                totals_b.usage.merge(mb.usage);
+                cells.push(format!("{d_turns:+}"));
+                cells.push(format!("{d_in:+}"));
+                cells.push(format!("{d_out:+}"));
+                cells.push(format!("{d_req:+}"));
+                if priced {
+                    let d_cost = cost(mb, args).unwrap_or(0.0) - cost(ma, args).unwrap_or(0.0);
+                    cost_da += d_cost;
+                    cells.push(format!("{d_cost:+.4}"));
                 }
-                _ => {
+            } else {
+                cells.push(String::new());
+                cells.push(String::new());
+                cells.push(String::new());
+                cells.push(String::new());
+                if priced {
                     cells.push(String::new());
-                    cells.push(String::new());
-                    cells.push(String::new());
-                    cells.push(String::new());
-                    if priced {
-                        cells.push(String::new());
-                    }
                 }
             }
         }
@@ -349,14 +354,15 @@ fn render(
         rows.push_str(" |\n");
     }
 
-    out.push_str(&format!(
-        "\nResolved: A {a_res}/{}, B {b_res}/{} — A wins {}, losses {}, ties {}\n",
+    let _ = writeln!(
+        out,
+        "\nResolved: A {a_res}/{}, B {b_res}/{} — A wins {}, losses {}, ties {}",
         shared.len(),
         shared.len(),
         wins,
         losses,
         ties
-    ));
+    );
 
     if with_metrics {
         let mut head = "| instance | A | B | Δturns | Δin | Δout | Δreq |".to_string();
@@ -371,24 +377,26 @@ fn render(
         out.push_str(&sep);
         out.push('\n');
         out.push_str(&rows);
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "\nTotals: turns {} → {} (Δ{turns_da:+}), input {} → {} (Δ{in_da:+}), \
              output {} → {} (Δ{out_da:+}), requests {} → {} (Δ{req_da:+})",
-            ma_sum.turns,
-            mb_sum.turns,
-            ma_sum.usage.input_tokens,
-            mb_sum.usage.input_tokens,
-            ma_sum.usage.output_tokens,
-            mb_sum.usage.output_tokens,
-            ma_sum.usage.model_requests,
-            mb_sum.usage.model_requests,
-        ));
+            totals_a.turns,
+            totals_b.turns,
+            totals_a.usage.input_tokens,
+            totals_b.usage.input_tokens,
+            totals_a.usage.output_tokens,
+            totals_b.usage.output_tokens,
+            totals_a.usage.model_requests,
+            totals_b.usage.model_requests,
+        );
         if priced {
-            out.push_str(&format!(
+            let _ = write!(
+                out,
                 ", cost ${:.4} → ${:.4} (Δ{cost_da:+.4})",
-                cost(&ma_sum, args).unwrap_or(0.0),
-                cost(&mb_sum, args).unwrap_or(0.0),
-            ));
+                cost(&totals_a, args).unwrap_or(0.0),
+                cost(&totals_b, args).unwrap_or(0.0),
+            );
         }
         out.push('\n');
     }
@@ -425,15 +433,7 @@ mod tests {
             ("c__c-3".to_owned(), true),
             ("e__e-5".to_owned(), true),
         ];
-        let report = render(
-            &a,
-            &b,
-            None,
-            None,
-            &no_dirs_args(),
-            "a.json".into(),
-            "b.json".into(),
-        );
+        let report = render(&a, &b, None, None, &no_dirs_args(), "a.json", "b.json");
         // Shared: a-1, b-2, c-3; d-4 is A-only, e-5 is B-only.
         assert!(report.contains("3 shared, 1 A-only, 1 B-only"), "{report}");
         assert!(report.contains("Resolved: A 2/3, B 2/3"), "{report}");

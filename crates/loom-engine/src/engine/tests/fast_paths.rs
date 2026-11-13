@@ -29,7 +29,7 @@ async fn fast_path_solves_a_rename_with_zero_model_requests() {
             &mut session,
             "Rename parse_opts to parse_options",
             &sink,
-            &Default::default(),
+            &crate::TaskControl::default(),
         )
         .await
         .expect("fast path task");
@@ -98,7 +98,7 @@ async fn fast_path_solves_a_dependency_update_with_zero_model_requests() {
             &mut session,
             "Update the dependency tiny-dep to 2.0.0.",
             &sink,
-            &Default::default(),
+            &crate::TaskControl::default(),
         )
         .await
         .expect("fast path task");
@@ -141,7 +141,7 @@ async fn unmatched_instructions_fall_through_to_the_agent_loop() {
             &mut session,
             "Say hello and stop.",
             &sink,
-            &Default::default(),
+            &crate::TaskControl::default(),
         )
         .await
         .expect("agent task");
@@ -195,7 +195,7 @@ async fn a_solver_decline_names_the_intent() {
             &mut session,
             "Rename missing_symbol to renamed_symbol",
             &sink,
-            &Default::default(),
+            &crate::TaskControl::default(),
         )
         .await
         .expect("agent task");
@@ -236,7 +236,7 @@ async fn fast_paths_can_be_disabled_by_override() {
             &mut session,
             "Rename parse_opts to parse_options",
             &sink,
-            &Default::default(),
+            &crate::TaskControl::default(),
         )
         .await
         .expect("agent task");

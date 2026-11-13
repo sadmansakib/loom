@@ -1,6 +1,7 @@
 //! The `run_command` tool proper: the spec, the policy verdict gate, and
 //! the orchestration from parsed input to rendered output.
 
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -77,11 +78,13 @@ impl RunCommandTool {
 
     /// The shipped tool: the workspace's manifest policy resolved by
     /// the engine, or `cargo`-only when opened directly.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Sets explicit output budgets (item 20.2) on this instance.
+    #[must_use]
     pub fn with_budgets(mut self, budgets: ToolBudgets) -> Self {
         self.budgets = budgets;
         self
@@ -89,12 +92,14 @@ impl RunCommandTool {
 
     /// A tool under an explicit policy (the engine's entry point after
     /// loading a workspace manifest).
+    #[must_use]
     pub fn with_policy(policy: CommandPolicy) -> Self {
         Self::under(policy)
     }
 
     /// Attaches the operator-approval hook for `ask` verdicts
     /// (interactive frontends; without one, `ask` fails closed).
+    #[must_use]
     pub fn with_ask_resolver(mut self, ask: AskResolver) -> Self {
         self.ask = Some(ask);
         self
@@ -133,10 +138,92 @@ fn admission_sentence(policy: &CommandPolicy) -> String {
             .map(|name| format!("`{name}`"))
             .collect::<Vec<_>>()
             .join(", ");
-        sentence.push_str(&format!(" Never run: {names}."));
+        let _ = write!(sentence, " Never run: {names}.");
     }
     sentence
 }
+/// A path-qualified program is normally the same program the model
+/// means, so keep the bare name when it resolves on PATH
+/// (`/usr/bin/cargo` behaves like `cargo`). Only a basename that is
+/// not on PATH stays an error. Returns the original spelling when a
+/// normalization happened.
+fn normalize_program(program: &mut String) -> Result<Option<String>, ToolError> {
+    let mut normalized = None;
+    if program.contains('/') || program.contains('\\') {
+        let original = program.clone();
+        match std::path::Path::new(&original)
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+        {
+            Some(base) if resolve_in_path(base).is_some() => {
+                base.clone_into(program);
+                normalized = Some(original);
+            }
+            _ => {
+                return Err(ToolError::InvalidInput(format!(
+                    "program \"{program}\" must be a bare executable name, not a path",
+                )));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+/// The verdict layer gates execution before anything runs: denied
+/// programs never execute (wrappers carrying a denied program in
+/// their arguments are refused too — review F-09), and `ask` verdicts
+/// need operator approval (failing closed without a frontend).
+async fn gate_program(
+    policy: &CommandPolicy,
+    ask: Option<&AskResolver>,
+    program: &str,
+    args: &[String],
+) -> Result<(), ToolError> {
+    match policy.verdict_for_argv(program, args) {
+        PolicyVerdict::Allow => {}
+        PolicyVerdict::Deny => {
+            let wrapped = policy.wrapped_denied_name(program, args);
+            return Err(ToolError::InvalidInput(format!(
+                "program \"{program}\" is denied by workspace policy (.loom/commands.toml){}; \
+                 pick another approach",
+                wrapped.map_or_else(String::new, |name| format!(
+                    " — it wraps the denied program \"{name}\""
+                )),
+            )));
+        }
+        PolicyVerdict::Ask => {
+            // Full-argv approval (review F-13): the operator sees
+            // exactly what will run and under which escalation, not
+            // just the program name.
+            let rule = policy.rule(program);
+            let approved = match ask {
+                Some(resolver) => {
+                    resolver(AskRequest {
+                        program: program.to_owned(),
+                        args: args.to_vec(),
+                        sandboxed: rule.is_none_or(|rule| rule.sandbox),
+                        network: rule.is_some_and(|rule| rule.network),
+                    })
+                    .await
+                }
+                None => false,
+            };
+            if !approved {
+                return Err(ToolError::InvalidInput(format!(
+                    "program \"{program}\" needs operator approval (policy unknown = \"ask\") \
+                     and was not approved{}; pick another approach",
+                    if ask.is_none() {
+                        " — no interactive frontend is attached"
+                    } else {
+                        ""
+                    }
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Tool for RunCommandTool {
     fn spec(&self) -> &ToolSpec {
         &self.spec
@@ -158,6 +245,8 @@ impl Tool for RunCommandTool {
     }
 
     fn failure_hint(&self, failure: loom_kernel::transcript::ToolFailure) -> Option<String> {
+        // ToolFailure is #[non_exhaustive]: the wildcard arm is required.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match failure {
             loom_kernel::transcript::ToolFailure::InvalidInput => Some(
                 "expected fields: program (bare executable name), args (array of strings)"
@@ -175,78 +264,12 @@ impl Tool for RunCommandTool {
         Box::pin(async move {
             let mut input: RunInput = serde_json::from_value(input)
                 .map_err(|err| ToolError::InvalidInput(format!("invalid arguments: {err}")))?;
-            // A path-qualified program is normally the same program the
-            // model means, so keep the bare name when it resolves on
-            // PATH (`/usr/bin/cargo` behaves like `cargo`). Only a
-            // basename that is not on PATH stays an error.
-            let mut normalized = None;
-            if input.program.contains('/') || input.program.contains('\\') {
-                let original = input.program.clone();
-                match std::path::Path::new(&original)
-                    .file_name()
-                    .and_then(std::ffi::OsStr::to_str)
-                {
-                    Some(base) if resolve_in_path(base).is_some() => {
-                        input.program = base.to_owned();
-                        normalized = Some(original);
-                    }
-                    _ => {
-                        return Err(ToolError::InvalidInput(format!(
-                            "program \"{}\" must be a bare executable name, not a path",
-                            input.program
-                        )));
-                    }
-                }
-            }
-            // The verdict layer gates execution before anything runs:
-            // denied programs never execute (wrappers carrying a
-            // denied program in their arguments are refused too —
-            // review F-09), and `ask` verdicts need operator approval
-            // (failing closed without a frontend).
-            match self.policy.verdict_for_argv(&input.program, &input.args) {
-                PolicyVerdict::Allow => {}
-                PolicyVerdict::Deny => {
-                    let wrapped = self.policy.wrapped_denied_name(&input.program, &input.args);
-                    return Err(ToolError::InvalidInput(format!(
-                        "program \"{}\" is denied by workspace policy (.loom/commands.toml){}; \
-                         pick another approach",
-                        input.program,
-                        wrapped.map_or_else(String::new, |name| format!(
-                            " — it wraps the denied program \"{name}\""
-                        )),
-                    )));
-                }
-                PolicyVerdict::Ask => {
-                    // Full-argv approval (review F-13): the operator
-                    // sees exactly what will run and under which
-                    // escalation, not just the program name.
-                    let rule = self.policy.rule(&input.program);
-                    let approved = match &self.ask {
-                        Some(resolver) => {
-                            resolver(AskRequest {
-                                program: input.program.clone(),
-                                args: input.args.clone(),
-                                sandboxed: rule.is_none_or(|rule| rule.sandbox),
-                                network: rule.is_some_and(|rule| rule.network),
-                            })
-                            .await
-                        }
-                        None => false,
-                    };
-                    if !approved {
-                        return Err(ToolError::InvalidInput(format!(
-                            "program \"{}\" needs operator approval (policy unknown = \"ask\") \
-                             and was not approved{}; pick another approach",
-                            input.program,
-                            if self.ask.is_none() {
-                                " — no interactive frontend is attached"
-                            } else {
-                                ""
-                            }
-                        )));
-                    }
-                }
-            }
+            // A path-qualified program is normalized to its bare name
+            // (see `normalize_program`), then gated: denied programs
+            // never execute and `ask` verdicts need operator approval
+            // before anything runs.
+            let normalized = normalize_program(&mut input.program)?;
+            gate_program(&self.policy, self.ask.as_ref(), &input.program, &input.args).await?;
             // The sandbox wrapper reports a missing program as an opaque
             // non-zero exit; resolve bare names on PATH first so the
             // model gets the same "cannot run" either way.

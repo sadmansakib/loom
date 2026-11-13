@@ -13,11 +13,13 @@ use super::error::AuthError;
 pub struct AccountId(String);
 
 impl AccountId {
+    #[must_use]
     /// Generates a fresh, time-ordered account id.
     pub fn new() -> Self {
         Self(uuid::Uuid::now_v7().to_string())
     }
 
+    #[must_use]
     /// The id as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -62,6 +64,7 @@ pub enum Method {
 }
 
 impl Method {
+    #[must_use]
     /// Stable token used in the database and in `loom auth list`.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -108,14 +111,16 @@ pub struct Account {
     pub last4: Option<String>,
 }
 
+#[must_use]
 /// Unix epoch milliseconds, UTC.
+#[allow(clippy::cast_possible_truncation)] // u128 millis fit u64 until the year ~584 million
 pub fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |duration| duration.as_millis() as u64)
 }
 
+#[must_use]
 /// The last four characters of a secret, for display; `None` when shorter.
 pub fn last_four(secret: &str) -> Option<String> {
     let chars: Vec<char> = secret.chars().collect();

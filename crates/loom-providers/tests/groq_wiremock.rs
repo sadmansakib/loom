@@ -1,7 +1,7 @@
 //! Integration tests for the Groq adapter against a real HTTP stack via
 //! wiremock.
 //!
-//! Groq rides the same OpenAI-compatible wire as DeepSeek, GLM, and NVIDIA
+//! Groq rides the same `OpenAI`-compatible wire as `DeepSeek`, GLM, and NVIDIA
 //! (`openai_wire` + `wire_stream`), so the shared transport surface — SSE
 //! decoding, EOF tolerance, error-body excerpts, cancellation — is covered
 //! by `deepseek_wiremock.rs`. This file pins the behaviours that are
@@ -21,6 +21,9 @@
 //! * capability resolution from the adapter's own table, which is the
 //!   only authority here (Groq publishes no capability document).
 
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use futures::StreamExt;
 use loom_kernel::model::{
     Message, ModelError, ModelErrorKind, ModelEvent, ModelProvider, ModelRequest, StopReason,
@@ -69,7 +72,7 @@ fn request_for(model: &str) -> ModelRequest {
     }
 }
 
-fn data_event(payload: Value) -> String {
+fn data_event(payload: &Value) -> String {
     payload.to_string()
 }
 
@@ -91,7 +94,7 @@ fn done() -> String {
 /// request the adapter sent.
 fn empty_stream() -> String {
     sse(&[
-        data_event(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
+        data_event(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
         done(),
     ])
 }
@@ -213,10 +216,10 @@ async fn groq_streams_reasoning_from_the_plain_delta_field() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({"choices":[{"delta":{"reasoning":"weighing "}}]})),
-            data_event(json!({"choices":[{"delta":{"reasoning":"the tradeoff"}}]})),
-            data_event(json!({"choices":[{"delta":{"content":"done"}}]})),
-            data_event(json!({
+            data_event(&json!({"choices":[{"delta":{"reasoning":"weighing "}}]})),
+            data_event(&json!({"choices":[{"delta":{"reasoning":"the tradeoff"}}]})),
+            data_event(&json!({"choices":[{"delta":{"content":"done"}}]})),
+            data_event(&json!({
                 "choices": [{"delta": {}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 40, "completion_tokens": 9}
             })),
@@ -249,13 +252,13 @@ async fn groq_prefers_the_plain_field_and_tolerates_the_shared_one() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({"choices":[{"delta":{
+            data_event(&json!({"choices":[{"delta":{
                 "reasoning": "groq's own ",
                 "reasoning_content": "the wrong dialect "
             }}]})),
-            data_event(json!({"choices":[{"delta":{"reasoning_content":"only the shared one"}}]})),
-            data_event(json!({"choices":[{"delta":{"content":"hi"}}]})),
-            data_event(json!({
+            data_event(&json!({"choices":[{"delta":{"reasoning_content":"only the shared one"}}]})),
+            data_event(&json!({"choices":[{"delta":{"content":"hi"}}]})),
+            data_event(&json!({
                 "choices": [{"delta": {}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 3, "completion_tokens": 1}
             })),
@@ -282,16 +285,16 @@ async fn groq_tool_call_turn_keeps_the_provider_id() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({"choices":[{"delta":{"tool_calls":[{
+            data_event(&json!({"choices":[{"delta":{"tool_calls":[{
                 "index": 0,
                 "id": "fc_9840b1fd-6a7c-4f21-9c3e-2b8d5a1e77aa",
                 "function": {"name": "read_file", "arguments": "{\"path\":"}
             }]}}]})),
-            data_event(json!({"choices":[{"delta":{"tool_calls":[{
+            data_event(&json!({"choices":[{"delta":{"tool_calls":[{
                 "index": 0,
                 "function": {"arguments": "\"src/main.rs\"}"}
             }]}}]})),
-            data_event(json!({
+            data_event(&json!({
                 "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
                 "usage": {"prompt_tokens": 60, "completion_tokens": 20}
             })),
@@ -319,11 +322,11 @@ async fn groq_synthesizes_ids_for_idless_tool_fragments() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({"choices":[{"delta":{"tool_calls":[{
+            data_event(&json!({"choices":[{"delta":{"tool_calls":[{
                 "index": 0,
                 "function": {"name": "list_dir", "arguments": "{\"path\":\".\"}"}
             }]}}]})),
-            data_event(json!({
+            data_event(&json!({
                 "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
                 "usage": {"prompt_tokens": 12, "completion_tokens": 8}
             })),
@@ -352,8 +355,8 @@ async fn groq_envelope_error_is_the_mid_stream_failure_channel() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({"choices":[{"delta":{"content":"partial"}}]})),
-            data_event(json!({"x_groq": {"error": {
+            data_event(&json!({"choices":[{"delta":{"content":"partial"}}]})),
+            data_event(&json!({"x_groq": {"error": {
                 "message": "The model is overloaded",
                 "type": "server_error"
             }}})),

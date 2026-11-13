@@ -68,6 +68,7 @@ pub struct Session {
 
 impl Session {
     /// Creates an empty session with the given id.
+    #[must_use]
     pub fn new(id: crate::id::SessionId) -> Self {
         Self {
             id,
@@ -78,10 +79,15 @@ impl Session {
     }
 
     /// The index the next appended item will receive.
+    #[must_use]
     pub fn next_index(&self) -> ItemIndex {
         // A u32 would overflow after 4 billion items; not a real risk for
         // an append-only conversation held in memory.
-        ItemIndex::from(self.transcript.len() as u32)
+        ItemIndex::from(
+            // The transcript never approaches u32::MAX items (see above).
+            #[allow(clippy::cast_possible_truncation)]
+            (self.transcript.len() as u32),
+        )
     }
 
     /// Appends a single item and returns its stable transcript index.
@@ -90,6 +96,12 @@ impl Session {
     /// it is the atomicity boundary. This method rejects an assistant
     /// item carrying tool calls in **every** build — committing one
     /// without its results would break the turn invariant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::AssistantToolCallsNeedAppendTurn`] when
+    /// `item` is an assistant item carrying tool calls; the transcript
+    /// is left unchanged.
     pub fn push_item(&mut self, item: Item) -> Result<ItemIndex, SessionError> {
         if let Item::Assistant(assistant) = &item
             && !assistant.tool_calls.is_empty()
@@ -109,7 +121,7 @@ impl Session {
     /// of §6.1's "commit = turn" guarantee.
     ///
     /// Returns `[assistant_start, results_start]`. When the turn has no
-    /// tool calls (EndTurn), `results_start` equals the index one past the
+    /// tool calls (`EndTurn`), `results_start` equals the index one past the
     /// assistant item — i.e. [`Session::next_index`] at commit time, a
     /// slot no item of this turn occupies. Persistence should slice
     /// `[assistant_start, next_index())`, not read through
@@ -118,6 +130,12 @@ impl Session {
     /// This is plan-then-apply in one call. The agent loop instead calls
     /// [`Session::plan_turn`], persists the [`PlannedTurn`], and then
     /// [`Session::apply_planned_turn`] — persist-then-commit (ADR-012).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] when validation fails (results do not
+    /// match tool calls one-to-one, in order); the transcript is
+    /// unchanged.
     pub fn append_turn(
         &mut self,
         assistant: AssistantMessage,
@@ -135,6 +153,11 @@ impl Session {
     /// persist-then-commit): the store persists the returned [`PlannedTurn`],
     /// then [`Session::apply_planned_turn`] commits it. Validation is
     /// identical to the old `append_turn`, so a planned turn always applies.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] when the results do not match the tool
+    /// calls one-to-one, in original call order.
     pub fn plan_turn(
         &self,
         assistant: AssistantMessage,
@@ -230,27 +253,36 @@ pub struct PlannedTurn {
 
 impl PlannedTurn {
     /// Index the assistant item occupies.
+    #[must_use]
     pub fn assistant_at(&self) -> ItemIndex {
         self.assistant_at
     }
 
     /// Index the first tool result occupies. For a turn with no tool calls
-    /// (EndTurn) no item occupies it; it equals [`PlannedTurn::end_index`].
+    /// (`EndTurn`) no item occupies it; it equals [`PlannedTurn::end_index`].
+    #[must_use]
     pub fn results_at(&self) -> ItemIndex {
         self.results_at
     }
 
     /// Index one past the last item of this turn.
+    #[must_use]
     pub fn end_index(&self) -> ItemIndex {
-        ItemIndex::from(self.results_at.as_u32() + self.results.len() as u32)
+        // A turn's result count is bounded by the model's tool calls —
+        // far below `u32::MAX`.
+        #[allow(clippy::cast_possible_truncation)]
+        let results_len = self.results.len() as u32;
+        ItemIndex::from(self.results_at.as_u32() + results_len)
     }
 
     /// The assistant message.
+    #[must_use]
     pub fn assistant(&self) -> &AssistantMessage {
         &self.assistant
     }
 
     /// The tool results, in original call order.
+    #[must_use]
     pub fn results(&self) -> &[ToolResult] {
         &self.results
     }
@@ -261,7 +293,10 @@ impl PlannedTurn {
         let assistant =
             std::iter::once((self.assistant_at, Item::Assistant(self.assistant.clone())));
         let results = self.results.iter().enumerate().map(|(offset, result)| {
-            let index = ItemIndex::from(self.results_at.as_u32() + offset as u32);
+            // A turn's result count is bounded by the model's tool calls.
+            #[allow(clippy::cast_possible_truncation)]
+            let offset = offset as u32;
+            let index = ItemIndex::from(self.results_at.as_u32() + offset);
             (index, Item::ToolResult(result.clone()))
         });
         assistant.chain(results)
@@ -279,10 +314,10 @@ impl PlannedTurn {
 pub enum TaskStatus {
     /// The loop is still executing.
     Running,
-    /// Terminal: the model ended its turn (EndTurn).
+    /// Terminal: the model ended its turn (`EndTurn`).
     Completed,
     /// Terminal: model error, context error, max turns, or a fatal stop
-    /// reason (MaxTokens / ContextLimit / ContentFilter).
+    /// reason (`MaxTokens` / `ContextLimit` / `ContentFilter`).
     Failed,
     /// Terminal: the user (or a shutdown) cancelled the run.
     Cancelled,
@@ -311,7 +346,7 @@ pub struct TaskRecord {
     /// When the task reached a terminal state, if it has.
     pub completed_at_millis: Option<u64>,
     /// Short machine-readable token naming the cause of the ending, in
-    /// snake_case (e.g. `"end_turn"`, `"max_turns"`, `"model_error"`,
+    /// `snake_case` (e.g. `"end_turn"`, `"max_turns"`, `"model_error"`,
     /// `"user_cancelled"`, `"shutdown"`). Convention: **always set on
     /// terminal records** — even when the status alone implies the cause
     /// (`"end_turn"` on [`TaskStatus::Completed`]) — so stored values stay
@@ -325,10 +360,10 @@ pub struct TaskRecord {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TerminalTaskStatus {
-    /// Terminal: the model ended its turn (EndTurn).
+    /// Terminal: the model ended its turn (`EndTurn`).
     Completed,
     /// Terminal: model error, context error, max turns, or a fatal stop
-    /// reason (MaxTokens / ContextLimit / ContentFilter).
+    /// reason (`MaxTokens` / `ContextLimit` / `ContentFilter`).
     Failed,
     /// Terminal: the user (or a shutdown) cancelled the run.
     Cancelled,
@@ -506,6 +541,7 @@ impl TodoList {
 
 impl TaskRecord {
     /// Creates a fresh record in the [`TaskStatus::Running`] state.
+    #[must_use]
     pub fn new(id: TaskId, started_at_millis: u64) -> Self {
         Self {
             id,

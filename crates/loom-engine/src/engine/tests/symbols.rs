@@ -70,11 +70,18 @@ async fn run_symbols_task(config: EngineConfig, overrides: EngineOverrides) -> V
     let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
     let mut session = engine.new_session();
     let _ = engine
-        .run_task(&mut session, "List the symbols", &sink, &Default::default())
+        .run_task(
+            &mut session,
+            "List the symbols",
+            &sink,
+            &crate::TaskControl::default(),
+        )
         .await;
     drain(&mut receiver)
 }
 
+// EventKind is #[non_exhaustive]; this probe only wants symbols_overview completions
+#[allow(clippy::wildcard_enum_match_arm)]
 fn overview_content(kinds: &[EventKind]) -> Option<&str> {
     kinds.iter().find_map(|kind| match kind {
         EventKind::ToolCompleted {
@@ -83,6 +90,8 @@ fn overview_content(kinds: &[EventKind]) -> Option<&str> {
             content_head,
             ..
         } if name == "symbols_overview" => Some(content_head.as_str()),
+        // EventKind is #[non_exhaustive]; this probe only wants symbols_overview completions
+        #[allow(clippy::wildcard_enum_match_arm)]
         _ => None,
     })
 }
@@ -155,6 +164,8 @@ async fn two_failed_edits_on_one_file_inject_its_symbol_outline() {
         FakeProvider::end_turn_script("done"),
     ]));
     let kinds = run_symbols_task(config, EngineOverrides::default().with_provider(provider)).await;
+    // EventKind is #[non_exhaustive]; this probe only wants the stall-breaker nudge
+    #[allow(clippy::wildcard_enum_match_arm)]
     let nudge = kinds
         .iter()
         .find_map(|kind| match kind {

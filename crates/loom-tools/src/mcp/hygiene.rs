@@ -3,6 +3,7 @@
 //! SHA-256 pinning of tool definitions.
 
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 
 // ---------------------------------------------------------------------------
 // Hygiene
@@ -19,6 +20,7 @@ use super::DESC_MAX_CHARS;
 
 /// Strips invisible characters and collapses whitespace runs to single
 /// spaces — the deterministic normal form all ingest checks run against.
+#[must_use]
 pub fn sanitize_text(raw: &str) -> String {
     let stripped: String = raw.chars().filter(|c| !is_invisible(*c)).collect();
     let mut out = String::with_capacity(stripped.len());
@@ -38,6 +40,7 @@ pub fn sanitize_text(raw: &str) -> String {
 }
 
 /// Caps a sanitized description at [`DESC_MAX_CHARS`] on a char boundary.
+#[must_use]
 pub fn truncate_description(desc: &str) -> String {
     if desc.chars().count() <= DESC_MAX_CHARS {
         return desc.to_owned();
@@ -122,11 +125,11 @@ pub(super) fn pin_hash(
         hasher.update(part.as_bytes());
         hasher.update([0x1f]);
     }
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let mut hex = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// Warns when the server argv uses a fetch-and-run runner without a

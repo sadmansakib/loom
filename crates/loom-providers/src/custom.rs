@@ -1,9 +1,9 @@
 //! The custom adapter: any OpenAI-compatible endpoint the user points
 //! at, described entirely by two URLs and a key.
 //!
-//! Some teams run their own gateways (LiteLLM, vLLM, an internal
+//! Some teams run their own gateways (`LiteLLM`, vLLM, an internal
 //! proxy, a vendor Loom has no adapter for). They all speak the
-//! OpenAI chat wire, but their model catalogs differ in field names
+//! `OpenAI` chat wire, but their model catalogs differ in field names
 //! and detail. This adapter is deliberately schema-tolerant: it
 //! reads `GET /models` from any of the common shapes ({`data`: [...]},
 //! {`models`: [...]}, or a bare array) and sniffs the well-known
@@ -12,8 +12,8 @@
 //! the model id itself is required, so a typo in `--model` still
 //! fails loudly as an unknown model instead of guessing.
 //!
-//! Chat requests ride the plain OpenAI wire (no extra fields), so
-//! anything that accepts the OpenAI chat-completions shape works
+//! Chat requests ride the plain `OpenAI` wire (no extra fields), so
+//! anything that accepts the `OpenAI` chat-completions shape works
 //! unchanged. Status classification follows the shared OpenAI-family
 //! error model.
 
@@ -43,7 +43,7 @@ pub const PROVIDER_NAME: &str = "custom";
 /// wrong claims (a 2K window) fail loudly at build time.
 pub const DEFAULT_CONTEXT_TOKENS: u32 = 128 * 1024;
 
-/// Cap on the catalog response body, shared scale with the OpenRouter
+/// Cap on the catalog response body, shared scale with the `OpenRouter`
 /// fetch; a cap keeps a misbehaving endpoint from ballooning memory.
 const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 
@@ -182,6 +182,13 @@ impl CustomCatalog {
 ///
 /// Builds its own connection-pooled client; the header timeout bounds
 /// time-to-headers and the idle timeout bounds the body read.
+///
+/// # Errors
+///
+/// Returns [`crate::openrouter::CatalogError`] when the client cannot
+/// be built, the request times out or fails, the endpoint answers
+/// with a non-success status, or the body exceeds the byte cap, is
+/// not valid UTF-8, or does not parse as a catalog.
 pub async fn fetch_custom_catalog(
     models_url: &str,
     api_key: &str,
@@ -192,6 +199,13 @@ pub async fn fetch_custom_catalog(
 }
 
 /// [`fetch_custom_catalog`] for callers that already own a client.
+///
+/// # Errors
+///
+/// Returns [`crate::openrouter::CatalogError`] when the request times
+/// out or fails, the endpoint answers with a non-success status, or
+/// the body exceeds the byte cap, is not valid UTF-8, or does not
+/// parse as a catalog.
 pub async fn fetch_custom_catalog_with(
     client: &reqwest::Client,
     models_url: &str,
@@ -244,10 +258,16 @@ pub async fn fetch_custom_catalog_with(
 
 /// Parses a models response body into a catalog.
 ///
-/// Accepts the three envelope shapes seen in the wild — OpenAI's
-/// `{data: [...]}` (also OpenRouter, most gateways), `{models: [...]}`,
+/// Accepts the three envelope shapes seen in the wild — `OpenAI`'s
+/// `{data: [...]}` (also `OpenRouter`, most gateways), `{models: [...]}`,
 /// and a bare array — and tolerates per-entry field variations; see
 /// the field sniffing in [`reduce_entry`].
+///
+/// # Errors
+///
+/// Returns a descriptive `String` when the body is not valid JSON, is
+/// not one of the three envelope shapes, or carries no usable
+/// `data`/`models` array.
 pub fn parse_custom_catalog(
     body: &str,
     source: &str,
@@ -263,7 +283,9 @@ pub fn parse_custom_catalog(
                 .and_then(Value::as_array)
                 .ok_or_else(|| "catalog envelope: no data/models array".to_owned())?,
         },
-        _ => return Err("catalog envelope: expected an object or array".to_owned()),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            return Err("catalog envelope: expected an object or array".to_owned());
+        }
     };
     // Entries without an id carry nothing addressable; skip rather
     // than fail the whole catalog (some gateways prepend metadata
@@ -369,9 +391,12 @@ fn numeric_u32(value: Option<&Value>) -> Option<u32> {
     let number = match value? {
         Value::Number(number) => number.as_f64()?,
         Value::String(text) => text.trim().parse::<f64>().ok()?,
-        _ => return None,
+        Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => return None,
     };
-    Some(number.max(0.0).min(u32::MAX as f64) as u32)
+    // Clamped into `[0.0, u32::MAX]` above; `as` implements the
+    // documented truncate-toward-zero narrowing.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Some(number.max(0.0).min(f64::from(u32::MAX)) as u32)
 }
 
 /// Parses a price that the catalog may encode as a JSON number or a
@@ -380,7 +405,7 @@ fn price(value: Option<&Value>) -> Option<f64> {
     let parsed = match value? {
         Value::Number(number) => number.as_f64()?,
         Value::String(text) => text.parse().ok()?,
-        _ => return None,
+        Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => return None,
     };
     (parsed >= 0.0).then_some(parsed)
 }
@@ -402,7 +427,10 @@ impl CustomProvider {
     /// Creates a provider bound to `catalog` with a connection-pooled
     /// HTTP client.
     ///
-    /// Fails only when the TLS backend cannot be initialized.
+    /// # Errors
+    ///
+    /// Returns [`reqwest::Error`] when the TLS backend cannot be
+    /// initialized.
     pub fn new(config: CustomConfig, catalog: CustomCatalog) -> Result<Self, reqwest::Error> {
         let client = build_client(&config.timeouts)?;
         Ok(Self {
@@ -525,7 +553,7 @@ impl WireEndpoint for CustomProvider {
         ModelError::new(kind, format!("HTTP {status}: {}", body_excerpt(body)))
     }
 
-    /// Many gateways (LiteLLM and OpenRouter-format proxies alike)
+    /// Many gateways (`LiteLLM` and `OpenRouter`-format proxies alike)
     /// echo the actual USD charge back in `usage.cost`, and upstream
     /// DeepSeek-family models report cache hits as flat
     /// `prompt_cache_hit_tokens` instead of the OpenAI-standard
@@ -598,8 +626,8 @@ mod tests {
         let full = catalog.model("full-model").expect("full model");
         assert_eq!(full.context_length, Some(200_000));
         assert_eq!(full.max_completion_tokens, Some(8192));
-        assert_eq!(full.prompt_price, Some(0.000003));
-        assert_eq!(full.completion_price, Some(0.000015));
+        assert_eq!(full.prompt_price, Some(0.000_003));
+        assert_eq!(full.completion_price, Some(0.000_015));
         assert!(full.tool_capable && full.parallel_tool_calls && full.reasoning_capable);
     }
 
@@ -656,25 +684,25 @@ mod tests {
         let catalog = catalog(body);
         assert_eq!(catalog.len(), 5); // the id-less entry is skipped
 
-        let a = catalog.model("a").expect("a");
-        assert_eq!(a.context_length, Some(32_768));
-        assert_eq!(a.max_completion_tokens, Some(4096));
+        let row_a = catalog.model("a").expect("row_a");
+        assert_eq!(row_a.context_length, Some(32_768));
+        assert_eq!(row_a.max_completion_tokens, Some(4096));
 
-        let b = catalog.model("b").expect("b");
-        assert_eq!(b.context_length, None);
-        assert_eq!(b.max_completion_tokens, Some(512));
-        assert!(!b.tool_capable && b.parallel_tool_calls && b.reasoning_capable);
+        let row_b = catalog.model("b").expect("row_b");
+        assert_eq!(row_b.context_length, None);
+        assert_eq!(row_b.max_completion_tokens, Some(512));
+        assert!(!row_b.tool_capable && row_b.parallel_tool_calls && row_b.reasoning_capable);
 
-        let c = catalog.model("c").expect("c");
-        assert!(!c.tool_capable);
+        let row_c = catalog.model("c").expect("row_c");
+        assert!(!row_c.tool_capable);
 
-        let d = catalog.model("d").expect("d");
-        assert!(d.tool_capable);
-        assert!(!d.parallel_tool_calls && !d.reasoning_capable);
+        let row_d = catalog.model("d").expect("row_d");
+        assert!(row_d.tool_capable);
+        assert!(!row_d.parallel_tool_calls && !row_d.reasoning_capable);
 
         // max_completion_tokens wins over max_tokens; both present.
-        let e = catalog.model("e").expect("e");
-        assert_eq!(e.max_completion_tokens, Some(2048));
+        let row_e = catalog.model("e").expect("row_e");
+        assert_eq!(row_e.max_completion_tokens, Some(2048));
     }
 
     #[test]
@@ -739,7 +767,7 @@ mod tests {
     fn dialect_reads_reported_cost_and_cache_hits() {
         use crate::openai_wire::DialectUsage;
         let mut extra = serde_json::Map::new();
-        extra.insert("cost".to_string(), serde_json::Value::from(0.000123));
+        extra.insert("cost".to_string(), serde_json::Value::from(0.000_123));
         extra.insert(
             "prompt_cache_hit_tokens".to_string(),
             serde_json::Value::from(4096u64),
@@ -748,14 +776,14 @@ mod tests {
             <CustomProvider as WireEndpoint>::dialect_usage(&extra),
             DialectUsage {
                 cached_input_tokens: Some(4096),
-                cost_usd: Some(0.000123),
+                cost_usd: Some(0.000_123),
             }
         );
         // Gateways that echo neither key stay at the defaults; the
         // OpenAI-standard nested shape is read by the shared wire
         // fallback in `finalize`, not here.
         assert_eq!(
-            <CustomProvider as WireEndpoint>::dialect_usage(&Default::default()),
+            <CustomProvider as WireEndpoint>::dialect_usage(&serde_json::Map::new()),
             DialectUsage::default()
         );
     }

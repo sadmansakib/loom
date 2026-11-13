@@ -41,6 +41,7 @@ pub struct SweepProvenance {
 }
 
 /// sha256 of `bytes` as lowercase hex.
+#[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -56,6 +57,11 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Reads and hashes the staged binary (when the arm runs one); fails
 /// loudly rather than stamping a report with no provenance.
+///
+/// # Errors
+///
+/// Returns the `std::io::Error` of [`std::fs::read`] when the staged
+/// binary exists but cannot be read.
 pub fn sweep_provenance(
     loom_bin: Option<&Path>,
     agent: AgentKind,
@@ -80,6 +86,7 @@ pub fn sweep_provenance(
 
 /// The digest recorded in a sweep report's `provenance.loom_sha256`
 /// (absent in pre-2026-10-25 reports).
+#[must_use]
 pub fn recorded_loom_digest(sweep_json: &serde_json::Value) -> Option<&str> {
     sweep_json.get("provenance")?.get("loom_sha256")?.as_str()
 }
@@ -88,6 +95,11 @@ pub fn recorded_loom_digest(sweep_json: &serde_json::Value) -> Option<&str> {
 /// sweep reports that record *different* binary digests mixes builds
 /// into one number and is refused. Reports without provenance
 /// predate the rule and pass — callers warn on them separately.
+///
+/// # Errors
+///
+/// Returns the reason as a `String` when the two reports record
+/// different `provenance.loom_sha256` digests.
 pub fn span_one_build(left: &serde_json::Value, right: &serde_json::Value) -> Result<(), String> {
     let (Some(left), Some(right)) = (recorded_loom_digest(left), recorded_loom_digest(right))
     else {

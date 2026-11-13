@@ -1,8 +1,8 @@
-//! The OpenRouter adapter: an OpenAI-compatible client for
+//! The `OpenRouter` adapter: an `OpenAI`-compatible client for
 //! openrouter.ai, with capabilities resolved from the provider's model
 //! catalog.
 //!
-//! OpenRouter fronts many upstream models — free and paid alike — behind
+//! `OpenRouter` fronts many upstream models — free and paid alike — behind
 //! one OpenAI-shaped endpoint. Loom treats those the same way: nothing in
 //! this adapter branches on whether a model is free. Pricing arrives as
 //! catalog data (zero for free models, non-zero for paid ones) and is
@@ -13,7 +13,7 @@
 //! handed to the engine as data, so the engine stays synchronous and
 //! offline-capable: it never performs discovery itself. `GET /models` is
 //! the source of truth for context limits, output limits, tool support,
-//! and prices (verified against the OpenRouter API reference,
+//! and prices (verified against the `OpenRouter` API reference,
 //! openrouter.ai/docs, fetched 2026-10-06).
 //!
 //! Free-tier specifics live outside this adapter: the day/rate quotas are
@@ -33,7 +33,7 @@ use crate::openai_wire::{WireOptions, build_request_body};
 use crate::secret::SecretString;
 use crate::wire_stream::{WireEndpoint, stream_endpoint};
 
-/// Default OpenRouter API base URL.
+/// Default `OpenRouter` API base URL.
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
 /// The provider name this adapter answers to in configuration.
@@ -237,6 +237,13 @@ pub enum CatalogError {
 /// Builds its own connection-pooled client so a frontend needs no HTTP
 /// client of its own; the header timeout bounds time-to-headers and the
 /// idle timeout bounds the body read.
+///
+/// # Errors
+///
+/// Returns [`CatalogError`] when the client cannot be built, the
+/// request times out or fails, the endpoint answers with a
+/// non-success status, or the body exceeds the byte cap, is not valid
+/// UTF-8, or does not parse as a catalog.
 pub async fn fetch_catalog(
     base_url: &str,
     api_key: &str,
@@ -252,6 +259,12 @@ pub async fn fetch_catalog(
 const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 
 /// [`fetch_catalog`] for callers that already own a client.
+///
+/// # Errors
+///
+/// Returns [`CatalogError`] when the request times out or fails, the
+/// endpoint answers with a non-success status, or the body exceeds
+/// the byte cap, is not valid UTF-8, or does not parse as a catalog.
 pub async fn fetch_catalog_with(
     client: &reqwest::Client,
     base_url: &str,
@@ -302,6 +315,11 @@ pub async fn fetch_catalog_with(
 
 /// Parses a `/models` response body into a catalog stamped with
 /// `fetched_at` (exposed for offline re-reads of a cached snapshot).
+///
+/// # Errors
+///
+/// Returns [`serde_json::Error`] when `body` does not match the
+/// `/models` envelope.
 pub fn parse_catalog(body: &str, fetched_at: u64) -> Result<OpenRouterCatalog, serde_json::Error> {
     let raw: ModelsResponse = serde_json::from_str(body)?;
     Ok(OpenRouterCatalog {
@@ -311,6 +329,7 @@ pub fn parse_catalog(body: &str, fetched_at: u64) -> Result<OpenRouterCatalog, s
 }
 
 /// Current Unix time in seconds; `0` if the clock is before the epoch.
+#[must_use]
 pub fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -381,12 +400,12 @@ fn price(value: Option<&Value>) -> Option<f64> {
     let parsed = match value? {
         Value::Number(number) => number.as_f64()?,
         Value::String(text) => text.parse().ok()?,
-        _ => return None,
+        Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => return None,
     };
     (parsed >= 0.0).then_some(parsed)
 }
 
-/// The OpenRouter [`ModelProvider`] adapter.
+/// The `OpenRouter` [`ModelProvider`] adapter.
 ///
 /// Bound to one catalog snapshot: capabilities resolve from it, so a
 /// model change requires a new catalog (the frontend refreshes and the
@@ -404,7 +423,10 @@ impl OpenRouterProvider {
     /// Creates a provider bound to `catalog` with a connection-pooled
     /// HTTP client.
     ///
-    /// Fails only when the TLS backend cannot be initialized.
+    /// # Errors
+    ///
+    /// Returns [`reqwest::Error`] when the TLS backend cannot be
+    /// initialized.
     pub fn new(
         config: OpenRouterConfig,
         catalog: OpenRouterCatalog,
@@ -423,7 +445,7 @@ impl OpenRouterProvider {
         &self.catalog
     }
 
-    /// Classifies an HTTP status per the OpenRouter error model.
+    /// Classifies an HTTP status per the `OpenRouter` error model.
     ///
     /// Test-only alias for [`WireEndpoint::classify_status`]; the
     /// adapter trait is the single implementation.
@@ -493,7 +515,7 @@ impl WireEndpoint for OpenRouterProvider {
         self.config.timeouts
     }
 
-    /// OpenRouter streams upstream failures as a `finish_reason` of
+    /// `OpenRouter` streams upstream failures as a `finish_reason` of
     /// `error`; retry, since another upstream can serve the request.
     fn in_stream_failure(reason: &str) -> Option<ModelErrorKind> {
         match reason {
@@ -502,9 +524,9 @@ impl WireEndpoint for OpenRouterProvider {
         }
     }
 
-    /// OpenRouter's usage block carries a `cost` key with the actual
+    /// `OpenRouter`'s usage block carries a `cost` key with the actual
     /// USD charge for the request (`0.0` for free models). Read it
-    /// here, in the OpenRouter file, and let the generic wire stay
+    /// here, in the `OpenRouter` file, and let the generic wire stay
     /// dialect-free.
     fn dialect_usage(
         extra: &serde_json::Map<String, serde_json::Value>,
@@ -523,7 +545,7 @@ impl WireEndpoint for OpenRouterProvider {
         }
     }
 
-    /// Classifies an HTTP status per the OpenRouter error model.
+    /// Classifies an HTTP status per the `OpenRouter` error model.
     ///
     /// 402 signals exhausted credits and blocks even free models (a
     /// permanent condition the loop must not retry); 429 is the shared
@@ -612,8 +634,8 @@ mod tests {
         let paid = catalog.model("vendor/paid-model").expect("paid model");
         assert_eq!(paid.context_length, Some(1_048_576));
         assert_eq!(paid.max_completion_tokens, Some(65_536));
-        assert_eq!(paid.prompt_price, Some(0.000003));
-        assert_eq!(paid.completion_price, Some(0.000015));
+        assert_eq!(paid.prompt_price, Some(0.000_003));
+        assert_eq!(paid.completion_price, Some(0.000_015));
         assert_eq!(paid.is_free(), Some(false));
         // `tools` listed without `parallel_tool_calls`: calls serialize.
         assert!(paid.tool_capable && !paid.parallel_tool_calls && !paid.reasoning_capable);
@@ -730,16 +752,16 @@ mod tests {
     fn dialect_reads_reported_cost() {
         use crate::openai_wire::DialectUsage;
         let mut extra = serde_json::Map::new();
-        extra.insert("cost".to_string(), serde_json::Value::from(0.000123));
+        extra.insert("cost".to_string(), serde_json::Value::from(0.000_123));
         assert_eq!(
             <OpenRouterProvider as WireEndpoint>::dialect_usage(&extra),
             DialectUsage {
                 cached_input_tokens: None,
-                cost_usd: Some(0.000123),
+                cost_usd: Some(0.000_123),
             }
         );
         assert_eq!(
-            <OpenRouterProvider as WireEndpoint>::dialect_usage(&Default::default()),
+            <OpenRouterProvider as WireEndpoint>::dialect_usage(&serde_json::Map::new()),
             DialectUsage::default()
         );
     }

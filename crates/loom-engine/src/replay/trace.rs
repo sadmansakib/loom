@@ -36,6 +36,16 @@ pub struct TraceInput {
 impl TraceInput {
     /// Loads and parses a task directory written by `loom run --trace`:
     /// `manifest.json` + `transcript.json` (events optional).
+    ///
+    /// Numeric manifest fields were written by loom itself; the narrow
+    /// integer casts inside only round-trip values that fit by construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplayError::InvalidTrace`] when a required file is
+    /// missing or unreadable, or a JSON file will not parse or has the
+    /// wrong shape.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn read(dir: &Path) -> Result<Self, ReplayError> {
         let manifest_text =
             std::fs::read_to_string(dir.join(MANIFEST_FILE_NAME)).map_err(|error| {
@@ -98,6 +108,8 @@ impl TraceInput {
                     && let Ok(report) =
                         serde_json::from_value::<PruneReport>(event["report"].clone())
                 {
+                    #[allow(clippy::cast_possible_truncation)]
+                    // recorded values are loom-written counts
                     let turn = event["turn"].as_u64().unwrap_or_default() as u32;
                     prune_events.push((turn, report));
                 }

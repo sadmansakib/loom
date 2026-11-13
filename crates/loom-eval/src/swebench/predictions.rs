@@ -19,6 +19,12 @@ pub struct Prediction<'a> {
 /// Writes one predictions file. One row per instance — the official
 /// scorer keys by `instance_id`, so repeated runs write per-run files
 /// (`predictions-<n>.jsonl`), never duplicate rows in one file.
+///
+/// # Panics
+///
+/// Panics when the file cannot be written: the predictions file is the
+/// sweep's deliverable, so a failed write must abort the run.
+#[allow(clippy::panic)] // deliverable write failure must abort the sweep
 pub fn write_predictions(path: &Path, rows: &[Prediction<'_>]) {
     let body = rows
         .iter()
@@ -31,6 +37,7 @@ pub fn write_predictions(path: &Path, rows: &[Prediction<'_>]) {
 
 /// Writes one prediction file per run and, when there are multiple runs,
 /// a best-of-N file selected by normalized-diff majority.
+#[must_use]
 pub fn write_prediction_sets(
     directory: &Path,
     filename_prefix: &str,
@@ -88,6 +95,7 @@ pub fn write_prediction_sets(
 
 /// Filesystem-safe run id: `/` and `:` folded to `-` (the same slug
 /// rule the in-house harness used).
+#[must_use]
 pub fn slug(id: &str) -> String {
     id.replace(['/', ':'], "-")
 }
@@ -100,6 +108,7 @@ pub fn slug(id: &str) -> String {
 /// earlier run (cache-friendlier, run-1-compatible); if every patch is
 /// empty the first (empty) patch is returned so the scorer still gets
 /// its one row per instance.
+#[must_use]
 pub fn select_patch<'a>(patches: &[&'a str]) -> &'a str {
     let normalize = |patch: &str| {
         patch
@@ -116,10 +125,7 @@ pub fn select_patch<'a>(patches: &[&'a str]) -> &'a str {
             .filter(|other| normalize(other) == normalized)
             .count();
         // Strictly greater: ties keep the earlier run's patch.
-        if best
-            .map(|(_, best_count)| count > best_count)
-            .unwrap_or(true)
-        {
+        if best.is_none_or(|(_, best_count)| count > best_count) {
             best = Some((patch, count));
         }
     }

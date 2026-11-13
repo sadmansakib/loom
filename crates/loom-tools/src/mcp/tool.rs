@@ -55,6 +55,7 @@ fn render_content(result: &Value) -> String {
 /// Builds the model-facing tool name: `mcp_<server>_<tool>`, restricted
 /// to the charset registry consumers expect. Public for tests and D2's
 /// facts-block index.
+#[must_use]
 pub fn mcp_tool_name(server: &str, tool: &str) -> String {
     fn sanitize(part: &str) -> String {
         part.chars()

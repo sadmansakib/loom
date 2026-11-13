@@ -7,7 +7,7 @@ use serde_json::Value;
 /// the arguments it accepts).
 ///
 /// This is what a provider adapter renders into its wire tool format
-/// (e.g. OpenAI `function` definitions); it contains no execution
+/// (e.g. `OpenAI` `function` definitions); it contains no execution
 /// state and no provider details.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolSpec {

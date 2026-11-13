@@ -129,19 +129,16 @@ impl TreeNode {
         let mut node = self;
         let mut rest = rel;
         loop {
-            match rest.split_once('/') {
-                Some((head, tail)) => {
-                    node = node.dirs.entry(head.to_owned()).or_default();
-                    rest = tail;
+            if let Some((head, tail)) = rest.split_once('/') {
+                node = node.dirs.entry(head.to_owned()).or_default();
+                rest = tail;
+            } else {
+                if is_dir {
+                    node.dirs.entry(rest.to_owned()).or_default();
+                } else {
+                    node.files.insert(rest.to_owned());
                 }
-                None => {
-                    if is_dir {
-                        node.dirs.entry(rest.to_owned()).or_default();
-                    } else {
-                        node.files.insert(rest.to_owned());
-                    }
-                    break;
-                }
+                break;
             }
         }
     }
@@ -163,7 +160,7 @@ impl TreeNode {
             .map(|name| (name.as_str(), true))
             .chain(self.files.iter().map(|name| (name.as_str(), false)))
             .collect();
-        names.sort();
+        names.sort_unstable();
         for (name, is_dir) in names {
             if is_dir {
                 lines.push(format!("{indent}{name}/"));

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 /// Provider adapters fill this from the wire response; the agent loop sums
 /// it per task. `cached_input_tokens` is `Option` because not every
 /// provider reports cache hits. `cost_usd` is `Option` for the same reason:
-/// only providers that price per request report it (OpenRouter returns the
+/// only providers that price per request report it (`OpenRouter` returns the
 /// actual charge for both free — `0.0` — and paid models).
 ///
 /// Part of the event wire format (via `ModelCompleted`): adding a field
@@ -31,7 +31,7 @@ pub struct Usage {
     /// not part of it was served from a provider-side cache.
     /// Invariant: `cached_input_tokens ⊆ input_tokens` (and on the
     /// Anthropic wire, `cache_creation_input_tokens ⊆ input_tokens`
-    /// as well). The OpenAI family's `prompt_tokens` already includes
+    /// as well). The `OpenAI` family's `prompt_tokens` already includes
     /// the cached share; the Anthropic wire sums its three input
     /// counters to the same meaning.
     pub input_tokens: u64,
@@ -111,7 +111,7 @@ impl std::ops::Add for Usage {
 /// decision at all:
 ///
 /// - cancellation is signalled by a `CancellationToken`, not a stop reason;
-/// - protocol / transport failures are `ModelError`s (e.g. DeepSeek's
+/// - protocol / transport failures are `ModelError`s (e.g. `DeepSeek`'s
 ///   `finish_reason: "aborted"` is a transport error and
 ///   `"insufficient_system_resource"` an overload, not stop reasons).
 ///
@@ -294,7 +294,7 @@ pub struct ModelRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextEditingHint {
     /// Clear only once the request's input tokens exceed this
-    /// threshold (Anthropic requires >= 50_000 for its compaction
+    /// threshold (Anthropic requires >= `50_000` for its compaction
     /// trigger; this field imposes no such floor — validation is the
     /// provider's, not the kernel's).
     pub trigger_tokens: u32,
@@ -340,6 +340,7 @@ impl ModelCapabilities {
     /// `#[non_exhaustive]` means callers outside this crate cannot use a
     /// struct literal, so provider adapters build values through this
     /// constructor and the `with_*` methods.
+    #[must_use]
     pub const fn new(max_context_tokens: u32) -> Self {
         Self {
             max_context_tokens,
@@ -480,7 +481,7 @@ impl ModelErrorKind {
 }
 
 impl std::fmt::Display for ModelErrorKind {
-    /// Renders the stable snake_case name, matching the serde form, so
+    /// Renders the stable `snake_case` name, matching the serde form, so
     /// `ModelError`'s Display (e.g. `[rate_limited] …`) lines up with
     /// serialized values.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -550,7 +551,7 @@ pub type ModelStream<'a> = futures::stream::BoxStream<'a, Result<ModelEvent, Mod
 /// The provider seam (§2): everything the agent loop knows about a model
 /// backend.
 ///
-/// Implementations live in `loom-providers` (e.g. the DeepSeek adapter); the
+/// Implementations live in `loom-providers` (e.g. the `DeepSeek` adapter); the
 /// core depends only on this trait. Cancellation is by *dropping* the
 /// returned stream — no token is passed in (§6.6), so the trait carries no
 /// redundant cancellation path.
@@ -623,7 +624,7 @@ mod tests {
     struct StubProvider;
 
     impl ModelProvider for StubProvider {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "stub"
         }
 

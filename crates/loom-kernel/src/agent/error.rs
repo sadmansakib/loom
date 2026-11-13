@@ -110,7 +110,7 @@ impl TaskError {
         matches!(self, TaskError::Paused)
     }
 
-    /// Stable snake_case token recorded as the task's `end_reason`.
+    /// Stable `snake_case` token recorded as the task's `end_reason`.
     #[must_use]
     pub fn end_reason(&self) -> &str {
         match self {
@@ -131,6 +131,9 @@ impl TaskError {
 }
 
 /// Maps a store failure to the task-level persistence error (ADR-012).
+// By value by design: used as a `.map_err(persistence)` fn pointer,
+// which passes the error by value.
+#[allow(clippy::needless_pass_by_value)]
 pub(super) fn persistence(error: StoreError) -> TaskError {
     TaskError::Persistence(error.to_string())
 }

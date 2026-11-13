@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 /// Existing byte oracle used to prove the one-pass census's array
-/// composition is identical to serde_json's ordinary serialization.
+/// composition is identical to `serde_json`'s ordinary serialization.
 fn old_list_serialization<T: serde::Serialize>(items: &[T]) -> String {
     serde_json::to_string(items).unwrap_or_default()
 }

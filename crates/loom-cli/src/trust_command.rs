@@ -21,7 +21,7 @@ pub fn run(args: TrustArgs) -> anyhow::Result<std::process::ExitCode> {
     let workspace: PathBuf = args.workspace.unwrap_or_else(|| PathBuf::from("."));
     let workspace = workspace
         .canonicalize()
-        .map_err(|error| anyhow!("workspace {workspace:?}: {error}"))
+        .map_err(|error| anyhow!("workspace {}: {error}", workspace.display()))
         .context("resolving the workspace root")?;
 
     let statuses = trust::status(&workspace);

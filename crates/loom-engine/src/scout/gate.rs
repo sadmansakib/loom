@@ -1,13 +1,15 @@
 //! The deterministic weak-answer gate and the `file:line` citation
 //! machinery it guards (FrugalGPT-shaped, docs/subagents-design.md §3).
 
+use std::fmt::Write as _;
+
 use super::run::{ScoutOutcome, Status};
 
-/// The deterministic weak-answer gate (FrugalGPT's quality check with
+/// The deterministic weak-answer gate (`FrugalGPT`'s quality check with
 /// code heuristics instead of a learned scorer — conservative recall
 /// by design, per docs/subagents-design.md §3): timeouts, failures,
 /// empty answers, answers that hit the truncation budget, and answers
-/// that violate the capsule's file:line contract all escalate once.
+/// that violate the capsule's `file:line` contract all escalate once.
 pub(super) fn weak_reason(outcome: &ScoutOutcome) -> Option<&'static str> {
     match &outcome.status {
         Status::TimedOut => Some("timed out"),
@@ -105,19 +107,13 @@ pub(super) fn agreement_note(primary: &str, strong: &str) -> String {
     if both.is_empty() {
         note.push_str("no shared citations");
     } else {
-        note.push_str(&format!("both cite {}", both.join(", ")));
+        let _ = write!(note, "both cite {}", both.join(", "));
     }
     if !only_a.is_empty() {
-        note.push_str(&format!(
-            "; only the primary model cites {}",
-            only_a.join(", ")
-        ));
+        let _ = write!(note, "; only the primary model cites {}", only_a.join(", "));
     }
     if !only_b.is_empty() {
-        note.push_str(&format!(
-            "; only the strong model cites {}",
-            only_b.join(", ")
-        ));
+        let _ = write!(note, "; only the strong model cites {}", only_b.join(", "));
     }
     format!("{note}]")
 }

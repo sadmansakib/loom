@@ -74,7 +74,7 @@ pub(super) async fn apply_rename(
     }
     Ok(Some(FastPathOutcome {
         kind: "rename",
-        files_changed: touched.len() as u32,
+        files_changed: u32::try_from(touched.len()).unwrap_or(u32::MAX),
         note: format!(
             "Fast path (rename): `{from}` → `{to}` across {} file(s), \
              {occurrences} occurrence(s); verified with `cargo check`.",
@@ -113,15 +113,15 @@ pub(super) async fn apply_rename_lsp(
     let server = servers.iter().find(|server| {
         matches!(
             &server.capabilities.rename_provider,
-            Some(OneOf::Left(true)) | Some(OneOf::Right(_))
+            Some(OneOf::Left(true) | OneOf::Right(_))
         )
     })?;
     // Resolve the declaration site: exactly one exact match.
     let symbols = server
         .request::<WorkspaceSymbolRequest>(WorkspaceSymbolParams {
             query: from.to_owned(),
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
+            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+            partial_result_params: lsp_types::PartialResultParams::default(),
         })
         .await
         .ok()??;
@@ -147,7 +147,7 @@ pub(super) async fn apply_rename_lsp(
                 position: location.range.start,
             },
             new_name: to.to_owned(),
-            work_done_progress_params: Default::default(),
+            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
         })
         .await
         .ok()??;
@@ -172,10 +172,13 @@ pub(super) async fn apply_rename_lsp(
         restore(&snapshots);
         return None;
     }
-    let files_changed = snapshots
-        .iter()
-        .filter(|snap| std::fs::read(&snap.path).is_ok_and(|now| now != snap.bytes))
-        .count() as u32;
+    let files_changed = u32::try_from(
+        snapshots
+            .iter()
+            .filter(|snap| std::fs::read(&snap.path).is_ok_and(|now| now != snap.bytes))
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
     Some(FastPathOutcome {
         kind: "rename",
         files_changed,

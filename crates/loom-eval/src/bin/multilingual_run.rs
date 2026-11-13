@@ -23,12 +23,12 @@
 //! untouched.
 
 // A harness binary: panicking on a setup failure is the intended
-// behavior.
+// behavior, as are the `unwrap`/`expect` calls in pure setup code.
 
 // Terminal output is this harness's product; the workspace-wide
 // `clippy::print_stdout`/`print_stderr` denies target library crates.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -136,8 +136,7 @@ fn parse_args() -> Args {
         max_turns: 100,
         arm: std::env::var("LOOM_EVAL_ARM").unwrap_or_else(|_| "full".into()),
         eval_dir: std::env::var("LOOM_EVAL_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("target/eval")),
+            .map_or_else(|_| PathBuf::from("target/eval"), PathBuf::from),
     };
     let mut values = std::env::args().skip(1);
     while let Some(flag) = values.next() {
@@ -176,27 +175,38 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+// Rate-limit retry, same contract as the Verified sweep: a 429-killed
+// run is infrastructure, not model competence.
+const MAX_ATTEMPTS: usize = 10;
+const RATE_LIMIT_COOLDOWN_SECS: u64 = 180;
+
+/// One instance's sweep result: the last report (or `None` when every
+/// attempt failed to even start) plus per-run patches and usage.
+type InstanceOutcome = Option<(
+    serde_json::Value,
+    Vec<Vec<(String, String, String)>>,
+    RunUsage,
+)>;
+
 fn resolve_api_key(provider: &str) -> (String, String) {
     // The engine's single resolution order (ADR-009): the active
     // `loom auth login <provider>` account, then the provider's env
     // vars. Either way the key is carried into the container under the
     // provider's first env-var name.
-    match loom_core::engine::auth::Auth::open(&loom_core::paths::db_path())
+    let Ok(credential) = loom_core::engine::auth::Auth::open(&loom_core::paths::db_path())
         .and_then(|auth| auth.resolve(provider, None))
-    {
-        Ok(credential) => (
-            api_key_envs(provider).into_iter().next().unwrap(),
-            credential.secret.expose().to_owned(),
-        ),
-        Err(_) => {
-            eprintln!(
-                "no API key for provider `{provider}`: run `loom auth login {provider}` \
-                 or export one of {} (see multilingual-run --help)",
-                api_key_envs(provider).join(" / ")
-            );
-            std::process::exit(2);
-        }
-    }
+    else {
+        eprintln!(
+            "no API key for provider `{provider}`: run `loom auth login {provider}` \
+             or export one of {} (see multilingual-run --help)",
+            api_key_envs(provider).join(" / ")
+        );
+        std::process::exit(2);
+    };
+    (
+        api_key_envs(provider).into_iter().next().unwrap(),
+        credential.secret.expose().to_owned(),
+    )
 }
 
 /// Cross-builds the linux loom binary inside a docker rust image and
@@ -226,9 +236,7 @@ fn build_loom_linux(base: &Path) -> PathBuf {
         .status()
         .expect("spawning docker");
     assert!(status.success(), "linux loom build failed");
-    let built = root
-        .join("target/x86_64-unknown-linux-musl/release/loom")
-        .to_owned();
+    let built = root.join("target/x86_64-unknown-linux-musl/release/loom");
     let dest_dir = base.join("loom-linux");
     std::fs::create_dir_all(&dest_dir).unwrap();
     let dest = dest_dir.join("loom");
@@ -243,8 +251,7 @@ fn image_exists(image: &str) -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .is_ok_and(|status| status.success())
 }
 
 /// Makes sure the row's testbed image is present. Unlike the Verified
@@ -337,40 +344,38 @@ fn select_slice(
         .collect()
 }
 
+#[allow(clippy::too_many_lines)] // one linear sweep orchestration: dataset → slice → runs → report
 fn main() {
     let args = parse_args();
     let base = args.eval_dir.join("swebench");
     std::fs::create_dir_all(base.join("instances")).unwrap();
 
     // Dataset: explicit file, cache, or live fetch (then cached).
-    let dataset = match multilingual::load_dataset_cached(&args.eval_dir) {
-        Some(dataset) => {
-            println!("dataset: {} instances (cached)", dataset.len());
-            dataset
-        }
-        None => {
-            println!(
-                "fetching {} from the datasets-server…",
-                multilingual::MULTILINGUAL_DATASET_ID
-            );
-            let body = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio runtime")
-                .block_on(multilingual::fetch_dataset_multilingual())
-                .unwrap_or_else(|error| panic!("dataset fetch: {error}"));
-            let dataset = multilingual::parse_multilingual(&body);
-            assert_eq!(dataset.len(), multilingual::EXPECTED_ROWS);
-            let cache = multilingual::dataset_cache_path(&args.eval_dir);
-            std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
-            std::fs::write(&cache, &body).unwrap();
-            println!(
-                "dataset: {} instances (fetched, cached at {})",
-                dataset.len(),
-                cache.display()
-            );
-            dataset
-        }
+    let dataset = if let Some(dataset) = multilingual::load_dataset_cached(&args.eval_dir) {
+        println!("dataset: {} instances (cached)", dataset.len());
+        dataset
+    } else {
+        println!(
+            "fetching {} from the datasets-server…",
+            multilingual::MULTILINGUAL_DATASET_ID
+        );
+        let body = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(multilingual::fetch_dataset_multilingual())
+            .unwrap_or_else(|error| panic!("dataset fetch: {error}"));
+        let dataset = multilingual::parse_multilingual(&body);
+        assert_eq!(dataset.len(), multilingual::EXPECTED_ROWS);
+        let cache = multilingual::dataset_cache_path(&args.eval_dir);
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, &body).unwrap();
+        println!(
+            "dataset: {} instances (fetched, cached at {})",
+            dataset.len(),
+            cache.display()
+        );
+        dataset
     };
 
     // The slice and its integrity gate — before any spend.
@@ -478,11 +483,6 @@ fn main() {
     let mut report: Vec<serde_json::Value> = Vec::new();
     let mut prediction_paths: Vec<PathBuf> = Vec::new();
 
-    type InstanceOutcome = Option<(
-        serde_json::Value,
-        Vec<Vec<(String, String, String)>>,
-        RunUsage,
-    )>;
     // Pulls serialize across workers; runs stay as parallel as --jobs.
     let pull_lock = std::sync::Mutex::new(());
     let run_instance = |instance: &MultilingualInstance| -> InstanceOutcome {
@@ -511,10 +511,6 @@ fn main() {
                 .canonicalize()
                 .unwrap_or_else(|error| panic!("{}: {error}", out_dir.display()));
             let container_name = format!("loom-ml-{slug}-run{run}");
-            // Rate-limit retry, same contract as the Verified sweep: a
-            // 429-killed run is infrastructure, not model competence.
-            const MAX_ATTEMPTS: usize = 10;
-            const RATE_LIMIT_COOLDOWN_SECS: u64 = 180;
             let mut exit_code = -1;
             let mut patch = String::new();
             let mut outcome = (0usize, None);

@@ -103,7 +103,7 @@ pub fn go_failures(output: &str) -> Vec<TestFailure> {
                 failure.location = Some(location);
             }
             if failure.message.is_empty() {
-                failure.message = message.to_owned();
+                message.clone_into(&mut failure.message);
             }
         }
     }

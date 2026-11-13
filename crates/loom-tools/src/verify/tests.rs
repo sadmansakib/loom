@@ -385,8 +385,7 @@ async fn ask_verdicts_reach_the_operator_with_the_full_command_line() {
     let captured = std::sync::Arc::clone(&seen);
     let tool =
         VerifyTool::with_policy(policy).with_ask_resolver(std::sync::Arc::new(move |request| {
-            let request = request.clone();
-            *captured.lock().unwrap() = Some(request.clone());
+            *captured.lock().unwrap() = Some(request);
             Box::pin(async move { false }) // declined this time
         }));
 

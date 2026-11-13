@@ -21,6 +21,7 @@ use super::dataset::{fixture_jsonl, parse_dataset};
 /// demands the issue's example verbatim — same nesting, same definitions —
 /// after sphinx-9281 died to __qualname__ on a test-local enum the model's
 /// simplified repro (module-level class) could never expose.
+#[must_use]
 pub fn build_prompt(instance: &SweInstance) -> String {
     prompt_text(
         &instance.repo,
@@ -68,12 +69,11 @@ pub(crate) fn prompt_text(repo: &str, problem_statement: &str, hints_text: &str)
          - Do not commit, branch, or tag; leave your changes in the working tree.\n\
          - Do not modify or delete the .git directory.\n\n\
          The issue follows.\n\n\
-         <problem_statement>\n{problem}\n</problem_statement>\n",
-        repo = repo,
-        problem = problem_statement,
+         <problem_statement>\n{problem_statement}\n</problem_statement>\n",
     );
     if !hints_text.trim().is_empty() {
-        prompt.push_str(&format!("\n<hints>\n{}\n</hints>\n", hints_text.trim()));
+        use std::fmt::Write as _;
+        let _ = write!(prompt, "\n<hints>\n{}\n</hints>\n", hints_text.trim());
     }
     prompt.push_str(
         "\nWhen the fix is complete, reply with a short summary of what you changed and why, and finish — do not wait for further input.\n",

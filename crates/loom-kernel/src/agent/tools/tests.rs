@@ -88,6 +88,9 @@ impl Tool for MockTool {
     }
 
     fn touched_paths(&self, _input: &Value) -> Option<Vec<PathTouch>> {
+        // Seven test-action variants and only Track+declared produce
+        // touches; the rest deliberately yield none.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match &self.action {
             Action::Track {
                 reads,

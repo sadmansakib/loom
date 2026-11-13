@@ -37,6 +37,14 @@ impl Agent {
     /// The loop never blocks on the event sink and never treats delivery
     /// failure as a task failure (§11): events are best-effort, the
     /// transcript is the durable record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskError`] when the session is leased by another
+    /// writer, a store write fails, the model or a tool fails after
+    /// retries, or the loop hits an internal invariant breach.
+    /// Cancellation and a graceful pause also surface as
+    /// [`TaskError`] variants rather than success.
     pub async fn run_task(
         &self,
         session: &mut Session,
@@ -107,6 +115,15 @@ impl Agent {
     /// zeroed accounting is the proof of the zero-invocation claim. The
     /// solve's note becomes the task's single assistant item, so
     /// continuation sessions see what changed and why.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskError`] when the session is leased by another
+    /// writer, a store write fails, or transcript bookkeeping hits an
+    /// internal invariant breach.
+    // Public embedder API is awaited like `run_task`; kept `async` so
+    // callers' `.await`s (and future awaits inside) stay signature-stable.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn record_fast_path(
         &self,
         session: &mut Session,
@@ -143,7 +160,7 @@ impl Agent {
         sink.emit(
             task_id,
             EventKind::FastPathHit {
-                kind: solve.kind.clone(),
+                kind: solve.kind,
                 files_changed: solve.files_changed,
             },
         );
@@ -176,13 +193,8 @@ impl Agent {
                 "fast_path".to_owned(),
             );
         }
-        let finished = session
-            .tasks
-            .iter()
-            .find(|task| task.id == task_id)
-            .cloned();
-        if let Some(record) = finished {
-            self.persist_task(session, &record)?;
+        if let Some(record) = session.tasks.iter().find(|task| task.id == task_id) {
+            self.persist_task(session, record)?;
         }
         sink.emit(task_id, EventKind::TaskCompleted);
         let summary = TaskSummary {
@@ -237,13 +249,8 @@ impl Agent {
         // Persist the terminal record before announcing it: a store failure
         // fails the task, and no terminal event claims a completion the store
         // never saw.
-        let finished = session
-            .tasks
-            .iter()
-            .find(|task| task.id == task_id)
-            .cloned();
-        if let Some(record) = finished {
-            self.persist_task(session, &record)?;
+        if let Some(record) = session.tasks.iter().find(|task| task.id == task_id) {
+            self.persist_task(session, record)?;
         }
         match &outcome {
             Ok(_) => sink.emit(task_id, EventKind::TaskCompleted),
@@ -279,7 +286,11 @@ impl Agent {
 
     /// The turn loop proper (§13). Returns the final compiled request's
     /// census on `EndTurn`, or the error that ended the task.
-    #[allow(clippy::too_many_arguments)] // the loop's full state; one call site
+    #[allow(clippy::too_many_arguments)]
+    // the loop's full state; one call site
+    // Splitting this state machine would scatter the interleaved
+    // persist-then-commit invariants; a refactor is out of scope here.
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn run_turns(
         &self,
         session: &mut Session,
@@ -455,8 +466,12 @@ impl Agent {
                 Err(_) => Vec::new(),
             };
             if !steered.is_empty() {
-                for text in &steered {
-                    let user = Item::User { text: text.clone() };
+                // Queue depth is bounded by the embedder's steering rate —
+                // far below `u32::MAX`.
+                #[allow(clippy::cast_possible_truncation)]
+                let steered_count = steered.len() as u32;
+                for text in steered {
+                    let user = Item::User { text };
                     if let Some(store) = &self.store {
                         store
                             .append_item(&session.id, session.next_index(), &user)
@@ -470,7 +485,7 @@ impl Agent {
                     task_id,
                     EventKind::SteeringApplied {
                         turn,
-                        messages: steered.len() as u32,
+                        messages: steered_count,
                     },
                 );
             }
@@ -490,7 +505,7 @@ impl Agent {
                 };
                 let nudge_text = match &notice {
                     Item::User { text } => text.clone(),
-                    _ => String::new(),
+                    Item::Assistant(_) | Item::ToolResult(_) => String::new(),
                 };
                 sink.emit(task_id, EventKind::LoopNudge { text: nudge_text });
                 if let Some(store) = &self.store {
@@ -518,7 +533,7 @@ impl Agent {
                 };
                 let nudge_text = match &notice {
                     Item::User { text } => text.clone(),
-                    _ => String::new(),
+                    Item::Assistant(_) | Item::ToolResult(_) => String::new(),
                 };
                 sink.emit(task_id, EventKind::LoopNudge { text: nudge_text });
                 if let Some(store) = &self.store {
@@ -550,7 +565,7 @@ impl Agent {
                 };
                 let nudge_text = match &notice {
                     Item::User { text } => text.clone(),
-                    _ => String::new(),
+                    Item::Assistant(_) | Item::ToolResult(_) => String::new(),
                 };
                 sink.emit(task_id, EventKind::LoopNudge { text: nudge_text });
                 if let Some(store) = &self.store {
@@ -576,15 +591,15 @@ impl Agent {
                 budget,
                 &capabilities,
                 &facts,
-                &prune_checkpoint,
+                prune_checkpoint.as_ref(),
                 &turn_tools,
             ) {
                 Ok(compiled) => compiled,
                 Err(overrun @ TaskError::Context(ContextError::BudgetExceeded { .. }))
                     if self.config.handoff_compaction
-                        && !prune_checkpoint
+                        && prune_checkpoint
                             .as_ref()
-                            .is_some_and(|frozen| frozen.handoff.is_some()) =>
+                            .is_none_or(|frozen| frozen.handoff.is_none()) =>
                 {
                     let Some(checkpoint) = self
                         .attempt_handoff(session, task_id, sink, &hard, accounting, turn)
@@ -599,7 +614,7 @@ impl Agent {
                         budget,
                         &capabilities,
                         &facts,
-                        &prune_checkpoint,
+                        prune_checkpoint.as_ref(),
                         &turn_tools,
                     )?
                 }
@@ -724,7 +739,7 @@ impl Agent {
                         && assistant
                             .tool_calls
                             .iter()
-                            .all(|call| call.arguments_are_malformed());
+                            .all(super::super::transcript::ToolCall::arguments_are_malformed);
                     if all_malformed {
                         malformed_turns += 1;
                         if malformed_turns >= MALFORMED_ARGUMENT_TURNS_LIMIT {
@@ -811,7 +826,7 @@ impl Agent {
                     // durable state the next session load must see.
                     let todos = todos
                         .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .clone();
                     if todos.revision != todo_revision {
                         session.todos = todos;
@@ -875,13 +890,14 @@ impl Agent {
                         });
                     }
                     self.reconcile_surface();
-                    continue;
                 }
-                other => {
-                    // `context_limit` / `content_filter` (and any future
-                    // reason), or `max_tokens` past the continuation cap.
-                    // The reply is committed first so it stays inspectable,
-                    // then the task fails.
+                // `context_limit` / `content_filter` (and any future
+                // reason), or `max_tokens` past the continuation cap.
+                // The reply is committed first so it stays inspectable,
+                // then the task fails.
+                other @ (StopReason::MaxTokens
+                | StopReason::ContextLimit
+                | StopReason::ContentFilter) => {
                     if has_calls {
                         return Err(TaskError::Protocol(format!(
                             "{} response carried tool calls",

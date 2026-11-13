@@ -2,6 +2,7 @@
 //! model reads to confirm the edit landed.
 
 use crate::budget::{self, ToolBudgets};
+use std::fmt::Write as _;
 
 use super::matching::EditOutcome;
 
@@ -50,11 +51,12 @@ pub(super) fn render_echo(outcome: &EditOutcome, budgets: &ToolBudgets) -> (Stri
             .saturating_sub(budgets.edit_echo_context_lines)
             .max(1);
         let ctx_last = (last_line + budgets.edit_echo_context_lines).min(total_lines);
-        joined.push_str(&format!(
-            "{relative}: lines {first_line}-{last_line} of {total_lines}\n"
-        ));
+        let _ = writeln!(
+            joined,
+            "{relative}: lines {first_line}-{last_line} of {total_lines}"
+        );
         for (number, line) in text.lines().enumerate().take(ctx_last).skip(ctx_first - 1) {
-            joined.push_str(&format!("{}\t{line}\n", number + 1));
+            let _ = writeln!(joined, "{}\t{line}", number + 1);
         }
     }
     if joined.is_empty() {

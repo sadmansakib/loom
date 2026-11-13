@@ -16,6 +16,9 @@ use loom_core::kernel::event::{EventEnvelope, EventKind};
 use loom_core::kernel::id::SessionId;
 
 /// Renders the event stream to a terminal or to NDJSON.
+// The bool fields are the renderer's mode/state bits — mode flags and
+// open-line markers, not independent dimensions.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Renderer {
     json: bool,
     color: bool,
@@ -46,6 +49,10 @@ impl Renderer {
             return;
         }
 
+        // `EventKind` is `#[non_exhaustive]`: a newer core may add
+        // variants this iteration does not know how to render; known
+        // no-op variants fold into the wildcard.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match &envelope.kind {
             EventKind::TextDelta { text } => {
                 self.close_reasoning();
@@ -111,18 +118,8 @@ impl Renderer {
             EventKind::ModelCompleted { .. } => {
                 self.close_all();
             }
-            EventKind::TaskStarted
-            | EventKind::TurnStarted { .. }
-            | EventKind::ModelRequestStarted { .. }
-            | EventKind::TaskCompleted
-            | EventKind::TaskFailed { .. }
-            | EventKind::TaskCancelled
-            | EventKind::TaskPaused
             // The engine is idle again; a one-shot run just exits, so the
             // marker needs no output.
-            | EventKind::AwaitingInput { .. } => {}
-            // `EventKind` is `#[non_exhaustive]`: a newer core may add
-            // variants this iteration does not know how to render.
             _ => {}
         }
     }
@@ -181,7 +178,7 @@ pub fn print_summary(summary: &TaskSummary, end_reason: &str, session_id: &Sessi
             "cached_input_tokens": summary.cached_input_tokens,
             "successful_tool_calls": summary.successful_tool_calls,
             "failed_tool_calls": summary.failed_tool_calls,
-            "wall_time_ms": summary.wall_time.as_millis() as u64,
+            "wall_time_ms": u64::try_from(summary.wall_time.as_millis()).unwrap_or(u64::MAX),
             "events_dropped": summary.events_dropped,
         });
         if let Ok(text) = serde_json::to_string(&line) {
@@ -217,7 +214,7 @@ pub fn print_summary(summary: &TaskSummary, end_reason: &str, session_id: &Sessi
         summary.wall_time.as_secs_f64(),
         summary.events_dropped
     );
-    let _ = writeln!(err, "  session {}", session_id);
+    let _ = writeln!(err, "  session {session_id}");
 }
 
 /// Reports a terminal task error to stderr. A no-op in NDJSON mode, where the

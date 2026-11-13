@@ -75,7 +75,7 @@ async fn harness_notices_dedupe_within_a_batch() {
             &mut session,
             "Check the toolchain twice.",
             &sink,
-            &Default::default(),
+            &crate::TaskControl::default(),
         )
         .await
         .expect("agent task");

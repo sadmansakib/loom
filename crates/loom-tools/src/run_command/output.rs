@@ -20,7 +20,7 @@ use super::process::status_line;
 /// Three body shapes, best-fit first (the output filters, roadmap
 /// item 3):
 /// - a **failed** run whose output parses into structured evidence —
-///   compiler diagnostics, libtest failures, nextest JUnit, the same
+///   compiler diagnostics, libtest failures, nextest `JUnit`, the same
 ///   parsers `verify` uses — is shaped into that compact block
 ///   (ADR-014, ADR-017 decision 3), and the raw log it replaced is
 ///   teed to `ctx`'s artifact store for refetch, so nothing is lost;

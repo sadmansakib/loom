@@ -39,7 +39,7 @@ pub struct ToolCounts {
 
 impl ToolCounts {
     /// Counts one status into the map.
-    pub(crate) fn record(&mut self, status: &ToolStatus) {
+    pub(crate) fn record(&mut self, status: ToolStatus) {
         self.calls += 1;
         match status {
             ToolStatus::Success => self.success += 1,

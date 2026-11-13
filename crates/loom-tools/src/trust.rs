@@ -24,6 +24,7 @@
 //! keep the two in sync.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// The manifests the gate knows, as (store key, workspace-relative
@@ -64,7 +65,7 @@ fn store_override() -> Option<PathBuf> {
     // set or not, so recover the inner value rather than propagate.
     STORE_OVERRIDE
         .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
 }
 
@@ -75,7 +76,7 @@ pub fn use_store(path: impl Into<PathBuf>) {
     // See `store_override` on lock poisoning.
     *STORE_OVERRIDE
         .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path.into());
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path.into());
 }
 
 /// One workspace's pinned manifest digests, keyed by workspace path.
@@ -108,6 +109,10 @@ pub(crate) enum Trust {
 /// for `loom trust` and for harnesses that construct workspaces
 /// programmatically (eval testbeds). Returns the relative manifest
 /// paths pinned.
+///
+/// # Errors
+///
+/// Fails when the trust store cannot be written (permissions, disk).
 pub fn pin(workspace: &Path) -> std::io::Result<Vec<String>> {
     TrustGate::open().pin(workspace)
 }
@@ -169,9 +174,8 @@ impl TrustGate {
     }
 
     fn load(&self) -> Store {
-        let text = match std::fs::read_to_string(&self.path) {
-            Ok(text) => text,
-            Err(_) => return Store::default(),
+        let Ok(text) = std::fs::read_to_string(&self.path) else {
+            return Store::default();
         };
         toml::from_str(&text).unwrap_or_else(|error| {
             // A corrupt store must not widen execution: treat it as
@@ -189,8 +193,10 @@ impl TrustGate {
         Some(
             Sha256::digest(&bytes)
                 .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect(),
+                .fold(String::new(), |mut hex, byte| {
+                    let _ = write!(hex, "{byte:02x}");
+                    hex
+                }),
         )
     }
 
@@ -229,8 +235,7 @@ impl TrustGate {
         MANIFESTS
             .iter()
             .find(|(_, path)| *path == relative)
-            .map(|(key, _)| *key)
-            .unwrap_or("commands")
+            .map_or("commands", |(key, _)| *key)
     }
 
     /// Pins the digests of every present manifest under `workspace`,
@@ -246,7 +251,7 @@ impl TrustGate {
         static PIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = PIN_LOCK
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = Self::workspace_key(workspace);
         let mut store = self.load();
         let entry = store.workspace.entry(root).or_default();

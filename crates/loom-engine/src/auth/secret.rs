@@ -14,10 +14,22 @@ pub const KEYRING_SERVICE: &str = "loom";
 /// Secret storage backend (OS keychain; stub for tests).
 pub trait SecretBackend: Send + Sync {
     /// Stores `secret` for `id`, replacing any previous value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::SecretBackend`] when the backend cannot write.
     fn set(&self, id: &AccountId, secret: &str) -> Result<(), AuthError>;
     /// Retrieves the secret for `id`, or `None` when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::SecretBackend`] when the backend cannot read.
     fn get(&self, id: &AccountId) -> Result<Option<String>, AuthError>;
     /// Deletes the secret for `id`. No-op when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::SecretBackend`] when the backend cannot delete.
     fn delete(&self, id: &AccountId) -> Result<(), AuthError>;
 }
 
@@ -163,7 +175,11 @@ impl SecretBackend for KeychainBackend {
     }
 
     fn get(&self, id: &AccountId) -> Result<Option<String>, AuthError> {
-        match with_store(&self.service, id.as_str(), |entry| entry.get_password()) {
+        match with_store(
+            &self.service,
+            id.as_str(),
+            keyring_core::Entry::get_password,
+        ) {
             Ok(secret) => Ok(Some(secret)),
             Err(keyring_core::Error::NoEntry) => Ok(None),
             Err(error) => Err(AuthError::SecretBackend(error.to_string())),
@@ -189,6 +205,7 @@ pub struct StubBackend {
 
 #[cfg(test)]
 impl StubBackend {
+    #[must_use]
     /// Creates an empty stub backend.
     pub fn new() -> Self {
         Self::default()

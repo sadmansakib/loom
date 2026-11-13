@@ -25,6 +25,7 @@ pub struct SymbolsOverviewTool {
 impl SymbolsOverviewTool {
     /// Builds the tool under explicit output budgets (the engine's
     /// entry point).
+    #[must_use]
     pub fn with_budgets(mut self, budgets: ToolBudgets) -> Self {
         self.budgets = budgets;
         self
@@ -156,7 +157,8 @@ fn render_overview(
 /// Kind-count fallback for files whose full listing overflows the
 /// budget: names are dropped, buckets remain.
 fn render_kind_counts(relative: &str, symbols: &[FlatSymbol]) -> String {
-    let mut counts: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    let mut counts: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::default();
     for symbol in symbols {
         *counts.entry(symbol.kind).or_default() += 1;
     }

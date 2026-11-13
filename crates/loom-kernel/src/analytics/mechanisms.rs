@@ -122,6 +122,9 @@ pub fn session_mechanisms(session: &Session, events: &[EventEnvelope]) -> Mechan
     }
 
     for envelope in events {
+        // Delta/prune events are stats-neutral, and unknown future
+        // events must not silently move aggregate counters either.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match &envelope.kind {
             EventKind::ContextPruned { report, .. } => {
                 stats.prune_events += 1;
@@ -148,6 +151,11 @@ pub fn session_mechanisms(session: &Session, events: &[EventEnvelope]) -> Mechan
 ///
 /// Sessions and events are separate seams (a store may implement
 /// either); both come from the same database in every current frontend.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] when either store cannot enumerate sessions
+/// or read a session's event stream.
 pub fn mechanisms_overview(
     sessions: &dyn SessionStore,
     events: &dyn EventStore,
@@ -176,6 +184,7 @@ pub fn mechanisms_overview(
 
 /// The JSON block for a mechanisms report, with the semantics note that
 /// keeps counted fields from being read as token deltas.
+#[must_use]
 pub fn mechanisms_json(stats: &MechanismStats) -> Value {
     serde_json::json!({
         "prune_events": stats.prune_events,

@@ -19,6 +19,10 @@ pub struct Auth {
 
 impl Auth {
     /// Opens the frontend-selected store and the keychain backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Store`] when the account store cannot be opened.
     pub fn open(db_path: &std::path::Path) -> Result<Self, AuthError> {
         Ok(Self {
             store: open_store(db_path)?,
@@ -27,21 +31,37 @@ impl Auth {
     }
 
     /// Saves a new account and makes it active (see [`login`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError`] under the same conditions as [`login`].
     pub fn login(&self, spec: LoginSpec) -> Result<Account, AuthError> {
         login(&self.store, &self.secrets, spec)
     }
 
     /// Lists accounts, optionally filtered to one provider (see [`AuthStore::list`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Store`] when the query fails.
     pub fn list(&self, provider: Option<&str>) -> Result<Vec<Account>, AuthError> {
         self.store.list(provider)
     }
 
     /// Makes the matching account active (see [`activate`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError`] under the same conditions as [`activate`].
     pub fn activate(&self, provider: &str, target: &str) -> Result<Account, AuthError> {
         activate(&self.store, provider, target)
     }
 
     /// Removes an account and its secret (see [`remove_account`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError`] under the same conditions as [`remove_account`].
     pub fn remove(&self, provider: &str, target: &str) -> Result<RemovedAccount, AuthError> {
         remove_account(&self.store, &self.secrets, provider, target)
     }
@@ -51,8 +71,17 @@ impl Auth {
     /// environment variables).
     ///
     /// A frontend that must act before opening the engine — fetching an
-    /// OpenRouter catalog, say — uses this so credential resolution has
+    /// `OpenRouter` catalog, say — uses this so credential resolution has
     /// exactly one implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Store`] when the account query fails,
+    /// [`AuthError::NoCredential`] when no saved account and no environment
+    /// fallback produced a credential, [`AuthError::MissingSecret`] when a
+    /// saved account's keychain entry is gone, [`AuthError::Command`] or
+    /// [`AuthError::CommandTimeout`] when a command credential fails, and
+    /// [`AuthError::SecretBackend`] when the keychain read fails.
     pub fn resolve(
         &self,
         provider: &str,
@@ -88,6 +117,15 @@ pub struct LoginSpec {
 ///
 /// A [`Method::Key`] secret is written to the keychain first and dropped again
 /// if the row insert fails, so a failed login cannot orphan a keychain entry.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Invalid`] for [`Method::Environment`] specs or a
+/// missing command, [`AuthError::NoSecretInput`] when a key secret is absent,
+/// [`AuthError::SecretBackend`] when the keychain write fails,
+/// [`AuthError::Command`] or [`AuthError::CommandTimeout`] when a command
+/// credential fails validation, and [`AuthError::Store`] when the row insert
+/// fails.
 pub fn login(
     store: &dyn AuthStore,
     secrets: &dyn SecretBackend,
@@ -111,7 +149,7 @@ pub fn login(
             secrets.set(&id, &secret)?;
             Account {
                 id,
-                provider: provider.clone(),
+                provider,
                 label,
                 method: Method::Key,
                 active: false,
@@ -129,7 +167,7 @@ pub fn login(
             let secret = run_command(&command)?;
             Account {
                 id: AccountId::new(),
-                provider: provider.clone(),
+                provider,
                 label,
                 method: Method::Command,
                 active: false,
@@ -151,6 +189,11 @@ pub fn login(
 }
 
 /// Makes the account matching `target` (label or id) the provider's active one.
+///
+/// # Errors
+///
+/// Returns [`AuthError::NoAccount`] when no account matches, and
+/// [`AuthError::Store`] when the lookup or activation write fails.
 pub fn activate(store: &dyn AuthStore, provider: &str, target: &str) -> Result<Account, AuthError> {
     let account = store
         .find(provider, target)?
@@ -178,6 +221,13 @@ pub struct RemovedAccount {
 /// A failed keychain delete is reported (not fatal): the row is already gone,
 /// so the entry is inert, and the provider must not be left with no active
 /// account.
+///
+/// # Errors
+///
+/// Returns [`AuthError::NoAccount`] when no account matches, and
+/// [`AuthError::Store`] when the remove, lookup, or promotion writes fail.
+/// A keychain-delete failure is reported as
+/// [`RemovedAccount::secret_warning`], not an error.
 pub fn remove_account(
     store: &dyn AuthStore,
     secrets: &dyn SecretBackend,

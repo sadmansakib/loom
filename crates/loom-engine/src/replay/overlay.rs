@@ -13,6 +13,11 @@ use super::options::ReplaySummary;
 /// `elide_assistant_text`). Optional knobs take `off` (or `0`) to
 /// disable. Unknown keys are an error — a silently ignored key would make
 /// every delta a lie.
+///
+/// # Errors
+///
+/// Returns the offending key with its rejection reason when a pair is
+/// not `KEY=VAL`, names an unknown knob, or supplies an invalid value.
 pub fn overlay_config(
     base: PruneConfig,
     pairs: &[String],
@@ -25,8 +30,8 @@ pub fn overlay_config(
         };
         let key = key.trim();
         let value = value.trim();
-        let bare = key.strip_prefix("LOOM_").unwrap_or(key).to_lowercase();
-        match bare.as_str() {
+        let name = key.strip_prefix("LOOM_").unwrap_or(key).to_lowercase();
+        match name.as_str() {
             "prune_trigger_percent" => config.trigger_percent = positive(value, key)?,
             "prune_floor_tokens" => config.floor_tokens = positive(value, key)?,
             "prune_min_reclaim_tokens" => config.min_reclaim_tokens = positive(value, key)?,
@@ -97,12 +102,12 @@ pub fn median(values: &[f64]) -> f64 {
         return 0.0;
     }
     let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
+    sorted.sort_by(f64::total_cmp);
     let middle = sorted.len() / 2;
     if sorted.len() % 2 == 1 {
         sorted[middle]
     } else {
-        (sorted[middle - 1] + sorted[middle]) / 2.0
+        f64::midpoint(sorted[middle - 1], sorted[middle])
     }
 }
 

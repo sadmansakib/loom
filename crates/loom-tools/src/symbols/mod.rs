@@ -161,6 +161,7 @@ fn parse_symbols(lang: SymbolLanguage, source: &str) -> Result<(Tree, Vec<FlatSy
 /// unsupported or the file produced no tree; a line missing from the
 /// map (imports, whitespace between declarations) carries no cue —
 /// honest absence, not a guessed parent.
+#[must_use]
 pub fn enclosing_symbol_cues(
     path: &Path,
     source: &str,

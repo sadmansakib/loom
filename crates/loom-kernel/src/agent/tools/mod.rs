@@ -73,16 +73,19 @@ impl ToolExposure {
     }
 
     /// Whether `name` was exposed in this request.
+    #[must_use]
     pub fn contains(&self, name: &str) -> bool {
         self.names.contains(name)
     }
 
     /// Number of exposed tools.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.names.len()
     }
 
     /// Whether no tools are exposed.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.names.is_empty()
     }
@@ -294,7 +297,7 @@ impl<'a> ToolBatch<'a> {
             // `Agent::run_task` (the scout) requires. The loop shape
             // borrows with `execute`'s own lifetimes and type-checks.
             let mut wave_futures = Vec::with_capacity(wave.len());
-            for &index in wave.iter() {
+            for &index in wave {
                 wave_futures.push(run_wave_item(
                     self.registry,
                     self.exposure,
@@ -310,7 +313,7 @@ impl<'a> ToolBatch<'a> {
             while remaining > 0 {
                 let mut cancelled = std::pin::pin!(ctx.cancellation.cancelled());
                 match future::select(cancelled.as_mut(), stream.next()).await {
-                    Either::Right((Some(_), _)) => remaining -= 1,
+                    Either::Right((Some(()), _)) => remaining -= 1,
                     Either::Right((None, _)) => break,
                     Either::Left(_) => {
                         drop(stream);
@@ -361,12 +364,13 @@ pub(super) async fn run_wave_item(
     }
     // Same wedged-lock policy as `lock_slot`: poison-tolerant.
     slot.lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .replace(result);
 }
 
 /// Locks a result slot, surviving poisoning (a panicked tool future
 /// must not poison cancellation assembly).
 pub(super) fn lock_slot(slot: &Mutex<Option<ToolResult>>) -> MutexGuard<'_, Option<ToolResult>> {
-    slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

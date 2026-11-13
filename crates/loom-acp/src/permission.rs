@@ -58,11 +58,17 @@ pub(crate) async fn ask_permission(
             );
             false
         }
-        Ok(Ok(response)) => match response.outcome {
-            acp::RequestPermissionOutcome::Selected(selected) => &*selected.option_id.0 == "allow",
-            // Cancelled, or a future outcome kind: fail closed.
-            _ => false,
-        },
+        Ok(Ok(response)) => {
+            // Upstream enum is non-exhaustive; unknown outcomes fail closed.
+            #[allow(clippy::wildcard_enum_match_arm)]
+            match response.outcome {
+                acp::RequestPermissionOutcome::Selected(selected) => {
+                    &*selected.option_id.0 == "allow"
+                }
+                // Cancelled, or a future outcome kind: fail closed.
+                _ => false,
+            }
+        }
         // Transport failure: fail closed.
         Ok(Err(_)) => false,
     }

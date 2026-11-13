@@ -108,7 +108,7 @@ mod tests {
     }
 
     impl ModelProvider for ScriptedProvider {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "scripted"
         }
 

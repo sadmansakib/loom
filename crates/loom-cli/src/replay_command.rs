@@ -45,7 +45,7 @@ enum Source {
 }
 
 /// Runs `loom replay-context`.
-pub fn run(args: ReplayContextArgs) -> anyhow::Result<ExitCode> {
+pub fn run(args: &ReplayContextArgs) -> anyhow::Result<ExitCode> {
     let source = resolve_source(&args.source)?;
     let mut trace = match &source {
         Source::Trace(dir) => TraceInput::read(dir).map_err(anyhow::Error::msg)?,
@@ -54,7 +54,7 @@ pub fn run(args: ReplayContextArgs) -> anyhow::Result<ExitCode> {
     // `--provider` overrides the manifest's provider (gateway runs whose
     // manifest provider is not the estimator family the operator wants).
     if let Some(provider) = &args.provider {
-        trace.provider = provider.clone();
+        provider.clone_into(&mut trace.provider);
     }
 
     let mut options = ReplayOptions::new(&trace.provider);
@@ -65,7 +65,7 @@ pub fn run(args: ReplayContextArgs) -> anyhow::Result<ExitCode> {
         options.reserved_output_tokens = reserved;
     }
     if let Some(prompt) = &args.system_prompt {
-        options.system_prompt = prompt.clone();
+        prompt.clone_into(&mut options.system_prompt);
     }
 
     // Baseline: the provider's base config, exactly as a live run with
@@ -165,6 +165,8 @@ fn session_trace(id: &SessionId, provider: Option<&str>) -> anyhow::Result<Trace
         .map(|envelope| envelope.schema_version)
         .max()
         .unwrap_or(loom_core::kernel::event::EVENT_SCHEMA_VERSION);
+    // EventKind is #[non_exhaustive]: the wildcard arm is required.
+    #[allow(clippy::wildcard_enum_match_arm)]
     let prune_events: Vec<(u32, PruneReport)> = events
         .into_iter()
         .filter_map(|envelope| match envelope.kind {
@@ -277,15 +279,19 @@ fn print_paired(baseline: &ReplaySummary, overlay: &ReplaySummary) {
         overlay.median_input_tokens,
         delta_pct(baseline.median_input_tokens, overlay.median_input_tokens),
     );
-    println!(
-        "  total input tokens:   {:>8} -> {:>8}  ({:+.1}%)",
-        baseline.total_input_tokens,
-        overlay.total_input_tokens,
-        delta_pct(
-            baseline.total_input_tokens as f64,
-            overlay.total_input_tokens as f64
-        ),
-    );
+    // Percent display: f64 lossiness is inherent to the format.
+    #[allow(clippy::cast_precision_loss)]
+    {
+        println!(
+            "  total input tokens:   {:>8} -> {:>8}  ({:+.1}%)",
+            baseline.total_input_tokens,
+            overlay.total_input_tokens,
+            delta_pct(
+                baseline.total_input_tokens as f64,
+                overlay.total_input_tokens as f64
+            ),
+        );
+    }
     println!(
         "  reclaimed tokens:     {:>8} -> {:>8}",
         baseline.reclaimed_tokens, overlay.reclaimed_tokens,
@@ -443,6 +449,9 @@ mod tests {
     }
 
     #[test]
+    // The operands are exactly representable, so the comparisons are
+    // bit-exact by construction.
+    #[allow(clippy::float_cmp)]
     fn paired_deltas_computed_from_summaries() {
         let baseline = ReplaySummary {
             turns: Vec::new(),

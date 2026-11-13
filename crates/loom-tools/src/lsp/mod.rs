@@ -1,7 +1,7 @@
 //! LSP integration, slice E (docs/lsp-design.md).
 //!
 //! Opt-in via `--lsp`: attaches language servers from the built-in
-//! KNOWN_SERVERS table plus `.loom/lsp.toml`, spawns them under the
+//! `KNOWN_SERVERS` table plus `.loom/lsp.toml`, spawns them under the
 //! same OS sandbox as every loom command (network off unless granted,
 //! no environment inheritance), and exposes a fixed set of read-only
 //! semantic tools. Without the flag nothing here runs and the default

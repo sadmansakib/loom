@@ -54,7 +54,7 @@ pub const LOCK_RELATIVE_PATH: &str = ".loom/mcp.lock";
 const PROTOCOL_VERSION: &str = "2025-06-18";
 /// Cap on one server stdout line (bytes). The codec discards oversized
 /// lines whole and keeps reading — a server that never emits a newline
-/// cannot grow reader memory without bound (broken/malicious DoS bound).
+/// cannot grow reader memory without bound (broken/malicious `DoS` bound).
 const LINE_MAX_BYTES: usize = 1024 * 1024;
 /// Pages of `tools/list` fetched before the pagination cap warning fires.
 const LIST_MAX_PAGES: usize = 10;

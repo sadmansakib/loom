@@ -214,9 +214,12 @@ impl SessionStore for MemorySessionStore {
             todos: TodoList::default(),
         };
         guard.insert(*new_id, forked);
+        // `boundary` is a transcript length — far below `u32::MAX`.
+        #[allow(clippy::cast_possible_truncation)]
+        let boundary = boundary as u32;
         let provenance = ForkProvenance {
             forked_from: *source,
-            boundary: ItemIndex::from(boundary as u32),
+            boundary: ItemIndex::from(boundary),
         };
         self.forks
             .lock()

@@ -1,5 +1,6 @@
 use super::*;
 use loom_kernel::tool::{Tool, ToolContext};
+use std::fmt::Write as _;
 
 fn ctx_for(root: &std::path::Path) -> ToolContext {
     ToolContext::new(
@@ -52,7 +53,7 @@ fn name_path_matches_suffix_and_absolute() {
 
 // ---- Rust ----
 
-const RUST_SRC: &str = r#"//! module docs
+const RUST_SRC: &str = r"//! module docs
 use std::fmt;
 
 const LIMIT: usize = 10;
@@ -75,7 +76,7 @@ pub fn main() {
     let inner = || 1;
     let _ = inner();
 }
-"#;
+";
 
 #[tokio::test]
 async fn rust_overview_lists_top_level_and_children() {
@@ -155,7 +156,7 @@ async fn rust_ambiguous_and_missing_match_errors() {
     );
     assert!(err.contains("no symbol matches"), "{err}");
     assert!(err.contains("dup"), "{err}");
-    assert!(err.contains("a"), "{err}");
+    assert!(err.contains('a'), "{err}");
     drop(dir);
 }
 
@@ -265,7 +266,7 @@ async fn python_replacing_decorated_symbol_requires_body_with_decorator() {
 
 // ---- TypeScript / TSX ----
 
-const TS_SRC: &str = r#"
+const TS_SRC: &str = r"
 export interface Point {
     x: number;
     y: number;
@@ -296,7 +297,7 @@ export function render(id: Id): string {
 const makePoint = (x: number, y: number): Point => ({ x, y });
 
 let plain = 3;
-"#;
+";
 
 #[tokio::test]
 async fn typescript_overview_kinds() {
@@ -400,7 +401,7 @@ async fn overview_falls_back_to_kind_counts_on_huge_listings() {
     // 8 KB budget; the fallback keeps the response bounded.
     let mut src = String::new();
     for i in 0..6_000 {
-        src.push_str(&format!("fn f{i}() {{}}\n"));
+        let _ = writeln!(src, "fn f{i}() {{}}");
     }
     std::fs::write(root.join("big.rs"), src).expect("seed");
     let out = call_overview(&root, serde_json::json!({"path": "big.rs"})).await;

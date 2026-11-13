@@ -26,7 +26,7 @@
 //!   safe one, so adapters reusing this decoder get no flush by design.
 //!   An adapter facing gateways that close right after `data: [DONE]`
 //!   can peek [`SseDecoder::pending_event`] for exactly `[DONE]` at
-//!   EOF — the DeepSeek adapter does.
+//!   EOF — the `DeepSeek` adapter does.
 //!
 //! Buffering is byte-based so a chunk boundary inside a multi-byte UTF-8
 //! sequence cannot corrupt a line (`0x0A` never appears inside one).

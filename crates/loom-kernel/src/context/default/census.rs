@@ -5,9 +5,7 @@ use crate::model::ModelRequest;
 /// Serialized byte length of a value, or 0 if serialization fails (it cannot
 /// for the types in this crate; the fallback keeps the census panic-free).
 pub(in crate::context) fn serialized_size<T: serde::Serialize>(value: &T) -> u64 {
-    serde_json::to_string(value)
-        .map(|json| json.len() as u64)
-        .unwrap_or(0)
+    serde_json::to_string(value).map_or(0, |json| json.len() as u64)
 }
 
 /// Attributes the request's estimated context to its sources (ADR-016, V18).

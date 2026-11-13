@@ -27,6 +27,7 @@ use std::time::Duration;
 use loom_core::Engine;
 use loom_core::engine::TaskControl;
 use loom_core::kernel::id::SessionId;
+use loom_core::kernel::session::Session;
 
 use crate::args::{ChatArgs, RewindArgs, StatsArgs};
 
@@ -117,12 +118,92 @@ fn parse_rewind(rest: &[&str]) -> Action {
     Action::Rewind { at, restore }
 }
 
+/// Reads the shared session id. The lock guards one copyable id;
+/// a poisoned lock still carries the last value written.
+fn shared_session_id(cell: &Mutex<SessionId>) -> SessionId {
+    *cell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Writes the shared session id (worker side).
+fn set_shared_session_id(cell: &Mutex<SessionId>, id: SessionId) {
+    *cell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = id;
+}
+
+/// The worker thread: owns the engine and session for the process's
+/// life, runs one task at a time off the channel, and publishes the
+/// live session id plus task liveness for the REPL.
+// The parameters are the worker's moved-in state, exactly what the
+// spawned closure used to capture.
+#[allow(clippy::too_many_arguments)]
+fn spawn_worker(
+    engine: Engine,
+    session: Session,
+    handle: tokio::runtime::Handle,
+    rx: std::sync::mpsc::Receiver<WorkerMsg>,
+    session_id: Arc<Mutex<SessionId>>,
+    task_live: Arc<AtomicBool>,
+    workspace: std::path::PathBuf,
+    no_save: bool,
+    json: bool,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut session = session;
+        for message in rx {
+            match message {
+                WorkerMsg::Task { text, control } => {
+                    // The consumers are per task, exactly like `loom
+                    // run`: the renderer owns stdout for the task's
+                    // duration, the decisions footer prints after.
+                    let decision_log = crate::run::DecisionLog::default();
+                    let (sink, renderer_thread, tracer_thread) =
+                        crate::run::spawn_consumers(json, None, decision_log.clone());
+                    let signal = handle.spawn(crate::run::ctrl_c_ladder(control.clone()));
+                    let outcome =
+                        handle.block_on(engine.run_task(&mut session, text, &sink, &control));
+                    let _ =
+                        crate::run::join_consumers(sink, &signal, renderer_thread, tracer_thread);
+                    match &outcome {
+                        Ok(summary) => {
+                            crate::output::print_summary(summary, "completed", &session.id, json);
+                        }
+                        Err(error) => {
+                            crate::output::print_failure(error, json);
+                        }
+                    }
+                    crate::run::print_decisions(&decision_log);
+                    set_shared_session_id(&session_id, session.id);
+                    task_live.store(false, Ordering::SeqCst);
+                }
+                WorkerMsg::New => {
+                    session = engine.new_session();
+                    crate::run::record_start_checkpoint(&session.id, &workspace, no_save);
+                    set_shared_session_id(&session_id, session.id);
+                    println!("new session {}", session.id);
+                }
+                WorkerMsg::Adopt(id) => match engine.load_session(&id) {
+                    Ok(Some(loaded)) => {
+                        session = loaded;
+                        set_shared_session_id(&session_id, session.id);
+                        println!("continuing from fork {id}");
+                    }
+                    Ok(None) => eprintln!("warning: fork {id} is not in the store"),
+                    Err(error) => eprintln!("warning: could not adopt fork {id}: {error}"),
+                },
+            }
+        }
+    })
+}
+
 /// Runs the interactive session and returns the process exit code.
 ///
 /// Setup failures propagate as `Err`; everything after the prompt is
 /// interactive, so task failures print and the REPL continues — the
 /// session is the durable artifact, not the exit code.
-pub fn chat(args: ChatArgs) -> anyhow::Result<ExitCode> {
+pub fn chat(args: &ChatArgs) -> anyhow::Result<ExitCode> {
     if args.flags.best_of.is_some() {
         anyhow::bail!("chat does not support --best-of; run parallel rollouts with `loom run`");
     }
@@ -175,66 +256,20 @@ pub fn chat(args: ChatArgs) -> anyhow::Result<ExitCode> {
     let task_live = Arc::new(AtomicBool::new(false));
     let worker_session_id = Arc::clone(&session_id);
 
-    /// Reads the shared session id. The lock guards one copyable id;
-    /// a poisoned lock still carries the last value written.
-    fn shared_session_id(cell: &Mutex<SessionId>) -> SessionId {
-        *cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Writes the shared session id (worker side).
-    fn set_shared_session_id(cell: &Mutex<SessionId>, id: SessionId) {
-        *cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = id;
-    }
-    let worker_task_live = Arc::clone(&task_live);
-    let workspace = args.flags.workspace.clone();
-    let no_save = args.flags.no_save;
     // The worker closure below moves `handle`; the idle Ctrl-C watcher
     // spawned after it needs its own clone.
     let idle_handle = handle.clone();
-    let worker = std::thread::spawn(move || {
-        let mut session = session;
-        for message in rx {
-            match message {
-                WorkerMsg::Task { text, control } => {
-                    // The consumers are per task, exactly like `loom
-                    // run`: the renderer owns stdout for the task's
-                    // duration, the decisions footer prints after.
-                    let decision_log = crate::run::DecisionLog::default();
-                    let (sink, renderer_thread, tracer_thread) =
-                        crate::run::spawn_consumers(json, None, decision_log.clone());
-                    let signal = handle.spawn(crate::run::ctrl_c_ladder(control.clone()));
-                    let outcome =
-                        handle.block_on(engine.run_task(&mut session, text, &sink, &control));
-                    let _ =
-                        crate::run::join_consumers(sink, signal, renderer_thread, tracer_thread);
-                    match &outcome {
-                        Ok(summary) => {
-                            crate::output::print_summary(summary, "completed", &session.id, json)
-                        }
-                        Err(error) => crate::output::print_failure(error, json),
-                    }
-                    crate::run::print_decisions(&decision_log);
-                    set_shared_session_id(&worker_session_id, session.id);
-                    worker_task_live.store(false, Ordering::SeqCst);
-                }
-                WorkerMsg::New => {
-                    session = engine.new_session();
-                    crate::run::record_start_checkpoint(&session.id, &workspace, no_save);
-                    set_shared_session_id(&worker_session_id, session.id);
-                    println!("new session {}", session.id);
-                }
-                WorkerMsg::Adopt(id) => match engine.load_session(&id) {
-                    Ok(Some(loaded)) => {
-                        session = loaded;
-                        set_shared_session_id(&worker_session_id, session.id);
-                        println!("continuing from fork {id}");
-                    }
-                    Ok(None) => eprintln!("warning: fork {id} is not in the store"),
-                    Err(error) => eprintln!("warning: could not adopt fork {id}: {error}"),
-                },
-            }
-        }
-    });
+    let worker = spawn_worker(
+        engine,
+        session,
+        handle,
+        rx,
+        worker_session_id,
+        Arc::clone(&task_live),
+        args.flags.workspace.clone(),
+        args.flags.no_save,
+        json,
+    );
 
     // Ctrl-C while a task runs belongs to that task's ladder (spawned
     // per task above: first press pauses, second aborts). While idle
@@ -260,14 +295,27 @@ pub fn chat(args: ChatArgs) -> anyhow::Result<ExitCode> {
         }
     });
 
+    print_banner(args, &session_id);
+    repl_loop(args, tx, &task_live, &session_id);
+
+    // The worker holds only a Handle, which does not keep the runtime
+    // alive; join it before the runtime goes away.
+    let _ = worker.join();
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The one-time chat header: provider/model, resume hint, and notes for
+/// the non-default surfaces the user switched on.
+fn print_banner(args: &ChatArgs, session_id: &Arc<Mutex<SessionId>>) {
     eprintln!(
         "loom chat — provider {} model {} (max {} turns per task)",
         args.flags.provider, args.flags.model, args.flags.max_turns
     );
     eprintln!(
         "session {} — resume later with `loom run --session {}`",
-        shared_session_id(&session_id),
-        shared_session_id(&session_id)
+        shared_session_id(session_id),
+        shared_session_id(session_id)
     );
     eprintln!("type a task to run it; /help lists commands; Ctrl-D exits");
     if args.flags.bg_commands {
@@ -280,6 +328,18 @@ pub fn chat(args: ChatArgs) -> anyhow::Result<ExitCode> {
             "stall escalation on: a nudged task that runs out of turns or budget is retried on a session fork with {model}"
         );
     }
+}
+
+/// The chat REPL: reads lines until Ctrl-D, dispatches each to its
+/// action, and owns the task-phase state (`running`/`control`).
+/// Consumes `tx` at exit so the worker's loop ends.
+fn repl_loop(
+    args: &ChatArgs,
+    tx: std::sync::mpsc::Sender<WorkerMsg>,
+    task_live: &Arc<AtomicBool>,
+    session_id: &Arc<Mutex<SessionId>>,
+) {
+    let json = args.flags.json;
 
     // The UI-side control handle for the running task, if any.
     let mut control: Option<TaskControl> = None;
@@ -306,12 +366,7 @@ pub fn chat(args: ChatArgs) -> anyhow::Result<ExitCode> {
             running = false;
             control = None;
         }
-        if running {
-            eprint!("(running — type to steer, /pause, /cancel) ");
-        } else {
-            eprint!("loom> ");
-        }
-        let _ = std::io::stderr().flush();
+        prompt(running);
         line.clear();
         match stdin.read_line(&mut line) {
             Ok(0) | Err(_) => {
@@ -326,11 +381,13 @@ pub fn chat(args: ChatArgs) -> anyhow::Result<ExitCode> {
             Ok(_) => {}
         }
 
-        let live = running && task_live.load(Ordering::SeqCst);
-        match dispatch(&line, live) {
+        // Computed after the read: a task that finished while we were
+        // blocked flips the phase before dispatch.
+        let active = running && task_live.load(Ordering::SeqCst);
+        match dispatch(&line, active) {
             Action::Empty => {}
             Action::Text(text) => {
-                if live {
+                if active {
                     if let Some(control) = &control {
                         control.steer(text);
                         eprintln!("(queued — lands at the next turn boundary)");
@@ -351,18 +408,8 @@ pub fn chat(args: ChatArgs) -> anyhow::Result<ExitCode> {
                     }
                 }
             }
-            Action::Pause => {
-                if let Some(control) = &control {
-                    control.pause();
-                    eprintln!("(pausing after the current turn)");
-                }
-            }
-            Action::Cancel => {
-                if let Some(control) = &control {
-                    control.cancel();
-                    eprintln!("(aborting…)");
-                }
-            }
+            Action::Pause => pause_task(control.as_ref()),
+            Action::Cancel => cancel_task(control.as_ref()),
             Action::Exit => {
                 if let Some(control) = &control {
                     control.cancel();
@@ -370,47 +417,23 @@ pub fn chat(args: ChatArgs) -> anyhow::Result<ExitCode> {
                 break;
             }
             Action::Help => print_help(),
-            Action::Model => {
-                eprintln!(
-                    "provider {} / model {} / max {} turns / session {}",
-                    args.flags.provider,
-                    args.flags.model,
-                    args.flags.max_turns,
-                    shared_session_id(&session_id),
-                );
-            }
+            Action::Model => chat_model(args, session_id),
             Action::Sessions => {
                 let _ = crate::sessions_command::run();
             }
-            Action::Stats => {
-                let _ = crate::stats_command::run(StatsArgs {
-                    trace: None,
-                    session: Some(shared_session_id(&session_id).to_string()),
-                    json,
-                });
-            }
+            Action::Stats => chat_stats(session_id, json),
             Action::New => {
-                if live {
-                    eprintln!("(a task is running; /new needs an idle session)");
-                } else if tx.send(WorkerMsg::New).is_ok() {
+                if request_new(active, &tx) {
                     running = false;
                     control = None;
                 }
             }
             Action::Rewind { at, restore } => {
-                if live {
+                if active {
                     eprintln!("(a task is running; /rewind needs an idle session)");
                     continue;
                 }
-                let id = shared_session_id(&session_id);
-                let rewind = crate::rewind_command::rewind(&RewindArgs {
-                    session: id.to_string(),
-                    at,
-                    restore_workspace: restore,
-                    to_start: false,
-                    accept_unrestorable: false,
-                });
-                match rewind {
+                match chat_rewind(session_id, at, restore) {
                     Ok(Some(fork)) => {
                         if tx.send(WorkerMsg::Adopt(fork)).is_ok() {
                             running = false;
@@ -427,13 +450,81 @@ pub fn chat(args: ChatArgs) -> anyhow::Result<ExitCode> {
         }
     }
 
-    // Drop the channel so the worker's loop ends, then join it before
-    // the runtime goes away (the worker holds only a Handle, which
-    // does not keep the runtime alive).
+    // Drop the channel so the worker's loop ends.
     drop(tx);
-    let _ = worker.join();
-    runtime.shutdown_timeout(Duration::from_secs(5));
-    Ok(ExitCode::SUCCESS)
+}
+
+/// `/pause`: stop after the current turn.
+fn pause_task(control: Option<&TaskControl>) {
+    if let Some(control) = control {
+        control.pause();
+        eprintln!("(pausing after the current turn)");
+    }
+}
+
+/// `/cancel`: abort the running task mid-flight.
+fn cancel_task(control: Option<&TaskControl>) {
+    if let Some(control) = control {
+        control.cancel();
+        eprintln!("(aborting…)");
+    }
+}
+
+/// The REPL prompt: phase-aware, flushed so the user actually sees it.
+fn prompt(running: bool) {
+    if running {
+        eprint!("(running — type to steer, /pause, /cancel) ");
+    } else {
+        eprint!("loom> ");
+    }
+    let _ = std::io::stderr().flush();
+}
+
+/// `/model`: the active provider/model/turn-cap/session line.
+fn chat_model(args: &ChatArgs, session_id: &Arc<Mutex<SessionId>>) {
+    eprintln!(
+        "provider {} / model {} / max {} turns / session {}",
+        args.flags.provider,
+        args.flags.model,
+        args.flags.max_turns,
+        shared_session_id(session_id),
+    );
+}
+
+/// `/stats`: run stats for the live session, human or NDJSON.
+fn chat_stats(session_id: &Arc<Mutex<SessionId>>, json: bool) {
+    let _ = crate::stats_command::run(&StatsArgs {
+        trace: None,
+        session: Some(shared_session_id(session_id).to_string()),
+        json,
+    });
+}
+
+/// `/new` when idle: swap to a fresh session. Returns whether the
+/// phase actually reset (the worker acked).
+fn request_new(active: bool, tx: &std::sync::mpsc::Sender<WorkerMsg>) -> bool {
+    if active {
+        eprintln!("(a task is running; /new needs an idle session)");
+        return false;
+    }
+    tx.send(WorkerMsg::New).is_ok()
+}
+
+/// `/rewind` inside chat: fork the session at a boundary (optionally
+/// restoring the workspace) and report the fork id for adoption.
+fn chat_rewind(
+    session_id: &Arc<Mutex<SessionId>>,
+    at: Option<u32>,
+    restore: bool,
+) -> anyhow::Result<Option<SessionId>> {
+    let id = shared_session_id(session_id);
+    crate::rewind_command::rewind(&RewindArgs {
+        session: id.to_string(),
+        at,
+        restore_workspace: restore,
+        to_start: false,
+        accept_unrestorable: false,
+    })
 }
 
 /// The command surface, one line each — also the `/help` output.

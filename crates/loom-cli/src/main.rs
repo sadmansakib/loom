@@ -35,15 +35,15 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
     let outcome = match cli.command {
-        Command::Run(args) => run::run(*args),
-        Command::Chat(args) => chat::chat(*args),
+        Command::Run(args) => run::run(&args),
+        Command::Chat(args) => chat::chat(&args),
         Command::Auth(args) => auth_command::run(args.command).map(|()| ExitCode::SUCCESS),
         Command::Provider(args) => provider_command::run(args.command).map(|()| ExitCode::SUCCESS),
         Command::Sessions => sessions_command::run(),
-        Command::Rewind(args) => rewind_command::run(args),
-        Command::Stats(args) => stats_command::run(args),
-        Command::Lessons(args) => lessons_command::run(args),
-        Command::ReplayContext(args) => replay_command::run(args),
+        Command::Rewind(args) => rewind_command::run(&args),
+        Command::Stats(args) => stats_command::run(&args),
+        Command::Lessons(args) => lessons_command::run(&args),
+        Command::ReplayContext(args) => replay_command::run(&args),
         Command::Trust(args) => trust_command::run(args),
     };
 

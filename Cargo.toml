@@ -130,19 +130,54 @@ wiremock = "0.6.5"
 tempfile = "3.27.0"
 
 [workspace.lints.rust]
+# Safety
 unsafe_code = "forbid"
+unsafe_op_in_unsafe_fn = "deny"
+
+# Correctness
+unused_must_use = "deny"
+unused_imports = "deny"
+unused_variables = "deny"
+unused_mut = "deny"
+
+# API documentation
 missing_docs = "warn"
 
 [workspace.lints.clippy]
-unwrap_used = "warn"
-expect_used = "warn"
-# Guardrails: these must never ship. If a lint fires, fix the code, do
-# not add an allow.
+# Core Clippy lints: correctness, suspicious, style, complexity, performance
+all = { level = "deny", priority = -1 }
+
+# Stricter code quality and API design
+pedantic = { level = "warn", priority = -1 }
+
+# Prohibit dangerous or unfinished coding practices
+unwrap_used = "deny"
+panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"
-print_stdout = "deny"
-print_stderr = "deny"
+
+# Error handling discipline
+expect_used = "warn"
+
+# API documentation
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+
+# Avoid accidental console output in production code
+print_stdout = "warn"
+print_stderr = "warn"
+
+# Additional maintainability
+wildcard_enum_match_arm = "warn"
+enum_glob_use = "deny"
+mem_forget = "deny"
+# Covers `.to_string()` on &String etc. (replaces removed `string_to_string`)
+implicit_clone = "deny"
+
+# Guardrails: fix code rather than adding allows.
+# Zero provably-redundant clones (nursery lint, currently zero findings).
+redundant_clone = "warn"
 
 [profile.release]
 lto = "thin"

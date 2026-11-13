@@ -4,7 +4,9 @@
 //! these prove the wiring — `EngineConfig::autofix` → tool flag →
 //! failing verify → applied `MachineApplicable` span → re-run → gate —
 //! with rustc's actual suggestions. Skipped when no toolchain exists.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::Path;
 use std::time::Duration;

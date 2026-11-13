@@ -61,8 +61,8 @@ pub fn session_stats(session: &Session) -> SessionStats {
                 let name = (*name).to_owned();
 
                 let counts = stats.tools.entry(name.clone()).or_default();
-                counts.record(&result.status);
-                stats.totals.record(&result.status);
+                counts.record(result.status);
+                stats.totals.record(result.status);
                 stats.repairs += result.effects.repairs.len() as u64;
 
                 if name == "edit_file" || name == "write_file" {
@@ -143,6 +143,11 @@ pub struct SessionsOverview {
 /// [`session_stats`]; an unreadable session fails the pass (the store
 /// is the source of truth, and silently skipping a row would
 /// undercount).
+///
+/// # Errors
+///
+/// Returns [`StoreError`] when the store cannot enumerate sessions or
+/// read a session (an unreadable session fails the whole pass).
 pub fn sessions_overview(
     store: &dyn SessionStore,
     filter: Option<&str>,

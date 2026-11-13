@@ -78,6 +78,9 @@ impl PruningContextCompiler {
 }
 
 impl ContextCompiler for PruningContextCompiler {
+    // Layered wrapper: capture, estimate, rescue-arm, handoff retry —
+    // one linear protocol; a split would pass its locals by reference.
+    #[allow(clippy::too_many_lines)]
     fn compile(&self, input: ContextInput<'_>) -> Result<CompiledContext, ContextError> {
         // The inner compiler takes `input` by value, so destructure it once
         // and keep every field the wrapper still needs. These are references
@@ -178,12 +181,16 @@ impl ContextCompiler for PruningContextCompiler {
                         // stubbed session the inner compiler projected, so
                         // record the decisions verbatim.
                         stubbed_calls.extend(decisions.stubbed.iter().map(|d| d.call_id.clone()));
+                        // Take the previous checkpoint so the frozen handoff
+                        // moves into the re-freeze instead of cloning its
+                        // summary text.
+                        let previous = checkpoint.take();
                         checkpoint = Some(PruneCheckpoint {
                             // Under a handoff the tail start is the point
                             // the handoff summarized up to; a re-freeze
                             // must not move it past the summarized region.
                             upto_item: if handoff_active {
-                                checkpoint.as_ref().map_or(0, |frozen| frozen.upto_item)
+                                previous.as_ref().map_or(0, |frozen| frozen.upto_item)
                             } else {
                                 session.transcript.len()
                             },
@@ -192,9 +199,7 @@ impl ContextCompiler for PruningContextCompiler {
                             elided_users: decisions.elided_users,
                             elided_reasoning: decisions.elided_reasoning,
                             elided_assistant_text: decisions.elided_assistant_text,
-                            handoff: checkpoint
-                                .as_ref()
-                                .and_then(|frozen| frozen.handoff.clone()),
+                            handoff: previous.and_then(|frozen| frozen.handoff),
                         });
                         report = Some(rescue_report);
                         compiled
@@ -318,9 +323,11 @@ impl ContextCompiler for PruningContextCompiler {
                     );
                 }
                 compiled.census = census(&compiled.request, facts_tokens, &*self.estimator);
+                // Same move of the frozen handoff as the rescue re-freeze.
+                let previous = checkpoint.take();
                 checkpoint = Some(PruneCheckpoint {
                     upto_item: if handoff_active {
-                        checkpoint.as_ref().map_or(0, |frozen| frozen.upto_item)
+                        previous.as_ref().map_or(0, |frozen| frozen.upto_item)
                     } else {
                         session.transcript.len()
                     },
@@ -329,9 +336,7 @@ impl ContextCompiler for PruningContextCompiler {
                     elided_users: decisions.elided_users,
                     elided_reasoning: decisions.elided_reasoning,
                     elided_assistant_text: decisions.elided_assistant_text,
-                    handoff: checkpoint
-                        .as_ref()
-                        .and_then(|frozen| frozen.handoff.clone()),
+                    handoff: previous.and_then(|frozen| frozen.handoff),
                 });
                 report = Some(candidate_report);
             }

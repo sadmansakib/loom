@@ -231,7 +231,7 @@ fn elision_off_when_none() {
             text: "go".to_owned(),
         },
         Item::User {
-            text: big("follow-up", 80).to_owned(),
+            text: big("follow-up", 80),
         },
         assistant_calls("write", vec![big_write]),
         result("w0", "ok"),
@@ -464,7 +464,7 @@ fn elided_assistant_text_freezes_and_reapplies_bytewise() {
     let first = compiler(config)
         .compile(input(&session, None))
         .expect("compiles");
-    let checkpoint = first.prune_checkpoint.clone().expect("fired");
+    let checkpoint = first.prune_checkpoint.expect("fired");
     items.push(assistant_text("one more turn"));
     let grown = session_with(items);
     let second = compiler(config)

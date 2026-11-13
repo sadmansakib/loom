@@ -111,7 +111,7 @@ impl AnthropicAssembler {
     /// `message_start`: the input-side usage snapshot. Anthropic's
     /// `input_tokens` already *excludes* both cache reads and cache
     /// writes, so the full prompt — the kernel's `input_tokens`
-    /// meaning, matching the OpenAI wire's `prompt_tokens` — is the
+    /// meaning, matching the `OpenAI` wire's `prompt_tokens` — is the
     /// sum of all three counters.
     fn ingest_message_start(&mut self, event: &Value) {
         let usage = &event["message"]["usage"];
@@ -174,7 +174,7 @@ impl AnthropicAssembler {
     }
 
     /// Builds the terminal response. Structural normalization mirrors
-    /// the OpenAI wire's contract: `ToolCalls` without calls and calls
+    /// the `OpenAI` wire's contract: `ToolCalls` without calls and calls
     /// with malformed argument JSON are salvaged (the engine refuses to
     /// dispatch them and reports the parse failure back to the model); a
     /// `MaxTokens` response discards partially-assembled calls.
@@ -208,7 +208,7 @@ impl AnthropicAssembler {
             });
         }
         let mut tool_calls = Vec::new();
-        for block in &self.blocks {
+        for block in std::mem::take(&mut self.blocks) {
             if let Block::Tool { id, name, json } = block {
                 // Salvage instead of failing: unparseable or non-object
                 // arguments become a placeholder object under the
@@ -222,26 +222,25 @@ impl AnthropicAssembler {
                     loom_kernel::transcript::ToolArguments::try_from(json!({}))
                         .expect("the empty object is always valid ToolArguments")
                 } else {
-                    let parsed = serde_json::from_str::<Value>(json)
+                    let parsed = serde_json::from_str::<Value>(&json)
                         .map_err(|_| ())
                         .and_then(|value| {
                             loom_kernel::transcript::ToolArguments::try_from(value).map_err(|_| ())
                         });
                     match parsed {
                         Ok(arguments) => arguments,
-                        Err(_) => loom_kernel::transcript::ToolArguments::malformed(json),
+                        Err(()) => loom_kernel::transcript::ToolArguments::malformed(&json),
                     }
                 };
-                let id =
-                    loom_kernel::transcript::ToolCallId::try_from(id.clone()).map_err(|_| {
-                        ModelError::new(
-                            ModelErrorKind::Protocol,
-                            format!("empty tool_use id for {name:?}"),
-                        )
-                    })?;
+                let id = loom_kernel::transcript::ToolCallId::try_from(id).map_err(|_| {
+                    ModelError::new(
+                        ModelErrorKind::Protocol,
+                        format!("empty tool_use id for {name:?}"),
+                    )
+                })?;
                 tool_calls.push(loom_kernel::transcript::ToolCall {
                     id,
-                    name: name.clone(),
+                    name,
                     arguments,
                 });
             }

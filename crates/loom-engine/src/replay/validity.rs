@@ -51,7 +51,9 @@ impl ValidityReport {
             Some((trace.schema_version, binary_schema))
         };
         let turns_match = trace.summary.as_ref().map(|summary| {
+            #[allow(clippy::cast_possible_truncation)] // recorded values are loom-written counts
             let recorded = summary["turns"].as_u64().unwrap_or_default() as u32;
+            #[allow(clippy::cast_possible_truncation)] // turn counts stay far below u32::MAX
             let ok = replay.turns.len() as u32 == recorded;
             if !ok {
                 notes.push(format!(
@@ -78,6 +80,8 @@ impl ValidityReport {
                 ];
                 let mut ok = true;
                 for (name, value) in fields {
+                    #[allow(clippy::cast_possible_truncation)]
+                    // recorded values are loom-written counts
                     let recorded_value = recorded[name].as_u64().unwrap_or_default() as u32;
                     if recorded_value != value {
                         ok = false;
@@ -93,40 +97,7 @@ impl ValidityReport {
             if trace.prune_events.is_empty() && replay.freezes == 0 || schema_skew.is_some() {
                 None
             } else {
-                let mut ok = true;
-                let freezes: Vec<(u32, &PruneReport)> = replay
-                    .turns
-                    .iter()
-                    .filter_map(|turn| turn.froze.as_ref().map(|report| (turn.turn, report)))
-                    .collect();
-                if freezes.len() != trace.prune_events.len() {
-                    ok = false;
-                    notes.push(format!(
-                        "prune events: replay {} vs recorded {}",
-                        freezes.len(),
-                        trace.prune_events.len()
-                    ));
-                } else {
-                    for ((replay_turn, replay_report), (event_turn, event_report)) in
-                        freezes.iter().zip(&trace.prune_events)
-                    {
-                        if replay_turn != event_turn
-                            || replay_report.trigger != event_report.trigger
-                            || replay_report.reclaimed_tokens != event_report.reclaimed_tokens
-                        {
-                            ok = false;
-                            notes.push(format!(
-                                "prune at turn {event_turn}: replay (turn {replay_turn}, {:?}, \
-                                 {} tok) vs recorded ({:?}, {} tok)",
-                                replay_report.trigger,
-                                replay_report.reclaimed_tokens,
-                                event_report.trigger,
-                                event_report.reclaimed_tokens
-                            ));
-                        }
-                    }
-                }
-                Some(ok)
+                Some(compare_prunes(trace, replay, &mut notes))
             };
         let valid = turns_match.unwrap_or(true)
             && census_match.unwrap_or(true)
@@ -140,4 +111,43 @@ impl ValidityReport {
             notes,
         }
     }
+}
+
+/// Compares the replay arm's prune freezes against the trace's
+/// recorded prune events: counts must match, then each freeze's turn,
+/// trigger, and reclaimed tokens.
+fn compare_prunes(trace: &TraceInput, replay: &ReplaySummary, notes: &mut Vec<String>) -> bool {
+    let freezes: Vec<(u32, &PruneReport)> = replay
+        .turns
+        .iter()
+        .filter_map(|turn| turn.froze.as_ref().map(|report| (turn.turn, report)))
+        .collect();
+    if freezes.len() != trace.prune_events.len() {
+        notes.push(format!(
+            "prune events: replay {} vs recorded {}",
+            freezes.len(),
+            trace.prune_events.len()
+        ));
+        return false;
+    }
+    let mut ok = true;
+    for ((replay_turn, replay_report), (event_turn, event_report)) in
+        freezes.iter().zip(&trace.prune_events)
+    {
+        if replay_turn != event_turn
+            || replay_report.trigger != event_report.trigger
+            || replay_report.reclaimed_tokens != event_report.reclaimed_tokens
+        {
+            ok = false;
+            notes.push(format!(
+                "prune at turn {event_turn}: replay (turn {replay_turn}, {:?}, \
+                 {} tok) vs recorded ({:?}, {} tok)",
+                replay_report.trigger,
+                replay_report.reclaimed_tokens,
+                event_report.trigger,
+                event_report.reclaimed_tokens
+            ));
+        }
+    }
+    ok
 }

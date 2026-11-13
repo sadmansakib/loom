@@ -99,7 +99,7 @@ pub struct BoundaryRestoreSummary {
 /// advisory summary the listing prints.
 pub fn boundary_restore_summary(session: &Session, from: u32) -> BoundaryRestoreSummary {
     let (first_touch, commands) = dropped_region_effects(session, from);
-    let provable = first_touch.values().all(|image| image.is_some());
+    let provable = first_touch.values().all(std::option::Option::is_some);
     BoundaryRestoreSummary {
         provable,
         commands: commands.len(),
@@ -193,7 +193,7 @@ pub fn plan_boundary_restore(
     boundary: u32,
     workspace: &Path,
 ) -> Result<BoundaryRestorePlan> {
-    let tip = session.transcript.len() as u32;
+    let tip = u32::try_from(session.transcript.len()).unwrap_or(u32::MAX);
     anyhow::ensure!(
         boundary <= tip,
         "boundary {boundary} is past the session tip {tip}"

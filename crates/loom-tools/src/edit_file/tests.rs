@@ -203,6 +203,8 @@ async fn a_trimmed_match_that_is_still_ambiguous_keeps_the_error() {
     )
     .await
     .expect_err("two trimmed matches must not be repaired");
+    // ToolError is #[non_exhaustive]: the wildcard arm is required.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match err {
         ToolError::InvalidInput(msg) => {
             assert!(msg.starts_with("old_string not found in file"), "{msg}");
@@ -227,6 +229,8 @@ async fn a_stale_anchor_reports_the_nearest_current_line() {
     )
     .await
     .expect_err("stale anchor");
+    // ToolError is #[non_exhaustive]: the wildcard arm is required.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match err {
         ToolError::InvalidInput(msg) => {
             assert!(msg.starts_with("old_string not found in file"), "{msg}");
@@ -661,7 +665,7 @@ async fn fused_check_fixes_and_verifies_in_one_call() {
     std::fs::write(root.join("src/lib.rs"), "pub fn one() -> u32 { 1  }\n").expect("seed");
 
     let ctx = ToolContext::new(
-        root.to_path_buf(),
+        root.clone(),
         CancellationToken::new(),
         Duration::from_secs(120),
     );

@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::sync::{Arc, OnceLock};
 
 use async_lsp::lsp_types;
@@ -54,8 +55,8 @@ impl Tool for LspDefinitionTool {
                     },
                     position,
                 },
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
             };
             let result = server
                 .request::<GotoDefinition>(params)
@@ -74,20 +75,20 @@ impl Tool for LspDefinitionTool {
                 }
                 Some(lsp_types::GotoDefinitionResponse::Link(links)) => {
                     for link in &links {
-                        let file = link
-                            .target_uri
-                            .to_file_path()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|_| link.target_uri.to_string());
-                        body.push_str(&format!(
-                            "definition: {file}:{}\n",
+                        let file = link.target_uri.to_file_path().map_or_else(
+                            |()| link.target_uri.to_string(),
+                            |p| p.display().to_string(),
+                        );
+                        let _ = writeln!(
+                            body,
+                            "definition: {file}:{}",
                             render_position(link.target_selection_range.start)
-                        ));
+                        );
                     }
                 }
                 None => {}
             }
-            finish(&server, body)
+            Ok(finish(&server, body))
         })
     }
 }
@@ -127,8 +128,8 @@ impl Tool for LspReferencesTool {
                     },
                     position,
                 },
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
                 context: lsp_types::ReferenceContext {
                     include_declaration: true,
                 },
@@ -144,7 +145,7 @@ impl Tool for LspReferencesTool {
                     body.push('\n');
                 }
             }
-            finish(&server, body)
+            Ok(finish(&server, body))
         })
     }
 }
@@ -161,6 +162,24 @@ lsp_read_tool!(
     "Outline the symbols (functions, types, fields) of one file. Returns an indented outline with 1-based positions.",
     PathInput
 );
+
+/// Renders nested document symbols as an indented outline shared by
+/// the symbols tool call.
+fn walk_symbols(symbols: &[lsp_types::DocumentSymbol], depth: usize, body: &mut String) {
+    for s in symbols {
+        body.push_str(&"  ".repeat(depth));
+        let _ = writeln!(
+            body,
+            "{} [{:?}] {}",
+            s.name,
+            s.kind,
+            render_position(s.range.start)
+        );
+        if let Some(children) = &s.children {
+            walk_symbols(children, depth + 1, body);
+        }
+    }
+}
 
 impl Tool for LspSymbolsTool {
     fn spec(&self) -> &ToolSpec {
@@ -191,31 +210,17 @@ impl Tool for LspSymbolsTool {
                 text_document: lsp_types::TextDocumentIdentifier {
                     uri: document_uri(&server, &input.path)?,
                 },
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
             };
             let result = server
                 .request::<DocumentSymbolRequest>(params)
                 .await
                 .map_err(ToolError::Execution)?;
             let mut body = String::new();
-            fn walk(symbols: &[lsp_types::DocumentSymbol], depth: usize, body: &mut String) {
-                for s in symbols {
-                    body.push_str(&"  ".repeat(depth));
-                    body.push_str(&format!(
-                        "{} [{:?}] {}\n",
-                        s.name,
-                        s.kind,
-                        render_position(s.range.start)
-                    ));
-                    if let Some(children) = &s.children {
-                        walk(children, depth + 1, body);
-                    }
-                }
-            }
             match result {
                 Some(lsp_types::DocumentSymbolResponse::Nested(symbols)) => {
-                    walk(&symbols, 0, &mut body)
+                    walk_symbols(&symbols, 0, &mut body);
                 }
                 Some(lsp_types::DocumentSymbolResponse::Flat(infos)) => {
                     for info in &infos {
@@ -225,7 +230,7 @@ impl Tool for LspSymbolsTool {
                 }
                 None => {}
             }
-            finish(&server, body)
+            Ok(finish(&server, body))
         })
     }
 }
@@ -265,8 +270,8 @@ impl Tool for LspWorkspaceSymbolsTool {
             for server in &inner.servers {
                 let params = lsp_types::WorkspaceSymbolParams {
                     query: input.query.clone(),
-                    work_done_progress_params: Default::default(),
-                    partial_result_params: Default::default(),
+                    work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                    partial_result_params: lsp_types::PartialResultParams::default(),
                 };
                 let Ok(result) = server.request::<WorkspaceSymbolRequest>(params).await else {
                     continue;
@@ -286,10 +291,7 @@ impl Tool for LspWorkspaceSymbolsTool {
                                     body.push('\n');
                                 }
                                 lsp_types::OneOf::Right(wl) => {
-                                    body.push_str(&format!(
-                                        "{}: {} (no range)\n",
-                                        sym.name, wl.uri
-                                    ));
+                                    let _ = writeln!(body, "{}: {} (no range)", sym.name, wl.uri);
                                 }
                             }
                         }
@@ -346,7 +348,7 @@ impl Tool for LspHoverTool {
                     },
                     position,
                 },
-                work_done_progress_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
             };
             let result = server
                 .request::<HoverRequest>(params)
@@ -365,7 +367,7 @@ impl Tool for LspHoverTool {
                     }
                 }
             }
-            finish(&server, body)
+            Ok(finish(&server, body))
         })
     }
 }
@@ -413,12 +415,12 @@ impl Tool for LspDiagnosticsTool {
             let pull_supported = server.capabilities.diagnostic_provider.is_some();
             // True when the served diagnostics predate the document
             // version the server has been told about (push cache only).
-            let possibly_stale = |ver: Option<i32>| match ver {
-                Some(v) => match server.open_version(&cache_path) {
-                    Some(open) => open > v.max(0) as u32,
-                    None => false,
-                },
-                None => false,
+            let possibly_stale = |ver: Option<i32>| {
+                ver.is_some_and(|v| {
+                    server
+                        .open_version(&cache_path)
+                        .is_some_and(|open| i64::from(open) > i64::from(v.max(0)))
+                })
             };
             let (diagnostics, stale) = if pull_supported {
                 let params = lsp_types::DocumentDiagnosticParams {
@@ -427,8 +429,8 @@ impl Tool for LspDiagnosticsTool {
                     },
                     identifier: None,
                     previous_result_id: None,
-                    work_done_progress_params: Default::default(),
-                    partial_result_params: Default::default(),
+                    work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                    partial_result_params: lsp_types::PartialResultParams::default(),
                 };
                 match server.request::<DocumentDiagnosticRequest>(params).await {
                     Ok(lsp_types::DocumentDiagnosticReportResult::Report(
@@ -469,19 +471,19 @@ impl Tool for LspDiagnosticsTool {
             for d in &diagnostics {
                 let severity = d
                     .severity
-                    .map(|s| format!("{s:?}").to_lowercase())
-                    .unwrap_or_else(|| "info".to_string());
-                body.push_str(&format!(
-                    "{} {} {}\n",
+                    .map_or_else(|| "info".to_string(), |s| format!("{s:?}").to_lowercase());
+                let _ = writeln!(
+                    body,
+                    "{} {} {}",
                     severity,
                     render_position(d.range.start),
                     d.message.lines().next().unwrap_or("")
-                ));
+                );
             }
             if stale && !diagnostics.is_empty() {
                 body.push_str("(note: these diagnostics were published before the latest text version; possibly stale)\n");
             }
-            finish(&server, body)
+            Ok(finish(&server, body))
         })
     }
 }
@@ -508,6 +510,19 @@ lsp_read_tool!(
     "Show a symbol's callers (direction \"incoming\", the default) or callees (\"outgoing\"). Input: path plus `symbol` (substring) or 1-based line/column. Returns path:line:col entries with call-site counts.",
     CallHierarchyInput
 );
+
+/// Renders one call-hierarchy entry (`callee`/`caller`) with its
+/// call-site count.
+fn render_call(body: &mut String, label: &str, item: lsp_types::CallHierarchyItem, sites: usize) {
+    body.push_str(&loc_line(
+        &format!("{label} {}", item.name),
+        &lsp_types::Location {
+            uri: item.uri,
+            range: item.selection_range,
+        },
+    ));
+    let _ = writeln!(body, " ({sites} call site(s))");
+}
 
 impl Tool for LspCallHierarchyTool {
     fn spec(&self) -> &ToolSpec {
@@ -551,7 +566,7 @@ impl Tool for LspCallHierarchyTool {
                         path: input.path.clone(),
                         line: input.line,
                         column: input.column,
-                        symbol: input.symbol.clone(),
+                        symbol: input.symbol,
                     },
                 )
                 .await?;
@@ -562,14 +577,14 @@ impl Tool for LspCallHierarchyTool {
                     },
                     position,
                 },
-                work_done_progress_params: Default::default(),
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
             };
             let items = server
                 .request::<CallHierarchyPrepare>(params)
                 .await
                 .map_err(ToolError::Execution)?;
             let Some(item) = items.unwrap_or_default().into_iter().next() else {
-                return finish(&server, String::new());
+                return Ok(finish(&server, String::new()));
             };
             // Header names the symbol via its own definition location.
             let mut body = loc_line(
@@ -589,45 +604,31 @@ impl Tool for LspCallHierarchyTool {
                     .request::<CallHierarchyOutgoingCalls>(
                         lsp_types::CallHierarchyOutgoingCallsParams {
                             item,
-                            work_done_progress_params: Default::default(),
-                            partial_result_params: Default::default(),
+                            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                            partial_result_params: lsp_types::PartialResultParams::default(),
                         },
                     )
                     .await
                     .map_err(ToolError::Execution)?;
                 for call in calls.unwrap_or_default() {
-                    body.push_str(&loc_line(
-                        &format!("callee {}", call.to.name),
-                        &lsp_types::Location {
-                            uri: call.to.uri.clone(),
-                            range: call.to.selection_range,
-                        },
-                    ));
-                    body.push_str(&format!(" ({} call site(s))\n", call.from_ranges.len()));
+                    render_call(&mut body, "callee", call.to, call.from_ranges.len());
                 }
             } else {
                 let calls = server
                     .request::<CallHierarchyIncomingCalls>(
                         lsp_types::CallHierarchyIncomingCallsParams {
                             item,
-                            work_done_progress_params: Default::default(),
-                            partial_result_params: Default::default(),
+                            work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                            partial_result_params: lsp_types::PartialResultParams::default(),
                         },
                     )
                     .await
                     .map_err(ToolError::Execution)?;
                 for call in calls.unwrap_or_default() {
-                    body.push_str(&loc_line(
-                        &format!("caller {}", call.from.name),
-                        &lsp_types::Location {
-                            uri: call.from.uri.clone(),
-                            range: call.from.selection_range,
-                        },
-                    ));
-                    body.push_str(&format!(" ({} call site(s))\n", call.from_ranges.len()));
+                    render_call(&mut body, "caller", call.from, call.from_ranges.len());
                 }
             }
-            finish(&server, body)
+            Ok(finish(&server, body))
         })
     }
 }

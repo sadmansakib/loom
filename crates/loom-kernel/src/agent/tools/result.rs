@@ -62,8 +62,7 @@ pub(super) async fn cached_result(
     let cache = ctx.cache.as_ref()?;
     if !cache
         .lock()
-        .map(|cache| cache.has_entry(&call.name, &call.arguments))
-        .unwrap_or(false)
+        .is_ok_and(|cache| cache.has_entry(&call.name, &call.arguments))
     {
         return None;
     }
@@ -77,7 +76,7 @@ pub(super) async fn cached_result(
     let (output, original_id) = cache
         .lock()
         .ok()
-        .and_then(|mut cache| cache.lookup(&call.name, &call.arguments, current))?;
+        .and_then(|mut cache| cache.lookup(&call.name, &call.arguments, current.as_deref()))?;
     Some(if ctx.projected_calls.contains(&original_id) {
         finish(
             call,

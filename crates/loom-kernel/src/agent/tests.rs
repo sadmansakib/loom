@@ -88,7 +88,7 @@ fn a_tool_supplied_hint_replaces_the_generic_text() {
     append_failure_hint(
         &mut content,
         ToolFailure::InvalidInput,
-        Some("expected fields: program, args".to_owned()),
+        Some("expected fields: program, args"),
     );
     assert_eq!(
         content,
@@ -109,11 +109,7 @@ fn without_a_tool_hint_the_generic_text_is_used() {
 #[test]
 fn a_refusal_never_carries_a_hint() {
     let mut content = String::from("refused: the same call again");
-    append_failure_hint(
-        &mut content,
-        ToolFailure::RepeatedCall,
-        Some("never shown".to_owned()),
-    );
+    append_failure_hint(&mut content, ToolFailure::RepeatedCall, Some("never shown"));
     assert_eq!(content, "refused: the same call again");
 }
 

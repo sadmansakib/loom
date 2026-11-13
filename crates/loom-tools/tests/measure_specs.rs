@@ -7,6 +7,9 @@
 //! one description at a time. If an edit must grow a spec past a budget,
 //! raise it here in the same commit and say why in the benchmark record.
 
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use loom_kernel::tool::Tool;
 use loom_tools::{
     ArtifactReadTool, EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool,
@@ -69,8 +72,7 @@ fn serialized_specs_stay_within_budget() {
         let budget = SPEC_BUDGETS
             .iter()
             .find(|(name, _)| *name == spec.name)
-            .map(|(_, budget)| *budget)
-            .unwrap_or(PER_SPEC_BUDGET_BYTES);
+            .map_or(PER_SPEC_BUDGET_BYTES, |(_, budget)| *budget);
         assert!(
             json.len() <= budget,
             "{} serialized spec is {} bytes (budget {budget}); \

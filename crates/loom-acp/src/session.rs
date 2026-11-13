@@ -109,7 +109,7 @@ pub(crate) fn engine_config(
         workspace,
         system_prompt: None,
         max_turns: options.max_turns,
-        turn_budget: Default::default(),
+        turn_budget: loom_core::kernel::agent::TurnBudget::default(),
         context_editing: None,
         db_path: options.db_path.clone(),
         persist: true,
@@ -124,7 +124,7 @@ pub(crate) fn engine_config(
         lessons: false,
         mcp: false,
         lsp: false,
-        budgets: Default::default(),
+        budgets: loom_core::tools::ToolBudgets::default(),
         prune: None,
         autofix: false,
     }
@@ -140,7 +140,7 @@ pub(crate) fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, 
 }
 
 /// Parses an ACP session id back into the kernel id it was minted
-/// from: a UUIDv7 string. Everything else never named a loom session.
+/// from: a `UUIDv7` string. Everything else never named a loom session.
 pub(crate) fn kernel_session_id(acp_id: &acp::SessionId) -> Result<KernelSessionId, String> {
     let error = "session ids must be canonical UUIDv7 values minted by session/new";
     let uuid = uuid::Uuid::parse_str(&acp_id.0)

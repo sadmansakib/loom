@@ -35,6 +35,7 @@ const MARKERS: &[(&str, Ecosystem)] = &[
 ];
 
 /// Detects the workspace's ecosystem from root marker files.
+#[must_use]
 pub fn detect_ecosystem(root: &Path) -> Option<Ecosystem> {
     MARKERS
         .iter()

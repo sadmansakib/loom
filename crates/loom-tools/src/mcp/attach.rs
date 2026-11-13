@@ -182,7 +182,7 @@ async fn attach_declared(
         let Some((process, raw_tools)) = pair else {
             continue;
         };
-        if let Err(error) = ingest_server(
+        ingest_server(
             name,
             decl,
             &server_names,
@@ -190,14 +190,10 @@ async fn attach_declared(
             lock_dirty,
             &mut eager,
             &mut deferred,
-            process,
+            &process,
             raw_tools,
             eager_all,
-        )
-        .await
-        {
-            tracing::warn!(%error, "MCP server failed to attach");
-        }
+        );
     }
 
     // Name-collision dedup across servers in declaration order: later
@@ -247,11 +243,104 @@ async fn fetch_server(
     Ok((process, raw_tools))
 }
 
+/// Runs one raw tool through the ingest filters (empty name,
+/// description sanitize, cross-server reference, deny glob, schema
+/// cap, pin-hash quarantine). Logs the skip reason and returns `None`
+/// when the tool does not make it into the plan. The parameter list
+/// mirrors `ingest_server`'s ingest context on purpose: every entry is
+/// a distinct filter input, not a grouping opportunity.
+#[allow(clippy::too_many_arguments)]
+fn admit_tool(
+    name: &str,
+    decl: &McpServerDecl,
+    server_names: &[String],
+    deny: &[regex::Regex],
+    pinned: &mut BTreeMap<String, String>,
+    lock_dirty: &mut bool,
+    process: &Arc<McpServerProcess>,
+    raw: RawTool,
+) -> Option<Surviving> {
+    if raw.name.is_empty() {
+        tracing::warn!(server = name, "MCP tool with empty name skipped");
+        return None;
+    }
+    let desc = truncate_description(&sanitize_text(&raw.description));
+    let desc = if desc.is_empty() {
+        "(no description provided)".to_owned()
+    } else {
+        desc
+    };
+    if contains_cross_server_reference(&desc, name, server_names) {
+        tracing::warn!(server = name, tool = %raw.name, "MCP tool skipped: cross-server reference (shadowing class)");
+        return None;
+    }
+    if deny.iter().any(|re| re.is_match(&raw.name)) {
+        tracing::warn!(server = name, tool = %raw.name, "MCP tool skipped: denied by manifest glob");
+        return None;
+    }
+    let Ok(schema) = serde_json::to_string(&raw.input_schema) else {
+        tracing::warn!(server = name, tool = %raw.name, "MCP tool skipped: schema is not JSON");
+        return None;
+    };
+    if schema.len() > SCHEMA_MAX_BYTES {
+        tracing::warn!(
+            server = name,
+            tool = %raw.name,
+            bytes = schema.len(),
+            cap = SCHEMA_MAX_BYTES,
+            "MCP tool skipped: input schema over cap (truncating a schema would misdescribe the tool)"
+        );
+        return None;
+    }
+    let hash = pin_hash(name, &decl.command, &raw.name, &desc, &schema);
+    match pinned.get(&raw.name) {
+        Some(known) if *known != hash => {
+            tracing::warn!(
+                server = name,
+                tool = %raw.name,
+                "MCP tool quarantined: definition or server command changed since it was pinned (delete its entry in .loom/mcp.lock to re-approve)"
+            );
+            return None;
+        }
+        None => {
+            pinned.insert(raw.name.clone(), hash);
+            *lock_dirty = true;
+        }
+        _ => {}
+    }
+    let desc = if contains_imperative(&desc) {
+        // PolicyVerdict is #[non_exhaustive]; an equality test
+        // avoids a wildcard match arm.
+        if decl.policy.unknown != PolicyVerdict::Allow {
+            tracing::warn!(server = name, tool = %raw.name, "MCP tool skipped: imperative phrasing in description (verdict is ask/deny)");
+            return None;
+        }
+        tracing::warn!(server = name, tool = %raw.name, "MCP tool loaded with a warning: imperative phrasing in description");
+        format!("{IMPERATIVE_WARNING} {desc}")
+    } else {
+        desc
+    };
+    let model_name = mcp_tool_name(name, &raw.name);
+    Some(Surviving {
+        tool: Arc::new(McpTool {
+            process: Arc::clone(process),
+            server: name.to_owned(),
+            remote_name: raw.name.clone(),
+            spec: ToolSpec {
+                name: model_name.clone(),
+                description: desc,
+                parameters: raw.input_schema,
+            },
+        }),
+        model_name,
+    })
+}
+
 /// Ingests one server's advertisement. Errors abort that server's tools
 /// only; admitted tools split into `eager` (`always_load` pins, or every
 /// tool when `eager_all`) and `deferred` (catalog).
 #[allow(clippy::too_many_arguments)]
-async fn ingest_server(
+fn ingest_server(
     name: &str,
     decl: &McpServerDecl,
     server_names: &[String],
@@ -259,10 +348,10 @@ async fn ingest_server(
     lock_dirty: &mut bool,
     eager: &mut Vec<Surviving>,
     deferred: &mut Vec<McpCatalogEntry>,
-    process: Arc<McpServerProcess>,
+    process: &Arc<McpServerProcess>,
     raw_tools: Vec<RawTool>,
     eager_all: bool,
-) -> Result<(), McpError> {
+) {
     let deny: Vec<regex::Regex> = decl
         .policy
         .deny
@@ -280,85 +369,18 @@ async fn ingest_server(
     let mut admitted: Vec<Surviving> = Vec::new();
 
     for raw in raw_tools {
-        if raw.name.is_empty() {
-            tracing::warn!(server = name, "MCP tool with empty name skipped");
-            continue;
+        if let Some(surviving) = admit_tool(
+            name,
+            decl,
+            server_names,
+            &deny,
+            pinned,
+            lock_dirty,
+            process,
+            raw,
+        ) {
+            admitted.push(surviving);
         }
-        let desc = truncate_description(&sanitize_text(&raw.description));
-        let desc = if desc.is_empty() {
-            "(no description provided)".to_owned()
-        } else {
-            desc
-        };
-        if contains_cross_server_reference(&desc, name, server_names) {
-            tracing::warn!(server = name, tool = %raw.name, "MCP tool skipped: cross-server reference (shadowing class)");
-            continue;
-        }
-        if deny.iter().any(|re| re.is_match(&raw.name)) {
-            tracing::warn!(server = name, tool = %raw.name, "MCP tool skipped: denied by manifest glob");
-            continue;
-        }
-        let schema = match serde_json::to_string(&raw.input_schema) {
-            Ok(schema) => schema,
-            Err(_) => {
-                tracing::warn!(server = name, tool = %raw.name, "MCP tool skipped: schema is not JSON");
-                continue;
-            }
-        };
-        if schema.len() > SCHEMA_MAX_BYTES {
-            tracing::warn!(
-                server = name,
-                tool = %raw.name,
-                bytes = schema.len(),
-                cap = SCHEMA_MAX_BYTES,
-                "MCP tool skipped: input schema over cap (truncating a schema would misdescribe the tool)"
-            );
-            continue;
-        }
-        let hash = pin_hash(name, &decl.command, &raw.name, &desc, &schema);
-        match pinned.get(&raw.name) {
-            Some(known) if *known != hash => {
-                tracing::warn!(
-                    server = name,
-                    tool = %raw.name,
-                    "MCP tool quarantined: definition or server command changed since it was pinned (delete its entry in .loom/mcp.lock to re-approve)"
-                );
-                continue;
-            }
-            None => {
-                pinned.insert(raw.name.clone(), hash);
-                *lock_dirty = true;
-            }
-            _ => {}
-        }
-        let desc = if contains_imperative(&desc) {
-            match decl.policy.unknown {
-                PolicyVerdict::Allow => {
-                    tracing::warn!(server = name, tool = %raw.name, "MCP tool loaded with a warning: imperative phrasing in description");
-                    format!("{IMPERATIVE_WARNING} {desc}")
-                }
-                _ => {
-                    tracing::warn!(server = name, tool = %raw.name, "MCP tool skipped: imperative phrasing in description (verdict is ask/deny)");
-                    continue;
-                }
-            }
-        } else {
-            desc
-        };
-        let model_name = mcp_tool_name(name, &raw.name);
-        admitted.push(Surviving {
-            tool: Arc::new(McpTool {
-                process: Arc::clone(&process),
-                server: name.to_owned(),
-                remote_name: raw.name.clone(),
-                spec: ToolSpec {
-                    name: model_name.clone(),
-                    description: desc,
-                    parameters: raw.input_schema,
-                },
-            }),
-            model_name,
-        });
     }
     if admitted.len() > TOOLS_MAX_PER_SERVER {
         tracing::warn!(
@@ -390,5 +412,4 @@ async fn ingest_server(
             });
         }
     }
-    Ok(())
 }

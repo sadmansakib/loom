@@ -42,6 +42,7 @@ pub(crate) use resolve::Sandbox;
 /// commands on this platform, or that none exists. Per-command
 /// deviations (a policy opt-out, a platform without a wrapper) surface
 /// separately as `sandbox.passthrough` notices.
+#[must_use]
 pub fn baseline() -> &'static str {
     if cfg!(target_os = "macos") {
         "commands run OS-confined (macOS Seatbelt profile: workspace + temp + cargo home writable, network off)"

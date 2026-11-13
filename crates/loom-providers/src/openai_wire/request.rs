@@ -2,7 +2,7 @@
 //! chat-completions body builder.
 
 use loom_kernel::model::{Message, ModelRequest};
-use loom_kernel::transcript::ToolResult;
+use loom_kernel::transcript::{AssistantMessage, ToolResult};
 use serde_json::{Value, json};
 
 use super::REASONING_FIELD;
@@ -16,7 +16,7 @@ use super::REASONING_FIELD;
 /// and is merged last, never overwriting a core field.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WireOptions {
-    /// Extra top-level request fields (e.g. DeepSeek's `thinking` and
+    /// Extra top-level request fields (e.g. `DeepSeek`'s `thinking` and
     /// `reasoning_effort`; a later GLM adapter adds `clear_thinking`).
     /// A core field already present wins, so an adapter cannot
     /// accidentally override the request shape.
@@ -30,7 +30,7 @@ pub(crate) struct WireOptions {
 
 /// Builds the chat-completions request body for one [`ModelRequest`].
 ///
-/// Shape (verified against the DeepSeek API reference, 2026-10-03):
+/// Shape (verified against the `DeepSeek` API reference, 2026-10-03):
 /// `stream` is always `true` (the core's only model interface is the
 /// stream), `stream_options.include_usage` is requested, `tool_choice`
 /// is `"auto"` **only when tools are sent**, and provider-specific body
@@ -40,10 +40,10 @@ pub(crate) struct WireOptions {
 /// Reasoning replay: an assistant message carries its prior trace
 /// whenever the context compiler replayed it — with `tools` in
 /// the request, omitting the prior reasoning is an HTTP 400 on
-/// DeepSeek, so replay here must stay aligned with compiler policy
+/// `DeepSeek`, so replay here must stay aligned with compiler policy
 /// (ADR-006). The key it is written under is dialect-specific
 /// ([`WireOptions::reasoning_field`]). `provider_data` is never sent:
-/// DeepSeek replays text only.
+/// `DeepSeek` replays text only.
 pub(crate) fn build_request_body(request: &ModelRequest, options: &WireOptions) -> Value {
     let reasoning_field = options.reasoning_field.unwrap_or(REASONING_FIELD);
     let messages: Vec<Value> = request
@@ -52,31 +52,7 @@ pub(crate) fn build_request_body(request: &ModelRequest, options: &WireOptions) 
         .map(|message| match message {
             Message::System { text } => json!({"role": "system", "content": text}),
             Message::User { text } => json!({"role": "user", "content": text}),
-            Message::Assistant(assistant) => {
-                let mut value = json!({"role": "assistant", "content": assistant.content});
-                if let Some(reasoning) = &assistant.reasoning {
-                    value[reasoning_field] = json!(reasoning.text);
-                }
-                if !assistant.tool_calls.is_empty() {
-                    value["tool_calls"] = Value::Array(
-                        assistant
-                            .tool_calls
-                            .iter()
-                            .map(|call| {
-                                json!({
-                                    "id": call.id.as_str(),
-                                    "type": "function",
-                                    "function": {
-                                        "name": call.name,
-                                        "arguments": call.arguments.to_string(),
-                                    },
-                                })
-                            })
-                            .collect(),
-                    );
-                }
-                value
-            }
+            Message::Assistant(assistant) => assistant_wire_message(assistant, reasoning_field),
             Message::ToolResult(result) => tool_result_message(result),
         })
         .collect();
@@ -124,6 +100,35 @@ pub(crate) fn build_request_body(request: &ModelRequest, options: &WireOptions) 
         body["temperature"] = json!(temperature);
     }
     body
+}
+
+/// Maps one assistant transcript message to its wire form, replaying
+/// the prior reasoning trace under `reasoning_field` when the compiler
+/// carried it (see [`build_request_body`]).
+fn assistant_wire_message(assistant: &AssistantMessage, reasoning_field: &str) -> Value {
+    let mut value = json!({"role": "assistant", "content": assistant.content});
+    if let Some(reasoning) = &assistant.reasoning {
+        value[reasoning_field] = json!(reasoning.text);
+    }
+    if !assistant.tool_calls.is_empty() {
+        value["tool_calls"] = Value::Array(
+            assistant
+                .tool_calls
+                .iter()
+                .map(|call| {
+                    json!({
+                        "id": call.id.as_str(),
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": call.arguments.to_string(),
+                        },
+                    })
+                })
+                .collect(),
+        );
+    }
+    value
 }
 
 /// Maps one transcript [`ToolResult`] to its wire form.

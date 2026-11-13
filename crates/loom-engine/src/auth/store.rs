@@ -16,25 +16,53 @@ use super::error::AuthError;
 pub trait AuthStore {
     /// Inserts `account`, optionally making it the provider's active account
     /// (demoting the previous one in the same transaction).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Store`] when the metadata write fails.
     fn insert(&self, account: &Account, make_active: bool) -> Result<(), AuthError>;
 
     /// Removes an account by id. No-op if absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Store`] when the metadata write fails.
     fn remove(&self, id: &AccountId) -> Result<(), AuthError>;
 
     /// Makes `id` the active account for its provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Store`] when the metadata write fails.
     fn set_active(&self, provider: &str, id: &AccountId) -> Result<(), AuthError>;
 
     /// Lists accounts, optionally filtered to one provider, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Store`] when the query fails.
     fn list(&self, provider: Option<&str>) -> Result<Vec<Account>, AuthError>;
 
     /// Finds an account by label or id, newest match first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Store`] when the query fails.
     fn find(&self, provider: &str, target: &str) -> Result<Option<Account>, AuthError>;
 
     /// Returns the active account for a provider, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Store`] when the query fails.
     fn active(&self, provider: &str) -> Result<Option<Account>, AuthError>;
 
     /// Returns the newest remaining account for a provider, if any (used to
     /// promote a replacement after removing the active one).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Store`] when the query fails.
     fn newest(&self, provider: &str) -> Result<Option<Account>, AuthError>;
 }
 
@@ -45,6 +73,11 @@ pub struct SqliteAuthStore {
 
 impl SqliteAuthStore {
     /// Opens (creating if needed) the store at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Store`] when SQLite cannot open or migrate the
+    /// database at `path`.
     pub fn open(path: &Path) -> Result<Self, AuthError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| AuthError::Store(error.to_string()))?;
@@ -55,6 +88,10 @@ impl SqliteAuthStore {
     }
 
     /// Opens an in-memory store (tests).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Store`] when SQLite cannot open the database.
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self, AuthError> {
         let connection =
@@ -91,6 +128,7 @@ impl SqliteAuthStore {
         Ok(Self { connection })
     }
 
+    #[allow(clippy::cast_sign_loss)] // epoch millis are non-negative by construction
     fn row_to_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
         let method_text: String = row.get("method")?;
         let method = Method::from_str(&method_text).map_err(|error| {
@@ -138,6 +176,7 @@ impl SqliteAuthStore {
 }
 
 impl AuthStore for SqliteAuthStore {
+    #[allow(clippy::cast_possible_wrap)] // millis fit i64; symmetric with the i64→u64 read path
     fn insert(&self, account: &Account, make_active: bool) -> Result<(), AuthError> {
         let transaction = self
             .connection
@@ -266,6 +305,11 @@ impl AuthStore for SqliteAuthStore {
 ///
 /// Frontends call this instead of knowing the on-disk layout; `loom auth`
 /// and `Engine::open` share it.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Store`] when SQLite cannot open or migrate the
+/// database at `db_path`.
 pub fn open_store(db_path: &std::path::Path) -> Result<SqliteAuthStore, AuthError> {
     SqliteAuthStore::open(db_path)
 }

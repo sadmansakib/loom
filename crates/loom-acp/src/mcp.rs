@@ -119,7 +119,7 @@ pub(crate) fn forwarded_decls(
             network: true,
             // Eager-only attach (`attach_forwarded`): no pins.
             always_load: Vec::new(),
-            policy: Default::default(),
+            policy: loom_core::tools::mcp::McpToolPolicy::default(),
         };
         if decls.insert(name.clone(), declaration).is_some() {
             return Err(format!(

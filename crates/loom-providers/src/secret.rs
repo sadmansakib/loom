@@ -19,6 +19,7 @@ impl SecretString {
     }
 
     /// The secret value, for use at the point of authentication only.
+    #[must_use]
     pub fn expose(&self) -> &str {
         &self.0
     }

@@ -12,6 +12,9 @@
 //! `[dependencies]`, `[dev-dependencies]`, and any target-specific
 //! section — so a violation cannot hide in an uncommon section.
 
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use std::fs;
 
 #[test]

@@ -36,9 +36,7 @@ pub fn data_dir() -> PathBuf {
 ///
 /// Holds both account metadata and durable session transcripts (ADR-008).
 pub fn db_path() -> PathBuf {
-    std::env::var_os("LOOM_DB")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| data_dir().join("loom.db"))
+    std::env::var_os("LOOM_DB").map_or_else(|| data_dir().join("loom.db"), PathBuf::from)
 }
 
 /// Root of Loom's suggested per-user configuration directory.
@@ -69,6 +67,7 @@ pub fn config_dir() -> PathBuf {
 /// it to the system prompt at process start, and the eval harness — which
 /// builds its own `EngineConfig` — never sees it, so a developer's global
 /// file cannot leak into the frozen suite.
+#[must_use]
 pub fn global_instructions_path() -> PathBuf {
     config_dir().join("AGENTS.md")
 }

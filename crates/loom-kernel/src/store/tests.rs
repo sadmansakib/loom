@@ -105,7 +105,7 @@ fn seeded_session() -> (SessionId, Session) {
     let id = SessionId::new();
     let mut session = Session::new(id);
     let user = Item::User { text: "fix".into() };
-    let index = session.push_item(user.clone()).unwrap();
+    let index = session.push_item(user).unwrap();
     debug_assert_eq!(index, ItemIndex::from(0));
 
     let planned = session

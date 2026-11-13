@@ -1,6 +1,7 @@
 use super::*;
 use loom_kernel::tool::Tool;
 use serde_json::json;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -81,8 +82,8 @@ async fn summary_form_lines_carry_cues_too() {
     let (guard, root) = temp_root();
     let base = guard.path();
     let mut source = String::new();
-    for i in 0..SUMMARY_THRESHOLD + 1 {
-        source.push_str(&format!("fn f{i}() {{ needle }}\n"));
+    for i in 0..=SUMMARY_THRESHOLD {
+        let _ = writeln!(source, "fn f{i}() {{ needle }}");
     }
     std::fs::create_dir(base.join("src")).expect("mkdir");
     std::fs::write(base.join("src/big.rs"), source).expect("write");
@@ -280,14 +281,12 @@ async fn oversized_multibyte_file_is_searched_not_skipped() {
     // the cap admits — the cut lands mid-character. The file must
     // still be searched (not silently skipped), and the match
     // beyond the cap must not be reported.
-    let mut bytes = Vec::with_capacity(MAX_FILE_BYTES as usize + 32);
+    let cap = usize::try_from(MAX_FILE_BYTES).unwrap_or(usize::MAX);
+    let mut bytes = Vec::with_capacity(cap + 32);
     bytes.extend_from_slice(b"early needle\n");
-    bytes.extend(std::iter::repeat_n(
-        b'a',
-        MAX_FILE_BYTES as usize - bytes.len() - 1,
-    ));
+    bytes.extend(std::iter::repeat_n(b'a', cap - bytes.len() - 1));
     bytes.extend_from_slice("é plus tail needle\n".as_bytes());
-    assert!(bytes.len() > MAX_FILE_BYTES as usize);
+    assert!(bytes.len() > cap);
     std::fs::write(guard.path().join("big.txt"), &bytes).expect("write");
 
     let output = search(&root, json!({"pattern": "needle"}))

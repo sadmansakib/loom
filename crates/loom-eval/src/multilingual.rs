@@ -117,6 +117,13 @@ pub struct MultilingualInstance {
 /// Parses Multilingual dataset JSONL. A malformed line panics with its
 /// number, same contract as [`swebench::parse_dataset`]: a half-loaded
 /// corpus must fail loudly.
+///
+/// # Panics
+///
+/// Panics when any non-empty line is not a valid [`MultilingualInstance`]
+/// JSON object; the message names the 1-based line number.
+#[must_use]
+#[allow(clippy::panic)] // documented fail-loudly contract, exercised by #[should_panic]
 pub fn parse_multilingual(body: &str) -> Vec<MultilingualInstance> {
     body.lines()
         .enumerate()
@@ -130,6 +137,7 @@ pub fn parse_multilingual(body: &str) -> Vec<MultilingualInstance> {
 
 /// Dataset cache location: `<eval_dir>/swebench/multilingual.jsonl`,
 /// beside the Verified cache.
+#[must_use]
 pub fn dataset_cache_path(eval_dir: &Path) -> PathBuf {
     eval_dir.join("swebench").join("multilingual.jsonl")
 }
@@ -137,6 +145,15 @@ pub fn dataset_cache_path(eval_dir: &Path) -> PathBuf {
 /// Loads the dataset without touching the network: the explicit
 /// `LOOM_EVAL_MULTILINGUAL_JSONL` file wins (manual/offline mode), then
 /// the cache. `None` means the caller must fetch.
+///
+/// # Panics
+///
+/// Panics when `LOOM_EVAL_MULTILINGUAL_JSONL` is set but unreadable, when
+/// the cache file is unreadable, or when a line fails to parse (see
+/// [`parse_multilingual`]): manual/offline modes must fail loudly rather
+/// than silently fall back to a network fetch.
+#[must_use]
+#[allow(clippy::panic)] // fail-loudly contract: no silent refetch over the network
 pub fn load_dataset_cached(eval_dir: &Path) -> Option<Vec<MultilingualInstance>> {
     if let Ok(path) = std::env::var("LOOM_EVAL_MULTILINGUAL_JSONL") {
         return Some(parse_multilingual(
@@ -157,6 +174,13 @@ pub fn load_dataset_cached(eval_dir: &Path) -> Option<Vec<MultilingualInstance>>
 /// API and returns the canonical JSONL, mirroring the Verified fetch
 /// (including its drift checks). Live-only: called by the runner when
 /// no cache exists.
+///
+/// # Errors
+///
+/// Returns the error as a `String` when the HTTP client cannot be built,
+/// a page request or JSON decode fails, a page lacks a `rows` array or
+/// `num_rows_total`, a row fails to deserialize, or the fetched shape
+/// drifts from the expected row count.
 pub async fn fetch_dataset_multilingual() -> Result<String, String> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("loom-eval/", env!("CARGO_PKG_VERSION")))
@@ -173,7 +197,7 @@ pub async fn fetch_dataset_multilingual() -> Result<String, String> {
             .get(&url)
             .send()
             .await
-            .and_then(|response| response.error_for_status())
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|error| {
                 format!(
                     "datasets-server page at offset {}: {error}",
@@ -204,9 +228,12 @@ pub async fn fetch_dataset_multilingual() -> Result<String, String> {
             instances.push(instance);
         }
         total = Some(
-            page["num_rows_total"]
-                .as_u64()
-                .ok_or("datasets-server response missing num_rows_total")? as usize,
+            usize::try_from(
+                page["num_rows_total"]
+                    .as_u64()
+                    .ok_or("datasets-server response missing num_rows_total")?,
+            )
+            .map_err(|_| "datasets-server row count does not fit usize")?,
         );
     }
     let total = total.unwrap_or(0);
@@ -232,6 +259,7 @@ pub async fn fetch_dataset_multilingual() -> Result<String, String> {
 /// observed so far shares: `swebench/sweb.eval.x86_64.<slug>:latest`
 /// with the slug limited to the characters the harness's own rewrite
 /// produces (`a-z`, digits, `.`, `-`, `_`).
+#[must_use]
 pub fn image_is_wellformed(image: &str) -> bool {
     let Some(slug) = image
         .strip_prefix(IMAGE_PREFIX)
@@ -248,6 +276,7 @@ pub fn image_is_wellformed(image: &str) -> bool {
 /// Selects the Rust slice: rows whose repo is in [`RUST_REPOS`], in
 /// dataset order. Deterministic and independent of row counts, so a
 /// cached and a fresh fetch select the same tasks.
+#[must_use]
 pub fn select_rust_rows(rows: &[MultilingualInstance]) -> Vec<MultilingualInstance> {
     rows.iter()
         .filter(|row| RUST_REPOS.contains(&row.repo.as_str()))
@@ -258,6 +287,12 @@ pub fn select_rust_rows(rows: &[MultilingualInstance]) -> Vec<MultilingualInstan
 /// Integrity gate for the slice; every check that must hold before any
 /// spend. Aborts (Err) rather than degrades: a 42-task "Rust slice" of
 /// a drifted dataset is a silent headline change, not an inconvenience.
+///
+/// # Errors
+///
+/// Returns the reason as a `String` when the dataset row count, the Rust
+/// slice count, a slice row's log parser, or a slice row's image name
+/// fails its integrity check.
 pub fn check_slice_integrity(
     all: &[MultilingualInstance],
     rust: &[MultilingualInstance],
@@ -297,6 +332,7 @@ pub fn check_slice_integrity(
 /// contract is language-neutral on purpose, and sharing it means a
 /// Multilingual score is comparable to a Verified one down to the
 /// instruction the model actually saw.
+#[must_use]
 pub fn build_prompt_ml(instance: &MultilingualInstance) -> String {
     prompt_text(
         &instance.repo,
@@ -397,6 +433,7 @@ pub struct SliceProvenance {
 
 /// Assembles the slice provenance from the canonical JSONL text (the
 /// same bytes the cache holds) and the selected rows.
+#[must_use]
 pub fn slice_provenance(dataset_jsonl: &str, rust_rows: usize) -> SliceProvenance {
     SliceProvenance {
         dataset: MULTILINGUAL_DATASET_ID,
@@ -590,7 +627,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "dataset line 2")]
     fn malformed_multilingual_lines_fail_loudly() {
-        parse_multilingual(
+        let _ = parse_multilingual(
             "{\"instance_id\":\"ok\",\"repo\":\"tokio-rs/tokio\",\"base_commit\":\"c\",\"image\":\"i\",\"log_parser\":\"parse_log_cargo\",\"problem_statement\":\"p\"}\n{not json}\n",
         );
     }
@@ -619,7 +656,7 @@ mod tests {
         };
         assert_eq!(build_prompt_ml(&ml), swebench::build_prompt(&swe));
 
-        let mut hinted = ml.clone();
+        let mut hinted = ml;
         hinted.hints_text = "see the tracing docs".to_owned();
         let mut hinted_swe = swe;
         hinted_swe.hints_text = hinted.hints_text.clone();

@@ -69,7 +69,7 @@ async fn stalled_task_forks_and_escalates_on_a_second_model() {
             &mut session,
             "churn without changing anything",
             &sink,
-            &Default::default(),
+            &crate::TaskControl::default(),
         )
         .await
         .expect("the escalated attempt reports success");
@@ -82,6 +82,8 @@ async fn stalled_task_forks_and_escalates_on_a_second_model() {
             .iter()
             .any(|kind| matches!(kind, EventKind::LoopNudge { .. }))
     );
+    // EventKind is #[non_exhaustive]; this probe only wants the escalation notice
+    #[allow(clippy::wildcard_enum_match_arm)]
     let notice = kinds
         .iter()
         .find_map(|kind| match kind {
@@ -103,7 +105,9 @@ async fn stalled_task_forks_and_escalates_on_a_second_model() {
         .rev()
         .find_map(|item| match item {
             loom_kernel::transcript::Item::Assistant(message) => Some(message.content.clone()),
-            _ => None,
+            loom_kernel::transcript::Item::User { .. }
+            | loom_kernel::transcript::Item::ToolResult(_)
+            | _ => None,
         })
         .unwrap_or_default();
     assert_eq!(last_assistant, "");
@@ -139,7 +143,7 @@ async fn plain_exhaustion_without_nudge_does_not_escalate() {
             &mut session,
             "churn without changing anything",
             &sink,
-            &Default::default(),
+            &crate::TaskControl::default(),
         )
         .await;
     // Never-worse default: the original error surfaces untouched.

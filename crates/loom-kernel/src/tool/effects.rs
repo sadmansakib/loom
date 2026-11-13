@@ -69,7 +69,7 @@ pub struct ToolEffects {
     #[serde(default)]
     pub before_images: Vec<BeforeImage>,
     /// The verify-call autofix outcome (roadmap item 33), when this call
-    /// attempted one: MachineApplicable suggestions applied after a
+    /// attempted one: `MachineApplicable` suggestions applied after a
     /// failing verify, gated by a re-run. Like `repairs`, the record
     /// never makes `is_empty` true on its own — the file writes it kept
     /// already do. Additive (schema-era persisted effects deserialize
@@ -161,11 +161,13 @@ impl BeforeImage {
 
 impl ToolEffects {
     /// No effects — the read-only default.
+    #[must_use]
     pub fn none() -> Self {
         Self::default()
     }
 
     /// Whether the call changed anything outside Loom's own state.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.files_written.is_empty()
             && self.files_deleted.is_empty()

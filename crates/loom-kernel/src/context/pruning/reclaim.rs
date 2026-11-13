@@ -47,7 +47,7 @@ pub(super) fn frozen_reclaim(
                     continue;
                 };
                 reclaim += u64::from(estimate_serialized(estimator, item).saturating_sub(
-                    stub_tokens(&result.call_id, &result.status, *reason, estimator),
+                    stub_tokens(&result.call_id, result.status, *reason, estimator),
                 ));
             }
             Item::Assistant(assistant) => {
@@ -127,6 +127,9 @@ pub(super) fn projected_reclaim(
 /// [`projected_reclaim`]: per matched decision, full item estimate less
 /// its replacement's. `collect` controls whether the `PrunedCall`
 /// entries are built (report) or skipped (gate).
+// One walk drives both the report and the gate; splitting it would
+// duplicate the matched-decision accounting.
+#[allow(clippy::too_many_lines)]
 fn reclaim_walk(
     session: &Session,
     decisions: &DecisionSet,
@@ -161,7 +164,7 @@ fn reclaim_walk(
                     continue;
                 };
                 let full = estimate_serialized(estimator, item);
-                let stub = stub_tokens(&result.call_id, &result.status, reason, estimator);
+                let stub = stub_tokens(&result.call_id, result.status, reason, estimator);
                 reclaim += u64::from(full.saturating_sub(stub));
                 if collect {
                     calls.push(PrunedCall {
@@ -251,13 +254,13 @@ fn reclaim_walk(
 /// Estimated tokens of the stub that would replace this result.
 pub(super) fn stub_tokens(
     call_id: &ToolCallId,
-    status: &ToolStatus,
+    status: ToolStatus,
     reason: StubReason,
     estimator: &dyn TokenEstimator,
 ) -> u32 {
     let probe = Item::ToolResult(ToolResult {
         call_id: call_id.clone(),
-        status: *status,
+        status,
         content: reason.stub_text().to_owned(),
         truncated: false,
         effects: crate::tool::ToolEffects::none(),

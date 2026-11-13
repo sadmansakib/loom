@@ -18,6 +18,7 @@ pub const PROPOSER_SYSTEM_PROMPT: &str = "You are proposing harness-parameter ch
 /// baseline aggregates, per-instance deltas worth seeing, and the
 /// retained lessons — the full Actionable Side Information GEPA
 /// prescribes, reduced to what the loop can defend.
+#[must_use]
 pub fn build_proposal_prompt(
     baseline: &Baseline,
     stats: &[InstanceStat],
@@ -82,6 +83,7 @@ struct RawProposal {
 /// fences and surrounding prose, dropping anything that fails
 /// [`validate_overlay`] or duplicates an earlier overlay. Silent
 /// drops are counted in the return so the binary can report drift.
+#[must_use]
 pub fn parse_proposal_response(text: &str, max: usize) -> (Vec<Proposal>, usize) {
     let body = extract_json_array(text).unwrap_or_default();
     let Ok(raw) = serde_json::from_str::<Vec<RawProposal>>(&body) else {

@@ -61,9 +61,9 @@ async fn run_git(
     subcommand: &str,
     args: &[String],
 ) -> Result<(String, Option<i32>), ToolError> {
-    let mut argv: Vec<String> = GIT_GLOBALS.iter().map(|&g| g.to_owned()).collect();
-    argv.push(subcommand.to_owned());
-    argv.extend(args.iter().cloned());
+    let mut command: Vec<String> = GIT_GLOBALS.iter().map(|&g| g.to_owned()).collect();
+    command.push(subcommand.to_owned());
+    command.extend(args.iter().cloned());
     let mut grants = crate::sandbox::SandboxGrants::from_rule(None);
     // git's diff plumbing opens /dev/null read-write (the stand-in for
     // an absent file side); the blanket Seatbelt write-deny blocks the
@@ -74,7 +74,7 @@ async fn run_git(
     let sandbox = crate::sandbox::Sandbox::resolve(&ctx.workspace_root, grants);
     let outcome = crate::exec::run_bounded(
         "git",
-        &argv,
+        &command,
         ctx,
         &crate::exec::ExecLimits::default(),
         &sandbox,
@@ -170,7 +170,7 @@ impl Tool for GitStatusTool {
                     let _ = writeln!(out, "clean: no changes");
                 } else {
                     for entry in &parsed.entries {
-                        let _ = writeln!(out, "{}", entry);
+                        let _ = writeln!(out, "{entry}");
                     }
                 }
             } else {
@@ -207,7 +207,12 @@ fn parse_porcelain(raw: &str) -> Porcelain {
         // `HEAD (no branch)` and `main...origin/main` both reduce to
         // the bare name.
         let bare = rest.split("...").next().unwrap_or(rest);
-        branch = bare.trim_end_matches(" (no branch)").to_owned();
+        branch = {
+            // `branch` is `String`; reuse its allocation.
+            bare.trim_end_matches(" (no branch)")
+                .clone_into(&mut branch);
+            branch
+        };
         iter.next();
     }
     while let Some(record) = iter.next() {
@@ -307,7 +312,7 @@ impl Tool for GitDiffTool {
             let (raw, exit) = run_git(ctx, "diff", &args).await?;
             let mut out = raw;
             if exit.unwrap_or(0) == 0 && out.trim().is_empty() && parsed.path.is_none() {
-                out = "(no differences)\n".to_owned();
+                "(no differences)\n".clone_into(&mut out);
             }
             out.push_str(&status_line(exit));
             let effects = ToolEffects::none().with_command(CommandEffect::new(
@@ -401,7 +406,7 @@ impl Tool for GitLogTool {
             let (raw, exit) = run_git(ctx, "log", &args).await?;
             let mut out = raw;
             if exit.unwrap_or(0) == 0 && out.trim().is_empty() {
-                out = "(no commits)\n".to_owned();
+                "(no commits)\n".clone_into(&mut out);
             }
             out.push_str(&status_line(exit));
             let effects = ToolEffects::none().with_command(CommandEffect::new(

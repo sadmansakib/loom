@@ -9,8 +9,8 @@
 use loom_kernel::tool::{PathTouch, Tool};
 use serde_json::{Value, json};
 
-fn touches(tool: &dyn Tool, input: Value) -> Option<Vec<PathTouch>> {
-    tool.touched_paths(&input)
+fn touches(tool: &dyn Tool, input: &Value) -> Option<Vec<PathTouch>> {
+    tool.touched_paths(input)
 }
 
 fn read(path: &str) -> PathTouch {
@@ -23,26 +23,24 @@ fn write(path: &str) -> PathTouch {
 
 #[test]
 fn read_only_tools_declare_their_read_path() {
+    let read_file = loom_tools::ReadFileTool::default();
     assert_eq!(
-        touches(
-            &loom_tools::ReadFileTool::default(),
-            json!({"path": "src/a.rs"})
-        ),
+        touches(&read_file, &json!({"path": "src/a.rs"})),
         Some(vec![read("src/a.rs")])
     );
     assert_eq!(
-        touches(&loom_tools::ListDirTool, json!({"path": "src"})),
+        touches(&loom_tools::ListDirTool, &json!({"path": "src"})),
         Some(vec![read("src")])
     );
     // A search with no `path` reads the workspace root.
     assert_eq!(
-        touches(&loom_tools::SearchTool, json!({"pattern": "fn"})),
+        touches(&loom_tools::SearchTool, &json!({"pattern": "fn"})),
         Some(vec![read(".")])
     );
     assert_eq!(
         touches(
             &loom_tools::SearchTool,
-            json!({"pattern": "fn", "path": "src"})
+            &json!({"pattern": "fn", "path": "src"})
         ),
         Some(vec![read("src")])
     );
@@ -53,14 +51,14 @@ fn mutating_tools_declare_their_write_path() {
     assert_eq!(
         touches(
             &loom_tools::WriteFileTool::default(),
-            json!({"path": "src/a.rs", "content": "x"})
+            &json!({"path": "src/a.rs", "content": "x"})
         ),
         Some(vec![write("src/a.rs")])
     );
     assert_eq!(
         touches(
             &loom_tools::EditFileTool::default(),
-            json!({"path": "src/a.rs", "old_string": "a", "new_string": "b"})
+            &json!({"path": "src/a.rs", "old_string": "a", "new_string": "b"})
         ),
         Some(vec![write("src/a.rs")])
     );
@@ -71,7 +69,7 @@ fn artifact_read_touches_no_workspace_path() {
     assert_eq!(
         touches(
             &loom_tools::ArtifactReadTool::default(),
-            json!({"id": "abc"})
+            &json!({"id": "abc"})
         ),
         Some(Vec::new())
     );
@@ -83,12 +81,12 @@ fn run_command_and_verify_are_wildcards() {
     assert_eq!(
         touches(
             &loom_tools::RunCommandTool::new(),
-            json!({"program": "cargo"})
+            &json!({"program": "cargo"})
         ),
         None
     );
     assert_eq!(
-        touches(&loom_tools::VerifyTool::new(), json!({"scope": "test"})),
+        touches(&loom_tools::VerifyTool::new(), &json!({"scope": "test"})),
         None
     );
 }
@@ -98,11 +96,11 @@ fn unparseable_arguments_declare_nothing() {
     // An invalid call fails without touching anything, so it must not create a
     // false dependency.
     assert_eq!(
-        touches(&loom_tools::ReadFileTool::default(), json!({})),
+        touches(&loom_tools::ReadFileTool::default(), &json!({})),
         Some(Vec::new())
     );
     assert_eq!(
-        touches(&loom_tools::WriteFileTool::default(), json!({"path": "a"})),
+        touches(&loom_tools::WriteFileTool::default(), &json!({"path": "a"})),
         Some(Vec::new())
     );
 }

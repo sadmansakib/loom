@@ -1,4 +1,4 @@
-//! Integration tests for the DeepSeek adapter against a real HTTP stack:
+//! Integration tests for the `DeepSeek` adapter against a real HTTP stack:
 //! wiremock for full request/response exchanges, a raw TCP server where
 //! wiremock cannot help (mid-body stalls, disconnect detection).
 //!
@@ -6,10 +6,13 @@
 //! usage on the last content chunk, the HTTP-status error table, the
 //! in-stream failure mapping, every architecture §5.1 normalization row
 //! over the wire, keep-alive comments, request-body shape (thinking,
-//! explicit reasoning effort, tool_choice only with tools, reasoning
+//! explicit reasoning effort, `tool_choice` only with tools, reasoning
 //! replay when tools are sent), and the liveness/cancellation contract
 //! (drop = request cancelled, stalls = retryable Transport).
 
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -88,7 +91,7 @@ fn plain_request() -> ModelRequest {
 }
 
 /// Serializes one chunk payload as a `data:` event body.
-fn data_event(payload: Value) -> String {
+fn data_event(payload: &Value) -> String {
     payload.to_string()
 }
 
@@ -164,9 +167,9 @@ async fn streams_text_deltas_then_completed_end_turn() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({"choices":[{"delta":{"content":"Hel"}}]})),
-            data_event(json!({"choices":[{"delta":{"content":"lo"}}]})),
-            data_event(json!({"choices":[{"delta":{},"finish_reason":"stop"}],
+            data_event(&json!({"choices":[{"delta":{"content":"Hel"}}]})),
+            data_event(&json!({"choices":[{"delta":{"content":"lo"}}]})),
+            data_event(&json!({"choices":[{"delta":{},"finish_reason":"stop"}],
                                 "usage":{"prompt_tokens":10,"completion_tokens":5,
                                          "prompt_cache_hit_tokens":4}})),
         ]) + &done(),
@@ -192,10 +195,10 @@ async fn streams_reasoning_deltas_and_keeps_reasoning_text() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({"choices":[{"delta":{"reasoning_content":"Think"}}]})),
-            data_event(json!({"choices":[{"delta":{"reasoning_content":"ing…"}}]})),
-            data_event(json!({"choices":[{"delta":{"content":"answer"}}]})),
-            data_event(json!({"choices":[{"delta":{},"finish_reason":"stop"}],
+            data_event(&json!({"choices":[{"delta":{"reasoning_content":"Think"}}]})),
+            data_event(&json!({"choices":[{"delta":{"reasoning_content":"ing…"}}]})),
+            data_event(&json!({"choices":[{"delta":{"content":"answer"}}]})),
+            data_event(&json!({"choices":[{"delta":{},"finish_reason":"stop"}],
                                 "usage":{"prompt_tokens":1,"completion_tokens":1}})),
         ]) + &done(),
     )
@@ -226,17 +229,17 @@ async fn merges_tool_call_fragments_into_completed_response() {
         &server,
         sse(&[
             // First fragment carries id + name and the start of arguments.
-            data_event(json!({"choices":[{"delta":{"tool_calls":[
+            data_event(&json!({"choices":[{"delta":{"tool_calls":[
                 {"index":0,"id":"call_a","type":"function",
                  "function":{"name":"read_file","arguments":"{\"pa"}}]}}]})),
             // Continuation: arguments only.
-            data_event(json!({"choices":[{"delta":{"tool_calls":[
+            data_event(&json!({"choices":[{"delta":{"tool_calls":[
                 {"index":0,"function":{"arguments":"th\":\"x.rs\"}"}}]}}]})),
             // Second call with no id: the adapter must synthesize one.
-            data_event(json!({"choices":[{"delta":{"tool_calls":[
+            data_event(&json!({"choices":[{"delta":{"tool_calls":[
                 {"index":1,"function":{"name":"list_dir","arguments":"{}"}}]}}]})),
             data_event(
-                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}],
+                &json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}],
                                 "usage":{"prompt_tokens":100,"completion_tokens":20}}),
             ),
         ]) + &done(),
@@ -275,8 +278,8 @@ async fn trailing_junk_after_done_is_ignored() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({"choices":[{"delta":{"content":"Hi"}}]})),
-            data_event(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
+            data_event(&json!({"choices":[{"delta":{"content":"Hi"}}]})),
+            data_event(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
         ]) + &done()
             + "data: not-json\n\ndata: {\"evil\":true}\n\n",
     )
@@ -296,10 +299,10 @@ async fn stop_with_calls_normalizes_to_tool_calls() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({"choices":[{"delta":{"tool_calls":[
+            data_event(&json!({"choices":[{"delta":{"tool_calls":[
                 {"index":0,"id":"call_a","type":"function",
                  "function":{"name":"read_file","arguments":"{}"}}]}}]})),
-            data_event(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
+            data_event(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
         ]) + &done(),
     )
     .await;
@@ -318,7 +321,7 @@ async fn done_without_finish_reason_normalizes_structurally() {
     mount_sse(
         &server,
         sse(&[data_event(
-            json!({"choices":[{"delta":{"content":"done talking"}}]}),
+            &json!({"choices":[{"delta":{"content":"done talking"}}]}),
         )]) + &done(),
     )
     .await;
@@ -338,8 +341,8 @@ async fn stream_ending_without_done_is_retryable_transport() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({"choices":[{"delta":{"content":"partial"}}]})),
-            data_event(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
+            data_event(&json!({"choices":[{"delta":{"content":"partial"}}]})),
+            data_event(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
         ]),
     )
     .await;
@@ -363,10 +366,10 @@ async fn length_with_partial_args_discards_calls() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({"choices":[{"delta":{"tool_calls":[
+            data_event(&json!({"choices":[{"delta":{"tool_calls":[
                 {"index":0,"id":"call_a","type":"function",
                  "function":{"name":"read_file","arguments":"{\"path\": \"x.rs"}}]}}]})),
-            data_event(json!({"choices":[{"delta":{},"finish_reason":"length"}]})),
+            data_event(&json!({"choices":[{"delta":{},"finish_reason":"length"}]})),
         ]) + &done(),
     )
     .await;
@@ -388,10 +391,10 @@ async fn unparseable_args_is_salvaged_not_fatal() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({"choices":[{"delta":{"tool_calls":[
+            data_event(&json!({"choices":[{"delta":{"tool_calls":[
                 {"index":0,"id":"call_a","type":"function",
                  "function":{"name":"read_file","arguments":"not json"}}]}}]})),
-            data_event(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
+            data_event(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
         ]) + &done(),
     )
     .await;
@@ -416,9 +419,9 @@ async fn in_stream_insufficient_system_resource_is_overloaded() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({"choices":[{"delta":{"content":"half"}}]})),
+            data_event(&json!({"choices":[{"delta":{"content":"half"}}]})),
             data_event(
-                json!({"choices":[{"delta":{},"finish_reason":"insufficient_system_resource"}]}),
+                &json!({"choices":[{"delta":{},"finish_reason":"insufficient_system_resource"}]}),
             ),
         ]) + &done(),
     )
@@ -438,7 +441,7 @@ async fn in_stream_aborted_is_transport() {
     mount_sse(
         &server,
         sse(&[data_event(
-            json!({"choices":[{"delta":{},"finish_reason":"aborted"}]}),
+            &json!({"choices":[{"delta":{},"finish_reason":"aborted"}]}),
         )]) + &done(),
     )
     .await;
@@ -456,8 +459,8 @@ async fn keep_alive_comments_are_ignored() {
     let server = MockServer::start().await;
     let body = ": keep-alive\n\n".to_string()
         + &sse(&[
-            data_event(json!({"choices":[{"delta":{"content":"Hel"}}]})),
-            data_event(json!({"choices":[{"delta":{"content":"lo"}}]})),
+            data_event(&json!({"choices":[{"delta":{"content":"Hel"}}]})),
+            data_event(&json!({"choices":[{"delta":{"content":"lo"}}]})),
         ])
         + ": keep-alive\n\n"
         + &done()
@@ -543,8 +546,8 @@ async fn uppercase_content_type_is_accepted() {
     // rewrite the header case. The stream must still decode.
     let server = MockServer::start().await;
     let body = sse(&[
-        data_event(json!({"choices":[{"delta":{"content":"Hi"}}]})),
-        data_event(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
+        data_event(&json!({"choices":[{"delta":{"content":"Hi"}}]})),
+        data_event(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
     ]) + &done();
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -572,8 +575,8 @@ async fn done_without_blank_line_at_eof_completes() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({"choices":[{"delta":{"content":"Hi"}}]})),
-            data_event(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
+            data_event(&json!({"choices":[{"delta":{"content":"Hi"}}]})),
+            data_event(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
         ]) + "data: [DONE]\n", // no closing blank line
     )
     .await;
@@ -596,8 +599,8 @@ async fn done_without_newline_at_eof_completes() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({"choices":[{"delta":{"content":"Hi"}}]})),
-            data_event(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
+            data_event(&json!({"choices":[{"delta":{"content":"Hi"}}]})),
+            data_event(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
         ]) + "data: [DONE]", // no newline at all
     )
     .await;
@@ -644,7 +647,7 @@ async fn event_truncated_at_eof_still_fails_retryably() {
     let server = MockServer::start().await;
     mount_sse(
         &server,
-        sse(&[data_event(json!({"choices":[{"delta":{"content":"Hi"}}]}))])
+        sse(&[data_event(&json!({"choices":[{"delta":{"content":"Hi"}}]}))])
             + "data: {\"choices\":[{\"delta\":{\"content\":\"wor", // cut mid-event
     )
     .await;
@@ -686,7 +689,7 @@ async fn request_body_shape_and_reasoning_replay() {
     mount_sse(
         &server,
         sse(&[data_event(
-            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            &json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
         )]) + &done(),
     )
     .await;
@@ -710,7 +713,7 @@ async fn request_body_shape_and_reasoning_replay() {
     mount_sse(
         &server,
         sse(&[data_event(
-            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            &json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
         )]) + &done(),
     )
     .await;
@@ -915,7 +918,7 @@ async fn trailing_slash_base_url_still_hits_the_endpoint() {
     mount_sse(
         &server,
         sse(&[data_event(
-            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            &json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
         )]) + &done(),
     )
     .await;
@@ -1056,8 +1059,8 @@ async fn an_unknown_finish_reason_completes_the_run() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({"choices":[{"delta":{"content":"done"}}]})),
-            data_event(json!({"choices":[{"delta":{},"finish_reason":"eos_custom"}]})),
+            data_event(&json!({"choices":[{"delta":{"content":"done"}}]})),
+            data_event(&json!({"choices":[{"delta":{},"finish_reason":"eos_custom"}]})),
         ]) + &done(),
     )
     .await;

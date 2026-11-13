@@ -132,7 +132,10 @@ pub struct GlmProvider {
 impl GlmProvider {
     /// Creates a provider with a connection-pooled HTTP client.
     ///
-    /// Fails only when the TLS backend cannot be initialized.
+    /// # Errors
+    ///
+    /// Returns [`reqwest::Error`] when the TLS backend cannot be
+    /// initialized.
     pub fn new(config: GlmConfig) -> Result<Self, reqwest::Error> {
         let client = build_client(&config.timeouts)?;
         Ok(Self {
@@ -159,6 +162,7 @@ impl GlmProvider {
 /// generations (`glm-5.1` and below) predate the solid 1M window and
 /// are left out until their limits are verified — unknown ids resolve
 /// to `None`.
+#[must_use]
 pub fn model_capabilities(model: &str) -> Option<ModelCapabilities> {
     let limits = match model {
         "glm-5.3" | "glm-5.3-flash" | "glm-5.3-flashx" | "glm-5.2" => {
@@ -205,7 +209,7 @@ fn thinking_fields(model: &str, effort: ReasoningEffort) -> (Value, Option<&'sta
     } else {
         match effort {
             ReasoningEffort::None => (serde_json::json!({"type": "disabled"}), None),
-            effort => (
+            ReasoningEffort::Low | ReasoningEffort::High | ReasoningEffort::Max => (
                 serde_json::json!({"type": "enabled", "clear_thinking": false}),
                 Some(effort.as_str()),
             ),

@@ -26,7 +26,7 @@ fn manifest_extends_cargo_and_applies_limits() {
     let git = policy.rule("git").expect("git admitted");
     assert_eq!(git.timeout_secs, Some(60));
     let ripgrep = policy.rule("ripgrep").expect("ripgrep admitted");
-    assert_eq!(ripgrep.max_output_bytes, Some(131072));
+    assert_eq!(ripgrep.max_output_bytes, Some(131_072));
     assert_eq!(ripgrep.env_scrub, vec!["AWS_SECRET_ACCESS_KEY".to_owned()]);
 }
 

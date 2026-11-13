@@ -32,6 +32,23 @@ use crate::verify::{Ecosystem, Scope};
 /// under a never-worse gate. Its effects — re-run command, kept writes,
 /// pre-images, repair note, `AutofixEffect` — arrive in the returned
 /// [`ToolEffects`] for the host call to merge into its own.
+/// A deny posture (or unknown=ask without a frontend) skips the fused
+/// verify with a note; Allow (the default) keeps the historical
+/// auto-allow.
+fn refusal_note(verdict: crate::policy::PolicyVerdict, program: &str) -> Option<ToolOutput> {
+    match verdict {
+        crate::policy::PolicyVerdict::Allow => None,
+        crate::policy::PolicyVerdict::Deny => Some(ToolOutput::new(format!(
+            "verify skipped: program \"{program}\" is denied by workspace policy \
+             (.loom/commands.toml)"
+        ))),
+        crate::policy::PolicyVerdict::Ask => Some(ToolOutput::new(format!(
+            "verify skipped: program \"{program}\" needs operator approval \
+                 (policy unknown = \"ask\"); no interactive frontend is attached"
+        ))),
+    }
+}
+
 pub(crate) async fn run_fused(
     scope: Scope,
     ctx: &ToolContext,
@@ -56,22 +73,8 @@ pub(crate) async fn run_fused(
     // F-09): a fixed-table command wrapping a denied program refuses
     // too, same as run_command.
     let verdict = policy.verdict_for_argv(program, &args);
-    match verdict {
-        crate::policy::PolicyVerdict::Allow => {}
-        crate::policy::PolicyVerdict::Deny => {
-            let note = ToolOutput::new(format!(
-                "verify skipped: program \"{program}\" is denied by workspace policy \
-                 (.loom/commands.toml)"
-            ));
-            return Ok((note, ToolEffects::none()));
-        }
-        crate::policy::PolicyVerdict::Ask => {
-            let note = ToolOutput::new(format!(
-                "verify skipped: program \"{program}\" needs operator approval \
-                 (policy unknown = \"ask\"); no interactive frontend is attached"
-            ));
-            return Ok((note, ToolEffects::none()));
-        }
+    if let Some(note) = refusal_note(verdict, program) {
+        return Ok((note, ToolEffects::none()));
     }
     // A declared container/remote runner (item 23) executes the fused
     // verification too — the evidence contract is shared with the

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, oneshot};
 
 use crate::sandbox::{Sandbox, SandboxGrants};
@@ -50,6 +50,11 @@ pub struct McpServerProcess {
 
 impl McpServerProcess {
     /// Spawns (but does not handshake) one server process.
+    ///
+    /// # Errors
+    /// Fails when the sandbox cannot be built for the server's
+    /// declaration or the process itself cannot be spawned; the
+    /// `McpError` carries the OS error message.
     pub fn spawn(name: &str, decl: &McpServerDecl, workspace: &Path) -> Result<Self, McpError> {
         let sandbox = Sandbox::resolve(
             workspace,
@@ -102,109 +107,18 @@ impl McpServerProcess {
 
         // Stderr ring buffer (diagnostics only): the tail survives for
         // `stderr_tail()` without letting a chatty server grow memory.
-        let stderr_tail: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
-        let ring = Arc::clone(&stderr_tail);
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr);
-            let mut chunk = [0u8; 1024];
-            loop {
-                match reader.read(&mut chunk).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if let Ok(mut tail) = ring.lock() {
-                            tail.extend_from_slice(&chunk[..n]);
-                            let len = tail.len();
-                            if len > STDERR_TAIL_BYTES {
-                                tail.drain(..len - STDERR_TAIL_BYTES);
-                            }
-                        }
-                    }
-                }
-            }
-        });
+        let stderr_tail = spawn_stderr_tail(stderr);
 
         let stdin: Arc<Mutex<ChildStdin>> = Arc::new(Mutex::new(stdin));
         let pending: Arc<Pending> = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
         let list_changed = Arc::new(AtomicBool::new(false));
-        let reader_pending = Arc::clone(&pending);
-        let reader_changed = Arc::clone(&list_changed);
-        let reader_stdin = Arc::clone(&stdin);
-        let server_name = name.to_owned();
-        tokio::spawn(async move {
-            // Bounded line framing: oversized lines are discarded whole
-            // (the codec resynchronizes at the next newline) instead of
-            // buffering unbounded bytes.
-            let mut framed = tokio_util::codec::FramedRead::new(
-                stdout,
-                tokio_util::codec::LinesCodec::new_with_max_length(LINE_MAX_BYTES),
-            );
-            while let Some(item) = futures::StreamExt::next(&mut framed).await {
-                let line = match item {
-                    Ok(line) => line,
-                    Err(_) => {
-                        tracing::warn!(
-                            server = %server_name,
-                            "MCP server emitted a line over the size cap; discarded"
-                        );
-                        continue;
-                    }
-                };
-                // Non-JSON lines (harness noise, logs) are skipped.
-                let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                // Classify by `method` first: a server-initiated request
-                // carries BOTH `id` and `method`, and routing on `id`
-                // first would misdeliver it to a pending client request
-                // that happens to hold the same numeric id.
-                match value.get("method").and_then(Value::as_str) {
-                    Some(method) => {
-                        if let Some(id) = value.get("id").cloned() {
-                            // loom answers only the spec-required `ping`;
-                            // everything else (sampling, elicitation,
-                            // roots) is refused — those capabilities are
-                            // never declared, so a spec-compliant server
-                            // never calls them in the first place.
-                            let response = if method == "ping" {
-                                serde_json::json!({
-                                    "jsonrpc": "2.0",
-                                    "id": id,
-                                    "result": {},
-                                })
-                            } else {
-                                serde_json::json!({
-                                    "jsonrpc": "2.0",
-                                    "id": id,
-                                    "error": {
-                                        "code": -32601,
-                                        "message": format!("loom does not implement '{method}'"),
-                                    },
-                                })
-                            };
-                            let _ = write_raw(&reader_stdin, &response).await;
-                        } else if method == "notifications/tools/list_changed" {
-                            reader_changed.store(true, Ordering::Relaxed);
-                        }
-                        // Other notifications are ignored.
-                    }
-                    None => {
-                        if let Some(id) = value.get("id").and_then(Value::as_u64)
-                            && let Ok(mut map) = reader_pending.lock()
-                            && let Some(sender) = map.remove(&id)
-                        {
-                            let _ = sender.send(Ok(value));
-                        }
-                    }
-                }
-            }
-            // EOF: fail every outstanding request so callers wake.
-            if let Ok(mut map) = reader_pending.lock() {
-                let senders: Vec<_> = std::mem::take(&mut *map).into_values().collect();
-                for sender in senders {
-                    let _ = sender.send(Err("server closed its stdout".to_owned()));
-                }
-            }
-        });
+        spawn_reader(
+            stdout,
+            Arc::clone(&stdin),
+            Arc::clone(&pending),
+            Arc::clone(&list_changed),
+            name.to_owned(),
+        );
 
         Ok(Self {
             name: name.to_owned(),
@@ -234,6 +148,117 @@ impl McpServerProcess {
             .map(|tail| String::from_utf8_lossy(&tail).into_owned())
             .unwrap_or_default()
     }
+}
+
+/// Pumps server stderr into a bounded ring buffer: the tail survives
+/// for `stderr_tail()` without letting a chatty server grow memory.
+fn spawn_stderr_tail(stderr: ChildStderr) -> Arc<std::sync::Mutex<Vec<u8>>> {
+    let ring: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
+    let pump = Arc::clone(&ring);
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr);
+        let mut chunk = [0u8; 1024];
+        loop {
+            match reader.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut tail) = pump.lock() {
+                        tail.extend_from_slice(&chunk[..n]);
+                        let len = tail.len();
+                        if len > STDERR_TAIL_BYTES {
+                            tail.drain(..len - STDERR_TAIL_BYTES);
+                        }
+                    }
+                }
+            }
+        }
+    });
+    ring
+}
+
+/// Reads server stdout lines, routes responses to pending requests,
+/// answers the spec-required `ping`, and records
+/// `notifications/tools/list_changed`. Runs until EOF, then fails
+/// every outstanding request so callers wake.
+fn spawn_reader(
+    stdout: ChildStdout,
+    stdin: Arc<Mutex<ChildStdin>>,
+    pending: Arc<Pending>,
+    list_changed: Arc<AtomicBool>,
+    server_name: String,
+) {
+    tokio::spawn(async move {
+        // Bounded line framing: oversized lines are discarded whole
+        // (the codec resynchronizes at the next newline) instead of
+        // buffering unbounded bytes.
+        let mut framed = tokio_util::codec::FramedRead::new(
+            stdout,
+            tokio_util::codec::LinesCodec::new_with_max_length(LINE_MAX_BYTES),
+        );
+        while let Some(item) = futures::StreamExt::next(&mut framed).await {
+            let Ok(line) = item else {
+                tracing::warn!(
+                    server = %server_name,
+                    "MCP server emitted a line over the size cap; discarded"
+                );
+                continue;
+            };
+            // Non-JSON lines (harness noise, logs) are skipped.
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            // Classify by `method` first: a server-initiated request
+            // carries BOTH `id` and `method`, and routing on `id`
+            // first would misdeliver it to a pending client request
+            // that happens to hold the same numeric id.
+            match value.get("method").and_then(Value::as_str) {
+                Some(method) => {
+                    if let Some(id) = value.get("id").cloned() {
+                        // loom answers only the spec-required `ping`;
+                        // everything else (sampling, elicitation,
+                        // roots) is refused — those capabilities are
+                        // never declared, so a spec-compliant server
+                        // never calls them in the first place.
+                        let response = if method == "ping" {
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {},
+                            })
+                        } else {
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": -32601,
+                                    "message": format!("loom does not implement '{method}'"),
+                                },
+                            })
+                        };
+                        let _ = write_raw(&stdin, &response).await;
+                    } else if method == "notifications/tools/list_changed" {
+                        list_changed.store(true, Ordering::Relaxed);
+                    }
+                    // Other notifications are ignored.
+                }
+                None => {
+                    if let Some(id) = value.get("id").and_then(Value::as_u64)
+                        && let Ok(mut map) = pending.lock()
+                        && let Some(sender) = map.remove(&id)
+                    {
+                        let _ = sender.send(Ok(value));
+                    }
+                }
+            }
+        }
+        // EOF: fail every outstanding request so callers wake.
+        if let Ok(mut map) = pending.lock() {
+            let senders: Vec<_> = std::mem::take(&mut *map).into_values().collect();
+            for sender in senders {
+                let _ = sender.send(Err("server closed its stdout".to_owned()));
+            }
+        }
+    });
 }
 
 /// Writes one JSON-RPC line to a shared server stdin. Used by both
@@ -269,40 +294,36 @@ impl McpServerProcess {
         }))
         .await?;
         let outcome = tokio::time::timeout(timeout, receiver).await;
-        match outcome {
-            Ok(Ok(Ok(value))) => {
-                if let Some(error) = value.get("error") {
-                    return Err(McpError::Server {
-                        server: self.name.clone(),
-                        message: error
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown error")
-                            .to_owned(),
-                    });
-                }
-                Ok(value.get("result").cloned().unwrap_or(Value::Null))
+        let Ok(Ok(Ok(value))) = outcome else {
+            if let Ok(mut map) = self.pending.lock() {
+                map.remove(&id);
             }
-            _ => {
-                if let Ok(mut map) = self.pending.lock() {
-                    map.remove(&id);
-                }
-                // The request is abandoned; tell the server to stop
-                // spending on it (spec: `notifications/cancelled`).
-                // Best effort — a dead stdin is not a second error.
-                let _ = self
-                    .write_line(&serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "method": "notifications/cancelled",
-                        "params": {"id": id},
-                    }))
-                    .await;
-                Err(McpError::Server {
-                    server: self.name.clone(),
-                    message: format!("request '{method}' timed out or lost its reader"),
-                })
-            }
+            // The request is abandoned; tell the server to stop
+            // spending on it (spec: `notifications/cancelled`).
+            // Best effort — a dead stdin is not a second error.
+            let _ = self
+                .write_line(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": {"id": id},
+                }))
+                .await;
+            return Err(McpError::Server {
+                server: self.name.clone(),
+                message: format!("request '{method}' timed out or lost its reader"),
+            });
+        };
+        if let Some(error) = value.get("error") {
+            return Err(McpError::Server {
+                server: self.name.clone(),
+                message: error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error")
+                    .to_owned(),
+            });
         }
+        Ok(value.get("result").cloned().unwrap_or(Value::Null))
     }
 
     /// The initialize handshake plus the `initialized` notification.
@@ -310,6 +331,11 @@ impl McpServerProcess {
     /// spec says a client that does not support the negotiated version
     /// SHOULD disconnect, and loom only exercises `tools/*` on
     /// 2025-06-18, so anything else fails the attach closed.
+    ///
+    /// # Errors
+    /// Fails when the `initialize` request times out or the server's
+    /// response is malformed, or when the negotiated `protocolVersion`
+    /// is not exactly [`PROTOCOL_VERSION`].
     pub async fn handshake(&self) -> Result<(), McpError> {
         let result = self
             .request(

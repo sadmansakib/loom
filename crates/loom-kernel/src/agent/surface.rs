@@ -66,6 +66,9 @@ pub struct ToolSurface {
     state: Mutex<SurfaceState>,
 }
 
+// `state` is omitted: `dyn Tool` isn't `Debug`, and tool names (the
+// useful summary) are already rendered under `loaded`.
+#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for ToolSurface {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // `dyn Tool` isn't `Debug`; loaded names are the useful summary.
@@ -91,11 +94,16 @@ impl ToolSurface {
     /// (with the duplicate name) if the tool is already queued or
     /// loaded; the caller surfaces that to the model as a one-turn
     /// self-correction.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` with the tool's name when a tool with that name is
+    /// already queued or loaded (duplicate registration).
     pub fn queue(&self, tool: Arc<dyn Tool>) -> Result<(), String> {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let name = tool.spec().name.clone();
         if state.loaded.iter().any(|t| t.spec().name == name)
             || state.pending.iter().any(|t| t.spec().name == name)
@@ -113,7 +121,7 @@ impl ToolSurface {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.turn = state.turn.max(turn);
     }
 
@@ -124,7 +132,7 @@ impl ToolSurface {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let turn = state.turn;
         if state.last_used.contains_key(name) {
             state.last_used.insert(name.to_owned(), turn);
@@ -139,7 +147,7 @@ impl ToolSurface {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let turn = state.turn;
         let promoted: Vec<Arc<dyn Tool>> = std::mem::take(&mut state.pending);
         for tool in promoted {
@@ -158,11 +166,12 @@ impl ToolSurface {
             .loaded
             .iter()
             .filter_map(|tool| {
-                let name = tool.spec().name.clone();
+                // Borrow the name for the idle check; clone it only when
+                // the tool is actually evicted.
                 let idle = last_used
-                    .get(&name)
+                    .get(tool.spec().name.as_str())
                     .is_some_and(|&last| turn.saturating_sub(last) >= threshold);
-                idle.then_some(name)
+                idle.then(|| tool.spec().name.clone())
             })
             .collect();
         state
@@ -177,7 +186,7 @@ impl ToolSurface {
         let state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.loaded.iter().map(|t| t.spec().name.clone()).collect()
     }
 
@@ -190,7 +199,7 @@ impl ToolSurface {
         let state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut view = base.clone();
         for tool in &state.loaded {
             let _ = view.register_arc(Arc::clone(tool));
@@ -203,7 +212,7 @@ impl ToolSurface {
         let state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.loaded.iter().map(|t| t.spec().clone()).collect()
     }
 }

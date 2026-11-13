@@ -1,6 +1,6 @@
 //! Request-side wire mechanics: the Messages API body builder.
 
-use loom_kernel::model::{Message, ModelRequest};
+use loom_kernel::model::{ContextEditingHint, Message, ModelRequest, ReasoningEffort};
 use loom_kernel::transcript::{AssistantMessage, ToolStatus};
 use serde_json::{Value, json};
 
@@ -134,21 +134,7 @@ pub(crate) fn build_request_body(request: &ModelRequest) -> Value {
     // header is attached in `anthropic.rs` by detecting this key, so
     // the header cannot drift from the body.
     if let Some(hint) = &request.context_editing {
-        let mut edit = json!({
-            "type": "clear_tool_uses_20250919",
-            "trigger": {"type": "input_tokens", "value": hint.trigger_tokens},
-            "keep": {"type": "tool_uses", "value": hint.keep_tool_uses},
-        });
-        if let Some(clear_at_least) = hint.clear_at_least_tokens {
-            edit["clear_at_least"] = json!({
-                "type": "input_tokens",
-                "value": clear_at_least,
-            });
-        }
-        if !hint.exclude_tools.is_empty() {
-            edit["exclude_tools"] = json!(hint.exclude_tools);
-        }
-        body["context_management"] = json!({"edits": [edit]});
+        apply_context_editing(&mut body, hint);
     }
     // Per-turn reasoning effort (roadmap item 9's Anthropic tail):
     // the Messages API has no request field for a level — thinking is
@@ -161,9 +147,36 @@ pub(crate) fn build_request_body(request: &ModelRequest) -> Value {
     // it. Absent effort (the kernel default) sends nothing — the
     // request bytes are unchanged for models and schedules that never
     // set a level.
-    if let Some(effort) = request.reasoning_effort
-        && let Some(messages) = body["messages"].as_array_mut()
-    {
+    if let Some(effort) = request.reasoning_effort {
+        apply_reasoning_effort(&mut body, effort);
+    }
+    body
+}
+
+/// Builds the `context_management` parameter from the provider-agnostic
+/// hint (see [`build_request_body`]).
+fn apply_context_editing(body: &mut Value, hint: &ContextEditingHint) {
+    let mut edit = json!({
+        "type": "clear_tool_uses_20250919",
+        "trigger": {"type": "input_tokens", "value": hint.trigger_tokens},
+        "keep": {"type": "tool_uses", "value": hint.keep_tool_uses},
+    });
+    if let Some(clear_at_least) = hint.clear_at_least_tokens {
+        edit["clear_at_least"] = json!({
+            "type": "input_tokens",
+            "value": clear_at_least,
+        });
+    }
+    if !hint.exclude_tools.is_empty() {
+        edit["exclude_tools"] = json!(hint.exclude_tools);
+    }
+    body["context_management"] = json!({"edits": [edit]});
+}
+
+/// Appends the in-turn system message that carries a per-turn reasoning
+/// effort (see [`build_request_body`]).
+fn apply_reasoning_effort(body: &mut Value, effort: ReasoningEffort) {
+    if let Some(messages) = body["messages"].as_array_mut() {
         messages.push(json!({
             "role": "system",
             "content": [{
@@ -172,7 +185,6 @@ pub(crate) fn build_request_body(request: &ModelRequest) -> Value {
             }],
         }));
     }
-    body
 }
 
 /// Translates one assistant turn into a Messages API message value.

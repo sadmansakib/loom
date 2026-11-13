@@ -192,7 +192,8 @@ fn read_capped_text(path: &Path) -> Option<String> {
     if bytes.contains(&0) {
         return None;
     }
-    crate::text::decode_capped(bytes, MAX_FILE_BYTES as usize)
+    let cap = usize::try_from(MAX_FILE_BYTES).unwrap_or(usize::MAX);
+    crate::text::decode_capped(bytes, cap)
 }
 
 #[cfg(test)]

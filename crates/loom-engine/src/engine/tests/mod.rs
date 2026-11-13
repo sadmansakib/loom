@@ -59,7 +59,7 @@ impl FakeProvider {
 }
 
 impl ModelProvider for FakeProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "fake"
     }
 

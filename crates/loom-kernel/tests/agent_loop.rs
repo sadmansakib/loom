@@ -13,7 +13,9 @@
 // Integration tests are a separate crate; helpers below are not `#[test]`
 // functions, so the workspace's `unwrap_used` / `expect_used` warnings are
 // allowed file-wide for test ergonomics.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -105,7 +107,7 @@ impl FakeProvider {
 }
 
 impl ModelProvider for FakeProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "fake"
     }
 
@@ -540,6 +542,9 @@ async fn end_turn_completes_the_task_and_commits_the_assistant() {
 }
 
 #[tokio::test]
+// End-to-end refusal-loop scenario; the fixture setup is most of the
+// line count and serves exactly one scenario.
+#[allow(clippy::too_many_lines)]
 async fn an_unverified_finish_is_refused_until_the_cap_then_accepted() {
     // Roadmap item 8: a write lands, the model tries to finish without a
     // green check, the loop injects one refusal quoting the changed path
@@ -706,7 +711,7 @@ async fn the_bare_loop_never_refuses_an_unverified_finish() {
 
     // Two model requests: write, finish. The refusal never fired.
     assert_eq!(summary.model_requests, 2);
-    assert!(requests.lock().unwrap().len() == 2);
+    assert_eq!(requests.lock().unwrap().len(), 2);
     assert!(
         !session
             .transcript
@@ -2510,7 +2515,7 @@ async fn handoff_disabled_propagates_the_budget_error() {
     assert_eq!(requests.lock().unwrap().len(), 1, "no handoff call spent");
 }
 
-/// The handoff is only accepted as a plain EndTurn summary: a scripted
+/// The handoff is only accepted as a plain `EndTurn` summary: a scripted
 /// tool-call response falls through to the original budget error.
 #[tokio::test]
 async fn handoff_guard_rejects_a_scripted_tool_call_response() {
@@ -2585,6 +2590,8 @@ async fn record_fast_path_books_a_zero_request_completion() {
     // Transcript: the instruction and the solve's note, nothing else.
     assert_eq!(session.transcript.len(), 2);
     assert!(matches!(session.transcript[0], Item::User { ref text } if text.contains("Rename")));
+    // `Item` is `#[non_exhaustive]`, so a catch-all arm is required here.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match &session.transcript[1] {
         Item::Assistant(message) => {
             assert!(message.content.contains("parse_options"));
@@ -2634,6 +2641,9 @@ async fn record_fast_path_books_a_zero_request_completion() {
 /// * a quiet turn — a batch that did not touch the list — appends
 ///   nothing and still extends the projection by pure prefix growth.
 #[tokio::test]
+// Prefix-growth scenario with a full registry fixture; one scenario,
+// most of the line count is setup.
+#[allow(clippy::too_many_lines)]
 async fn todo_list_re_appends_at_the_tail_only_when_changed() {
     // Registry: the real kernel tool plus a read-only echo for the quiet
     // turn. The todo tool mutates, so its calls serialize in model order
@@ -2717,7 +2727,10 @@ async fn todo_list_re_appends_at_the_tail_only_when_changed() {
                 Message::User { text } if text.starts_with("## todo (kernel)") => {
                     Some(text.clone())
                 }
-                _ => None,
+                Message::System { .. }
+                | Message::User { .. }
+                | Message::Assistant(_)
+                | Message::ToolResult(_) => None,
             })
             .collect()
     };
@@ -3034,9 +3047,13 @@ async fn a_storm_of_varied_failed_calls_is_nudged_then_fails_the_task() {
     assert!(result.is_err(), "ten all-failed turns fail the task");
     let nudges: Vec<String> = drain(&mut receiver)
         .into_iter()
-        .filter_map(|kind| match kind {
-            EventKind::LoopNudge { text } => Some(text),
-            _ => None,
+        .filter_map(|kind| {
+            // Test filter: only nudges matter.
+            #[allow(clippy::wildcard_enum_match_arm)]
+            match kind {
+                EventKind::LoopNudge { text } => Some(text),
+                _ => None,
+            }
         })
         .collect();
     assert!(
@@ -3080,9 +3097,13 @@ async fn a_recovery_after_the_failed_call_nudge_completes_normally() {
     assert_eq!(summary.model_requests, 7);
     let nudges: Vec<String> = drain(&mut receiver)
         .into_iter()
-        .filter_map(|kind| match kind {
-            EventKind::LoopNudge { text } => Some(text),
-            _ => None,
+        .filter_map(|kind| {
+            // Test filter: only nudges matter.
+            #[allow(clippy::wildcard_enum_match_arm)]
+            match kind {
+                EventKind::LoopNudge { text } => Some(text),
+                _ => None,
+            }
         })
         .collect();
     assert_eq!(

@@ -1,4 +1,4 @@
-//! The skills seam (roadmap iteration 5): opt-in load_skill.
+//! The skills seam (roadmap iteration 5): opt-in `load_skill`.
 
 use super::*;
 
@@ -49,12 +49,14 @@ async fn run_skills_task(config: EngineConfig, overrides: EngineOverrides) -> Ve
             &mut session,
             "Load the alpha skill",
             &sink,
-            &Default::default(),
+            &crate::TaskControl::default(),
         )
         .await;
     drain(&mut receiver)
 }
 
+// EventKind is #[non_exhaustive]; this probe only wants load_skill completions
+#[allow(clippy::wildcard_enum_match_arm)]
 fn skill_content(kinds: &[EventKind]) -> Option<&str> {
     kinds.iter().find_map(|kind| match kind {
         EventKind::ToolCompleted {
@@ -63,6 +65,8 @@ fn skill_content(kinds: &[EventKind]) -> Option<&str> {
             content_head,
             ..
         } if name == "load_skill" => Some(content_head.as_str()),
+        // EventKind is #[non_exhaustive]; this probe only wants load_skill completions
+        #[allow(clippy::wildcard_enum_match_arm)]
         _ => None,
     })
 }

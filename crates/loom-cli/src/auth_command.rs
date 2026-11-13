@@ -16,15 +16,15 @@ use crate::args::{AuthCommand, ListArgs, LoginArgs, RemoveArgs, UseArgs};
 pub fn run(command: AuthCommand) -> anyhow::Result<()> {
     let auth = Auth::open(&loom_core::paths::db_path()).context("opening the account store")?;
     match command {
-        AuthCommand::Login(args) => login(&auth, args),
-        AuthCommand::List(args) => list(&auth, args),
-        AuthCommand::Use(args) => use_account(&auth, args),
-        AuthCommand::Remove(args) => remove(&auth, args),
+        AuthCommand::Login(args) => login(&auth, &args),
+        AuthCommand::List(args) => list(&auth, &args),
+        AuthCommand::Use(args) => use_account(&auth, &args),
+        AuthCommand::Remove(args) => remove(&auth, &args),
     }
 }
 
-fn login(auth: &Auth, args: LoginArgs) -> anyhow::Result<()> {
-    let provider = args.provider;
+fn login(auth: &Auth, args: &LoginArgs) -> anyhow::Result<()> {
+    let provider = args.provider.clone();
     let secret = if args.method == Method::Key {
         Some(read_secret(args.stdin)?)
     } else {
@@ -32,9 +32,9 @@ fn login(auth: &Auth, args: LoginArgs) -> anyhow::Result<()> {
     };
     let account = auth.login(LoginSpec {
         provider: provider.clone(),
-        label: args.label,
+        label: args.label.clone(),
         method: args.method,
-        command: args.command,
+        command: args.command.clone(),
         secret,
     })?;
     println!(
@@ -50,7 +50,7 @@ fn login(auth: &Auth, args: LoginArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn list(auth: &Auth, args: ListArgs) -> anyhow::Result<()> {
+fn list(auth: &Auth, args: &ListArgs) -> anyhow::Result<()> {
     let accounts = auth.list(args.provider.as_deref())?;
     if accounts.is_empty() {
         println!("no saved accounts");
@@ -94,13 +94,13 @@ fn list(auth: &Auth, args: ListArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn use_account(auth: &Auth, args: UseArgs) -> anyhow::Result<()> {
+fn use_account(auth: &Auth, args: &UseArgs) -> anyhow::Result<()> {
     let account = auth.activate(&args.provider, &args.target)?;
     println!("active {} account: {}", args.provider, account.label);
     Ok(())
 }
 
-fn remove(auth: &Auth, args: RemoveArgs) -> anyhow::Result<()> {
+fn remove(auth: &Auth, args: &RemoveArgs) -> anyhow::Result<()> {
     let removed = auth.remove(&args.provider, &args.target)?;
     if let Some(warning) = &removed.secret_warning {
         eprintln!("warning: could not remove the keychain secret: {warning}");

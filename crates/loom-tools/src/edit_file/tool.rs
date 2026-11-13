@@ -8,6 +8,7 @@ use loom_kernel::tool::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -57,6 +58,7 @@ pub struct EditFileTool {
 impl EditFileTool {
     /// Builds the tool under explicit output budgets (the engine's
     /// entry point).
+    #[must_use]
     pub fn with_budgets(mut self, budgets: ToolBudgets) -> Self {
         self.budgets = budgets;
         self
@@ -231,7 +233,7 @@ impl Tool for EditFileTool {
             let root = ctx.workspace_root.clone();
             let artifacts = ctx.artifacts.clone();
             let outcome =
-                tokio::task::spawn_blocking(move || apply_edits(&root, &edits, artifacts))
+                tokio::task::spawn_blocking(move || apply_edits(&root, &edits, artifacts.as_ref()))
                     .await
                     .map_err(|err| ToolError::Execution(format!("edit task failed: {err}")))??;
             let (mut effects, mut content, truncated_echo) = assemble_body(&outcome, &self.budgets);
@@ -275,10 +277,77 @@ impl Tool for EditFileTool {
 /// matched exactly once. `root` is the workspace root, for relative
 /// paths in the effects. `artifacts` carries the tier-2 pre-image
 /// capture (already-loaded originals, no extra IO).
+/// Applies one edit to its loaded file text: unique-match replace,
+/// with CRLF/BOM-normalized and trimmed-whitespace repair fallbacks
+/// (review item 3.1). Repair notes land in `repairs`; a refusal
+/// (empty needle, no match, ambiguous match) errors the whole batch.
+fn apply_one_edit(
+    text: &mut String,
+    spans: &mut Vec<(usize, usize)>,
+    old: &str,
+    new: &str,
+    prefix: &str,
+    repairs: &mut Vec<String>,
+) -> Result<(), ToolError> {
+    if old.is_empty() {
+        return Err(ToolError::InvalidInput(format!(
+            "{prefix}old_string must not be empty"
+        )));
+    }
+    match (text.matches(old).count(), text.find(old)) {
+        (0, _) => {
+            // Review item 3.1: try the CRLF/BOM-normalized view
+            // before the whitespace repair — a byte-exact miss is
+            // most often a line-ending mismatch, not a stale copy.
+            let normalized = normalized_view(text);
+            if !normalized.is_identity(text) {
+                let old_norm = normalized_old(old);
+                if let (1, Some(start)) = (
+                    normalized.view.matches(&old_norm).count(),
+                    normalized.view.find(&old_norm),
+                ) {
+                    let (orig_start, orig_len) = normalized.map_span(start, old_norm.len());
+                    let adapted = if normalized.all_crlf {
+                        Cow::Owned(new.replace('\n', "\r\n"))
+                    } else {
+                        Cow::Borrowed(new)
+                    };
+                    replace_span(text, spans, orig_start, orig_len, &adapted);
+                    repairs.push(format!(
+                        "{prefix}old_string matched after normalizing line endings (CRLF/BOM); the file keeps its own endings"
+                    ));
+                    return Ok(());
+                }
+            }
+            if let Some(start) = trimmed_match(text, old) {
+                replace_span(text, spans, start, old.trim().len(), new);
+                repairs.push(format!(
+                    "{prefix}old_string matched after trimming whitespace"
+                ));
+            } else {
+                let mut message = format!("{prefix}old_string not found in file");
+                if let Some(hint) = near_miss_hint(text, old) {
+                    message.push_str(&hint);
+                }
+                return Err(ToolError::InvalidInput(message));
+            }
+        }
+        (1, Some(start)) => {
+            replace_span(text, spans, start, old.len(), new);
+        }
+        (n, _) => {
+            return Err(ToolError::InvalidInput(format!(
+                "{prefix}old_string appears {n} times; include more surrounding text to make it unique"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn apply_edits(
     root: &Path,
     edits: &[(PathBuf, String, String)],
-    artifacts: Option<std::sync::Arc<dyn loom_kernel::store::ArtifactStore>>,
+    artifacts: Option<&std::sync::Arc<dyn loom_kernel::store::ArtifactStore>>,
 ) -> Result<EditOutcome, ToolError> {
     let batch_len = edits.len();
     let prefix = |index: usize| -> String {
@@ -292,74 +361,22 @@ fn apply_edits(
     let mut spans: Vec<Vec<(usize, usize)>> = vec![Vec::new(); files.len()];
     let mut repairs: Vec<String> = Vec::new();
     for (index, (path, old, new)) in edits.iter().enumerate() {
-        let file_idx = match files.iter().position(|(p, _, _)| p == path) {
-            Some(idx) => idx,
-            None => {
-                // Unreachable: `load_edit_files` inserted every edit's
-                // path. Stated as an error rather than a panic so the
-                // invariant is checkable, not assumed.
-                return Err(ToolError::Execution(String::from(
-                    "internal error: edit target was not loaded",
-                )));
-            }
-        };
-        let text = &mut files[file_idx].2;
-        if old.is_empty() {
-            return Err(ToolError::InvalidInput(format!(
-                "{}old_string must not be empty",
-                prefix(index)
+        let Some(file_idx) = files.iter().position(|(p, _, _)| p == path) else {
+            // Unreachable: `load_edit_files` inserted every edit's
+            // path. Stated as an error rather than a panic so the
+            // invariant is checkable, not assumed.
+            return Err(ToolError::Execution(String::from(
+                "internal error: edit target was not loaded",
             )));
-        }
-        match (text.matches(old).count(), text.find(old)) {
-            (0, _) => {
-                // Review item 3.1: try the CRLF/BOM-normalized view
-                // before the whitespace repair — a byte-exact miss is
-                // most often a line-ending mismatch, not a stale copy.
-                let normalized = normalized_view(text);
-                if !normalized.is_identity(text) {
-                    let old_norm = normalized_old(old);
-                    if let (1, Some(start)) = (
-                        normalized.view.matches(&old_norm).count(),
-                        normalized.view.find(&old_norm),
-                    ) {
-                        let (orig_start, orig_len) = normalized.map_span(start, old_norm.len());
-                        let adapted = if normalized.all_crlf {
-                            new.replace('\n', "\r\n")
-                        } else {
-                            new.clone()
-                        };
-                        replace_span(text, &mut spans[file_idx], orig_start, orig_len, &adapted);
-                        repairs.push(format!(
-                            "{}old_string matched after normalizing line endings (CRLF/BOM); the file keeps its own endings",
-                            prefix(index)
-                        ));
-                        continue;
-                    }
-                }
-                if let Some(start) = trimmed_match(text, old) {
-                    replace_span(text, &mut spans[file_idx], start, old.trim().len(), new);
-                    repairs.push(format!(
-                        "{}old_string matched after trimming whitespace",
-                        prefix(index)
-                    ));
-                } else {
-                    let mut message = format!("{}old_string not found in file", prefix(index));
-                    if let Some(hint) = near_miss_hint(text, old) {
-                        message.push_str(&hint);
-                    }
-                    return Err(ToolError::InvalidInput(message));
-                }
-            }
-            (1, Some(start)) => {
-                replace_span(text, &mut spans[file_idx], start, old.len(), new);
-            }
-            (n, _) => {
-                return Err(ToolError::InvalidInput(format!(
-                    "{}old_string appears {n} times; include more surrounding text to make it unique",
-                    prefix(index)
-                )));
-            }
-        }
+        };
+        apply_one_edit(
+            &mut files[file_idx].2,
+            &mut spans[file_idx],
+            old,
+            new,
+            &prefix(index),
+            &mut repairs,
+        )?;
     }
     // Syntax guard (roadmap item 5 phase B): every candidate buffer
     // must parse before anything reaches the disk, so a batch that
@@ -380,7 +397,7 @@ fn apply_edits(
         .iter()
         .filter_map(|(path, original, _)| {
             crate::pre_image::capture_before_image(
-                artifacts.as_deref(),
+                artifacts.map(|arc| &**arc),
                 &workspace_relative(root, path),
                 Some(original.as_bytes()),
             )
@@ -395,8 +412,8 @@ fn apply_edits(
             .map_err(|err| ToolError::Execution(format!("cannot write: {err}")))?;
     }
     let resolved: Vec<(String, String)> = files
-        .iter()
-        .map(|(path, _, text)| (workspace_relative(root, path), text.clone()))
+        .into_iter()
+        .map(|(path, _, text)| (workspace_relative(root, &path), text))
         .collect();
     let per_file_counts: Vec<usize> = spans.iter().map(Vec::len).collect();
     let mut echoes = Vec::new();

@@ -8,11 +8,11 @@
 //! of wire stop signals into `loom_kernel` semantics are shared, so no
 //! provider specifics leak into the core.
 //!
-//! Shipped adapters: DeepSeek (built-in capability table, since its API
-//! serves none), OpenRouter (capabilities and pricing resolved from
+//! Shipped adapters: `DeepSeek` (built-in capability table, since its API
+//! serves none), `OpenRouter` (capabilities and pricing resolved from
 //! the provider's model catalog, which the frontend fetches and caches),
 //! Anthropic (its own Messages API driver — see [`anthropic`] for
-//! why it does not share the OpenAI wire machine), GLM (Z.ai's
+//! why it does not share the `OpenAI` wire machine), GLM (Z.ai's
 //! metered API on the OpenAI-compatible wire — see [`glm`] for why the
 //! Coding Plan endpoint is off-limits), NVIDIA (NIM hosted
 //! inference — see [`nvidia`] for why the free tier matters to the

@@ -6,6 +6,9 @@
 //! environment variable. Run `loom auth login groq` once and live tests
 //! need no env vars at all.
 
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 fn loom_db_path() -> std::path::PathBuf {
     if let Ok(db) = std::env::var("LOOM_DB") {
         return db.into();
@@ -40,7 +43,7 @@ pub fn live_key(provider: &str, env_name: &str) -> String {
                     .output()
             })
         })
-        .and_then(|o| o.ok())
+        .and_then(Result::ok)
         .filter(|o| o.status.success());
     if let Some(out) = keychain {
         let key = String::from_utf8_lossy(&out.stdout).trim().to_string();

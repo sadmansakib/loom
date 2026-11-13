@@ -16,7 +16,7 @@
 //!
 //! Everything else — including all reasoning (§4.2) — is projected verbatim
 //! in transcript order. Reasoning is replayed byte-exact because the
-//! DeepSeek thinking-mode contract demands the complete, unmodified
+//! `DeepSeek` thinking-mode contract demands the complete, unmodified
 //! reasoning of every prior turn once tools are sent (ADR-006).
 
 mod census;

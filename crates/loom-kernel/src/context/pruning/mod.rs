@@ -31,7 +31,7 @@
 //!
 //! Result stubbing alone leaves two buckets stacking verbatim every
 //! turn: tool-call *arguments* (an edit call carries the whole new file
-//! content — 28 % of context tokens on CliffCompaction's Terminal-Bench
+//! content — 28 % of context tokens on `CliffCompaction`'s Terminal-Bench
 //! unpacking) and old non-first *user items*. When `elide_turns` is
 //! set (default 8), the same episodic machinery reduces them below the
 //! window trigger:
@@ -46,8 +46,8 @@
 //!   age past the window.
 //! * assistant reasoning traces older than `elide_reasoning` turns are
 //!   dropped from the projection (`reasoning = None`). Off by default:
-//!   replaying reasoning verbatim is a provider contract on the OpenAI
-//!   wire (DeepSeek rejects a tool-bearing request whose prior
+//!   replaying reasoning verbatim is a provider contract on the `OpenAI`
+//!   wire (`DeepSeek` rejects a tool-bearing request whose prior
 //!   assistant turns lack `reasoning_content`), so the engine enables
 //!   it only where omission is provably safe — GLM (forfeits only the
 //!   preserved-thinking cache benefit) and Anthropic (never forwards

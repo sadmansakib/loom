@@ -31,6 +31,7 @@ pub struct ScoutTool {
 }
 
 impl ScoutTool {
+    #[must_use]
     /// Wraps a composed child agent with the wall-clock budget and the
     /// default concurrency cap ([`SCOUT_CONCURRENCY`] parallel scouts).
     pub fn new(agent: Arc<Agent>, timeout_secs: u64) -> Self {
@@ -43,18 +44,21 @@ impl ScoutTool {
         }
     }
 
+    #[must_use]
     /// Overrides the parallel-scout cap (tests; future config wiring).
     pub fn with_concurrency(mut self, concurrency: usize) -> Self {
         self.permits = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
         self
     }
 
+    #[must_use]
     /// Sets the provenance footer label for the primary model.
     pub fn with_model_label(mut self, label: impl Into<String>) -> Self {
         self.model_label = label.into();
         self
     }
 
+    #[must_use]
     /// Attaches the stronger escalation/cross-check agent with its
     /// provenance label.
     pub fn with_escalation(mut self, agent: Arc<Agent>, model_label: impl Into<String>) -> Self {
@@ -156,16 +160,13 @@ fn run_scout(
         // Fail-soft concurrency gate: never queue. A parent fanning out
         // scouts gets an immediate "at capacity" it can act on instead
         // of a pile of child spends waiting on permits.
-        let permit = match permits.try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                return Ok(ToolOutput::new(
-                    "scout is at capacity (all parallel scout permits are \
-                     held); retry after the running scouts answer, or \
-                     proceed without it"
-                        .to_owned(),
-                ));
-            }
+        let Ok(permit) = permits.try_acquire_owned() else {
+            return Ok(ToolOutput::new(
+                "scout is at capacity (all parallel scout permits are \
+                 held); retry after the running scouts answer, or \
+                 proceed without it"
+                    .to_owned(),
+            ));
         };
         let handle = tokio::spawn(run_scout_task(
             agent,

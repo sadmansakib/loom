@@ -90,7 +90,8 @@ fn unquote_git_path(path: &str) -> String {
             Some('f') => out.push(0x0c),
             Some('v') => out.push(0x0b),
             Some('"') => out.push(b'"'),
-            Some('\\') => out.push(b'\\'),
+            // A lone trailing backslash is a literal backslash.
+            Some('\\') | None => out.push(b'\\'),
             Some(first @ '0'..='7') => {
                 // Exactly three octal digits name one raw byte.
                 let mut value = first.to_digit(8).unwrap_or(0);
@@ -100,10 +101,11 @@ fn unquote_git_path(path: &str) -> String {
                         None => break,
                     }
                 }
+                #[allow(clippy::cast_possible_truncation)]
+                // three octal digits are ≤ 0o777, always a valid u8
                 out.push(value as u8);
             }
             Some(other) => out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes()),
-            None => out.push(b'\\'),
         }
     }
     String::from_utf8_lossy(&out).into_owned()

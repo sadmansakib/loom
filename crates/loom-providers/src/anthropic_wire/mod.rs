@@ -25,7 +25,7 @@
 //!   [`ModelRequest::stable_prefix_messages`] hint (the kernel itself
 //!   stays provider-blind).
 //!
-//! Deviations from the OpenAI wire that matter here:
+//! Deviations from the `OpenAI` wire that matter here:
 //!
 //! - `max_tokens` is **required** — defaulted when the request omits it;
 //! - `temperature` is **never sent**: Claude 4.7 and later (the whole

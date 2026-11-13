@@ -1,5 +1,7 @@
 use super::*;
 
+// Mirrors `analyze`'s `Option<Intent>` so tests compare directly.
+#[allow(clippy::unnecessary_wraps)]
 fn rename(from: &str, to: &str) -> Option<Intent> {
     Some(Intent::Rename {
         from: from.to_owned(),
@@ -272,6 +274,8 @@ fn analyze_format_grammar() {
     assert_eq!(analyze("format the disk"), None);
 }
 
+// Mirrors `analyze`'s `Option<Intent>` so tests compare directly.
+#[allow(clippy::unnecessary_wraps)]
 fn dependency(name: &str, version: &str) -> Option<Intent> {
     Some(Intent::DependencyUpdate {
         crate_name: name.to_owned(),
@@ -327,7 +331,7 @@ fn edit_manifest_rewrites_only_dependency_tables() {
             [dev-dependencies]\nserde = \"1.0.100\"\n\n\
             [build-dependencies]\nserde = \"1.0.100\"\n\n\
             [features]\nserde = [\"full\"]\n";
-    let (out, changes) = edit_manifest(manifest, "serde", "1.0.300").unwrap();
+    let (out, changes) = edit_manifest(manifest, "serde", "1.0.300");
     assert_eq!(changes.len(), 3);
     assert!(
         changes
@@ -346,16 +350,16 @@ fn edit_manifest_rewrites_only_dependency_tables() {
 fn edit_manifest_leaves_complex_entries_and_reports_no_changes() {
     let manifest = "[dependencies]\nserde = { version = \"1.0.100\", features = [\"derive\"] }\n\
             other.workspace = true\nother.default-features = false\n";
-    let (out, changes) = edit_manifest(manifest, "serde", "1.0.300").unwrap();
+    let (out, changes) = edit_manifest(manifest, "serde", "1.0.300");
     assert!(changes.is_empty());
     assert_eq!(out, manifest);
 
-    let (out, changes) = edit_manifest(manifest, "other", "2").unwrap();
+    let (out, changes) = edit_manifest(manifest, "other", "2");
     assert!(changes.is_empty());
     assert_eq!(out, manifest);
 
     // A plain entry elsewhere under the same name does not leak in.
-    let (out, changes) = edit_manifest(manifest, "version", "9").unwrap();
+    let (out, changes) = edit_manifest(manifest, "version", "9");
     assert!(changes.is_empty());
     assert_eq!(out, manifest);
 }
@@ -363,12 +367,12 @@ fn edit_manifest_leaves_complex_entries_and_reports_no_changes() {
 #[test]
 fn edit_manifest_preserves_indent_and_final_newline() {
     let manifest = "[dependencies]\n    serde = \"1.0.100\"\n";
-    let (out, changes) = edit_manifest(manifest, "serde", "2").unwrap();
+    let (out, changes) = edit_manifest(manifest, "serde", "2");
     assert_eq!(changes, vec![("1.0.100".to_owned(), "2".to_owned())]);
     assert_eq!(out, "[dependencies]\n    serde = \"2\"\n");
 
     let manifest = "[dependencies]\nserde = \"1.0.100\"";
-    let (out, _) = edit_manifest(manifest, "serde", "2").unwrap();
+    let (out, _) = edit_manifest(manifest, "serde", "2");
     assert_eq!(out, "[dependencies]\nserde = \"2\"");
 }
 

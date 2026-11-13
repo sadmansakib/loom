@@ -47,8 +47,8 @@ struct Boundary {
 }
 
 /// Lists rewind boundaries for `args.session`, or forks it at `--at`.
-pub fn run(args: RewindArgs) -> anyhow::Result<ExitCode> {
-    rewind(&args)?;
+pub fn run(args: &RewindArgs) -> anyhow::Result<ExitCode> {
+    rewind(args)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -69,7 +69,7 @@ pub(crate) fn rewind(args: &RewindArgs) -> anyhow::Result<Option<SessionId>> {
         .context("loading the session")?
         .with_context(|| format!("unknown session {id} (see `loom sessions`)"))?;
     let boundaries = boundary_rows(&session);
-    let tip = session.transcript.len() as u32;
+    let tip = u32::try_from(session.transcript.len()).unwrap_or(u32::MAX);
     let checkpoint = store
         .start_checkpoint(&id)
         .context("reading the start checkpoint")?;
@@ -102,52 +102,7 @@ pub(crate) fn rewind(args: &RewindArgs) -> anyhow::Result<Option<SessionId>> {
     // checked read-only BEFORE the fork runs, so a refused restore
     // leaves nothing half-done. The workspace comes from the
     // checkpoint, not the cwd — a rewind may run from anywhere.
-    let restore = if args.restore_workspace {
-        if args.to_start {
-            let checkpoint = checkpoint.as_ref().with_context(|| {
-                format!(
-                    "--restore-workspace refused: session {id} has no start \
-                     checkpoint (it predates the feature or was run with \
-                     --no-save); the conversation fork alone is available"
-                )
-            })?;
-            Restore::Start(crate::workspace::plan_restore(checkpoint)?)
-        } else {
-            // Tier 2: restore to the fork boundary itself. Only the
-            // checkpoint's workspace location is needed — the claims
-            // come from recorded effects, so a dirty or non-git
-            // workspace restores exactly like a clean one.
-            let at = args.at.with_context(|| {
-                "--restore-workspace restores to a boundary: pass --at IDX \
-                 from this listing (or --to-start for the session-start \
-                 reset)"
-            })?;
-            let checkpoint = checkpoint.as_ref().with_context(|| {
-                format!(
-                    "--restore-workspace refused: session {id} has no start \
-                     checkpoint (it predates the feature or was run with \
-                     --no-save), so the workspace it ran in is unknown; the \
-                     conversation fork alone is available"
-                )
-            })?;
-            let plan =
-                crate::workspace::plan_boundary_restore(&session, at, &checkpoint.workspace)?;
-            // Commands are effects Loom cannot undo; they gate rather
-            // than silently absorb (invariant 6).
-            if !plan.commands.is_empty() && !args.accept_unrestorable {
-                anyhow::bail!(
-                    "the dropped region ran {} command(s) Loom cannot undo \
-                     ({}); pass --accept-unrestorable to restore the provable \
-                     file changes anyway",
-                    plan.commands.len(),
-                    summarize_commands(&plan.commands)
-                );
-            }
-            Restore::Boundary(plan)
-        }
-    } else {
-        Restore::None
-    };
+    let restore = plan_workspace_restore(args, &id, &session, checkpoint.as_ref())?;
     let new_id = SessionId::new();
     store
         .fork(&id, ItemIndex::from(at), &new_id)
@@ -156,7 +111,74 @@ pub(crate) fn rewind(args: &RewindArgs) -> anyhow::Result<Option<SessionId>> {
         "forked {new_id} from {id}: kept [0, {at}), dropped {} item(s)",
         tip - at
     );
-    match &restore {
+    apply_workspace_restore(&restore, at, &store)?;
+    println!("resume with: loom run --session {new_id} TASK");
+    Ok(Some(new_id))
+}
+
+/// Read-only pre-flight for `--restore-workspace`: resolves which tier
+/// of restore the flags select and verifies every tree claim before the
+/// fork runs, so a refusal here leaves nothing half-done.
+fn plan_workspace_restore(
+    args: &RewindArgs,
+    id: &SessionId,
+    session: &Session,
+    checkpoint: Option<&StartCheckpoint>,
+) -> anyhow::Result<Restore> {
+    if !args.restore_workspace {
+        return Ok(Restore::None);
+    }
+    if args.to_start {
+        let checkpoint = checkpoint.with_context(|| {
+            format!(
+                "--restore-workspace refused: session {id} has no start \
+                 checkpoint (it predates the feature or was run with \
+                 --no-save); the conversation fork alone is available"
+            )
+        })?;
+        Ok(Restore::Start(crate::workspace::plan_restore(checkpoint)?))
+    } else {
+        // Tier 2: restore to the fork boundary itself. Only the
+        // checkpoint's workspace location is needed — the claims
+        // come from recorded effects, so a dirty or non-git
+        // workspace restores exactly like a clean one.
+        let at = args.at.with_context(|| {
+            "--restore-workspace restores to a boundary: pass --at IDX \
+             from this listing (or --to-start for the session-start \
+             reset)"
+        })?;
+        let checkpoint = checkpoint.with_context(|| {
+            format!(
+                "--restore-workspace refused: session {id} has no start \
+                 checkpoint (it predates the feature or was run with \
+                 --no-save), so the workspace it ran in is unknown; the \
+                 conversation fork alone is available"
+            )
+        })?;
+        let plan = crate::workspace::plan_boundary_restore(session, at, &checkpoint.workspace)?;
+        // Commands are effects Loom cannot undo; they gate rather
+        // than silently absorb (invariant 6).
+        if !plan.commands.is_empty() && !args.accept_unrestorable {
+            anyhow::bail!(
+                "the dropped region ran {} command(s) Loom cannot undo \
+                 ({}); pass --accept-unrestorable to restore the provable \
+                 file changes anyway",
+                plan.commands.len(),
+                summarize_commands(&plan.commands)
+            );
+        }
+        Ok(Restore::Boundary(plan))
+    }
+}
+
+/// Applies the selected restore after a successful fork and prints what
+/// the user keeps: nothing, the start reset, or the boundary pre-images.
+fn apply_workspace_restore(
+    restore: &Restore,
+    at: u32,
+    store: &loom_core::store::SqliteStore,
+) -> anyhow::Result<()> {
+    match restore {
         Restore::None => {}
         Restore::Start(plan) => {
             let patch = crate::workspace::apply_restore(plan)?;
@@ -168,7 +190,7 @@ pub(crate) fn rewind(args: &RewindArgs) -> anyhow::Result<Option<SessionId>> {
             );
         }
         Restore::Boundary(plan) => {
-            let snapshot = crate::workspace::apply_boundary_restore(plan, &store)?;
+            let snapshot = crate::workspace::apply_boundary_restore(plan, store)?;
             let restored = plan
                 .entries
                 .iter()
@@ -190,8 +212,7 @@ pub(crate) fn rewind(args: &RewindArgs) -> anyhow::Result<Option<SessionId>> {
             }
         }
     }
-    println!("resume with: loom run --session {new_id} TASK");
-    Ok(Some(new_id))
+    Ok(())
 }
 
 /// A workspace restore this rewind will apply after the fork.
@@ -233,9 +254,12 @@ fn boundary_rows(session: &Session) -> Vec<Boundary> {
     let mut rows = Vec::new();
     let mut turn = 0;
     for (index, item) in session.transcript.iter().enumerate() {
+        // `Item` is non_exhaustive; future kinds start no boundary
+        // until proven otherwise (tool results included).
+        #[allow(clippy::wildcard_enum_match_arm)]
         match item {
             Item::User { text } => rows.push(Boundary {
-                index: index as u32,
+                index: u32::try_from(index).unwrap_or(u32::MAX),
                 kind: "user".to_owned(),
                 head: head_line(text),
             }),
@@ -247,14 +271,11 @@ fn boundary_rows(session: &Session) -> Vec<Boundary> {
                     message.content.clone()
                 };
                 rows.push(Boundary {
-                    index: index as u32,
+                    index: u32::try_from(index).unwrap_or(u32::MAX),
                     kind: format!("turn {turn}"),
                     head: head_line(&raw),
                 });
             }
-            Item::ToolResult(_) => {}
-            // `Item` is non_exhaustive; future kinds start no boundary
-            // until proven otherwise.
             _ => {}
         }
     }

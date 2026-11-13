@@ -5,6 +5,7 @@
 //! (ADR-014, V7). The window is bounded by lines (`limit`) and by bytes
 //! ([`READ_FILE_HEAD_BYTES`]); both cuts are explicit.
 
+use std::fmt::Write as _;
 use std::io::Read;
 use std::path::Path;
 
@@ -109,24 +110,21 @@ pub(crate) fn render_window(
     };
     if window.lines.is_empty() {
         // Only reachable when `offset` is past the last line.
-        text.push_str(&format!("... [offset {offset} is past the last line]"));
+        let _ = write!(text, "... [offset {offset} is past the last line]");
         return (text, false);
     }
     for (number, line) in &window.lines {
-        text.push_str(&format!("{number}\t{line}\n"));
+        let _ = writeln!(text, "{number}\t{line}");
     }
-    let shown_end = window
-        .lines
-        .last()
-        .map(|(number, _)| *number)
-        .unwrap_or(offset);
+    let shown_end = window.lines.last().map_or(offset, |(number, _)| *number);
     let mut truncated = !window.complete;
     if window.complete && window.total > shown_end {
         let remaining = window.total - shown_end;
-        text.push_str(&format!(
-            "... [{remaining} more lines; read with offset={}]\n",
+        let _ = writeln!(
+            text,
+            "... [{remaining} more lines; read with offset={}]",
             shown_end + 1
-        ));
+        );
         truncated = true;
     }
     let (text, cut) = budget::head_only(&text, head_bytes);

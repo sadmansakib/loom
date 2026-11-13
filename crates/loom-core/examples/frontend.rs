@@ -45,12 +45,12 @@ fn main() -> anyhow::Result<()> {
         base_url: None,
         models_url: None,
         headers: Vec::new(),
-        reasoning_effort: Default::default(),
+        reasoning_effort: loom_core::providers::ReasoningEffort::default(),
         account: None,
         workspace: std::env::current_dir()?,
         system_prompt: None,
         max_turns: 8,
-        turn_budget: Default::default(),
+        turn_budget: loom_core::kernel::agent::TurnBudget::default(),
         context_editing: None,
         db_path: loom_core::paths::db_path(),
         persist: false,
@@ -101,7 +101,7 @@ fn main() -> anyhow::Result<()> {
         outcome
             .as_ref()
             .map(|summary| summary.turns)
-            .map_err(|error| error.to_string())
+            .map_err(ToString::to_string)
     );
     Ok(())
 }

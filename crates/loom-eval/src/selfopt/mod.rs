@@ -185,6 +185,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)] // exact medians of exact inputs
     fn median_handles_odd_even_and_empty() {
         assert_eq!(median(&[3.0, 1.0, 2.0]), 2.0);
         assert_eq!(median(&[4.0, 1.0, 3.0, 2.0]), 2.5);
@@ -208,6 +209,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)] // exact medians of exact inputs
     fn per_instance_takes_medians_over_runs() {
         let runs = vec![
             run_stat("a", 1, 100, 30, false),
@@ -450,7 +452,7 @@ mod tests {
     // ------------------------------------------------- pre-probe ---
 
     /// Writes a minimal `loom run --trace`-shaped directory: a user
-    /// task, `reads` rounds of a read_file call + result of roughly
+    /// task, `reads` rounds of a `read_file` call + result of roughly
     /// `read_bytes` bytes each, and a final end turn. No summary, no
     /// events — the pre-probe needs neither.
     fn write_replay_trace(
@@ -500,7 +502,7 @@ mod tests {
         // `turns` must be non-zero or the replay treats the task as a
         // fast-path solve and compiles nothing.
         let mut task = TaskRecord::new(TaskId::new(), 0);
-        task.turns = (reads + 1) as u32;
+        task.turns = u32::try_from(reads + 1).unwrap_or(u32::MAX);
         let manifest = serde_json::json!({
             "harness": {"provider": "deepseek", "model": "m"},
             "task_id": task.id.to_string(),

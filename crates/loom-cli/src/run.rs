@@ -14,6 +14,7 @@ use loom_core::engine::TaskControl;
 use loom_core::kernel::agent::{TaskError, TaskSummary};
 use loom_core::kernel::event::{ChannelEventSink, FanoutSink};
 use loom_core::kernel::session::Session;
+use loom_core::kernel::store::SessionStore as _;
 use loom_core::{Engine, EngineConfig, EngineOverrides, ScoutConfig};
 
 use crate::args::RunArgs;
@@ -34,6 +35,9 @@ pub(crate) struct DecisionLog {
 
 impl EventSink for DecisionLog {
     fn emit(&self, _task_id: TaskId, kind: EventKind) {
+        // `EventKind` is `#[non_exhaustive]`; unknown variants render
+        // no line.
+        #[allow(clippy::wildcard_enum_match_arm)]
         let line = match kind {
             EventKind::CapabilitiesResolved { model, source } => {
                 format!("model {model}: capabilities resolved from {source}")
@@ -59,10 +63,7 @@ pub(crate) fn print_decisions(log: &DecisionLog) {
         Err(_) => return,
     };
     let mut seen = std::collections::HashSet::new();
-    let unique: Vec<&String> = lines
-        .iter()
-        .filter(|line| seen.insert((*line).clone()))
-        .collect();
+    let unique: Vec<&String> = lines.iter().filter(|line| seen.insert(*line)).collect();
     if unique.is_empty() {
         return;
     }
@@ -74,10 +75,73 @@ pub(crate) fn print_decisions(log: &DecisionLog) {
 
 /// Runs one task end to end and returns the process exit code.
 ///
+/// The parallel-rollout arm (roadmap item 21): N isolated worktrees,
+/// one deterministic winner, its patch applied here. The catalog
+/// sequencing and credential resolution are shared with the single
+/// run — one fetch, one keychain read, N cheap provider rebuilds.
+/// Returns `Some(exit)` when this arm handled the task; `None` falls
+/// through to the single-run path.
+fn run_best_of(
+    args: &RunArgs,
+    config: EngineConfig,
+    requested: usize,
+    runtime: tokio::runtime::Runtime,
+    input: &str,
+    bare_arm: bool,
+) -> anyhow::Result<ExitCode> {
+    if bare_arm {
+        anyhow::bail!("--best-of cannot combine with the LOOM_BARE arm");
+    }
+    if args.flags.session.is_some() {
+        anyhow::bail!("--best-of starts fresh parallel rollouts; --session continues one");
+    }
+    let n = requested.clamp(2, 8);
+    let config = runtime.block_on(Engine::resolve_catalog(config))?;
+    let factory = loom_core::engine::worktrees::provider_factory(&config)?;
+    let token = tokio_util::sync::CancellationToken::new();
+    // The ladder awaits its first ctrl_c() immediately, so the
+    // handler is installed before the rollouts start: tokio
+    // registers SIGINT lazily, and the old token-then-ctrl_c
+    // ordering left Ctrl-C on the default disposition — one press
+    // killed the process and orphaned the best-of-* worktrees.
+    let ladder_token = token.clone();
+    let signal = runtime.spawn(best_of_ctrl_c_ladder(
+        || async { tokio::signal::ctrl_c().await.is_ok() },
+        ladder_token,
+        || std::process::exit(130),
+    ));
+    let report = runtime.block_on(loom_core::engine::worktrees::best_of_n(
+        config,
+        factory,
+        input,
+        loom_core::engine::worktrees::BestOfNConfig {
+            n,
+            concurrency: 3,
+            keep_worktrees: false,
+            shared_prefix_turns: args.flags.best_of_prefix_turns,
+            vary_harness: args.flags.best_of_vary,
+            verify_selection: !args.flags.best_of_no_verify,
+        },
+        &token,
+    ))?;
+    signal.abort();
+    print_best_of_n(&report, args.flags.json);
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    let cancelled = token.is_cancelled();
+    Ok(if cancelled {
+        // A user stop exits 130, matching the single-run path.
+        ExitCode::from(130)
+    } else if report.applied {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
 /// Terminal `TaskError`s are reported here and mapped to a non-zero code
 /// (`130` for a user stop — cancellation or pause — `1` otherwise); only
 /// setup failures propagate as `Err`.
-pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
+pub fn run(args: &RunArgs) -> anyhow::Result<ExitCode> {
     // The sandbox preflight fails at setup, not mid-task: on a host
     // whose policy denies unprivileged user namespaces (Ubuntu 24.04+
     // by default) every sandboxed `run_command`/`verify` would fail one
@@ -110,58 +174,10 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
 
     let input = args.task.join(" ");
 
-    // The parallel-rollout arm (roadmap item 21): N isolated worktrees,
-    // one deterministic winner, its patch applied here. The catalog
-    // sequencing and credential resolution are shared with the single
-    // run — one fetch, one keychain read, N cheap provider rebuilds.
+    // The parallel-rollout arm (roadmap item 21) gets its own function:
+    // it resolves the catalog and never touches the single-run engine.
     if let Some(requested) = args.flags.best_of {
-        if bare_arm {
-            anyhow::bail!("--best-of cannot combine with the LOOM_BARE arm");
-        }
-        if args.flags.session.is_some() {
-            anyhow::bail!("--best-of starts fresh parallel rollouts; --session continues one");
-        }
-        let n = requested.clamp(2, 8);
-        let config = runtime.block_on(Engine::resolve_catalog(config))?;
-        let factory = loom_core::engine::worktrees::provider_factory(&config)?;
-        let token = tokio_util::sync::CancellationToken::new();
-        // The ladder awaits its first ctrl_c() immediately, so the
-        // handler is installed before the rollouts start: tokio
-        // registers SIGINT lazily, and the old token-then-ctrl_c
-        // ordering left Ctrl-C on the default disposition — one press
-        // killed the process and orphaned the best-of-* worktrees.
-        let ladder_token = token.clone();
-        let signal = runtime.spawn(best_of_ctrl_c_ladder(
-            || async { tokio::signal::ctrl_c().await.is_ok() },
-            ladder_token,
-            || std::process::exit(130),
-        ));
-        let report = runtime.block_on(loom_core::engine::worktrees::best_of_n(
-            config,
-            factory,
-            &input,
-            loom_core::engine::worktrees::BestOfNConfig {
-                n,
-                concurrency: 3,
-                keep_worktrees: false,
-                shared_prefix_turns: args.flags.best_of_prefix_turns,
-                vary_harness: args.flags.best_of_vary,
-                verify_selection: !args.flags.best_of_no_verify,
-            },
-            &token,
-        ))?;
-        signal.abort();
-        print_best_of_n(&report, args.flags.json);
-        runtime.shutdown_timeout(Duration::from_secs(5));
-        let cancelled = token.is_cancelled();
-        return Ok(if cancelled {
-            // A user stop exits 130, matching the single-run path.
-            ExitCode::from(130)
-        } else if report.applied {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
-        });
+        return run_best_of(args, config, requested, runtime, &input, bare_arm);
     }
 
     let engine = runtime.block_on(Engine::open_async_with(config, overrides))?;
@@ -177,42 +193,33 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let control = TaskControl::new();
     let signal = runtime.spawn(ctrl_c_ladder(control.clone()));
 
-    // Resume (item 15): with `--session` the engine loads the persisted
-    // transcript, appends the input, and runs to the next stopping point;
-    // `continue_session` returns the advanced session even when the task
-    // failed, so the trace export still has a transcript to write.
-    let (session, outcome) = match args.flags.session.as_deref() {
-        Some(id) => {
-            let id = id
-                .parse()
-                .context("parsing --session (expected an id from `loom sessions`)")?;
-            let continuation = runtime
-                .block_on(engine.continue_session(&id, input, &sink, &control))
-                .map_err(|error| {
-                    anyhow::Error::new(error).context(format!("resuming session {id}"))
-                })?;
-            (continuation.session, continuation.outcome)
-        }
-        None => {
-            let mut session = engine.new_session();
-            // Tier-1 start checkpoint (`docs/rewind-design.md` §4):
-            // snapshot the workspace before the task can touch the
-            // tree, so `loom rewind --restore-workspace --to-start`
-            // has an exact restore point. Recorded only for a new
-            // session — a `--session` resume keeps the baseline of the
-            // run that actually started the lineage. Best-effort: a
-            // run whose checkpoint fails to record still runs, and a
-            // later restore refuses (no row) rather than guessing.
-            crate::run::record_start_checkpoint(
-                &session.id,
-                &args.flags.workspace,
-                args.flags.no_save,
-            );
-            let outcome = runtime.block_on(engine.run_task(&mut session, input, &sink, &control));
-            (session, outcome)
-        }
+    let (session, outcome) = if let Some(id) = args.flags.session.as_deref() {
+        // Resume (item 15): with `--session` the engine loads the persisted
+        // transcript, appends the input, and runs to the next stopping point;
+        // `continue_session` returns the advanced session even when the task
+        // failed, so the trace export still has a transcript to write.
+        let id = id
+            .parse()
+            .context("parsing --session (expected an id from `loom sessions`)")?;
+        let continuation = runtime
+            .block_on(engine.continue_session(&id, input, &sink, &control))
+            .map_err(|error| anyhow::Error::new(error).context(format!("resuming session {id}")))?;
+        (continuation.session, continuation.outcome)
+    } else {
+        let mut session = engine.new_session();
+        // Tier-1 start checkpoint (`docs/rewind-design.md` §4):
+        // snapshot the workspace before the task can touch the
+        // tree, so `loom rewind --restore-workspace --to-start`
+        // has an exact restore point. Recorded only for a new
+        // session — a `--session` resume keeps the baseline of the
+        // run that actually started the lineage. Best-effort: a
+        // run whose checkpoint fails to record still runs, and a
+        // later restore refuses (no row) rather than guessing.
+        crate::run::record_start_checkpoint(&session.id, &args.flags.workspace, args.flags.no_save);
+        let outcome = runtime.block_on(engine.run_task(&mut session, input, &sink, &control));
+        (session, outcome)
     };
-    let tracer = join_consumers(sink, signal, renderer_thread, tracer_thread);
+    let tracer = join_consumers(sink, &signal, renderer_thread, tracer_thread);
     print_decisions(&decision_log);
 
     // The trace export is best-effort: a failure to write files must not
@@ -320,6 +327,106 @@ fn print_best_of_n(report: &loom_core::engine::worktrees::BestOfNReport, json: b
 /// configure the engine identically. Returns the overrides too — the
 /// bare-loop arm (`LOOM_BARE`) changes both, and callers need it for
 /// `Engine::open_async_with`.
+/// One bare-arm gate: the feature is on unless `LOOM_BARE` strips it
+/// (the bare arm measures the plain loop); an ignored flag prints a
+/// note instead of failing.
+fn bare_gated(on: bool, flag: &str, bare_arm: bool) -> bool {
+    if on && !bare_arm {
+        return true;
+    }
+    if on {
+        eprintln!("note: --{flag} is ignored in the bare-loop arm");
+    }
+    false
+}
+
+/// The scout arm (roadmap item 19): off unless both flags are given;
+/// the bare arm never carries it (it measures the plain loop).
+fn scout_config(
+    flags: &crate::args::RunFlags,
+    bare_arm: bool,
+) -> anyhow::Result<Option<ScoutConfig>> {
+    let escalation = match (
+        flags.scout_escalation.as_deref(),
+        flags.scout_escalation_model.as_deref(),
+    ) {
+        (Some(_), None) => anyhow::bail!("--scout-escalation requires --scout-escalation-model"),
+        (None, Some(_)) => anyhow::bail!("--scout-escalation-model requires --scout-escalation"),
+        (Some(provider), Some(model)) => {
+            if flags.scout.is_none() || flags.scout_model.is_none() {
+                anyhow::bail!("--scout-escalation requires --scout and --scout-model");
+            }
+            Some((provider.to_owned(), model.to_owned()))
+        }
+        (None, None) => None,
+    };
+    let scout = match (flags.scout.as_deref(), flags.scout_model.as_deref()) {
+        (Some(provider), Some(model)) => {
+            if bare_arm {
+                eprintln!("note: --scout is ignored in the bare-loop arm");
+                None
+            } else {
+                let mut config = ScoutConfig::new(provider.to_owned(), model.to_owned());
+                if let Some((esc_provider, esc_model)) = escalation {
+                    config = config.with_escalation(esc_provider, esc_model);
+                }
+                Some(config)
+            }
+        }
+        (Some(_), None) => anyhow::bail!("--scout requires --scout-model"),
+        (None, Some(_)) => anyhow::bail!("--scout-model requires --scout"),
+        (None, None) => None,
+    };
+    Ok(scout)
+}
+
+/// Item 20.2/26: per-tool budgets, pruning policy, and the staged turn
+/// budget are sweepable via env (`LOOM_*_BYTES`/`_LINES`,
+/// `LOOM_PRUNE_*`, `LOOM_*_TURNS`), layered over the defaults. Presence
+/// echoes (honesty: the run log records what varied); invalid values
+/// warn and are ignored.
+fn env_budgets(
+    provider: &str,
+) -> (
+    loom_core::tools::ToolBudgets,
+    loom_core::kernel::context::PruneConfig,
+    loom_core::kernel::agent::TurnBudget,
+) {
+    for name in loom_core::engine::BUDGET_ENV_VARS
+        .into_iter()
+        .chain(loom_core::engine::PRUNE_ENV_VARS)
+    {
+        if let Ok(value) = std::env::var(name) {
+            eprintln!("override: {name}={value}");
+        }
+    }
+    let (budgets, budget_warnings) =
+        loom_core::engine::budgets_with_env(loom_core::tools::ToolBudgets::default(), |name| {
+            std::env::var(name).ok()
+        });
+    for warning in &budget_warnings {
+        eprintln!("warning: {warning}");
+    }
+    for name in loom_core::engine::TURN_BUDGET_ENV_VARS {
+        if let Ok(value) = std::env::var(name) {
+            eprintln!("override: {name}={value}");
+        }
+    }
+    let (prune, prune_warnings) =
+        loom_core::engine::prune_with_env(provider, |name| std::env::var(name).ok());
+    for warning in &prune_warnings {
+        eprintln!("warning: {warning}");
+    }
+    let (turn_budget, turn_budget_warnings) = loom_core::engine::turn_budget_with_env(
+        loom_core::kernel::agent::TurnBudget::default(),
+        |name| std::env::var(name).ok(),
+    );
+    for warning in &turn_budget_warnings {
+        eprintln!("warning: {warning}");
+    }
+    (budgets, prune, turn_budget)
+}
+
 pub(crate) fn engine_config_from(
     flags: &crate::args::RunFlags,
 ) -> anyhow::Result<(EngineConfig, EngineOverrides)> {
@@ -366,134 +473,17 @@ pub(crate) fn engine_config_from(
     } else {
         EngineOverrides::default()
     };
-    // The scout arm (roadmap item 19): off unless both flags are given;
-    // the bare arm never carries it (it measures the plain loop).
-    let escalation = match (
-        flags.scout_escalation.as_deref(),
-        flags.scout_escalation_model.as_deref(),
-    ) {
-        (Some(_), None) => anyhow::bail!("--scout-escalation requires --scout-escalation-model"),
-        (None, Some(_)) => anyhow::bail!("--scout-escalation-model requires --scout-escalation"),
-        (Some(provider), Some(model)) => {
-            if flags.scout.is_none() || flags.scout_model.is_none() {
-                anyhow::bail!("--scout-escalation requires --scout and --scout-model");
-            }
-            Some((provider.to_owned(), model.to_owned()))
-        }
-        (None, None) => None,
-    };
-    let scout = match (flags.scout.as_deref(), flags.scout_model.as_deref()) {
-        (Some(provider), Some(model)) => {
-            if bare_arm {
-                eprintln!("note: --scout is ignored in the bare-loop arm");
-                None
-            } else {
-                let mut config = ScoutConfig::new(provider.to_owned(), model.to_owned());
-                if let Some((esc_provider, esc_model)) = escalation {
-                    config = config.with_escalation(esc_provider, esc_model);
-                }
-                Some(config)
-            }
-        }
-        (Some(_), None) => anyhow::bail!("--scout requires --scout-model"),
-        (None, Some(_)) => anyhow::bail!("--scout-model requires --scout"),
-        (None, None) => None,
-    };
-    // The symbol tools (roadmap item 18): off unless asked; the bare
-    // arm measures the plain loop, so it never carries them.
-    let symbols = if flags.symbols && !bare_arm {
-        true
-    } else {
-        if flags.symbols {
-            eprintln!("note: --symbols is ignored in the bare-loop arm");
-        }
-        false
-    };
-    // The skills seam (iteration 5): same gate, same bare-arm rule.
-    let skills = if flags.skills && !bare_arm {
-        true
-    } else {
-        if flags.skills {
-            eprintln!("note: --skills is ignored in the bare-loop arm");
-        }
-        false
-    };
-    // Evidence-gated lessons (roadmap item 20.4): same gate, same
-    // bare-arm rule.
-    let lessons = if flags.lessons && !bare_arm {
-        true
-    } else {
-        if flags.lessons {
-            eprintln!("note: --lessons is ignored in the bare-loop arm");
-        }
-        false
-    };
-    // Slice D (iteration 6): MCP servers. Same gate, same bare-arm rule.
-    let mcp = if flags.mcp && !bare_arm {
-        true
-    } else {
-        if flags.mcp {
-            eprintln!("note: --mcp is ignored in the bare-loop arm");
-        }
-        false
-    };
-    // Slice E (iteration 6): LSP servers. Same gate, same bare-arm rule.
-    let lsp = if flags.lsp && !bare_arm {
-        true
-    } else {
-        if flags.lsp {
-            eprintln!("note: --lsp is ignored in the bare-loop arm");
-        }
-        false
-    };
-    // Structured git tools (iteration 4): same gate, same bare-arm rule.
-    let git = if flags.git && !bare_arm {
-        true
-    } else {
-        if flags.git {
-            eprintln!("note: --git is ignored in the bare-loop arm");
-        }
-        false
-    };
-    // Item 20.2: per-tool budgets and pruning policy are sweepable via
-    // env (LOOM_*_BYTES/_LINES and LOOM_PRUNE_*), layered over the
-    // defaults. Presence echoes (honesty: the run log records what
-    // varied); invalid values warn and are ignored.
-    for name in loom_core::engine::BUDGET_ENV_VARS
-        .into_iter()
-        .chain(loom_core::engine::PRUNE_ENV_VARS)
-    {
-        if let Ok(value) = std::env::var(name) {
-            eprintln!("override: {name}={value}");
-        }
-    }
-    let (budgets, budget_warnings) =
-        loom_core::engine::budgets_with_env(loom_core::tools::ToolBudgets::default(), |name| {
-            std::env::var(name).ok()
-        });
-    for warning in &budget_warnings {
-        eprintln!("warning: {warning}");
-    }
-    for name in loom_core::engine::TURN_BUDGET_ENV_VARS {
-        if let Ok(value) = std::env::var(name) {
-            eprintln!("override: {name}={value}");
-        }
-    }
-    let (prune, prune_warnings) =
-        loom_core::engine::prune_with_env(&flags.provider, |name| std::env::var(name).ok());
-    for warning in &prune_warnings {
-        eprintln!("warning: {warning}");
-    }
-    // Item 26: the staged turn budget is sweepable the same way
-    // (LOOM_INITIAL_TURNS / LOOM_EXTENSION_TURNS /
-    // LOOM_MAX_TURN_EXTENSIONS). The default stays inert.
-    let (turn_budget, turn_budget_warnings) =
-        loom_core::engine::turn_budget_with_env(Default::default(), |name| {
-            std::env::var(name).ok()
-        });
-    for warning in &turn_budget_warnings {
-        eprintln!("warning: {warning}");
-    }
+    let scout = scout_config(flags, bare_arm)?;
+    // Feature seams share one bare-arm gate: the bare arm measures the
+    // plain loop, so each feature is off there (flag asked for and
+    // ignored prints a note).
+    let symbols = bare_gated(flags.symbols, "symbols", bare_arm);
+    let skills = bare_gated(flags.skills, "skills", bare_arm);
+    let lessons = bare_gated(flags.lessons, "lessons", bare_arm);
+    let mcp = bare_gated(flags.mcp, "mcp", bare_arm);
+    let lsp = bare_gated(flags.lsp, "lsp", bare_arm);
+    let git = bare_gated(flags.git, "git", bare_arm);
+    let (budgets, prune, turn_budget) = env_budgets(&flags.provider);
     // Header pairs are validated once, here; the engine carries them
     // verbatim to the custom adapter.
     let headers = crate::args::parse_header_pairs(&flags.headers).map_err(anyhow::Error::msg)?;
@@ -557,7 +547,6 @@ pub(crate) fn record_start_checkpoint(
     if no_save {
         return;
     }
-    use loom_core::kernel::store::SessionStore;
     let checkpoint = crate::workspace::snapshot_start(workspace);
     if let Some(reason) = &checkpoint.reason {
         eprintln!("note: no workspace start checkpoint ({reason})");
@@ -575,7 +564,7 @@ pub(crate) fn record_start_checkpoint(
             }
         }
         Err(error) => {
-            eprintln!("warning: opening store for start checkpoint: {error}")
+            eprintln!("warning: opening store for start checkpoint: {error}");
         }
     }
 }
@@ -675,8 +664,10 @@ async fn best_of_ctrl_c_ladder<S, F>(
 /// `blocking_recv` loops, and the trace writer — when one ran — comes
 /// back for the export below.
 pub(crate) fn join_consumers(
-    sink: FanoutSink,
-    signal: tokio::task::JoinHandle<()>,
+    // `sink` is moved in only to be dropped: closing the fanout's
+    // sender side is the shutdown signal for the consumers.
+    #[allow(clippy::needless_pass_by_value)] sink: FanoutSink,
+    signal: &tokio::task::JoinHandle<()>,
     renderer_thread: std::thread::JoinHandle<()>,
     tracer_thread: Option<std::thread::JoinHandle<TraceWriter>>,
 ) -> Option<TraceWriter> {
@@ -685,9 +676,10 @@ pub(crate) fn join_consumers(
     if renderer_thread.join().is_err() {
         eprintln!("warning: event renderer thread panicked");
     }
-    tracer_thread.and_then(|thread| match thread.join() {
-        Ok(writer) => Some(writer),
-        Err(_) => {
+    tracer_thread.and_then(|thread| {
+        if let Ok(writer) = thread.join() {
+            Some(writer)
+        } else {
             eprintln!("warning: trace consumer thread panicked; trace not written");
             None
         }
@@ -797,7 +789,7 @@ mod tests {
         tx.send(true).await.unwrap();
         drop(tx);
         best_of_ctrl_c_ladder(fake_signals(rx), token.clone(), move || {
-            flag.store(true, Ordering::SeqCst)
+            flag.store(true, Ordering::SeqCst);
         })
         .await;
         assert!(token.is_cancelled());

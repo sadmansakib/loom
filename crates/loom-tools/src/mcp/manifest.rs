@@ -58,6 +58,11 @@ pub struct McpToolPolicy {
 
 impl McpManifest {
     /// Parses manifest TOML.
+    ///
+    /// # Errors
+    /// Fails when the TOML is malformed or a server declaration is
+    /// invalid (duplicate names, empty commands); the `McpError`
+    /// carries the detail.
     pub fn parse(text: &str) -> Result<Self, McpError> {
         let manifest: Self =
             toml::from_str(text).map_err(|error| McpError::Invalid(error.to_string()))?;

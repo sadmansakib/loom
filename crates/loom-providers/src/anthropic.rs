@@ -4,18 +4,18 @@
 //! header auth (`x-api-key` + `anthropic-version`) instead of bearer,
 //! a top-level `system` parameter, typed content blocks, and an SSE
 //! stream that terminates with a `message_stop` event instead of the
-//! OpenAI `[DONE]` sentinel.
+//! `OpenAI` `[DONE]` sentinel.
 //!
 //! This is deliberately **not** built on [`crate::wire_stream`]: that
-//! machine's accumulator is the OpenAI chunk shape, and refactoring the
-//! delicate OpenAI paths (unterminated-`[DONE]` tolerance, mid-stream
+//! machine's accumulator is the `OpenAI` chunk shape, and refactoring the
+//! delicate `OpenAI` paths (unterminated-`[DONE]` tolerance, mid-stream
 //! error objects) without a funded Anthropic key to re-verify live
 //! behaviour risks drift in the working providers for ~100 lines of
 //! duplication. The HTTP/SSE plumbing (timeouts, error-body reads,
 //! `SseDecoder`, idle handling) is shared; only the event assembly and
 //! termination differ.
 //!
-//! Capability discovery deviates from the OpenRouter catalog pattern on
+//! Capability discovery deviates from the `OpenRouter` catalog pattern on
 //! purpose: Anthropic's models endpoint exposes no capability fields,
 //! so a static table stands in until live verification is possible.
 //!
@@ -96,8 +96,10 @@ pub struct AnthropicProvider {
 impl AnthropicProvider {
     /// Creates the provider, building its HTTP client.
     ///
-    /// Errors only when the client cannot be built (TLS backend
-    /// failure) — same contract as the other adapters.
+    /// # Errors
+    ///
+    /// Returns [`reqwest::Error`] when the client cannot be built (TLS
+    /// backend failure) — same contract as the other adapters.
     pub fn new(config: AnthropicConfig) -> Result<Self, reqwest::Error> {
         let client = build_client(&config.timeouts)?;
         Ok(Self {
@@ -137,7 +139,7 @@ impl ModelProvider for AnthropicProvider {
 ///
 /// Anthropic's models endpoint carries no capability fields, so there
 /// is nothing to reduce a catalog from (the deliberate deviation from
-/// the OpenRouter pattern). Unknown models resolve to `None` — the
+/// the `OpenRouter` pattern). Unknown models resolve to `None` — the
 /// core fails loud rather than guessing a window.
 ///
 /// Every entry is a pinned Claude API id, so dateless aliases
@@ -151,10 +153,9 @@ fn capabilities(model: &str) -> Option<ModelCapabilities> {
         // Claude 5.5 family (2026): 1M context, 128K output, adaptive
         // thinking. Opus 5.5 and Fable 5.1 additionally always think
         // (thinking cannot be disabled) and reject forced tool use.
-        "claude-fable-5-1" => (1_000_000, 128_000, true),
-        "claude-opus-5-5" => (1_000_000, 128_000, true),
-        "claude-sonnet-5-5" => (1_000_000, 128_000, true),
-        "claude-haiku-5-5" => (1_000_000, 128_000, true),
+        "claude-fable-5-1" | "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-haiku-5-5" => {
+            (1_000_000, 128_000, true)
+        }
         // Claude 4.x long-context models; output caps per the model cards.
         "claude-opus-4-1" => (200_000, 32_000, true),
         "claude-sonnet-4-5" => (200_000, 64_000, true),
@@ -195,7 +196,11 @@ enum State {
 }
 
 /// One unfold step — same shape as [`crate::wire_stream`]'s machine,
-/// minus the OpenAI `[DONE]` sentinel handling.
+/// minus the `OpenAI` `[DONE]` sentinel handling.
+// Deliberately linear: the Send and Body arms each own the full
+// transition for one state, and the machine's local state (decoder,
+// assembler, pending queue) must stay in one scope.
+#[allow(clippy::too_many_lines)]
 async fn step(state: State) -> Option<(Result<Option<ModelEvent>, ModelError>, State)> {
     match state {
         State::Send { provider, body } => {

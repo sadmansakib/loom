@@ -101,6 +101,7 @@ pub(crate) fn head_bytes(text: &str, budget: usize) -> &str {
 /// Head-bounds a string to `budget` bytes on a char boundary, marking
 /// the cut. Used by the tool events so the stream stays forensic
 /// without reproducing whole file bodies or tool outputs.
+#[must_use]
 pub fn text_head(text: &str, budget: usize) -> String {
     let head = head_bytes(text, budget);
     if head.len() < text.len() {

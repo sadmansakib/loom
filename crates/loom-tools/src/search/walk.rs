@@ -70,7 +70,7 @@ pub(super) fn search_tree(
         .git_global(false)
         .parents(false)
         .require_git(false)
-        .sort_by_file_name(|a, b| a.cmp(b));
+        .sort_by_file_name(std::cmp::Ord::cmp);
     if !ancestor_matchers.is_empty() {
         // Each matcher strips its own root from the absolute entry
         // path, so a root `src/gen/` rule anchors at the workspace root
@@ -80,7 +80,7 @@ pub(super) fn search_tree(
         // prunes the whole subtree before descent. Pinned by the item-16
         // tests (`nested_path_styled_rule_anchors_at_its_own_directory`,
         // `repo_shaped_tree_scoped_and_whole_agree`).
-        let matchers = ancestor_matchers.clone();
+        let matchers = ancestor_matchers;
         builder.filter_entry(move |entry| {
             let is_dir = entry.file_type().is_some_and(|ty| ty.is_dir());
             // Deepest ancestor with an opinion wins; a shallower file
@@ -110,11 +110,10 @@ pub(super) fn search_tree(
         if cancellation.is_cancelled() {
             return Err("cancelled".to_owned());
         }
-        let entry = match entry {
-            Ok(entry) => entry,
-            // Unreadable entries (permission denials, racing deletes)
-            // are skipped, not fatal: search reports what it can see.
-            Err(_) => continue,
+        // Unreadable entries (permission denials, racing deletes)
+        // are skipped, not fatal: search reports what it can see.
+        let Ok(entry) = entry else {
+            continue;
         };
         if !entry.file_type().is_some_and(|ty| ty.is_file()) {
             continue;

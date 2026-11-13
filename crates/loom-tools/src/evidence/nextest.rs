@@ -1,8 +1,8 @@
-//! nextest JUnit XML parsing (best effort).
+//! nextest `JUnit` XML parsing (best effort).
 
 use super::TestFailure;
 
-/// Parses nextest JUnit XML into failing tests (best effort).
+/// Parses nextest `JUnit` XML into failing tests (best effort).
 ///
 /// Only `<testcase>` blocks containing a `<failure>` element are reported; the
 /// `name` attribute and the `message` attribute (or body) supply the fields.

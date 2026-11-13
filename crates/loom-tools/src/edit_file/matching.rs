@@ -32,7 +32,7 @@ pub(super) struct EditOutcome {
 ///
 /// Unlike the read tools, a missing file here is an execution error, not an
 /// informational "does not exist": a write path that targets nothing is a
-/// model mistake (read first, or use write_file), and the loop's failure
+/// model mistake (read first, or use `write_file`), and the loop's failure
 /// ledger should refuse a blind repeat (ADR-020).
 /// The line-ending/BOM rescue (review item 3.1): models emit LF-only
 /// `old_string`s, while checkout tools and Windows editors leave CRLF
@@ -181,10 +181,17 @@ pub(super) fn replace_span(
         recorded_end <= start || *recorded_start >= end
     });
     text.replace_range(start..end, new);
+    // Offsets are file positions, far below isize::MAX on any target;
+    // the signed delta only shifts recorded spans left or right.
+    #[allow(clippy::cast_possible_wrap)]
     let delta = new.len() as isize - old_len as isize;
     for (recorded_start, _) in file_spans.iter_mut() {
         if start < *recorded_start {
-            *recorded_start = (*recorded_start as isize + delta) as usize;
+            #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+            {
+                let shifted = *recorded_start as isize + delta;
+                *recorded_start = shifted as usize;
+            }
         }
     }
     file_spans.push((start, new.len()));

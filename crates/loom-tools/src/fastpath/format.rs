@@ -25,9 +25,14 @@ pub(super) async fn apply_format(
         FormatClass::Auto => match ecosystem {
             Some(crate::verify::Ecosystem::Cargo) => apply_format_cargo(workspace, policy).await,
             Some(crate::verify::Ecosystem::Go) => apply_format_go(workspace, policy).await,
-            _ => None,
+            Some(
+                crate::verify::Ecosystem::Python
+                | crate::verify::Ecosystem::Npm
+                | crate::verify::Ecosystem::Make,
+            )
+            | None => None,
         },
-        _ => None,
+        FormatClass::Rust | FormatClass::Go => None,
     }
 }
 
@@ -50,10 +55,13 @@ async fn apply_format_cargo(workspace: &Path, policy: &CommandPolicy) -> Option<
     // Pre-check names the files fmt would touch, so the snapshot is
     // exactly the revert set.
     let check = program_output(workspace, policy, "cargo", &["fmt", "--check"]).await?;
-    let unformatted = check
-        .lines()
-        .filter(|line| line.starts_with("Diff in "))
-        .count() as u32;
+    let unformatted = u32::try_from(
+        check
+            .lines()
+            .filter(|line| line.starts_with("Diff in "))
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
     if unformatted == 0 {
         return Some(FastPathOutcome {
             kind: "format",
@@ -101,7 +109,7 @@ async fn apply_format_go(workspace: &Path, policy: &CommandPolicy) -> Option<Fas
     let listed = program_output(workspace, policy, "gofmt", &["-l", "."]).await?;
     let files: Vec<PathBuf> = listed
         .lines()
-        .map(|line| line.trim())
+        .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('/') && !line.contains(".."))
         .map(|relative| workspace.join(relative))
         .collect();
@@ -132,7 +140,7 @@ async fn apply_format_go(workspace: &Path, policy: &CommandPolicy) -> Option<Fas
         .map(|path| path.to_string_lossy().into_owned())
         .collect();
     let mut write_args: Vec<&str> = vec!["-w"];
-    write_args.extend(owned.iter().map(|path| path.as_str()));
+    write_args.extend(owned.iter().map(String::as_str));
     if !program_ok(workspace, policy, "gofmt", &write_args).await {
         restore(&snapshots);
         return None;
@@ -147,7 +155,7 @@ async fn apply_format_go(workspace: &Path, policy: &CommandPolicy) -> Option<Fas
     }
     Some(FastPathOutcome {
         kind: "format",
-        files_changed: files.len() as u32,
+        files_changed: u32::try_from(files.len()).unwrap_or(u32::MAX),
         note: format!(
             "Fast path (format): `gofmt` applied to {} file(s); verified \
              with `gofmt -l .` and `go build ./...`.",

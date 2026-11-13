@@ -173,8 +173,7 @@ impl RetryPolicy {
 fn jitter_unit() -> f64 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.subsec_nanos())
-        .unwrap_or(0);
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
     let mixed = nanos.wrapping_mul(2_654_435_761);
     f64::from(mixed % 1_000_003) / 1_000_003.0
 }
@@ -240,6 +239,8 @@ mod tests {
     fn delay_stays_within_the_jitter_band() {
         let policy = RetryPolicy::default();
         let base = policy.backoff(2); // 4 s
+        // Millisecond magnitude (≈4000) loses nothing measurable in f64.
+        #[allow(clippy::cast_precision_loss)]
         let base_millis = base.as_millis() as f64;
         let low = base_millis * 0.75;
         let high = base_millis * 1.25;

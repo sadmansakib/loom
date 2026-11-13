@@ -27,10 +27,14 @@ pub fn locate_symbol(lines: &[&str], symbol: &str) -> Option<SurfacePosition> {
         let mut byte_idx = 0usize;
         for (char_idx, ch) in line.chars().enumerate() {
             if line[byte_idx..].starts_with(symbol) {
-                return Some(SurfacePosition {
-                    line: idx as u32 + 1,
-                    column: Some(char_idx as u32 + 1),
-                });
+                // File line/char indices fit u32 for any real source file.
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    return Some(SurfacePosition {
+                        line: idx as u32 + 1,
+                        column: Some(char_idx as u32 + 1),
+                    });
+                }
             }
             byte_idx += ch.len_utf8();
         }
@@ -40,6 +44,8 @@ pub fn locate_symbol(lines: &[&str], symbol: &str) -> Option<SurfacePosition> {
 
 /// Converts a 1-based (line, column-char) surface position to an LSP
 /// zero-based position encoded for `utf16` servers.
+// LSP positions are u32; single-line unit counts fit far below u32::MAX.
+#[allow(clippy::cast_possible_truncation)]
 pub fn surface_to_utf16(line: u32, column_chars: u32, text_of_line: &str) -> lsp_types::Position {
     let mut units = 0u32;
     for (i, ch) in text_of_line.chars().enumerate() {
@@ -60,6 +66,8 @@ pub fn surface_to_utf16(line: u32, column_chars: u32, text_of_line: &str) -> lsp
 /// (bytes), NOT chars: the line text must be walked so multibyte
 /// characters before the column are counted with their byte length
 /// (mirrors the utf-16 branch; both need the line's text).
+// LSP positions are u32; single-line byte counts fit far below u32::MAX.
+#[allow(clippy::cast_possible_truncation)]
 pub fn surface_to_utf8(line: u32, column_chars: u32, text_of_line: &str) -> lsp_types::Position {
     let mut bytes = 0u32;
     for (i, ch) in text_of_line.chars().enumerate() {
@@ -89,7 +97,8 @@ pub fn utf16_units_to_byte_offset(line_text: &str, units: u32) -> usize {
         if seen >= units {
             return byte_idx;
         }
-        seen += ch.len_utf16() as u32;
+        // One char is at most two UTF-16 units — always in u32 range.
+        seen += u32::try_from(ch.len_utf16()).unwrap_or(2);
     }
     line_text.len()
 }

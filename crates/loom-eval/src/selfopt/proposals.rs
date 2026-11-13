@@ -39,6 +39,7 @@ impl Proposal {
     /// Builds a rule proposal's [`Proposal::label`] via
     /// [`overlay_label`]; model proposals get labels the same way
     /// after validation.
+    #[must_use]
     pub fn labeled(
         overlay: Overlay,
         class: ProposalClass,
@@ -63,6 +64,7 @@ impl Proposal {
 /// clamp rounds back to the baseline value) are skipped. This exists
 /// so the loop has signal before the model proposer earns trust, and
 /// so regressions in the model path never leave the loop empty.
+#[must_use]
 pub fn rule_proposals(baseline: &Overlay, max: usize) -> Vec<Proposal> {
     let mut out = Vec::new();
     for knob in KNOBS {

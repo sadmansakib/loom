@@ -51,11 +51,17 @@ impl std::fmt::Debug for ToolRegistry {
 
 impl ToolRegistry {
     /// An empty registry.
+    #[must_use]
     pub fn new() -> Self {
         Self { tools: Vec::new() }
     }
 
     /// Adds a tool, refusing duplicates by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolRegistryError::DuplicateName`] when a tool with
+    /// the same name is already registered.
     pub fn register(&mut self, tool: Box<dyn Tool>) -> Result<(), ToolRegistryError> {
         self.register_arc(tool.into())
     }
@@ -65,6 +71,11 @@ impl ToolRegistry {
     /// The dynamic tool surface hands the same `Arc` it tracks to the
     /// per-turn registry view, so dispatch and the surface stay in
     /// lockstep without re-boxing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolRegistryError::DuplicateName`] when a tool with
+    /// the same name is already registered.
     pub fn register_arc(&mut self, tool: Arc<dyn Tool>) -> Result<(), ToolRegistryError> {
         let name = tool.spec().name.clone();
         if self.get(&name).is_some() {
@@ -75,11 +86,12 @@ impl ToolRegistry {
     }
 
     /// Looks a tool up by the name the model used.
+    #[must_use]
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools
             .iter()
             .find(|tool| tool.spec().name == name)
-            .map(|tool| tool.as_ref())
+            .map(std::convert::AsRef::as_ref)
     }
 
     /// All specs, in registration order — the stable ordering the model
@@ -89,11 +101,13 @@ impl ToolRegistry {
     }
 
     /// Number of registered tools.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.tools.len()
     }
 
     /// Whether no tools are registered.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }

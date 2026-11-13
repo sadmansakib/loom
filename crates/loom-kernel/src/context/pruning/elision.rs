@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use crate::model::Message;
 use crate::session::Session;
 use crate::transcript::{Item, ToolArguments};
@@ -35,7 +37,8 @@ pub(super) fn elide_text(text: &str) -> String {
         boundary = offset + ch.len_utf8();
     }
     let mut signature = String::from(&text[..boundary]);
-    signature.push_str(&format!(" [pruned {} chars]", text.chars().count()));
+    // Same bytes as `format!` would build, without the temporary.
+    let _ = write!(signature, " [pruned {} chars]", text.chars().count());
     signature
 }
 
@@ -145,7 +148,7 @@ pub(super) fn elide_aged_users(
 ///
 /// Provider-gated: the default is `None`, and only the engine's
 /// provider gate enables it — omitting replayed reasoning is a hard
-/// error on DeepSeek's tool-bearing wire but costs GLM only an
+/// error on `DeepSeek`'s tool-bearing wire but costs GLM only an
 /// episodic cache miss, and Anthropic never forwards reasoning on
 /// replay. The protected tail always wins. Ordinals are among
 /// non-`ContentFilter` assistants, matching what the projection (and
@@ -255,6 +258,8 @@ fn elide_strings(value: &mut serde_json::Value, min_chars: usize) -> bool {
             .iter_mut()
             .map(|(_, item)| elide_strings(item, min_chars))
             .fold(false, |changed, item_changed| changed | item_changed),
-        _ => false,
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            false
+        }
     }
 }

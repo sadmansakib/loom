@@ -9,8 +9,11 @@
 //! of the dispatcher is a no-op; the declaring test sets the variable
 //! before invoking the tool, and the spawned runner inherits it.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -29,13 +32,11 @@ use loom_tools::VerifyTool;
 /// `unsafe` and the workspace bans `unsafe`).
 #[test]
 fn verify_mock_runner() {
-    let mock_mode = std::env::current_dir()
-        .map(|dir| dir.join(".loom/verify.toml").is_file())
-        .unwrap_or(false);
+    let mock_mode =
+        std::env::current_dir().is_ok_and(|dir| dir.join(".loom/verify.toml").is_file());
     if !mock_mode {
         return;
     }
-    use std::io::Write as _;
     let mut out = std::io::stdout();
     // Libtest prints its progress line without a newline; give the
     // harness's line-oriented reader a clean boundary.

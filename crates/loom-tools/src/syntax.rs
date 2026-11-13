@@ -41,6 +41,7 @@ const EXCERPT_MAX_CHARS: usize = 60;
 /// Whether the syntax guard is active: on unless `LOOM_SYNTAX_GUARD`
 /// is set to exactly `0`. Read per call so an operator can flip it
 /// without restarting the session.
+#[must_use]
 pub fn syntax_guard_enabled() -> bool {
     #[cfg(test)]
     {
@@ -72,14 +73,16 @@ fn enabled_from_env(value: Option<&str>) -> bool {
 /// model can fix the buffer it was about to write instead of guessing.
 /// A missing tree (no language configured on the parser) also passes:
 /// the guard fails open exactly like it does for unknown languages.
+///
+/// # Errors
+/// Returns [`SyntaxGuardError`] with the first error node's 1-based
+/// position and line excerpt when the candidate introduces a parse
+/// error; unknown languages and missing trees fail open with `Ok(())`.
 pub fn guard(path: &Path, candidate: &str) -> Result<(), SyntaxGuardError> {
-    if !syntax_guard_enabled() {
-        return Ok(());
-    }
-    if path
-        .extension()
-        .map(|ext| ext == std::ffi::OsStr::new("rs"))
-        != Some(true)
+    if !(syntax_guard_enabled()
+        && path
+            .extension()
+            .is_some_and(|ext| ext == std::ffi::OsStr::new("rs")))
     {
         return Ok(());
     }
@@ -109,6 +112,11 @@ pub fn guard(path: &Path, candidate: &str) -> Result<(), SyntaxGuardError> {
 /// with a message pointing at a line it never touched. So when
 /// `previous` already fails to parse, the guard fails open, exactly as
 /// it does for a language it cannot reason about at all.
+///
+/// # Errors
+/// Returns [`SyntaxGuardError`] when the candidate introduces a parse
+/// error that `previous` did not have; a pre-broken `previous` fails
+/// open with `Ok(())`.
 pub fn guard_against(previous: &str, candidate: &str, path: &Path) -> Result<(), SyntaxGuardError> {
     if !syntax_guard_enabled() || guard(path, previous).is_err() {
         return Ok(());
@@ -197,7 +205,7 @@ pub(crate) mod testing {
     pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
         ENV_LOCK
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// RAII guard (acquires [`env_lock`], then disables the syntax

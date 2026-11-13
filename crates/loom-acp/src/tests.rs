@@ -14,18 +14,17 @@ use crate::session::{SessionRegistry, SessionReservation, begin_prompt, kernel_s
 use crate::updates::{prompt_text, stop_reason, tool_kind, updates_for};
 
 fn kinds(updates: &[acp::SessionUpdate]) -> String {
-    updates
-        .iter()
-        .map(|u| match u {
-            acp::SessionUpdate::AgentMessageChunk(_) => "message",
-            acp::SessionUpdate::AgentThoughtChunk(_) => "thought",
-            acp::SessionUpdate::ToolCall(_) => "tool_call",
-            acp::SessionUpdate::ToolCallUpdate(_) => "tool_update",
-            acp::SessionUpdate::Plan(_) => "plan",
-            _ => "other",
-        })
-        .collect::<Vec<_>>()
-        .join(",")
+    // SessionUpdate is #[non_exhaustive]; unknown kinds label "other".
+    #[allow(clippy::wildcard_enum_match_arm)]
+    let label = |u: &acp::SessionUpdate| match u {
+        acp::SessionUpdate::AgentMessageChunk(_) => "message",
+        acp::SessionUpdate::AgentThoughtChunk(_) => "thought",
+        acp::SessionUpdate::ToolCall(_) => "tool_call",
+        acp::SessionUpdate::ToolCallUpdate(_) => "tool_update",
+        acp::SessionUpdate::Plan(_) => "plan",
+        _ => "other",
+    };
+    updates.iter().map(label).collect::<Vec<_>>().join(",")
 }
 
 #[test]
@@ -37,6 +36,8 @@ fn text_and_reasoning_deltas_map_to_chunks() {
     let acp::SessionUpdate::AgentMessageChunk(chunk) = &updates[0] else {
         panic!("must be a message chunk");
     };
+    // ContentBlock is #[non_exhaustive]; anything else is a test failure.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match &chunk.content {
         acp::ContentBlock::Text(text) => assert_eq!(text.text, "hello"),
         other => panic!("must be text, got {other:?}"),
@@ -88,6 +89,9 @@ fn tool_events_map_with_kind_status_and_content() {
     let Some(content) = &update.fields.content else {
         panic!("content carried");
     };
+    // ToolCallContent/ContentBlock are #[non_exhaustive]; anything
+    // else is a test failure.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match &content[0] {
         acp::ToolCallContent::Content(block) => match &block.content {
             acp::ContentBlock::Text(text) => assert_eq!(text.text, "boom"),
@@ -196,7 +200,7 @@ fn harness_telemetry_maps_to_nothing() {
                     tool_calls: Vec::new(),
                     stop_reason: loom_core::kernel::model::StopReason::EndTurn,
                 },
-                usage: Default::default(),
+                usage: loom_core::kernel::model::Usage::default(),
             },
         },
         EventKind::LoopNudge {

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 /// report needs: the event count and the terminal `task_failed` reason
 /// (if any). The stream is line-delimited, so a whole-file
 /// `from_str` would always fail; this walks events instead.
+#[must_use]
 pub fn run_outcome(run_json: &Path) -> (usize, Option<String>) {
     let Ok(body) = std::fs::read_to_string(run_json) else {
         return (0, None);
@@ -45,6 +46,7 @@ pub fn run_outcome(run_json: &Path) -> (usize, Option<String>) {
 /// pathologically long argv can truncate; best effort) and
 /// `tool_completed` content heads (command echoes). Returns one
 /// human-readable flag per hit; empty means clean.
+#[must_use]
 pub fn integrity_flags(run_json: &Path) -> Vec<String> {
     let Ok(body) = std::fs::read_to_string(run_json) else {
         return Vec::new();
@@ -104,6 +106,7 @@ pub fn integrity_flags(run_json: &Path) -> Vec<String> {
 /// Model turns in a run's JSONL event stream: the count of
 /// `turn_started` events (the terminal `task_completed` event carries
 /// no fields, so this is the only turn signal the artifacts hold).
+#[must_use]
 pub fn run_turns(run_json: &Path) -> u64 {
     let Ok(body) = std::fs::read_to_string(run_json) else {
         return 0;
@@ -124,6 +127,7 @@ pub struct RunMetrics {
 }
 
 /// Reads a run's turns and token totals in one pass.
+#[must_use]
 pub fn run_metrics(run_json: &Path) -> RunMetrics {
     RunMetrics {
         turns: run_turns(run_json),
@@ -136,16 +140,18 @@ pub fn run_metrics(run_json: &Path) -> RunMetrics {
 /// run — `resolved_ids` true; `unresolved_ids`, `incomplete_ids`,
 /// `error_ids`, `empty_patch_ids`, `infra_failure_ids`, and
 /// `ambiguous_failure_ids` false.
+///
+/// # Errors
+///
+/// Returns the `std::io::Error` of [`std::fs::read_to_string`] when the
+/// report file cannot be read, and of [`serde_json::from_str`] when the
+/// report is not valid JSON.
 pub fn scorer_outcomes(report_json: &Path) -> std::io::Result<Vec<(String, bool)>> {
     /// The scorer's id partitions; every other `*_ids` key (e.g.
     /// `unremoved_images`) is bookkeeping, not outcomes.
     fn partition(key: &str) -> Option<bool> {
         match key {
             "resolved_ids" | "resolved_instances" => Some(true),
-            // `incomplete_*` ids were never submitted — they carry no
-            // outcome and stay out of the map entirely, so contrasts
-            // pair attempted work only.
-            "incomplete_ids" | "incomplete_instances" => None,
             "unresolved_ids"
             | "unresolved_instances"
             | "error_ids"
@@ -156,6 +162,10 @@ pub fn scorer_outcomes(report_json: &Path) -> std::io::Result<Vec<(String, bool)
             | "infra_failure_instances"
             | "ambiguous_failure_ids"
             | "ambiguous_failure_instances" => Some(false),
+            // `incomplete_*` ids were never submitted — they carry no
+            // outcome and stay out of the map entirely, like every other
+            // unrecognized `*_ids` key (e.g. bookkeeping
+            // `unremoved_images`), so contrasts pair attempted work only.
             _ => None,
         }
     }
@@ -226,6 +236,7 @@ impl RunUsage {
     /// Cache-hit share of input tokens, when this run reported any
     /// split at all.
     #[must_use]
+    #[allow(clippy::cast_precision_loss)] // u64 token counts are far below f64's 2^53 mantissa
     pub fn hit_rate(&self) -> Option<f64> {
         self.cached_input_tokens
             .filter(|_| self.input_tokens > 0)
@@ -236,6 +247,7 @@ impl RunUsage {
 /// Reads a run's JSONL event stream and sums every model response's
 /// usage into [`RunUsage`] (the per-request split providers report on
 /// the authoritative `model_completed` event).
+#[must_use]
 pub fn run_usage(run_json: &Path) -> RunUsage {
     let mut totals = RunUsage::default();
     let Ok(body) = std::fs::read_to_string(run_json) else {

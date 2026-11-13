@@ -27,6 +27,8 @@ pub struct InstanceStat {
 
 /// Groups a run list into per-instance median aggregates, sorted by
 /// instance id (deterministic order for reports and comparisons).
+#[must_use]
+#[allow(clippy::cast_precision_loss)] // median aggregation works in f64; counters are far below 2^53
 pub fn per_instance(runs: &[RunStat]) -> Vec<InstanceStat> {
     let mut by_instance: BTreeMap<&str, Vec<&RunStat>> = BTreeMap::new();
     for run in runs {
@@ -56,17 +58,18 @@ pub fn per_instance(runs: &[RunStat]) -> Vec<InstanceStat> {
 /// Median of an arbitrary sample (sorted middle, mean of the middle
 /// pair when even). Empty samples read as `0.0` — a probe that never
 /// started must not read as an improvement.
+#[must_use]
 pub fn median(values: &[f64]) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
     let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
+    sorted.sort_by(f64::total_cmp);
     let middle = sorted.len() / 2;
     if sorted.len() % 2 == 1 {
         sorted[middle]
     } else {
-        (sorted[middle - 1] + sorted[middle]) / 2.0
+        sorted[middle - 1].midpoint(sorted[middle])
     }
 }
 
@@ -110,6 +113,7 @@ pub struct InstanceDelta {
 /// probe ran are ignored; instances only the baseline ran count as
 /// missing evidence (no delta) — the caller's instance list is the
 /// baseline's by construction in the binary.
+#[must_use]
 pub fn compare(baseline: &[RunStat], probe: &[RunStat]) -> Comparison {
     let base_stats = per_instance(baseline);
     let probe_stats = per_instance(probe);
@@ -193,6 +197,7 @@ pub struct Decision {
 /// Applies the adoption gate to one comparison: median input tokens
 /// down ≥ [`ADOPT_MIN_TOKEN_IMPROVEMENT_PERCENT`], events not up beyond
 /// [`EVENTS_REGRESSION_MAX_PERCENT`], and no new failed runs.
+#[must_use]
 pub fn decide(label: &str, comparison: &Comparison) -> Decision {
     let input_ok = comparison.median_input_improvement_pct >= ADOPT_MIN_TOKEN_IMPROVEMENT_PERCENT;
     let events_ok = comparison.median_events_improvement_pct >= -EVENTS_REGRESSION_MAX_PERCENT;
@@ -220,9 +225,10 @@ pub fn decide(label: &str, comparison: &Comparison) -> Decision {
 }
 
 /// Labels of adopted proposals on the Pareto frontier of (input
-/// improvement, events improvement, probe failures) — HarnessPro's
+/// improvement, events improvement, probe failures) — `HarnessPro`'s
 /// cost tiers: each frontier entry is a defensible operating point,
 /// no other adopted overlay beats it on all three. Input order.
+#[must_use]
 pub fn pareto_frontier(decisions: &[Decision]) -> Vec<String> {
     let adopted: Vec<&Decision> = decisions.iter().filter(|d| d.adopted).collect();
     adopted
@@ -246,13 +252,14 @@ pub fn pareto_frontier(decisions: &[Decision]) -> Vec<String> {
 /// any failed baseline run come first — they carry the most signal
 /// per probe dollar — then by total baseline input tokens descending,
 /// ties by id. Every instance keeps exactly one entry.
+#[must_use]
 pub fn order_instances(runs: &[RunStat]) -> Vec<String> {
     #[derive(Default)]
     struct Agg {
         failed: bool,
         input_tokens: u64,
     }
-    let mut agg: std::collections::BTreeMap<String, Agg> = Default::default();
+    let mut agg: std::collections::BTreeMap<String, Agg> = BTreeMap::default();
     for run in runs {
         let entry = agg.entry(run.instance.clone()).or_default();
         entry.failed |= run.task_failed.is_some();

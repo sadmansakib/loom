@@ -1,7 +1,9 @@
 //! `loom lessons` end to end (roadmap item 20.4): the binary mines
 //! failure-to-fix patterns from a store it did not create and writes the
 //! `.loom/lessons.json` store `loom run --lessons` reads. Zero tokens.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::process::Command;
 
@@ -57,7 +59,7 @@ fn commit(
     }
 }
 
-/// Three sessions, each with one invalid-input edit_file failure
+/// Three sessions, each with one invalid-input `edit_file` failure
 /// recovered by a same-tool success — the minimal qualifying pattern.
 fn qualifying_store(db: &std::path::Path) {
     let store = SqliteStore::open(db).unwrap();

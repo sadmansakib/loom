@@ -30,6 +30,7 @@ pub struct RegistryEntry {
     pub headers: BTreeMap<String, String>,
 }
 
+#[must_use]
 /// The registry file beside the database, alongside the catalog caches.
 pub fn registry_path(db_path: &Path) -> PathBuf {
     db_path.with_file_name("providers.json")
@@ -42,6 +43,7 @@ pub struct ProviderRegistry {
 }
 
 impl ProviderRegistry {
+    #[must_use]
     /// Reads the registry; an absent or unreadable file reads as empty —
     /// the same tolerance the catalog caches apply.
     pub fn load(db_path: &Path) -> Self {
@@ -62,6 +64,11 @@ impl ProviderRegistry {
     }
 
     /// Writes the registry, creating the parent directory as needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`std::io::Error`] when the parent directory cannot be
+    /// created, the registry cannot serialize, or the write fails.
     pub fn save(&self, db_path: &Path) -> std::io::Result<()> {
         let path = registry_path(db_path);
         if let Some(parent) = path.parent() {
@@ -71,6 +78,7 @@ impl ProviderRegistry {
         std::fs::write(path, body)
     }
 
+    #[must_use]
     /// The entry registered under `name`, if any.
     pub fn get(&self, name: &str) -> Option<&RegistryEntry> {
         self.providers.get(name)
@@ -109,6 +117,11 @@ pub const BUILTIN_PROVIDERS: &[&str] = &[
 /// A registry name must be lowercase kebab (`[a-z0-9-]`, starting with a
 /// letter) and not built-in, so [`env_var_name`] yields one valid,
 /// unambiguous variable per name.
+///
+/// # Errors
+///
+/// Returns the rejection reason when `name` is not lowercase kebab or
+/// collides with a built-in provider.
 pub fn validate_name(name: &str) -> Result<(), String> {
     let well_formed = name
         .chars()
@@ -128,6 +141,7 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[must_use]
 /// The environment variable a named provider falls back to:
 /// `orcarouter` → `ORCAROUTER_API_KEY`, `my-gateway` → `MY_GATEWAY_API_KEY`.
 pub fn env_var_name(name: &str) -> String {

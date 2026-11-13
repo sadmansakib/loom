@@ -27,7 +27,7 @@ fn policy(prefix: &str) -> FinalizePolicy<'_> {
     }
 }
 
-/// A policy wired to DeepSeek's real dialect override, so the
+/// A policy wired to `DeepSeek`'s real dialect override, so the
 /// `prompt_cache_hit_tokens` extraction is tested through the same
 /// path the stream driver uses.
 fn deepseek_policy(prefix: &str) -> FinalizePolicy<'_> {
@@ -100,8 +100,10 @@ fn body_carries_tools_and_auto_choice_only_with_tools() {
     assert_eq!(body["tools"][0]["function"]["name"], "read_file");
     assert_eq!(body["max_tokens"], 1024);
     // f32 0.2 does not survive JSON as an exact decimal; compare
-    // through the f32 the request carried.
-    assert_eq!(body["temperature"].as_f64().map(|x| x as f32), Some(0.2f32));
+    // through the f32 the request carried. The cast is the point.
+    #[allow(clippy::cast_possible_truncation)]
+    let temperature = body["temperature"].as_f64().map(|x| x as f32);
+    assert_eq!(temperature, Some(0.2f32));
 }
 
 #[test]
@@ -201,7 +203,7 @@ fn text_and_call_fragments() -> ChunkAccumulator {
 #[test]
 fn assemble_call_unwraps_double_encoded_arguments() {
     let call = assemble_call(
-        &PartialToolCall {
+        PartialToolCall {
             id: Some("call-1".to_owned()),
             name: Some("read_file".to_owned()),
             arguments: "\"{\\\"path\\\":\\\"src/lib.rs\\\"}\"".to_owned(),
@@ -215,7 +217,7 @@ fn assemble_call_unwraps_double_encoded_arguments() {
 #[test]
 fn assemble_call_treats_null_arguments_as_empty() {
     let call = assemble_call(
-        &PartialToolCall {
+        PartialToolCall {
             id: Some("call-2".to_owned()),
             name: Some("list_files".to_owned()),
             arguments: "null".to_owned(),
@@ -232,7 +234,7 @@ fn assemble_call_treats_null_arguments_as_empty() {
 #[test]
 fn assemble_call_salvages_unparseable_arguments() {
     let call = assemble_call(
-        &PartialToolCall {
+        PartialToolCall {
             id: Some("call-3".to_owned()),
             name: Some("read_file".to_owned()),
             arguments: "not json".to_owned(),
@@ -252,7 +254,7 @@ fn assemble_call_salvages_unparseable_arguments() {
 #[test]
 fn assemble_call_falls_back_to_an_unknown_name() {
     let call = assemble_call(
-        &PartialToolCall {
+        PartialToolCall {
             id: None,
             name: None,
             arguments: "not json".to_owned(),
@@ -277,7 +279,7 @@ fn finished(mut acc: ChunkAccumulator, reason: &str) -> ChunkAccumulator {
                 cached_tokens: Some(4),
             }),
             completion_tokens_details: None,
-            extra: Default::default(),
+            extra: serde_json::Map::new(),
         }),
         error: None,
         x_groq: None,
@@ -527,6 +529,12 @@ fn unparseable_args_is_salvaged_not_fatal() {
 
 #[test]
 fn in_stream_failure_classified_before_early_close() {
+    fn classify(reason: &str) -> Option<ModelErrorKind> {
+        match reason {
+            "aborted" => Some(ModelErrorKind::Transport),
+            _ => None,
+        }
+    }
     let mut acc = text_and_call_fragments();
     acc.ingest(ChatChunk {
         choices: vec![ChunkChoice {
@@ -537,12 +545,6 @@ fn in_stream_failure_classified_before_early_close() {
         error: None,
         x_groq: None,
     });
-    fn classify(reason: &str) -> Option<ModelErrorKind> {
-        match reason {
-            "aborted" => Some(ModelErrorKind::Transport),
-            _ => None,
-        }
-    }
     let error = acc
         .finalize(
             false,
@@ -608,7 +610,7 @@ fn reported_cost_passes_through_usage() {
             completion_tokens: Some(20),
             prompt_tokens_details: None,
             completion_tokens_details: None,
-            extra: Default::default(),
+            extra: serde_json::Map::new(),
         }),
         error: None,
         x_groq: None,
@@ -620,12 +622,12 @@ fn reported_cost_passes_through_usage() {
         classify_wire_error: &classify_wire_error,
         id_prefix: "openrouter",
         dialect_usage: &|_| DialectUsage {
-            cost_usd: Some(0.000123),
+            cost_usd: Some(0.000_123),
             ..Default::default()
         },
     };
     let response = acc.finalize(true, &policy).unwrap();
-    assert_eq!(response.usage.cost_usd, Some(0.000123));
+    assert_eq!(response.usage.cost_usd, Some(0.000_123));
     assert_eq!(response.usage.input_tokens, 100);
 }
 
@@ -819,7 +821,7 @@ fn usage_only_chunk_produces_no_deltas_but_sets_usage() {
             completion_tokens: Some(1),
             prompt_tokens_details: None,
             completion_tokens_details: None,
-            extra: Default::default(),
+            extra: serde_json::Map::new(),
         }),
         error: None,
         x_groq: None,
@@ -919,7 +921,7 @@ fn reasoning_tokens_map_to_the_thinking_attribution() {
             completion_tokens_details: Some(WireCompletionDetails {
                 reasoning_tokens: Some(12),
             }),
-            extra: Default::default(),
+            extra: serde_json::Map::new(),
         }),
         error: None,
         x_groq: None,
@@ -945,7 +947,7 @@ fn openai_dialect_cached_tokens_map_when_the_deepseek_field_is_absent() {
                 cached_tokens: Some(40),
             }),
             completion_tokens_details: None,
-            extra: Default::default(),
+            extra: serde_json::Map::new(),
         }),
         error: None,
         x_groq: None,
@@ -992,7 +994,7 @@ fn openai_dialect_cached_tokens_map_when_the_deepseek_field_is_absent() {
                 cached_tokens: Some(40),
             }),
             completion_tokens_details: None,
-            extra: Default::default(),
+            extra: serde_json::Map::new(),
         }),
         error: None,
         x_groq: None,

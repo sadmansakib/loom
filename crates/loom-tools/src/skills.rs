@@ -35,6 +35,7 @@ use futures::future::BoxFuture;
 use loom_kernel::tool::{PathTouch, Tool, ToolContext, ToolError, ToolOutput, ToolSpec};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -48,6 +49,7 @@ pub struct LoadSkillTool {
 impl LoadSkillTool {
     /// Builds the tool under explicit output budgets (the engine's
     /// registration path; item 20.2).
+    #[must_use]
     pub fn with_budgets(mut self, budgets: ToolBudgets) -> Self {
         self.budgets = budgets;
         self
@@ -205,6 +207,7 @@ pub struct SkillFrontmatter {
 /// missing opening fence or an unterminated block returns no
 /// frontmatter and the full text as the body (fail-open to the
 /// pre-frontmatter behavior — malformed metadata never hides a body).
+#[must_use]
 pub fn split_frontmatter(text: &str) -> (SkillFrontmatter, &str) {
     let Some(rest) = text
         .strip_prefix("---\n")
@@ -282,14 +285,14 @@ fn read_skill(
                             shown.join("\n  ")
                         );
                         if remaining > 0 {
-                            listing.push_str(&format!("\n  +{remaining} more"));
+                            let _ = write!(listing, "\n  +{remaining} more");
                         }
                         content.push_str(&listing);
                     }
                 }
                 return Ok((content, true));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(ToolError::Execution(format!(
                     "reading skill `{name}` failed: {error}"
@@ -558,6 +561,8 @@ mod tests {
             .call(serde_json::json!({ "name": "gamma" }), &ctx_at(&root))
             .await
             .unwrap_err();
+        // ToolError is #[non_exhaustive]: the wildcard arm is required.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match err {
             ToolError::InvalidInput(message) => {
                 assert!(message.contains("no skill named `gamma`"));
@@ -574,6 +579,8 @@ mod tests {
             .call(serde_json::json!({ "name": "any" }), &ctx_at(&root))
             .await
             .unwrap_err();
+        // ToolError is #[non_exhaustive]: the wildcard arm is required.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match err {
             ToolError::InvalidInput(message) => {
                 assert!(message.contains("no `.agents/skills/` directory"));

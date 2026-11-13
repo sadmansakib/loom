@@ -1,6 +1,6 @@
 //! `swebench-run`: orchestrates a SWE-bench Verified sweep in container
 //! isolation. One container per (instance, run); the agent is
-//! mini-swe-agent from PyPI (default — the published baseline whose
+//! mini-swe-agent from `PyPI` (default — the published baseline whose
 //! score gives loom's number meaning through `swebench-contrast`) or
 //! the staged linux loom binary bind-mounted into the official
 //! per-instance testbed image (`--agent loom`); the patch is extracted
@@ -21,7 +21,7 @@
 // Terminal output is this harness's product; the workspace-wide
 // `clippy::print_stdout`/`print_stderr` denies target library crates.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -146,6 +146,7 @@ or the provider's env var (e.g. DEEPSEEK_API_KEY). Named providers
 // Returns the parsed args plus any `loom provider add --header` pairs
 // recorded for the chosen provider: main() forwards them into every
 // eval container as `LOOM_HEADERS` alongside the correlation headers.
+#[allow(clippy::too_many_lines)] // one exhaustive flag list; each arm is a single assignment
 fn parse_args() -> (Args, Vec<(String, String)>) {
     let mut args = Args {
         instances: env_csv("LOOM_EVAL_SWEBENCH_INSTANCES"),
@@ -168,8 +169,7 @@ fn parse_args() -> (Args, Vec<(String, String)>) {
         arm: std::env::var("LOOM_EVAL_ARM").unwrap_or_else(|_| "full".into()),
         agent: std::env::var("LOOM_EVAL_AGENT").unwrap_or_else(|_| "mini".into()),
         eval_dir: std::env::var("LOOM_EVAL_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("target/eval")),
+            .map_or_else(|_| PathBuf::from("target/eval"), PathBuf::from),
         suite_audit: None,
         suite_audit_results: None,
         reasoning_schedule: std::env::var("LOOM_EVAL_REASONING_SCHEDULE")
@@ -179,9 +179,9 @@ fn parse_args() -> (Args, Vec<(String, String)>) {
             .and_then(|value| value.parse().ok())
             .unwrap_or(2),
     };
-    let mut argv = std::env::args().skip(1);
-    while let Some(flag) = argv.next() {
-        let mut value = || argv.next().unwrap_or_else(|| usage());
+    let mut raw = std::env::args().skip(1);
+    while let Some(flag) = raw.next() {
+        let mut value = || raw.next().unwrap_or_else(|| usage());
         match flag.as_str() {
             "--instances" => args.instances = csv(&value()),
             "--repos" => args.repos = csv(&value()),
@@ -206,8 +206,7 @@ fn parse_args() -> (Args, Vec<(String, String)>) {
             "--reasoning-open-turns" => {
                 args.reasoning_open_turns = value().parse().unwrap_or_else(|_| usage());
             }
-            "--help" | "-h" => usage(),
-            _ => usage(),
+            _ => usage(), // covers `--help`/`-h` too
         }
     }
     if args.runs == 0 || args.max == 0 {
@@ -279,22 +278,20 @@ fn resolve_api_key(provider: &str) -> (String, String) {
     // `loom auth login <provider>` account, then the provider's env
     // vars. Either way the key is carried into the container under the
     // provider's first env-var name.
-    match loom_core::engine::auth::Auth::open(&loom_core::paths::db_path())
+    let Ok(credential) = loom_core::engine::auth::Auth::open(&loom_core::paths::db_path())
         .and_then(|auth| auth.resolve(provider, None))
-    {
-        Ok(credential) => (
-            api_key_envs(provider).into_iter().next().unwrap(),
-            credential.secret.expose().to_owned(),
-        ),
-        Err(_) => {
-            eprintln!(
-                "no API key for provider `{provider}`: run `loom auth login {provider}` \
-                 or export one of {} (see swebench-run --help)",
-                api_key_envs(provider).join(" / ")
-            );
-            std::process::exit(2);
-        }
-    }
+    else {
+        eprintln!(
+            "no API key for provider `{provider}`: run `loom auth login {provider}` \
+             or export one of {} (see swebench-run --help)",
+            api_key_envs(provider).join(" / ")
+        );
+        std::process::exit(2);
+    };
+    (
+        api_key_envs(provider).into_iter().next().unwrap(),
+        credential.secret.expose().to_owned(),
+    )
 }
 
 /// Cross-builds the linux loom binary inside a docker rust image and
@@ -327,9 +324,7 @@ fn build_loom_linux(base: &Path) -> PathBuf {
         .status()
         .expect("spawning docker");
     assert!(status.success(), "linux loom build failed");
-    let built = root
-        .join("target/x86_64-unknown-linux-musl/release/loom")
-        .to_owned();
+    let built = root.join("target/x86_64-unknown-linux-musl/release/loom");
     let dest_dir = base.join("loom-linux");
     std::fs::create_dir_all(&dest_dir).unwrap();
     let dest = dest_dir.join("loom");
@@ -344,8 +339,7 @@ fn image_exists(image: &str) -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .is_ok_and(|status| status.success())
 }
 
 /// Makes sure the local testbed tag exists. Missing images are pulled
@@ -399,6 +393,23 @@ fn ensure_image(
     true
 }
 
+/// One instance's contribution to the sweep: the report row, per-run
+/// owned prediction rows (`instance_id`, `model`, `patch`), and the
+/// instance's rolled-up token usage for the sweep-level cache summary.
+type InstanceOutcome = Option<(
+    serde_json::Value,
+    Vec<Vec<(String, String, String)>>,
+    RunUsage,
+)>;
+
+// Free-tier gateways rate-limit under concurrent sweeps; a 429-killed
+// run is infrastructure, not model competence, so it is retried after
+// a cooldown before it can count. Free capacity comes in windows
+// (shared pools), so retry persistently: 10 x 3min ≈ 30min per run.
+const MAX_ATTEMPTS: usize = 10;
+const RATE_LIMIT_COOLDOWN_SECS: u64 = 180;
+
+#[allow(clippy::too_many_lines)] // one linear sweep: validate → dataset → runs → score → report
 fn main() {
     let (args, registry_headers) = parse_args();
     if args.suite_audit_results.is_some() && args.suite_audit.is_none() {
@@ -409,34 +420,31 @@ fn main() {
     std::fs::create_dir_all(base.join("instances")).unwrap();
 
     // Dataset: explicit file, cache, or live fetch (then cached).
-    let dataset = match load_dataset_cached(&args.eval_dir) {
-        Some(dataset) => {
-            println!("dataset: {} instances (cached)", dataset.len());
-            dataset
-        }
-        None => {
-            println!(
-                "fetching {} from the datasets-server…",
-                swebench::DATASET_ID
-            );
-            let body = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio runtime")
-                .block_on(fetch_dataset_verified())
-                .unwrap_or_else(|error| panic!("dataset fetch: {error}"));
-            let dataset = swebench::parse_dataset(&body);
-            assert_eq!(dataset.len(), EXPECTED_ROWS);
-            let cache = dataset_cache_path(&args.eval_dir);
-            std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
-            std::fs::write(&cache, &body).unwrap();
-            println!(
-                "dataset: {} instances (fetched, cached at {})",
-                dataset.len(),
-                cache.display()
-            );
-            dataset
-        }
+    let dataset = if let Some(dataset) = load_dataset_cached(&args.eval_dir) {
+        println!("dataset: {} instances (cached)", dataset.len());
+        dataset
+    } else {
+        println!(
+            "fetching {} from the datasets-server…",
+            swebench::DATASET_ID
+        );
+        let body = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(fetch_dataset_verified())
+            .unwrap_or_else(|error| panic!("dataset fetch: {error}"));
+        let dataset = swebench::parse_dataset(&body);
+        assert_eq!(dataset.len(), EXPECTED_ROWS);
+        let cache = dataset_cache_path(&args.eval_dir);
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, &body).unwrap();
+        println!(
+            "dataset: {} instances (fetched, cached at {})",
+            dataset.len(),
+            cache.display()
+        );
+        dataset
     };
 
     let selected = select_instances(
@@ -598,14 +606,6 @@ fn main() {
     let mut report: Vec<serde_json::Value> = Vec::new();
     let mut prediction_paths: Vec<PathBuf> = Vec::new();
 
-    // One instance's contribution: the report row, per-run owned
-    // prediction rows (instance_id, model, patch), and the instance's
-    // rolled-up token usage for the sweep-level cache summary.
-    type InstanceOutcome = Option<(
-        serde_json::Value,
-        Vec<Vec<(String, String, String)>>,
-        RunUsage,
-    )>;
     // Pulls serialize across workers; runs stay as parallel as --jobs.
     let pull_lock = std::sync::Mutex::new(());
     let run_instance = |instance: &SweInstance| -> InstanceOutcome {
@@ -634,13 +634,8 @@ fn main() {
                 .canonicalize()
                 .unwrap_or_else(|error| panic!("{}: {error}", out_dir.display()));
             let container_name = format!("loom-{slug}-run{run}");
-            // Free-tier gateways rate-limit under concurrent sweeps; a
-            // 429-killed run is infrastructure, not model competence,
-            // so it is retried after a cooldown before it can count.
-            // Free capacity comes in windows (shared pools), so retry
-            // persistently: 10 x 3min ≈ 30min of waiting per run.
-            const MAX_ATTEMPTS: usize = 10;
-            const RATE_LIMIT_COOLDOWN_SECS: u64 = 180;
+            // Free-tier gateways rate-limit under concurrent sweeps; retry
+            // policy is the module-level MAX_ATTEMPTS/RATE_LIMIT_COOLDOWN_SECS.
             let mut exit_code = -1;
             let mut patch = String::new();
             let mut outcome = (0usize, None);
@@ -884,7 +879,8 @@ fn main() {
         eprintln!("no runs completed — nothing to score");
         std::process::exit(1);
     }
-    let flagged: usize = sweep["integrity_flagged_runs"].as_u64().unwrap_or(0) as usize;
+    let flagged: usize =
+        usize::try_from(sweep["integrity_flagged_runs"].as_u64().unwrap_or(0)).unwrap_or(0);
     if flagged > 0 {
         eprintln!(
             "\nINTEGRITY: {flagged} run(s) reached outside the testbed (git fetch/clone/pull,\n\

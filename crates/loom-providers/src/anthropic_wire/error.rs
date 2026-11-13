@@ -26,7 +26,6 @@ pub(crate) fn classify_status(status: reqwest::StatusCode, body: &str) -> ModelE
         413 => ModelErrorKind::ContextOverflow,
         429 => ModelErrorKind::RateLimited,
         529 => ModelErrorKind::Overloaded,
-        500..=599 => ModelErrorKind::Server,
         _ => ModelErrorKind::Server,
     };
     let message = extract_error_message(body).map_or_else(
@@ -41,12 +40,10 @@ pub(crate) fn classify_stream_error(body: &str) -> ModelError {
     let kind = match extract_error_type(body).as_deref() {
         Some("overloaded_error") => ModelErrorKind::Overloaded,
         Some("rate_limit_error") => ModelErrorKind::RateLimited,
-        Some("api_error") => ModelErrorKind::Server,
-        Some("invalid_request_error") => ModelErrorKind::InvalidRequest,
-        Some("authentication_error") => ModelErrorKind::Auth,
-        Some("permission_error") => ModelErrorKind::Auth,
-        Some("not_found_error") => ModelErrorKind::InvalidRequest,
+        Some("invalid_request_error" | "not_found_error") => ModelErrorKind::InvalidRequest,
+        Some("authentication_error" | "permission_error") => ModelErrorKind::Auth,
         Some("request_too_large") => ModelErrorKind::ContextOverflow,
+        // `api_error` and every unrecognized type land on `Server`.
         _ => ModelErrorKind::Server,
     };
     ModelError::new(

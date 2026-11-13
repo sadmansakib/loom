@@ -25,11 +25,11 @@ pub(crate) struct ChatChunk {
     /// Usually exactly one; may be empty on usage-only chunks.
     #[serde(default, deserialize_with = "default_on_null")]
     pub choices: Vec<ChunkChoice>,
-    /// Rides on the final content chunk (DeepSeek) when requested via
+    /// Rides on the final content chunk (`DeepSeek`) when requested via
     /// `stream_options.include_usage`.
     #[serde(default)]
     pub usage: Option<WireUsage>,
-    /// A mid-stream failure object. OpenRouter (and some gateways) send
+    /// A mid-stream failure object. `OpenRouter` (and some gateways) send
     /// `{"error": {...}}` as a chunk instead of an HTTP error status,
     /// then end the stream; without this the failure would surface as a
     /// generic early-close transport error.
@@ -123,7 +123,7 @@ pub(crate) struct ChunkDelta {
 /// One `delta.tool_calls[]` fragment.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct ToolCallDelta {
-    /// Correlates the fragments of one call. DeepSeek (and OpenAI)
+    /// Correlates the fragments of one call. `DeepSeek` (and `OpenAI`)
     /// always send it; a gateway that omits it is routed by `id` (or by
     /// sole-pending-call) in [`ChunkAccumulator::ingest`].
     #[serde(default)]
@@ -165,7 +165,7 @@ pub(crate) struct WireUsage {
     #[serde(default)]
     pub completion_tokens_details: Option<WireCompletionDetails>,
     /// Every key the standard shapes above do not claim. Adapter
-    /// dialects (DeepSeek's `prompt_cache_hit_tokens`, OpenRouter's
+    /// dialects (`DeepSeek`'s `prompt_cache_hit_tokens`, `OpenRouter`'s
     /// `cost`) are read from here, in their own files.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -175,11 +175,11 @@ pub(crate) struct WireUsage {
 /// adapter from the keys the standard shapes do not claim.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct DialectUsage {
-    /// The provider's own name for the cache-hit count (DeepSeek's
+    /// The provider's own name for the cache-hit count (`DeepSeek`'s
     /// `prompt_cache_hit_tokens`). Wins over the generic
     /// `prompt_tokens_details.cached_tokens` when both appear.
     pub cached_input_tokens: Option<u64>,
-    /// The provider-reported charge for this request in USD (OpenRouter
+    /// The provider-reported charge for this request in USD (`OpenRouter`
     /// reports `0.0` for free models and the actual spend for paid ones).
     pub cost_usd: Option<f64>,
 }

@@ -163,11 +163,7 @@ impl std::fmt::Debug for ToolContext {
         // `dyn ArtifactStore` is not `Debug`; report only whether a store
         // is attached, which is all a caller needs from a log line. The
         // recent-change list is behind a lock, so read its length first.
-        let recent_changes = self
-            .recent_changes
-            .lock()
-            .map(|paths| paths.len())
-            .unwrap_or(0);
+        let recent_changes = self.recent_changes.lock().map_or(0, |paths| paths.len());
         formatter
             .debug_struct("ToolContext")
             .field("workspace_root", &self.workspace_root)
@@ -188,6 +184,7 @@ impl ToolContext {
     /// Explicit rather than defaulted: the engine always knows all three,
     /// and a silent default timeout or token would hide wiring mistakes.
     /// No artifact store is attached; add one with [`ToolContext::with_artifacts`].
+    #[must_use]
     pub fn new(
         workspace_root: PathBuf,
         cancellation: CancellationToken,

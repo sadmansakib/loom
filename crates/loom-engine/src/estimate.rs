@@ -4,9 +4,9 @@
 //! the kernel tokenizer-free; this module is the engine's injection.
 //! Two implementations ship:
 //!
-//! - [`O200kEstimator`] — the o200k_base BPE shared by the current
+//! - [`O200kEstimator`] — the `o200k_base` BPE shared by the current
 //!   generation of OpenAI-family (and DeepSeek/OpenRouter) models. It
-//!   approximates DeepSeek's own tokenizer far better than the bytes ÷ 3
+//!   approximates `DeepSeek`'s own tokenizer far better than the bytes ÷ 3
 //!   heuristic (±30 % → single-digit error on code-shaped JSON).
 //! - [`AnthropicEstimator`] — the same BPE scaled up for Anthropic,
 //!   whose tokenizer is not published as a local vocabulary. Anthropic's
@@ -35,7 +35,7 @@ use std::sync::Arc;
 /// in per-mille so the arithmetic stays integer-only.
 pub const ANTHROPIC_TOKEN_SCALE_PER_MILLE: u32 = 1_250;
 
-/// Estimates tokens with the o200k_base BPE (`tiktoken-rs` singleton).
+/// Estimates tokens with the `o200k_base` BPE (`tiktoken-rs` singleton).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct O200kEstimator;
 
@@ -60,7 +60,7 @@ impl AnthropicEstimator {
     /// figure without the trait.
     #[must_use]
     pub fn scaled(text: &str) -> u32 {
-        let base = O200kEstimator.estimate(text) as u64;
+        let base = u64::from(O200kEstimator.estimate(text));
         let scaled = base.saturating_mul(u64::from(ANTHROPIC_TOKEN_SCALE_PER_MILLE));
         // Ceiling division: never under-report.
         let scaled = scaled.div_ceil(1_000);
@@ -78,7 +78,7 @@ impl TokenEstimator for AnthropicEstimator {
 ///
 /// Anthropic models count text differently from everything else Loom
 /// speaks, so they get [`AnthropicEstimator`]; every other provider
-/// (DeepSeek, OpenRouter's OpenAI-family backends, GLM on Z.ai's and
+/// (`DeepSeek`, `OpenRouter`'s `OpenAI`-family backends, GLM on Z.ai's and
 /// NVIDIA's NIM OpenAI-compatible wires) uses [`O200kEstimator`].
 /// Called once per engine open, before the compilers are built.
 #[must_use]

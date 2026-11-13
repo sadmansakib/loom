@@ -64,6 +64,11 @@ pub struct ArtifactStat {
 /// `sha256` before it is returned. Refusal beats best-effort — a body
 /// that drifted (bit rot, a hand-edited blob, a foreign store) never
 /// reaches a restore.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Corrupt`] when `body` no longer hashes to
+/// `recorded`.
 pub fn verify_body_hash(id: &ArtifactId, recorded: &str, body: &[u8]) -> Result<(), StoreError> {
     let computed = crate::artifact::sha256_hex(body);
     if computed == recorded {
@@ -89,20 +94,45 @@ pub fn verify_body_hash(id: &ArtifactId, recorded: &str, body: &[u8]) -> Result<
 /// [`StoreError::Corrupt`] instead of flowing into restores.
 pub trait ArtifactStore: Send + Sync {
     /// Stores a body. Storing the same id twice replaces the row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the backend cannot persist the row.
     fn put(&self, artifact: &StoredArtifact) -> Result<(), StoreError>;
 
     /// Fetches a body by id, verifying its content hash first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Corrupt`] when the body no longer hashes
+    /// to its recorded `sha256`, and [`StoreError`] on backend
+    /// failure.
     fn get(&self, id: &ArtifactId) -> Result<Option<StoredArtifact>, StoreError>;
 
     /// Finds a body by content hash, for deduplication; the body
     /// returned is verified to still hash to `sha256`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Corrupt`] when the body no longer hashes
+    /// to its recorded `sha256`, and [`StoreError`] on backend
+    /// failure.
     fn find_by_sha256(&self, sha256: &str) -> Result<Option<StoredArtifact>, StoreError>;
 
     /// Lists every artifact's metadata, oldest first. Bodies are not
     /// included; this is the GC's and the stats surface's read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the backend cannot enumerate the
+    /// rows.
     fn list(&self) -> Result<Vec<ArtifactStat>, StoreError>;
 
     /// Deletes a body. Only the GC calls this, and only for ids the
     /// reference scan proved unreferenced.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the backend cannot delete the row.
     fn delete(&self, id: &ArtifactId) -> Result<(), StoreError>;
 }

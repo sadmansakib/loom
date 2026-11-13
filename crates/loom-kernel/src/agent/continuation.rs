@@ -134,12 +134,12 @@ pub(super) fn handoff_digest(session: &Session) -> String {
             Item::User { text } if !text.starts_with(crate::session::TODO_BLOCK_HEADER) => {
                 Some(text.clone())
             }
-            _ => None,
+            Item::User { .. } | Item::Assistant(_) | Item::ToolResult(_) => None,
         })
         .unwrap_or_default();
     let brief = session.transcript.first().and_then(|item| match item {
         Item::User { text } => Some(text.clone()),
-        _ => None,
+        Item::Assistant(_) | Item::ToolResult(_) => None,
     });
     digest.push_str("## Task\n");
     digest.push_str(&cap(&last_user, 2_000));
@@ -163,7 +163,7 @@ pub(super) fn handoff_digest(session: &Session) -> String {
             {
                 Some(assistant.content.as_str())
             }
-            _ => None,
+            Item::User { .. } | Item::Assistant(_) | Item::ToolResult(_) => None,
         })
         .collect();
     if !texts.is_empty() {
@@ -183,7 +183,7 @@ pub(super) fn handoff_digest(session: &Session) -> String {
             Item::ToolResult(result) if result.status != ToolStatus::Success => {
                 Some(result.content.as_str())
             }
-            _ => None,
+            Item::User { .. } | Item::Assistant(_) | Item::ToolResult(_) => None,
         })
         .collect();
     if !failures.is_empty() {

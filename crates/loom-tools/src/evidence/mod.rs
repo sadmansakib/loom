@@ -11,7 +11,7 @@
 //! - compiler diagnostics, from `cargo --message-format=json` (stable);
 //! - test failures, from libtest **human** output (`panicked at file:line:col`,
 //!   `---- <name> stdout ----` sections) — libtest JSON is nightly-only;
-//! - nextest JUnit XML, when present (stable).
+//! - nextest `JUnit` XML, when present (stable).
 //!
 //! Beyond cargo (roadmap "verification beyond Cargo"), the same
 //! [`Diagnostic`]/[`TestFailure`] shapes are parsed from other ecosystems'

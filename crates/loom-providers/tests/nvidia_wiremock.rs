@@ -1,7 +1,7 @@
 //! Integration tests for the NVIDIA adapter (NIM hosted inference)
 //! against a real HTTP stack via wiremock.
 //!
-//! NVIDIA rides the same OpenAI-compatible wire as DeepSeek and GLM
+//! NVIDIA rides the same `OpenAI`-compatible wire as `DeepSeek` and GLM
 //! (`openai_wire` + `wire_stream`), so the shared transport surface —
 //! SSE decoding, EOF tolerance, error-body excerpts, cancellation — is
 //! covered by `deepseek_wiremock.rs`. This file pins the behaviors
@@ -14,12 +14,15 @@
 //!   clamps to `low`;
 //! * the non-forced wire path — `none` passes through unchanged for
 //!   any deployment without forced thinking (the end-of-life
-//!   DeepSeek V4 ids stand in as inert strings; the wire layer is
+//!   `DeepSeek` V4 ids stand in as inert strings; the wire layer is
 //!   id-agnostic here);
 //! * usage accounting through the OpenAI-style details objects;
 //! * tool-call fragment assembly with nvidia-prefixed synthesized ids;
 //! * bearer authentication against `/v1/chat/completions`.
 
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use futures::StreamExt;
 use loom_kernel::model::{
     Message, ModelError, ModelErrorKind, ModelEvent, ModelProvider, ModelRequest, StopReason,
@@ -67,7 +70,7 @@ fn request_for(model: &str) -> ModelRequest {
     }
 }
 
-fn data_event(payload: Value) -> String {
+fn data_event(payload: &Value) -> String {
     payload.to_string()
 }
 
@@ -110,7 +113,7 @@ async fn nvidia_body_carries_publisher_ids_and_top_level_effort() {
     mount_sse(
         &server,
         sse(&[data_event(
-            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            &json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
         )]) + &done(),
     )
     .await;
@@ -150,7 +153,7 @@ async fn nvidia_glm_deployments_clamp_none_to_low() {
     mount_sse(
         &server,
         sse(&[data_event(
-            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            &json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
         )]) + &done(),
     )
     .await;
@@ -178,7 +181,7 @@ async fn nvidia_non_forced_deployments_pass_none_through() {
     mount_sse(
         &server,
         sse(&[data_event(
-            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            &json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
         )]) + &done(),
     )
     .await;
@@ -200,7 +203,7 @@ async fn nvidia_non_forced_deployments_map_max() {
     mount_sse(
         &server,
         sse(&[data_event(
-            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            &json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
         )]) + &done(),
     )
     .await;
@@ -222,10 +225,10 @@ async fn reasoning_and_usage_details_account_cache_and_thinking() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({"choices":[{"delta":{"reasoning_content":"Pon"}}]})),
-            data_event(json!({"choices":[{"delta":{"reasoning_content":"der"}}]})),
-            data_event(json!({"choices":[{"delta":{"content":"answer"}}]})),
-            data_event(json!({"choices":[{"delta":{},"finish_reason":"stop"}],
+            data_event(&json!({"choices":[{"delta":{"reasoning_content":"Pon"}}]})),
+            data_event(&json!({"choices":[{"delta":{"reasoning_content":"der"}}]})),
+            data_event(&json!({"choices":[{"delta":{"content":"answer"}}]})),
+            data_event(&json!({"choices":[{"delta":{},"finish_reason":"stop"}],
                 "usage":{"prompt_tokens":100,"completion_tokens":50,
                          "prompt_tokens_details":{"cached_tokens":40},
                          "completion_tokens_details":{"reasoning_tokens":30}}})),
@@ -267,17 +270,17 @@ async fn tool_call_fragments_assemble_with_nvidia_prefixed_ids() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({"choices":[{"delta":{"tool_calls":[
+            data_event(&json!({"choices":[{"delta":{"tool_calls":[
                 {"index":0,"id":"call_a","type":"function",
                  "function":{"name":"read_file","arguments":"{\"pa"}}]}}]})),
-            data_event(json!({"choices":[{"delta":{"tool_calls":[
+            data_event(&json!({"choices":[{"delta":{"tool_calls":[
                 {"index":0,"function":{"arguments":"th\":\"x.rs\"}"}}]}}]})),
-            data_event(json!({"choices":[{"delta":{"tool_calls":[
+            data_event(&json!({"choices":[{"delta":{"tool_calls":[
                 {"index":1,"type":"function",
                  "function":{"name":"list_dir","arguments":"{\"pa"}}]}}]})),
-            data_event(json!({"choices":[{"delta":{"tool_calls":[
+            data_event(&json!({"choices":[{"delta":{"tool_calls":[
                 {"index":1,"function":{"arguments":"th\":\".\"}"}}]}}]})),
-            data_event(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})),
+            data_event(&json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})),
         ]) + &done(),
     )
     .await;
@@ -320,7 +323,7 @@ async fn tool_results_round_trip_through_the_wire_body() {
     mount_sse(
         &server,
         sse(&[data_event(
-            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            &json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
         )]) + &done(),
     )
     .await;

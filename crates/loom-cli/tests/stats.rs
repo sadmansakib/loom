@@ -1,7 +1,9 @@
 //! `loom stats` end to end: the binary reads a store it did not create
 //! and reports the same transcript analytics the eval harness computes
 //! per run — same function, same numbers, zero tokens.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::process::Command;
 

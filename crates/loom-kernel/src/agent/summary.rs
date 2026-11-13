@@ -88,7 +88,7 @@ impl Accounting {
     }
 }
 
-/// A stable snake_case token for a stop reason, for protocol errors and the
+/// A stable `snake_case` token for a stop reason, for protocol errors and the
 /// `UnrecoverableStop` end reason.
 pub(super) fn stop_reason_token(reason: StopReason) -> &'static str {
     match reason {

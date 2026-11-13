@@ -15,16 +15,10 @@ use super::config::RolloutReport;
 /// report alone.
 pub(super) fn rank_key(run: &RolloutReport) -> (bool, u64, u32, u32) {
     (
-        !matches!(
-            run.end_reason.as_deref(),
-            Some("end_turn") | Some("fast_path")
-        ),
+        !matches!(run.end_reason.as_deref(), Some("end_turn" | "fast_path")),
         run.markers,
-        run.summary.as_ref().map(|s| s.turns).unwrap_or(u32::MAX),
-        run.summary
-            .as_ref()
-            .map(|s| s.model_requests)
-            .unwrap_or(u32::MAX),
+        run.summary.as_ref().map_or(u32::MAX, |s| s.turns),
+        run.summary.as_ref().map_or(u32::MAX, |s| s.model_requests),
     )
 }
 
@@ -53,11 +47,8 @@ pub(super) async fn run_selection_suites(
     // `.loom/verify.toml` runner is worktree-local state the parent
     // cannot rely on here, so detection is the parent's table alone.
     detect_ecosystem(repo_root)?;
-    let policy = match CommandPolicy::from_manifest(repo_root) {
-        Ok(policy) => policy,
-        Err(_) => {
-            return Some("execution filter skipped: policy manifest unreadable".to_owned());
-        }
+    let Ok(policy) = CommandPolicy::from_manifest(repo_root) else {
+        return Some("execution filter skipped: policy manifest unreadable".to_owned());
     };
     let mut tasks = Vec::new();
     for run in runs.iter() {

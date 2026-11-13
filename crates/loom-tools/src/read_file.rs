@@ -28,6 +28,7 @@ pub struct ReadFileTool {
 impl ReadFileTool {
     /// Builds the tool under explicit output budgets (the engine's
     /// entry point; `Default` keeps the documented constants).
+    #[must_use]
     pub fn with_budgets(mut self, budgets: ToolBudgets) -> Self {
         self.budgets = budgets;
         self
@@ -42,7 +43,13 @@ where
     D: serde::Deserializer<'de>,
 {
     let raw = Option::<i64>::deserialize(deserializer)?;
-    Ok(raw.map(|n| if n < 1 { 1 } else { n as usize }))
+    Ok(raw.map(|n| {
+        if n < 1 {
+            1
+        } else {
+            usize::try_from(n).unwrap_or(1)
+        }
+    }))
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -141,6 +148,16 @@ impl Tool for ReadFileTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
+
+    /// Test fixture body: `count` numbered lines, each newline-terminated.
+    fn line_body(count: usize) -> String {
+        let mut body = String::new();
+        for n in 1..=count {
+            let _ = writeln!(body, "line {n}");
+        }
+        body
+    }
     use loom_kernel::tool::Tool;
     use serde_json::json;
     use std::path::PathBuf;
@@ -194,7 +211,7 @@ mod tests {
     #[tokio::test]
     async fn window_returns_the_requested_lines_and_points_at_the_next() {
         let (guard, root) = temp_root();
-        let body: String = (1..=10).map(|n| format!("line {n}\n")).collect();
+        let body = line_body(10);
         std::fs::write(guard.path().join("f.txt"), body).expect("write");
         let output = read(&root, json!({"path": "f.txt", "offset": 4, "limit": 3}))
             .await
@@ -210,7 +227,7 @@ mod tests {
     #[tokio::test]
     async fn the_default_read_returns_a_long_file_whole() {
         let (guard, root) = temp_root();
-        let body: String = (1..=1000).map(|n| format!("line {n}\n")).collect();
+        let body = line_body(1000);
         std::fs::write(guard.path().join("f.txt"), body).expect("write");
         let output = read(&root, json!({"path": "f.txt"})).await.expect("ok");
         // The byte budget, not the line default, bounds an ordinary read.
@@ -222,7 +239,7 @@ mod tests {
     #[tokio::test]
     async fn an_explicit_limit_still_windows() {
         let (guard, root) = temp_root();
-        let body: String = (1..=10).map(|n| format!("line {n}\n")).collect();
+        let body = line_body(10);
         std::fs::write(guard.path().join("f.txt"), body).expect("write");
         let output = read(&root, json!({"path": "f.txt", "limit": 4}))
             .await

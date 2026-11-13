@@ -148,7 +148,7 @@ fn provider_subcommands_parse() {
             assert_eq!(models_url, None);
             assert!(headers.is_empty());
         }
-        _ => panic!("expected `add`"),
+        ProviderCommand::List | ProviderCommand::Remove { .. } => panic!("expected `add`"),
     }
 
     assert!(matches!(

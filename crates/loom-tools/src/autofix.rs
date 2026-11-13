@@ -3,7 +3,7 @@
 //!
 //! rustc ships exact fixes for a large class of mechanical errors —
 //! `suggested_replacement` spans flagged `MachineApplicable` — that
-//! `cargo_diagnostics` otherwise renders down to file:line text. This
+//! `cargo_diagnostics` otherwise renders down to `<file:line>` text. This
 //! module applies those spans after a **failing** Cargo verify, re-runs
 //! the same fixed-table command, and keeps the edits only under a
 //! never-worse gate: the diagnostic count must not increase. Anything
@@ -14,6 +14,7 @@
 //! the bare-loop arm never set the flag, so nothing changes for them.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use loom_kernel::store::ArtifactStore;
@@ -25,7 +26,7 @@ use loom_kernel::tool::{
 use crate::budget::ToolBudgets;
 use crate::confinement::{resolve_within, workspace_relative};
 use crate::evidence::cargo_diagnostics;
-use crate::exec::{ExecLimits, run_bounded};
+use crate::exec::{ExecLimits, ExecOutcome, run_bounded};
 use crate::pre_image::capture_before_image;
 use crate::sandbox::Sandbox;
 use crate::verify::render;
@@ -90,12 +91,15 @@ fn machine_applicable(output: &str) -> Vec<FixSpan> {
                 };
                 let (Some(file), Some(start), Some(end), Some(line)) = (
                     span.get("file_name").and_then(|file| file.as_str()),
-                    span.get("byte_start").and_then(|byte| byte.as_u64()),
-                    span.get("byte_end").and_then(|byte| byte.as_u64()),
-                    span.get("line_start").and_then(|line| line.as_u64()),
+                    span.get("byte_start").and_then(serde_json::Value::as_u64),
+                    span.get("byte_end").and_then(serde_json::Value::as_u64),
+                    span.get("line_start").and_then(serde_json::Value::as_u64),
                 ) else {
                     continue;
                 };
+                // rustc JSON offsets and line numbers are file-relative
+                // and fit usize/u32 on every supported target.
+                #[allow(clippy::cast_possible_truncation)]
                 spans.push(FixSpan {
                     file: file.to_owned(),
                     byte_start: start as usize,
@@ -236,6 +240,75 @@ fn diagnostic_count(output: &std::process::Output) -> usize {
 /// alone is reported.
 const MAX_REPORTED_FIXES: usize = 8;
 
+/// The never-worse gate over a re-run outcome: exit 0 is a strict win;
+/// a failing re-run must still be measurable (diagnostics present, not
+/// more) — a failure with zero parseable diagnostics cannot show "not
+/// worse", so it reverts rather than guessing.
+fn gate_verdict(
+    output: &std::process::Output,
+    program: &str,
+    args: &[String],
+    recent_changes: &[String],
+    budgets: &ToolBudgets,
+    before_count: usize,
+) -> (bool, ToolOutput) {
+    let after = diagnostic_count(output);
+    let kept = output.status.success() || (after > 0 && after <= before_count);
+    let rendered = render(
+        crate::verify::Ecosystem::Cargo,
+        program,
+        args,
+        output,
+        recent_changes,
+        budgets,
+    );
+    (kept, rendered)
+}
+
+/// Builds the bounded autofix report: one line per fix up to the cap,
+/// then the skip counts and the gate's verdict.
+fn build_summary(
+    staged: &[StagedFile],
+    edits_total: usize,
+    refusals: &Refusals,
+    before_count: usize,
+    after_count: usize,
+    kept: bool,
+) -> String {
+    let mut summary = String::new();
+    let mut reported = 0;
+    for file in staged {
+        for edit in &file.edits {
+            if reported >= MAX_REPORTED_FIXES {
+                break;
+            }
+            let code = edit.code.as_deref().unwrap_or("diagnostic");
+            let _ = writeln!(summary, "fixed {code} at {}:{}", file.rel, edit.line_start);
+            reported += 1;
+        }
+    }
+    if edits_total > MAX_REPORTED_FIXES {
+        let _ = writeln!(summary, "…and {} more", edits_total - MAX_REPORTED_FIXES);
+    }
+    if refusals.outside_workspace > 0 || refusals.overlapping > 0 {
+        let _ = writeln!(
+            summary,
+            "skipped: {} outside workspace, {} overlapping",
+            refusals.outside_workspace, refusals.overlapping
+        );
+    }
+    let _ = write!(
+        summary,
+        "diagnostics: {before_count} -> {after_count} ({})",
+        if kept {
+            "kept"
+        } else {
+            "reverted: never-worse gate"
+        }
+    );
+    summary
+}
+
 /// Attempts one autofix round after a failing Cargo verify: plan,
 /// snapshot, apply, re-run, gate. Returns `None` when there is nothing
 /// to do (the run passed, no machine-applicable spans, or everything was
@@ -293,23 +366,14 @@ pub(crate) async fn attempt(
     // worse", so the edits revert.
     let rerun_result = run_bounded(program, args, ctx, limits, sandbox).await;
     let (kept, rerun) = match &rerun_result {
-        Ok(outcome) => {
-            // Never-worse gate. Exit 0 is a strict win. A failing re-run
-            // must still be measurable (diagnostics present, not more)
-            // — a failure with zero parseable diagnostics cannot show
-            // "not worse", so it reverts rather than guessing.
-            let after = diagnostic_count(&outcome.output);
-            let kept = outcome.output.status.success() || (after > 0 && after <= before_count);
-            let rendered = render(
-                crate::verify::Ecosystem::Cargo,
-                program,
-                args,
-                &outcome.output,
-                recent_changes,
-                budgets,
-            );
-            (kept, rendered)
-        }
+        Ok(outcome) => gate_verdict(
+            &outcome.output,
+            program,
+            args,
+            recent_changes,
+            budgets,
+            before_count,
+        ),
         Err(err) => (
             false,
             ToolOutput::new(format!("re-verify failed to execute: {err}")),
@@ -333,69 +397,27 @@ pub(crate) async fn attempt(
 
     // The bounded report: what was applied, what was refused, the gate's
     // verdict. One line per fix up to the cap, then the counts.
-    let mut summary = String::new();
-    let mut reported = 0;
-    for file in &staged {
-        for edit in &file.edits {
-            if reported >= MAX_REPORTED_FIXES {
-                break;
-            }
-            let code = edit.code.as_deref().unwrap_or("diagnostic");
-            summary.push_str(&format!(
-                "fixed {code} at {}:{}\n",
-                file.rel, edit.line_start
-            ));
-            reported += 1;
-        }
-    }
-    if edits_total > MAX_REPORTED_FIXES {
-        summary.push_str(&format!("…and {} more\n", edits_total - MAX_REPORTED_FIXES));
-    }
-    if refusals.outside_workspace > 0 || refusals.overlapping > 0 {
-        summary.push_str(&format!(
-            "skipped: {} outside workspace, {} overlapping\n",
-            refusals.outside_workspace, refusals.overlapping
-        ));
-    }
-    summary.push_str(&format!(
-        "diagnostics: {before_count} -> {after_count} ({})",
-        if kept {
-            "kept"
-        } else {
-            "reverted: never-worse gate"
-        }
-    ));
-
-    let exit_code = rerun_result
-        .as_ref()
-        .ok()
-        .and_then(|outcome| outcome.output.status.code());
-    let mut effects =
-        ToolEffects::none().with_command(CommandEffect::new(program, args.to_vec(), exit_code));
-    let record = AutofixEffect::new(
-        edits_total as u32,
-        staged.len() as u32,
-        before_count as u32,
-        after_count as u32,
+    let summary = build_summary(
+        &staged,
+        edits_total,
+        &refusals,
+        before_count,
+        after_count,
         kept,
     );
-    if kept {
-        for file in &staged {
-            effects = effects.with_file_written(file.rel.clone());
-            if let Some(image) = &file.image {
-                effects = effects.with_before_image(image.clone());
-            }
-        }
-        effects = effects.with_repair(format!(
-            "autofix: applied {edits_total} machine-applicable fix(es) in {} file(s), diagnostics {before_count} -> {after_count}",
-            staged.len()
-        ));
-    } else {
-        effects = effects.with_repair(format!(
-            "autofix: attempted {edits_total} fix(es), reverted (diagnostics {before_count} -> {after_count})"
-        ));
-    }
-    effects = effects.with_autofix(record);
+
+    let effects = build_effects(
+        program,
+        args,
+        &staged,
+        edits_total,
+        &GateOutcome {
+            before: before_count,
+            after: after_count,
+            kept,
+        },
+        &rerun_result,
+    );
 
     Ok(Some(Outcome {
         summary,
@@ -407,6 +429,61 @@ pub(crate) async fn attempt(
             "autofix.reverted"
         },
     }))
+}
+
+/// The never-worse gate outcome for one autofix round.
+struct GateOutcome {
+    before: usize,
+    after: usize,
+    kept: bool,
+}
+
+/// Assembles the tool effects for one autofix round: the command
+/// effect for the re-run, file writes and before-images when the gate
+/// keeps the edits, and the bounded autofix record either way.
+fn build_effects(
+    program: &str,
+    args: &[String],
+    staged: &[StagedFile],
+    edits_total: usize,
+    gate: &GateOutcome,
+    rerun_result: &Result<ExecOutcome, ToolError>,
+) -> ToolEffects {
+    let exit_code = rerun_result
+        .as_ref()
+        .ok()
+        .and_then(|outcome| outcome.output.status.code());
+    let mut effects =
+        ToolEffects::none().with_command(CommandEffect::new(program, args.to_vec(), exit_code));
+    // Edit/diagnostic counts are bounded by tool budgets, far below u32.
+    #[allow(clippy::cast_possible_truncation)]
+    let record = AutofixEffect::new(
+        edits_total as u32,
+        staged.len() as u32,
+        gate.before as u32,
+        gate.after as u32,
+        gate.kept,
+    );
+    if gate.kept {
+        for file in staged {
+            effects = effects.with_file_written(file.rel.clone());
+            if let Some(image) = &file.image {
+                effects = effects.with_before_image(image.clone());
+            }
+        }
+        effects = effects.with_repair(format!(
+            "autofix: applied {edits_total} machine-applicable fix(es) in {} file(s), diagnostics {} -> {}",
+            staged.len(),
+            gate.before,
+            gate.after
+        ));
+    } else {
+        effects = effects.with_repair(format!(
+            "autofix: attempted {edits_total} fix(es), reverted (diagnostics {} -> {})",
+            gate.before, gate.after
+        ));
+    }
+    effects.with_autofix(record)
 }
 
 /// Captures pre-images and splices the planned edits into each file.

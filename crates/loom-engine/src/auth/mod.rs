@@ -11,7 +11,7 @@
 //! --account <label>  →  active saved account  →  provider env names  →  error
 //! ```
 //!
-//! A saved account deliberately beats the environment (OpenCode V2): an
+//! A saved account deliberately beats the environment (`OpenCode` V2): an
 //! explicit, named choice is not silently overridden by a stray exported
 //! variable. The resolved source is reported, never the secret value.
 //!

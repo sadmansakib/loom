@@ -71,6 +71,14 @@ impl Engine {
     /// [`TaskControl::cancel`] aborts mid-flight (the session survives —
     /// every committed item was persisted), [`TaskControl::pause`] stops at
     /// the next turn boundary with the in-flight turn fully committed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskError`] for every terminal failure: context
+    /// compilation refusing the request, a model request failing after its
+    /// retries, a protocol violation in the model's response, the turn or
+    /// task budget being exhausted, or cancellation. None of these lose
+    /// committed state — the session keeps everything persisted so far.
     pub async fn run_task(
         &self,
         session: &mut Session,
@@ -137,6 +145,7 @@ impl Engine {
         let escalation = self.stall_escalation.as_ref()?;
         let db_path = self.db_path.as_ref()?.clone();
         let fork_id = SessionId::new();
+        #[allow(clippy::cast_possible_truncation)] // transcript lengths stay far below u32::MAX
         let boundary = ItemIndex::from(session.transcript.len() as u32);
         let store = SqliteStore::open(db_path).ok()?;
         store.fork(&session.id, boundary, &fork_id).ok()?;
@@ -239,21 +248,10 @@ impl Engine {
         // final turn stay queued for the next run_task — nothing is
         // lost, and the frozen eval protocol never sees any of this
         // (background_commands is off there).
-        let background_watcher = self.background.as_ref().map(|jobs| {
-            for notice in jobs.take_finished_notices() {
-                control.steer(notice);
-            }
-            let jobs = jobs.clone();
-            let control = control.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    for notice in jobs.take_finished_notices() {
-                        control.steer(notice);
-                    }
-                }
-            })
-        });
+        let background_watcher = self
+            .background
+            .as_ref()
+            .map(|jobs| spawn_background_watcher(jobs, control));
         let outcome = match routed_agent {
             Some(routed) => routed.agent.run_task(session, input, sink, control).await,
             None => self.agent.run_task(session, input, sink, control).await,
@@ -261,47 +259,8 @@ impl Engine {
         if let Some(watcher) = background_watcher {
             watcher.abort();
         }
-        // v8 surfaced decisions, attributed to the task that just ran:
-        // the fast-path attempt that fell through (post-hoc — the
-        // attempt happens before a task record exists), then the
-        // engine's one-shot resolution facts.
-        if let Some(record) = session.tasks.last() {
-            if let Some(reason) = fast_path_decline {
-                sink.emit(
-                    record.id,
-                    EventKind::FastPathDeclined {
-                        reason: reason.to_owned(),
-                    },
-                );
-            }
-            if let Some((tier, model)) = &routed_notice {
-                sink.emit(
-                    record.id,
-                    EventKind::HarnessNotice {
-                        category: String::from("routing"),
-                        detail: format!("task routed to {model} (tier {})", tier.as_str()),
-                    },
-                );
-            }
-            if self.notices_flushed.set(()).is_ok()
-                && let Some((source, model)) = &self.resolution
-            {
-                sink.emit(
-                    record.id,
-                    EventKind::CapabilitiesResolved {
-                        model: model.clone(),
-                        source: (*source).to_owned(),
-                    },
-                );
-                sink.emit(
-                    record.id,
-                    EventKind::HarnessNotice {
-                        category: String::from("sandbox"),
-                        detail: loom_tools::sandbox::baseline().to_owned(),
-                    },
-                );
-            }
-        }
+        // v8 surfaced decisions, attributed to the task that just ran.
+        self.emit_surfaced_decisions(session, sink, fast_path_decline, routed_notice.as_ref());
         // The engine is idle again once the task's terminal event has been
         // emitted. The marker carries the ended task's id (envelope shape)
         // and the session (payload); a session whose very first user item
@@ -316,4 +275,77 @@ impl Engine {
         }
         outcome
     }
+
+    /// v8 surfaced decisions, attributed to the task that just ran:
+    /// the fast-path attempt that fell through (post-hoc — the
+    /// attempt happens before a task record exists), then the
+    /// engine's one-shot resolution facts.
+    fn emit_surfaced_decisions(
+        &self,
+        session: &Session,
+        sink: &dyn EventSink,
+        fast_path_decline: Option<&'static str>,
+        routed_notice: Option<&(crate::routing::Tier, String)>,
+    ) {
+        let Some(record) = session.tasks.last() else {
+            return;
+        };
+        if let Some(reason) = fast_path_decline {
+            sink.emit(
+                record.id,
+                EventKind::FastPathDeclined {
+                    reason: reason.to_owned(),
+                },
+            );
+        }
+        if let Some((tier, model)) = routed_notice {
+            sink.emit(
+                record.id,
+                EventKind::HarnessNotice {
+                    category: String::from("routing"),
+                    detail: format!("task routed to {model} (tier {})", tier.as_str()),
+                },
+            );
+        }
+        if self.notices_flushed.set(()).is_ok()
+            && let Some((source, model)) = &self.resolution
+        {
+            sink.emit(
+                record.id,
+                EventKind::CapabilitiesResolved {
+                    model: model.clone(),
+                    source: (*source).to_owned(),
+                },
+            );
+            sink.emit(
+                record.id,
+                EventKind::HarnessNotice {
+                    category: String::from("sandbox"),
+                    detail: loom_tools::sandbox::baseline().to_owned(),
+                },
+            );
+        }
+    }
+}
+
+/// Polls the background-job registry while the loop runs (roadmap
+/// item 13): a completion notice is steered into the task at the next
+/// turn boundary, exactly like a human steering mid-task.
+fn spawn_background_watcher(
+    jobs: &loom_tools::BackgroundJobs,
+    control: &TaskControl,
+) -> tokio::task::JoinHandle<()> {
+    for notice in jobs.take_finished_notices() {
+        control.steer(notice);
+    }
+    let jobs = jobs.clone();
+    let control = control.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            for notice in jobs.take_finished_notices() {
+                control.steer(notice);
+            }
+        }
+    })
 }

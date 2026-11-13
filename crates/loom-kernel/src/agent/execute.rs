@@ -54,6 +54,9 @@ impl Agent {
     /// until some call succeeds, and every failure the model sees carries a
     /// deterministic next-step hint.
     #[allow(clippy::too_many_arguments)]
+    // Batch execution interleaves per-call refusals, hints, and
+    // accounting invariants; a split would scatter those invariants.
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn execute_batch(
         &self,
         calls: &[ToolCall],
@@ -82,7 +85,7 @@ impl Agent {
         let mut is_runnable = vec![false; calls.len()];
         for (index, call) in calls.iter().enumerate() {
             let malformed = call.arguments_are_malformed();
-            if !malformed && !(self.loop_shaping && failures.refuses(call)) {
+            if !(malformed || (self.loop_shaping && failures.refuses(call))) {
                 runnable_indices.push(index);
                 runnable.push(call.clone());
                 is_runnable[index] = true;
@@ -136,8 +139,9 @@ impl Agent {
             }
         }
         // Dedupe key for harness notices within this batch: one event per
-        // distinct (category, detail), not one per parallel call.
-        let mut emitted_notices: HashSet<(String, String)> = HashSet::new();
+        // distinct (category, detail), not one per parallel call. The key
+        // borrows from `results`, which outlives the dedupe pass.
+        let mut emitted_notices: HashSet<(&str, &str)> = HashSet::new();
 
         // Refused calls were never handed to the engine; reconstruct every
         // result in call order from the executed set plus refusal fillers
@@ -174,7 +178,7 @@ impl Agent {
                         .registry
                         .get(&call.name)
                         .and_then(|tool| tool.failure_hint(kind));
-                    append_failure_hint(&mut result.content, kind, tool_hint);
+                    append_failure_hint(&mut result.content, kind, tool_hint.as_deref());
                 }
                 // A cancelled call is neither a success nor a failure of the
                 // tool; the task outcome records the cancellation.
@@ -215,8 +219,7 @@ impl Agent {
                 // one event per distinct notice in this batch (a healthy
                 // default run attaches none).
                 for notice in &result.notices {
-                    let key = (notice.category.clone(), notice.detail.clone());
-                    if emitted_notices.insert(key) {
+                    if emitted_notices.insert((notice.category.as_str(), notice.detail.as_str())) {
                         sink.emit(
                             task_id,
                             EventKind::HarnessNotice {
@@ -295,7 +298,7 @@ pub(super) fn visible_call_ids(request: &ModelRequest, stubbed: &[String]) -> Ha
         .iter()
         .filter_map(|message| match message {
             Message::ToolResult(result) => Some(result.call_id.as_str().to_owned()),
-            _ => None,
+            Message::System { .. } | Message::User { .. } | Message::Assistant(_) => None,
         })
         .filter(|call_id| !stubbed.contains(call_id.as_str()))
         .collect()
@@ -307,7 +310,7 @@ pub(super) fn visible_call_ids(request: &ModelRequest, stubbed: &[String]) -> Ha
 pub(super) fn append_failure_hint(
     content: &mut String,
     kind: ToolFailure,
-    tool_hint: Option<String>,
+    tool_hint: Option<&str>,
 ) {
     let generic = match kind {
         ToolFailure::InvalidInput => {
@@ -327,7 +330,7 @@ pub(super) fn append_failure_hint(
     };
     // A tool that knows the shape of its own governing mistakes says
     // something more specific than the loop's generic text.
-    let hint = tool_hint.as_deref().unwrap_or(generic);
+    let hint = tool_hint.unwrap_or(generic);
     // The engine bounded `content` before this, so reserve room for the hint
     // and keep the result within the same output bound.
     let needed = hint.len() + 1;

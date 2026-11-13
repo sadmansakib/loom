@@ -66,6 +66,13 @@ where
 
 /// Parses dataset JSONL. A malformed line panics with its number: a
 /// half-loaded corpus would silently shrink the sweep.
+///
+/// # Panics
+///
+/// Panics when any non-empty line is not a valid [`SweInstance`] JSON
+/// object; the message names the 1-based line number.
+#[must_use]
+#[allow(clippy::panic)] // documented fail-loudly contract, exercised by #[should_panic]
 pub fn parse_dataset(body: &str) -> Vec<SweInstance> {
     body.lines()
         .enumerate()
@@ -78,6 +85,7 @@ pub fn parse_dataset(body: &str) -> Vec<SweInstance> {
 }
 
 /// Dataset cache location: `<eval_dir>/swebench/verified.jsonl`.
+#[must_use]
 pub fn dataset_cache_path(eval_dir: &Path) -> PathBuf {
     eval_dir.join("swebench").join("verified.jsonl")
 }
@@ -85,6 +93,15 @@ pub fn dataset_cache_path(eval_dir: &Path) -> PathBuf {
 /// Loads the dataset without touching the network: the explicit
 /// `LOOM_EVAL_SWEBENCH_JSONL` file wins (manual/offline mode), then the
 /// cache. `None` means the caller must fetch.
+///
+/// # Panics
+///
+/// Panics when `LOOM_EVAL_SWEBENCH_JSONL` is set but unreadable, when the
+/// cache file is unreadable, or when a line fails to parse (see
+/// [`parse_dataset`]): manual/offline modes must fail loudly rather than
+/// silently fall back to a network fetch.
+#[must_use]
+#[allow(clippy::panic)] // fail-loudly contract: no silent refetch over the network
 pub fn load_dataset_cached(eval_dir: &Path) -> Option<Vec<SweInstance>> {
     if let Ok(path) = std::env::var("LOOM_EVAL_SWEBENCH_JSONL") {
         return Some(parse_dataset(
@@ -102,6 +119,13 @@ pub fn load_dataset_cached(eval_dir: &Path) -> Option<Vec<SweInstance>> {
 /// Fetches the Verified split through the HF datasets-server rows API
 /// (plain JSON, 100 rows per page) and returns the canonical JSONL.
 /// Live-only: called by the runner when no cache exists.
+///
+/// # Errors
+///
+/// Returns the error as a `String` when the HTTP client cannot be built,
+/// a page request or JSON decode fails, a page lacks a `rows` array or
+/// `num_rows_total`, a row fails to deserialize, or the fetched shape
+/// drifts from the expected row count.
 pub async fn fetch_dataset_verified() -> Result<String, String> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("loom-eval/", env!("CARGO_PKG_VERSION")))
@@ -118,7 +142,7 @@ pub async fn fetch_dataset_verified() -> Result<String, String> {
             .get(&url)
             .send()
             .await
-            .and_then(|response| response.error_for_status())
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|error| {
                 format!(
                     "datasets-server page at offset {}: {error}",
@@ -152,12 +176,18 @@ pub async fn fetch_dataset_verified() -> Result<String, String> {
             instances.push(instance);
         }
         total = Some(
-            page["num_rows_total"]
-                .as_u64()
-                .ok_or("datasets-server response missing num_rows_total")? as usize,
+            usize::try_from(
+                page["num_rows_total"]
+                    .as_u64()
+                    .ok_or("datasets-server response missing num_rows_total")?,
+            )
+            .map_err(|_| "datasets-server row count does not fit usize")?,
         );
     }
-    let total = total.unwrap();
+    // `total` is assigned on every page before this line, so it cannot
+    // be `None` here; surface the impossible case as a drift error
+    // rather than a panic.
+    let total = total.ok_or("dataset fetch never advertised num_rows_total")?;
     if total != EXPECTED_ROWS || instances.len() != total {
         return Err(format!(
             "dataset shape drifted: {} rows fetched of {} advertised (expected {EXPECTED_ROWS})",
@@ -166,12 +196,14 @@ pub async fn fetch_dataset_verified() -> Result<String, String> {
         ));
     }
     // Canonical order (as served), one instance per line.
-    Ok(instances
-        .iter()
-        .map(|instance| serde_json::to_string(instance).unwrap())
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n")
+    let mut lines = Vec::with_capacity(instances.len());
+    for instance in &instances {
+        lines.push(
+            serde_json::to_string(instance)
+                .map_err(|error| format!("re-serializing an instance: {error}"))?,
+        );
+    }
+    Ok(lines.join("\n") + "\n")
 }
 
 /// Selects the sweep's instances. Explicit ids win (every id must
@@ -180,6 +212,13 @@ pub async fn fetch_dataset_verified() -> Result<String, String> {
 /// requested repo, in repo order (stratified sampling); otherwise the
 /// repo filter applies and the first `max` instances in dataset order
 /// run.
+///
+/// # Panics
+///
+/// Panics when an explicit `ids` entry matches no instance in `all`:
+/// a typo must fail, not shrink the sweep silently.
+#[must_use]
+#[allow(clippy::panic)] // documented fail-loudly contract: unknown id aborts the sweep
 pub fn select_instances<'a>(
     all: &'a [SweInstance],
     ids: &[String],
@@ -277,7 +316,7 @@ fn dataset_parses_both_test_list_encodings() {
 #[test]
 #[should_panic(expected = "dataset line 2")]
 fn dataset_rejects_malformed_lines() {
-    parse_dataset(
+    let _ = parse_dataset(
         "{\"instance_id\":\"ok\",\"repo\":\"o/r\",\"base_commit\":\"c\",\"problem_statement\":\"p\"}\n{not json}\n",
     );
 }
@@ -300,7 +339,7 @@ fn selection_explicit_ids_must_resolve_in_order() {
 #[should_panic(expected = "unknown SWE-bench instance id")]
 fn selection_typo_fails_rather_than_shrinks() {
     let instances = parse_dataset(&fixture_jsonl());
-    select_instances(&instances, &[String::from("org/nope-9")], &[], 5, None);
+    let _ = select_instances(&instances, &[String::from("org/nope-9")], &[], 5, None);
 }
 
 #[test]
@@ -358,5 +397,5 @@ fn selection_stratified_takes_n_per_repo_in_repo_order() {
 #[should_panic(expected = "--per-repo needs --repos")]
 fn stratified_selection_requires_repos() {
     let instances = parse_dataset(&fixture_jsonl());
-    select_instances(&instances, &[], &[], 5, Some(1));
+    let _ = select_instances(&instances, &[], &[], 5, Some(1));
 }

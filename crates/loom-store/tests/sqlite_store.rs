@@ -4,7 +4,11 @@
 //! loop does: persist the planned turn *before* applying it, then load the
 //! session back and assert it round-trips.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+// Integration tests assert failure paths directly, so unwrapping results and
+// panicking on unexpected outcomes is the intended style here.
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use loom_kernel::artifact::sha256_hex;
 use loom_kernel::event::{EVENT_SCHEMA_VERSION, EventEnvelope, EventKind};
@@ -97,9 +101,12 @@ fn session_round_trips_through_sqlite() {
     let stored = loaded
         .transcript
         .iter()
-        .find_map(|item| match item {
-            Item::ToolResult(result) => Some(result),
-            _ => None,
+        .find_map(|item| {
+            if let Item::ToolResult(result) = item {
+                Some(result)
+            } else {
+                None
+            }
         })
         .expect("a tool result");
     assert_eq!(stored.effects.files_written, ["src/lib.rs"]);
@@ -318,14 +325,13 @@ fn a_newer_schema_version_is_refused() {
         .unwrap();
     drop(connection);
 
-    let error = match SqliteStore::open(&path) {
-        Ok(_) => panic!("opening a newer schema must fail"),
-        Err(error) => error,
+    let Err(error) = SqliteStore::open(&path) else {
+        panic!("opening a newer schema must fail")
     };
-    match error {
-        StoreError::Corrupt(message) => assert!(message.contains("newer"), "{message}"),
-        other => panic!("expected a corrupt-schema error, got {other:?}"),
-    }
+    let StoreError::Corrupt(message) = error else {
+        panic!("expected a corrupt-schema error, got {error:?}")
+    };
+    assert!(message.contains("newer"), "{message}");
 }
 
 /// Builds an envelope with a rich payload, proving full-fidelity

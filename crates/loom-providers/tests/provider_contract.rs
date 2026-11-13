@@ -4,8 +4,11 @@
 //! they prove that a *different crate* can implement `ModelProvider` and
 //! build the values it needs. `#[non_exhaustive]` types that only
 //! `loom-kernel`'s own tests construct would hide construction gaps until
-//! the real DeepSeek adapter hits them.
+//! the real `DeepSeek` adapter hits them.
 
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use loom_kernel::model::{
     Message, ModelCapabilities, ModelError, ModelErrorKind, ModelEvent, ModelProvider,
     ModelRequest, ModelResponse, ModelStream, StopReason, Usage,
@@ -16,6 +19,9 @@ use loom_kernel::transcript::AssistantMessage;
 struct TestProvider;
 
 impl ModelProvider for TestProvider {
+    // False positive: the trait fixes the elided lifetime to `&self`,
+    // so this impl cannot declare a `&'static str` return.
+    #[allow(clippy::unnecessary_literal_bound)]
     fn name(&self) -> &str {
         "test"
     }

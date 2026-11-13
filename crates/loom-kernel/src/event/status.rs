@@ -101,17 +101,19 @@ struct RecorderState {
 impl StatusRecorder {
     /// Creates a recorder whose snapshot starts `Idle` with no fields
     /// set — the state before any event is observed.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// The current progress picture (a cheap clone of small state).
+    #[must_use]
     pub fn snapshot(&self) -> StatusSnapshot {
         let state = self
             .inner
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         StatusSnapshot {
             task_id: state.task_id,
             session_id: state.session_id,
@@ -133,8 +135,11 @@ impl EventSink for StatusRecorder {
             .inner
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.task_id = Some(task_id);
+        // Deltas and prune reports do not move the coarse picture,
+        // and unknown future events must not move it either.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match kind {
             EventKind::TaskStarted => state.phase = TaskPhase::Running,
             EventKind::TurnStarted { turn } => state.turn = Some(turn),
@@ -158,7 +163,6 @@ impl EventSink for StatusRecorder {
                 state.session_id = Some(session_id);
                 state.phase = TaskPhase::Idle;
             }
-            // Deltas and prune reports do not move the coarse picture.
             _ => {}
         }
     }

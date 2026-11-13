@@ -22,7 +22,7 @@ use loom_core::store::SqliteStore;
 use crate::args::LessonsArgs;
 
 /// Runs `loom lessons`.
-pub fn run(args: LessonsArgs) -> anyhow::Result<ExitCode> {
+pub fn run(args: &LessonsArgs) -> anyhow::Result<ExitCode> {
     let db = loom_core::paths::db_path();
     let store = SqliteStore::open(&db).with_context(|| format!("opening {}", db.display()))?;
     let sessions = collect_sessions(&store).context("loading stored sessions")?;

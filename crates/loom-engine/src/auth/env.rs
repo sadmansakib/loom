@@ -8,6 +8,7 @@ use loom_providers::{
 /// The default provider for Iteration 1.
 pub const DEFAULT_PROVIDER: &str = DEEPSEEK_PROVIDER_NAME;
 
+#[must_use]
 /// Ordered environment-variable fallback names for a provider (ADR-009).
 ///
 /// Built-ins declare theirs statically; any other name (the named custom
@@ -38,6 +39,7 @@ pub struct EnvVarState {
     pub set: bool,
 }
 
+#[must_use]
 /// Which of `provider`'s environment fallbacks are currently live.
 ///
 /// Resolution consults the environment only after saved accounts (ADR-009),

@@ -34,6 +34,7 @@
 //! gate stays honest — the workspace may have been mutated. Dropping
 //! the registry (engine close) kills every still-running group.
 
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -132,7 +133,7 @@ impl BackgroundJobs {
         let job = Arc::new(Job {
             id,
             program: program.to_owned(),
-            args: args.clone(),
+            args,
             started: Instant::now(),
             state: Mutex::new(JobState::Running),
             notified: AtomicBool::new(false),
@@ -172,8 +173,8 @@ impl BackgroundJobs {
                                 &exec_job,
                                 None,
                                 format!(
-                                    "command \"{}\" timed out after {secs}s (process group killed)",
-                                    exec_program
+                                    "command \"{exec_program}\" timed out after {secs}s \
+                                     (process group killed)"
                                 ),
                             );
                             return;
@@ -193,12 +194,12 @@ impl BackgroundJobs {
         });
         *job.handle
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
         let mut jobs = self
             .inner
             .jobs
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         jobs.push(job);
         id
     }
@@ -208,11 +209,14 @@ impl BackgroundJobs {
         self.inner
             .jobs
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .filter(|job| {
                 matches!(
-                    &*job.state.lock().unwrap_or_else(|p| p.into_inner()),
+                    &*job
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
                     JobState::Running
                 )
             })
@@ -224,7 +228,7 @@ impl BackgroundJobs {
         self.inner
             .jobs
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .find(|job| job.id == id)
             .map(snapshot_of)
@@ -235,10 +239,13 @@ impl BackgroundJobs {
         self.inner
             .jobs
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .map(|job| {
-                let state = job.state.lock().unwrap_or_else(|p| p.into_inner());
+                let state = job
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 match &*state {
                     JobState::Running => format!(
                         "job {}: $ {} {} — running ({:.0}s)",
@@ -252,8 +259,7 @@ impl BackgroundJobs {
                         job.id,
                         job.program,
                         job.args.join(" "),
-                        exit.map(|code| code.to_string())
-                            .unwrap_or_else(|| "signal".to_owned())
+                        exit.map_or_else(|| "signal".to_owned(), |code| code.to_string())
                     ),
                 }
             })
@@ -263,18 +269,22 @@ impl BackgroundJobs {
     /// Drains completion notices not yet reported through the steering
     /// queue. Each notice is one steering message the kernel appends
     /// at the next turn boundary.
+    #[must_use]
     pub fn take_finished_notices(&self) -> Vec<String> {
         let jobs = self
             .inner
             .jobs
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut notices = Vec::new();
         for job in jobs.iter() {
             if job.notified.load(Ordering::Relaxed) {
                 continue;
             }
-            let state = job.state.lock().unwrap_or_else(|p| p.into_inner());
+            let state = job
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let JobState::Finished { exit, output } = &*state {
                 // Only claim the once-flag when a notice is actually
                 // emitted — a poll while the job is still running must
@@ -285,8 +295,7 @@ impl BackgroundJobs {
                     job.id,
                     job.program,
                     job.args.join(" "),
-                    exit.map(|code| code.to_string())
-                        .unwrap_or_else(|| "signal".to_owned()),
+                    exit.map_or_else(|| "signal".to_owned(), |code| code.to_string()),
                     output
                 ));
             }
@@ -301,8 +310,18 @@ impl Drop for JobsInner {
         // running job future. The abort drops run_bounded, whose
         // group-kill guard SIGKILLs the process group — the same
         // reaping a foreground timeout performs.
-        for job in self.jobs.lock().unwrap_or_else(|p| p.into_inner()).iter() {
-            if let Some(handle) = job.handle.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        for job in self
+            .jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+        {
+            if let Some(handle) = job
+                .handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
                 handle.abort();
             }
         }
@@ -310,11 +329,16 @@ impl Drop for JobsInner {
 }
 
 fn finish(job: &Job, exit: Option<i32>, output: String) {
-    *job.state.lock().unwrap_or_else(|p| p.into_inner()) = JobState::Finished { exit, output };
+    *job.state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = JobState::Finished { exit, output };
 }
 
 fn snapshot_of(job: &Arc<Job>) -> JobSnapshot {
-    let state = job.state.lock().unwrap_or_else(|p| p.into_inner());
+    let state = job
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (running, exit, output) = match &*state {
         JobState::Running => (true, None, String::new()),
         JobState::Finished { exit, output } => (false, *exit, output.clone()),
@@ -340,15 +364,14 @@ fn completion_body(program: &str, args: &[String], outcome: &crate::exec::ExecOu
         text.push_str(arg);
     }
     text.push('\n');
-    text.push_str(&format!(
+    let _ = write!(
+        text,
         "exit status: {}",
-        outcome
-            .output
-            .status
-            .code()
-            .map(|code| code.to_string())
-            .unwrap_or_else(|| "terminated by signal".to_owned())
-    ));
+        outcome.output.status.code().map_or_else(
+            || "terminated by signal".to_owned(),
+            |code| code.to_string()
+        )
+    );
     let stdout = String::from_utf8_lossy(&outcome.output.stdout);
     let stderr = String::from_utf8_lossy(&outcome.output.stderr);
     if !stdout.is_empty() {
@@ -449,6 +472,7 @@ pub struct RunBackgroundTool {
 impl RunBackgroundTool {
     /// Builds the detached-start tool around a shared job registry and
     /// the command policy every foreground command already follows.
+    #[must_use]
     pub fn new(policy: CommandPolicy, jobs: BackgroundJobs) -> Self {
         let description = format!(
             "Starts a program detached in the workspace (same OS sandbox and \
@@ -480,6 +504,7 @@ impl RunBackgroundTool {
     }
 
     /// Wires the interactive ask resolver, mirroring `run_command`.
+    #[must_use]
     pub fn with_ask_resolver(mut self, ask: AskResolver) -> Self {
         self.ask = Some(ask);
         self
@@ -508,6 +533,8 @@ impl Tool for RunBackgroundTool {
     }
 
     fn failure_hint(&self, failure: loom_kernel::transcript::ToolFailure) -> Option<String> {
+        // ToolFailure is #[non_exhaustive]: the wildcard arm is required.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match failure {
             loom_kernel::transcript::ToolFailure::InvalidInput => Some(
                 "expected fields: program (bare executable name), args (array of strings)"
@@ -564,10 +591,11 @@ impl Tool for RunBackgroundTool {
                 input.args.join(" ")
             );
             if let Some(secs) = rule_timeout {
-                text.push_str(&format!(
+                let _ = write!(
+                    text,
                     "\n(wall cap {secs}s from the workspace policy — the group is killed at \
                      the cap)"
-                ));
+                );
             }
             Ok(ToolOutput::new(text).with_effects(
                 ToolEffects::none().with_command(CommandEffect::new(
@@ -589,6 +617,7 @@ pub struct CommandStatusTool {
 
 impl CommandStatusTool {
     /// Builds the read-only status tool over the same job registry.
+    #[must_use]
     pub fn new(jobs: BackgroundJobs) -> Self {
         Self {
             spec: ToolSpec {
@@ -598,8 +627,7 @@ impl CommandStatusTool {
                      command, state), or shows one job in detail — running for how long, or \
                      finished with its exit status and bounded output. Read-only; use it \
                      before starting another job (at most {MAX_CONCURRENT_JOBS} run at once)."
-                )
-                .to_owned(),
+                ),
                 parameters: crate::schema::parameters::<StatusInput>(),
             },
             jobs,
@@ -668,18 +696,19 @@ impl Tool for CommandStatusTool {
                             snapshot.args.join(" ")
                         );
                         if snapshot.running {
-                            text.push_str(&format!(
+                            let _ = write!(
+                                text,
                                 "\nrunning for {:.0}s",
                                 snapshot.elapsed.as_secs_f32()
-                            ));
+                            );
                         } else {
-                            text.push_str(&format!(
+                            let _ = write!(
+                                text,
                                 "\nfinished, exit status: {}",
                                 snapshot
                                     .exit
-                                    .map(|code| code.to_string())
-                                    .unwrap_or_else(|| "signal".to_owned())
-                            ));
+                                    .map_or_else(|| "signal".to_owned(), |code| code.to_string())
+                            );
                             if !snapshot.output.is_empty() {
                                 text.push('\n');
                                 text.push_str(&snapshot.output);
@@ -871,7 +900,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let out = std::process::Command::new("pgrep")
                 .arg("-f")
-                .arg("sleep 30")
+                // Anchored: an unrelated `sleep 300` elsewhere on the
+                // box must not satisfy this poll.
+                .arg("sleep 30$")
                 .output()
                 .expect("pgrep");
             leftover = String::from_utf8_lossy(&out.stdout).into_owned();

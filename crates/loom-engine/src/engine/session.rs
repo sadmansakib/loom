@@ -35,6 +35,14 @@ impl Engine {
     ///
     /// Blocking up front (SQLite load); same call-off-thread guidance as
     /// [`Self::load_session`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::SessionNotFound`] when no persisted session
+    /// matches `id` (or persistence is off), [`EngineError::Session`] when
+    /// the session store cannot be read, and the task's own [`TaskError`]
+    /// (wrapped, see [`Continuation::outcome`]) under the conditions of
+    /// [`Engine::run_task`].
     pub async fn continue_session(
         &self,
         id: &SessionId,
@@ -57,6 +65,11 @@ impl Engine {
     ///
     /// Blocking: reads SQLite synchronously, so an event-loop frontend should
     /// call it off its render thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Session`] when the session store cannot be
+    /// read.
     pub fn load_session(&self, id: &SessionId) -> Result<Option<Session>, EngineError> {
         match self.agent.load_session(id) {
             Ok(session) => Ok(session),
@@ -67,6 +80,11 @@ impl Engine {
     /// Lists the ids of every persisted session, oldest creation order.
     ///
     /// Blocking (SQLite); same call-off-thread guidance as [`Self::load_session`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Session`] when the session store cannot be
+    /// read.
     pub fn session_ids(&self) -> Result<Vec<SessionId>, EngineError> {
         self.agent.session_ids().map_err(EngineError::Session)
     }

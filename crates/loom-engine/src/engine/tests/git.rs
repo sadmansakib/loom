@@ -49,12 +49,14 @@ async fn run_git_task(config: EngineConfig, overrides: EngineOverrides) -> Vec<E
             &mut session,
             "Show the workspace status",
             &sink,
-            &Default::default(),
+            &crate::TaskControl::default(),
         )
         .await;
     drain(&mut receiver)
 }
 
+// EventKind is #[non_exhaustive]; this probe only wants git_status completions
+#[allow(clippy::wildcard_enum_match_arm)]
 fn git_status_content(kinds: &[EventKind]) -> Option<&str> {
     kinds.iter().find_map(|kind| match kind {
         EventKind::ToolCompleted {
@@ -85,6 +87,8 @@ fn read_file_script(path: &str) -> Vec<Result<ModelEvent, ModelError>> {
     }))]
 }
 
+// EventKind is #[non_exhaustive]; this probe only wants read_file completions
+#[allow(clippy::wildcard_enum_match_arm)]
 fn read_file_content(kinds: &[EventKind]) -> Option<&str> {
     kinds.iter().find_map(|kind| match kind {
         EventKind::ToolCompleted {

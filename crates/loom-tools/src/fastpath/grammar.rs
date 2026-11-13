@@ -197,7 +197,7 @@ fn strip_noun(text: &str) -> &str {
 }
 
 /// Strips optional backticks around an already-parsed span boundary:
-/// given the remaining text, drops a leading and trailing '`' pair.
+/// given the remaining text, drops a leading and trailing backtick pair.
 fn strip_ticks(text: &str) -> &str {
     text.trim_matches('`')
 }
@@ -221,7 +221,7 @@ pub(super) fn parse_crate_name(text: &str) -> Option<(&str, &str)> {
 /// `latest` fail the leading-digit check and are declined.
 fn parse_version(text: &str) -> Option<(&str, &str)> {
     let bytes = text.as_bytes();
-    if !bytes.first().is_some_and(|byte| byte.is_ascii_digit()) {
+    if !bytes.first().is_some_and(u8::is_ascii_digit) {
         return None;
     }
     let end = bytes
@@ -246,84 +246,123 @@ pub(super) fn analyze(task: &str) -> Option<Intent> {
         }
     };
 
-    // rename [the][noun] `from` to `to`
-    if text.len() >= 7 && text[..7].eq_ignore_ascii_case("rename ") {
-        let rest = strip_noun(&text[7..]);
-        let rest = strip_ticks(rest.trim_start());
-        let (from, rest) = parse_ident(rest)?;
-        let rest = strip_ticks(rest);
-        let rest = rest.trim_start();
-        if rest.len() < 3 || !rest[..2].eq_ignore_ascii_case("to") {
-            return None;
-        }
-        let after_to = &rest[2..];
-        if !(after_to.starts_with(' ') || after_to.starts_with('`')) {
-            return None;
-        }
-        let rest = after_to.trim_start();
-        let rest = strip_noun(rest);
-        let rest = strip_ticks(rest.trim_start());
-        let (to, rest) = parse_ident(rest)?;
-        let rest = strip_ticks(rest).trim_start();
-        if !rest.is_empty() {
-            return None;
-        }
-        if from == to || KEYWORDS.contains(&from) || KEYWORDS.contains(&to) {
-            return None;
-        }
-        return Some(Intent::Rename {
-            from: from.to_owned(),
-            to: to.to_owned(),
-        });
-    }
+    parse_rename_phrase(text)
+        .or_else(|| parse_change_phrase(text))
+        .or_else(|| parse_set_phrase(text))
+        .or_else(|| parse_dependency_phrase(text))
+        .or_else(|| match_format_phrases(text))
+}
 
-    // change [the][constant] NAME from LIT to LIT
-    if text.len() >= 7 && text[..7].eq_ignore_ascii_case("change ") {
-        let rest = strip_noun(&text[7..]);
-        let (name, rest) = parse_ident(rest.trim_start())?;
-        let rest = rest.trim_start();
-        let lowered = rest.to_ascii_lowercase();
-        if !lowered.starts_with("from ") {
-            return None;
-        }
-        let (from, rest) = parse_literal(&rest[5..])?;
-        let rest = rest.trim_start();
-        let lowered = rest.to_ascii_lowercase();
-        if !lowered.starts_with("to ") {
-            return None;
-        }
-        let (to, rest) = parse_literal(&rest[3..])?;
-        if !rest.trim().is_empty() || KEYWORDS.contains(&name) {
-            return None;
-        }
-        return Some(Intent::Constant {
-            name: name.to_owned(),
-            from: Some(from),
-            to,
-        });
+fn match_format_phrases(text: &str) -> Option<Intent> {
+    if FORMAT_PHRASES
+        .iter()
+        .any(|phrase| text.eq_ignore_ascii_case(phrase))
+    {
+        return Some(Intent::FormatRust);
     }
-
-    // set [the][constant] NAME to LIT
-    if text.len() >= 4 && text[..4].eq_ignore_ascii_case("set ") {
-        let rest = strip_noun(&text[4..]);
-        let (name, rest) = parse_ident(rest.trim_start())?;
-        let rest = rest.trim_start();
-        let lowered = rest.to_ascii_lowercase();
-        if !lowered.starts_with("to ") {
-            return None;
-        }
-        let (to, rest) = parse_literal(&rest[3..])?;
-        if !rest.trim().is_empty() || KEYWORDS.contains(&name) {
-            return None;
-        }
-        return Some(Intent::Constant {
-            name: name.to_owned(),
-            from: None,
-            to,
-        });
+    if GO_FORMAT_PHRASES
+        .iter()
+        .any(|phrase| text.eq_ignore_ascii_case(phrase))
+    {
+        return Some(Intent::FormatGo);
     }
+    if GENERIC_FORMAT_PHRASES
+        .iter()
+        .any(|phrase| text.eq_ignore_ascii_case(phrase))
+    {
+        return Some(Intent::Format);
+    }
+    None
+}
 
-    // update|bump [the][dependency|crate] `NAME` to `VERSION`
+/// Parses the rename phrase: rename [the][noun] FROM to TO.
+fn parse_rename_phrase(text: &str) -> Option<Intent> {
+    if text.len() < 7 || !text[..7].eq_ignore_ascii_case("rename ") {
+        return None;
+    }
+    let rest = strip_noun(&text[7..]);
+    let rest = strip_ticks(rest.trim_start());
+    let (from, rest) = parse_ident(rest)?;
+    let rest = strip_ticks(rest);
+    let rest = rest.trim_start();
+    if rest.len() < 3 || !rest[..2].eq_ignore_ascii_case("to") {
+        return None;
+    }
+    let after_to = &rest[2..];
+    if !(after_to.starts_with(' ') || after_to.starts_with('`')) {
+        return None;
+    }
+    let rest = after_to.trim_start();
+    let rest = strip_noun(rest);
+    let rest = strip_ticks(rest.trim_start());
+    let (to, rest) = parse_ident(rest)?;
+    let rest = strip_ticks(rest).trim_start();
+    if !rest.is_empty() {
+        return None;
+    }
+    if from == to || KEYWORDS.contains(&from) || KEYWORDS.contains(&to) {
+        return None;
+    }
+    Some(Intent::Rename {
+        from: from.to_owned(),
+        to: to.to_owned(),
+    })
+}
+
+/// Parses `change [the][constant] NAME from LIT to LIT`.
+fn parse_change_phrase(text: &str) -> Option<Intent> {
+    if text.len() < 7 || !text[..7].eq_ignore_ascii_case("change ") {
+        return None;
+    }
+    let rest = strip_noun(&text[7..]);
+    let (name, rest) = parse_ident(rest.trim_start())?;
+    let rest = rest.trim_start();
+    let lowered = rest.to_ascii_lowercase();
+    if !lowered.starts_with("from ") {
+        return None;
+    }
+    let (from, rest) = parse_literal(&rest[5..])?;
+    let rest = rest.trim_start();
+    let lowered = rest.to_ascii_lowercase();
+    if !lowered.starts_with("to ") {
+        return None;
+    }
+    let (to, rest) = parse_literal(&rest[3..])?;
+    if !rest.trim().is_empty() || KEYWORDS.contains(&name) {
+        return None;
+    }
+    Some(Intent::Constant {
+        name: name.to_owned(),
+        from: Some(from),
+        to,
+    })
+}
+
+/// Parses `set [the][constant] NAME to LIT`.
+fn parse_set_phrase(text: &str) -> Option<Intent> {
+    if text.len() < 4 || !text[..4].eq_ignore_ascii_case("set ") {
+        return None;
+    }
+    let rest = strip_noun(&text[4..]);
+    let (name, rest) = parse_ident(rest.trim_start())?;
+    let rest = rest.trim_start();
+    let lowered = rest.to_ascii_lowercase();
+    if !lowered.starts_with("to ") {
+        return None;
+    }
+    let (to, rest) = parse_literal(&rest[3..])?;
+    if !rest.trim().is_empty() || KEYWORDS.contains(&name) {
+        return None;
+    }
+    Some(Intent::Constant {
+        name: name.to_owned(),
+        from: None,
+        to,
+    })
+}
+
+/// Parses the update/bump phrase: update|bump [the][dependency|crate] NAME to VERSION.
+fn parse_dependency_phrase(text: &str) -> Option<Intent> {
     for verb in ["update", "bump"] {
         let prefix = format!("{verb} ");
         if text.len() >= prefix.len() && text[..prefix.len()].eq_ignore_ascii_case(&prefix) {
@@ -348,25 +387,5 @@ pub(super) fn analyze(task: &str) -> Option<Intent> {
             });
         }
     }
-
-    if FORMAT_PHRASES
-        .iter()
-        .any(|phrase| text.eq_ignore_ascii_case(phrase))
-    {
-        return Some(Intent::FormatRust);
-    }
-    if GO_FORMAT_PHRASES
-        .iter()
-        .any(|phrase| text.eq_ignore_ascii_case(phrase))
-    {
-        return Some(Intent::FormatGo);
-    }
-    if GENERIC_FORMAT_PHRASES
-        .iter()
-        .any(|phrase| text.eq_ignore_ascii_case(phrase))
-    {
-        return Some(Intent::Format);
-    }
-
     None
 }

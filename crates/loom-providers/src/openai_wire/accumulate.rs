@@ -183,7 +183,7 @@ impl ChunkAccumulator {
     /// The classified terminal error for this stream, if any. A
     /// mid-stream error object is classified before any stop-reason
     /// interpretation (the stream may still carry a misleading
-    /// finish_reason, or end without `[DONE]`); a failure finish_reason
+    /// `finish_reason`, or end without `[DONE]`); a failure `finish_reason`
     /// is classified before the early-close check so a connection that
     /// dies after one keeps the sharper classification.
     fn terminal_error(&self, saw_done: bool, policy: &FinalizePolicy<'_>) -> Option<ModelError> {
@@ -242,7 +242,7 @@ impl ChunkAccumulator {
         // model as tool errors, which it can correct, rather than
         // killing the run with a non-retryable Protocol error.
         let mut calls = Vec::new();
-        for partial in self.tool_calls.values() {
+        for partial in self.tool_calls.into_values() {
             calls.push(assemble_call(partial, policy.id_prefix));
         }
 
@@ -281,7 +281,7 @@ impl ChunkAccumulator {
             tool_calls: calls,
             stop_reason,
         };
-        let usage = match self.usage.map(|wire| {
+        let usage = if let Some(usage) = self.usage.map(|wire| {
             let dialect = (policy.dialect_usage)(&wire.extra);
             Usage {
                 input_tokens: wire.prompt_tokens.unwrap_or(0),
@@ -298,18 +298,17 @@ impl ChunkAccumulator {
                 cost_usd: dialect.cost_usd,
             }
         }) {
-            Some(usage) => usage,
-            None => {
-                // DeepSeek documents usage on every final chunk
-                // (verified live); a missing block means a proxy
-                // stripped it. Totals would silently undercount —
-                // make that visible.
-                tracing::warn!(
-                    "model response carried no usage block; \
-                     token counts recorded as 0"
-                );
-                Usage::default()
-            }
+            usage
+        } else {
+            // DeepSeek documents usage on every final chunk
+            // (verified live); a missing block means a proxy
+            // stripped it. Totals would silently undercount —
+            // make that visible.
+            tracing::warn!(
+                "model response carried no usage block; \
+                 token counts recorded as 0"
+            );
+            Usage::default()
         };
         Ok(ModelResponse { message, usage })
     }
@@ -406,7 +405,7 @@ pub(crate) struct FinalizePolicy<'a> {
 /// Classifies a generic mid-stream error object by its HTTP-ish status.
 ///
 /// Shared by adapters: OpenAI-compatible servers that report errors as a
-/// stream chunk (OpenRouter, several gateways) use HTTP status codes for
+/// stream chunk (`OpenRouter`, several gateways) use HTTP status codes for
 /// the cause. An absent or unknown code is treated as a retryable server
 /// failure — the retry policy bounds it, and silently treating it as
 /// permanent would fail recoverable runs.
@@ -441,25 +440,24 @@ pub(crate) fn classify_wire_error(status: Option<u16>, _message: &str) -> ModelE
 // empty JSON object is always a valid `ToolArguments`, and the id is
 // either echoed non-empty by the model or synthesized above.
 #[allow(clippy::expect_used)]
-pub(super) fn assemble_call(partial: &PartialToolCall, id_prefix: &str) -> ToolCall {
-    let id = match &partial.id {
-        Some(id) if !id.is_empty() => id.clone(),
+pub(super) fn assemble_call(partial: PartialToolCall, id_prefix: &str) -> ToolCall {
+    let id = match partial.id {
+        Some(id) if !id.is_empty() => id,
         _ => {
             let nonce = *SYNTHESIZED_CALL_NONCE.get_or_init(|| {
                 std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0)
+                    .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
             });
             let seq = SYNTHESIZED_CALL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             format!("{id_prefix}-call-{nonce:x}-{seq}")
         }
     };
-    let name = partial.name.clone().unwrap_or_else(|| "unknown".to_owned());
+    let name = partial.name.unwrap_or_else(|| "unknown".to_owned());
     // An absent `arguments` (empty accumulated string) means the model
     // requested no arguments: send `{}`, not a parse error.
     let arguments = if partial.arguments.trim().is_empty() {
-        ToolArguments::try_from(Value::Object(Default::default()))
+        ToolArguments::try_from(Value::Object(serde_json::Map::new()))
             .expect("the empty object is always valid ToolArguments")
     } else {
         match serde_json::from_str::<Value>(&partial.arguments) {
@@ -473,7 +471,7 @@ pub(super) fn assemble_call(partial: &PartialToolCall, id_prefix: &str) -> ToolC
                     .unwrap_or_else(|_| ToolArguments::malformed(&partial.arguments))
             }
             // An explicit `null` means the same as an absent string.
-            Ok(Value::Null) => ToolArguments::try_from(Value::Object(Default::default()))
+            Ok(Value::Null) => ToolArguments::try_from(Value::Object(serde_json::Map::new()))
                 .expect("the empty object is always valid ToolArguments"),
             Ok(value) => ToolArguments::try_from(value)
                 .unwrap_or_else(|_| ToolArguments::malformed(&partial.arguments)),

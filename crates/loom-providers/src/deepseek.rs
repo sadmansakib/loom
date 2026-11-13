@@ -1,8 +1,8 @@
-//! The DeepSeek adapter: an OpenAI-compatible wire client plus DeepSeek
+//! The `DeepSeek` adapter: an `OpenAI`-compatible wire client plus `DeepSeek`
 //! error classification, in-stream failure mapping, and a capability
 //! table.
 //!
-//! Wire behaviour verified against the DeepSeek API reference
+//! Wire behaviour verified against the `DeepSeek` API reference
 //! (api-docs.deepseek.com, fetched 2026-10-03): `POST /chat/completions`
 //! with streamed `reasoning_content` and tool-call fragments, usage on
 //! the final content chunk, `data: [DONE]` terminator, `: keep-alive`
@@ -28,7 +28,7 @@ use crate::openai_wire::{WireOptions, build_request_body};
 use crate::secret::SecretString;
 use crate::wire_stream::{WireEndpoint, stream_endpoint};
 
-/// Default DeepSeek API base URL.
+/// Default `DeepSeek` API base URL.
 pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 
 /// The provider name this adapter answers to in configuration.
@@ -115,6 +115,7 @@ pub enum ThinkingMode {
 
 impl ThinkingMode {
     /// Wire string for the `thinking.type` field.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Enabled => "enabled",
@@ -184,7 +185,7 @@ impl DeepSeekConfig {
     }
 }
 
-/// The DeepSeek [`ModelProvider`] adapter.
+/// The `DeepSeek` [`ModelProvider`] adapter.
 ///
 /// `stream` uses `tokio::time::timeout`, so it must be polled inside a
 /// tokio runtime with the time driver enabled (`#[tokio::main]` and
@@ -198,9 +199,11 @@ pub struct DeepSeekProvider {
 impl DeepSeekProvider {
     /// Creates a provider with a connection-pooled HTTP client.
     ///
-    /// Fails only when the TLS backend cannot be initialized (e.g.
-    /// missing system roots); every other aspect of construction is
-    /// infallible configuration.
+    /// # Errors
+    ///
+    /// Returns [`reqwest::Error`] when the TLS backend cannot be
+    /// initialized (e.g. missing system roots); every other aspect of
+    /// construction is infallible configuration.
     pub fn new(config: DeepSeekConfig) -> Result<Self, reqwest::Error> {
         let client = build_client(&config.timeouts)?;
         Ok(Self {
@@ -209,7 +212,7 @@ impl DeepSeekProvider {
         })
     }
 
-    /// Classifies DeepSeek's in-stream failure `finish_reason` values —
+    /// Classifies `DeepSeek`'s in-stream failure `finish_reason` values —
     /// conditions that are transport/overload failures, not why the
     /// model stopped generating.
     ///
@@ -220,7 +223,7 @@ impl DeepSeekProvider {
         <Self as WireEndpoint>::in_stream_failure(reason)
     }
 
-    /// Classifies an HTTP status per the DeepSeek error model
+    /// Classifies an HTTP status per the `DeepSeek` error model
     /// (HTTP-status only; no business codes).
     ///
     /// Test-only alias for [`WireEndpoint::classify_status`].
@@ -230,12 +233,13 @@ impl DeepSeekProvider {
     }
 }
 
-/// Capability table mirroring the published DeepSeek "Models & Pricing"
+/// Capability table mirroring the published `DeepSeek` "Models & Pricing"
 /// page (fetched 2026-10-03): both current models are 1M context /
 /// 384K (393,216) max output with tools and thinking. Verified live
 /// (live verification): the API enumerates exactly these two ids — the
 /// legacy `deepseek-v4-flash` is rejected with a 400, so it maps to
 /// `None` (loud unknown-model failure, not a silently wrong row).
+#[must_use]
 pub fn model_capabilities(model: &str) -> Option<ModelCapabilities> {
     let limits = match model {
         "deepseek-flash" | "deepseek-v4-pro" => ModelCapabilities::new(1_048_576)
@@ -297,7 +301,7 @@ impl WireEndpoint for DeepSeekProvider {
         self.config.timeouts
     }
 
-    /// Classifies DeepSeek's in-stream failure `finish_reason` values —
+    /// Classifies `DeepSeek`'s in-stream failure `finish_reason` values —
     /// conditions that are transport/overload failures, not why the
     /// model stopped generating.
     fn in_stream_failure(reason: &str) -> Option<ModelErrorKind> {
@@ -308,10 +312,10 @@ impl WireEndpoint for DeepSeekProvider {
         }
     }
 
-    /// DeepSeek's usage block names the cache-hit count
+    /// `DeepSeek`'s usage block names the cache-hit count
     /// `prompt_cache_hit_tokens` instead of the OpenAI-standard
     /// `prompt_tokens_details.cached_tokens`. Read it here, in the
-    /// DeepSeek file, and let the generic wire stay dialect-free.
+    /// `DeepSeek` file, and let the generic wire stay dialect-free.
     fn dialect_usage(
         extra: &serde_json::Map<String, serde_json::Value>,
     ) -> crate::openai_wire::DialectUsage {
@@ -328,7 +332,7 @@ impl WireEndpoint for DeepSeekProvider {
         }
     }
 
-    /// Classifies an HTTP status per the DeepSeek error model
+    /// Classifies an HTTP status per the `DeepSeek` error model
     /// (HTTP-status only; no business codes).
     fn classify_status(status: reqwest::StatusCode, body: &str) -> ModelError {
         let kind = match status.as_u16() {
@@ -435,7 +439,7 @@ mod tests {
             }
         );
         assert_eq!(
-            <DeepSeekProvider as WireEndpoint>::dialect_usage(&Default::default()),
+            <DeepSeekProvider as WireEndpoint>::dialect_usage(&serde_json::Map::new()),
             DialectUsage::default()
         );
     }

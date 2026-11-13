@@ -84,6 +84,11 @@ pub fn now_millis() -> u64 {
 /// Every stored session is a live transcript — there is no archive tier —
 /// so this is the complete live set: an id is deletable only if no stored
 /// tool result carries it.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] when the store cannot enumerate sessions or
+/// load one.
 pub fn referenced_artifacts(
     sessions: &dyn SessionStore,
 ) -> Result<HashSet<ArtifactId>, StoreError> {
@@ -120,6 +125,14 @@ pub fn referenced_artifacts(
 /// Pure given its inputs — the clock arrives as `now_millis`, the live
 /// set as `referenced` — so tests can place artifacts in the past or
 /// future without touching the store's write path.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] when the store cannot list or delete
+/// artifact rows.
+// Single-crate helper; every caller builds a `std` HashSet. Generalizing
+// over `BuildHasher` would add generic noise for no user.
+#[allow(clippy::implicit_hasher)]
 pub fn collect(
     artifacts: &dyn ArtifactStore,
     referenced: &HashSet<ArtifactId>,

@@ -5,9 +5,9 @@
 //! Loom has no adapter for, so these tests pin the contract that makes
 //! "any gateway" work:
 //!
-//! * the catalog fetch against a full models URL (bearer auth, OpenAI
+//! * the catalog fetch against a full models URL (bearer auth, `OpenAI`
 //!   envelope, tolerant field sniffing) and its failure modes;
-//! * the happy-path chat round trip on the plain OpenAI wire — no
+//! * the happy-path chat round trip on the plain `OpenAI` wire — no
 //!   dialect fields a gateway might reject;
 //! * capability resolution from the fetched catalog, silent fields
 //!   resolving to safe defaults;
@@ -18,6 +18,9 @@
 //! is covered by `deepseek_wiremock.rs`; this file stays on what is
 //! particular to speaking an unspecified vendor's dialect.
 
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use futures::StreamExt;
 use loom_kernel::model::{
     Message, ModelError, ModelEvent, ModelProvider, ModelRequest, ModelResponse, ReasoningEffort,
@@ -44,7 +47,7 @@ fn request_for(model: &str) -> ModelRequest {
     }
 }
 
-fn data_event(payload: Value) -> String {
+fn data_event(payload: &Value) -> String {
     payload.to_string()
 }
 
@@ -171,11 +174,11 @@ async fn chat_round_trip_assembles_text_usage_and_reported_cost() {
         .and(path("/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_raw(
             sse(&[
-                data_event(json!({"id":"1","choices":[{"delta":{"role":"assistant"}}]})),
-                data_event(json!({"id":"1","choices":[{"delta":{"content":"Hel"}}]})),
-                data_event(json!({"id":"1","choices":[{"delta":{"content":"lo"}}]})),
-                data_event(json!({"id":"1","choices":[{"delta":{},"finish_reason":"stop"}]})),
-                data_event(json!({"id":"1","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9,"cost":0.000011}})),
+                data_event(&json!({"id":"1","choices":[{"delta":{"role":"assistant"}}]})),
+                data_event(&json!({"id":"1","choices":[{"delta":{"content":"Hel"}}]})),
+                data_event(&json!({"id":"1","choices":[{"delta":{"content":"lo"}}]})),
+                data_event(&json!({"id":"1","choices":[{"delta":{},"finish_reason":"stop"}]})),
+                data_event(&json!({"id":"1","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9,"cost":0.000_011}})),
                 done(),
             ])
             .into_bytes(),
@@ -195,7 +198,7 @@ async fn chat_round_trip_assembles_text_usage_and_reported_cost() {
     assert_eq!(response.usage.output_tokens, 2);
     // The gateway echoed an actual charge; it surfaces as
     // provider-reported cost.
-    assert_eq!(response.usage.cost_usd, Some(0.000011));
+    assert_eq!(response.usage.cost_usd, Some(0.000_011));
 }
 
 #[tokio::test]
@@ -207,7 +210,7 @@ async fn chat_request_is_the_plain_openai_shape() {
         .respond_with(
             ResponseTemplate::new(200).set_body_raw(
                 sse(&[
-                    data_event(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
+                    data_event(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
                     done(),
                 ])
                 .into_bytes(),
@@ -257,7 +260,7 @@ async fn reasoning_effort_rides_only_reasoning_capable_models() {
         .respond_with(
             ResponseTemplate::new(200).set_body_raw(
                 sse(&[
-                    data_event(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
+                    data_event(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
                     done(),
                 ])
                 .into_bytes(),
@@ -309,7 +312,7 @@ async fn config_headers_ride_on_the_wire() {
         .respond_with(
             ResponseTemplate::new(200).set_body_raw(
                 sse(&[
-                    data_event(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
+                    data_event(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]})),
                     done(),
                 ])
                 .into_bytes(),

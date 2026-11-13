@@ -27,7 +27,7 @@ pub(super) async fn apply_dependency_update(
     if text.contains("\r\n") {
         return None;
     }
-    let (rewritten, changes) = edit_manifest(&text, crate_name, to_version)?;
+    let (rewritten, changes) = edit_manifest(&text, crate_name, to_version);
     if changes.len() > 64 {
         return None;
     }
@@ -106,7 +106,7 @@ pub(super) fn edit_manifest(
     text: &str,
     crate_name: &str,
     to_version: &str,
-) -> Option<(String, Vec<(String, String)>)> {
+) -> (String, Vec<(String, String)>) {
     let mut out = String::with_capacity(text.len());
     let mut changes = Vec::new();
     let mut in_dep_table = false;
@@ -137,7 +137,7 @@ pub(super) fn edit_manifest(
         }
         out.push_str(line);
     }
-    Some((out, changes))
+    (out, changes)
 }
 
 /// Rewrites one dependency line when it is exactly `name = "version"`

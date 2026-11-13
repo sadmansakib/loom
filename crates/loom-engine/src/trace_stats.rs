@@ -73,7 +73,7 @@ pub struct TaskRow {
     pub model: Option<String>,
     /// Outcome status (`completed`, `cancelled`, `failed`), when present.
     pub status: Option<String>,
-    /// Stable snake_case end-reason token, when present.
+    /// Stable `snake_case` end-reason token, when present.
     pub end_reason: Option<String>,
     /// The manifest's billed-usage summary block, when present.
     pub summary: Option<Value>,
@@ -153,6 +153,10 @@ pub struct Totals {
 /// A directory without a readable `manifest.json` is not a trace and
 /// is skipped; one whose manifest will not parse yields a corrupt row.
 /// Fails only when `base` itself cannot be listed.
+///
+/// # Errors
+///
+/// Returns the [`io::Error`] from listing `base`.
 pub fn collect(base: &Path) -> io::Result<Vec<TaskRow>> {
     let mut rows = Vec::new();
     let entries = std::fs::read_dir(base).map_err(|error| {
@@ -166,21 +170,17 @@ pub fn collect(base: &Path) -> io::Result<Vec<TaskRow>> {
         if !path.is_dir() {
             continue;
         }
-        let manifest = match std::fs::read_to_string(path.join(MANIFEST_FILE_NAME)) {
-            Ok(text) => text,
-            Err(_) => continue, // not a trace directory
+        let Ok(manifest) = std::fs::read_to_string(path.join(MANIFEST_FILE_NAME)) else {
+            continue; // not a trace directory
         };
-        let manifest: Value = match serde_json::from_str(&manifest) {
-            Ok(value) => value,
-            Err(_) => {
-                let mut row = TaskRow::corrupt();
-                row.dir_name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                rows.push(row);
-                continue;
-            }
+        let Ok(manifest) = serde_json::from_str::<Value>(&manifest) else {
+            let mut row = TaskRow::corrupt();
+            row.dir_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            rows.push(row);
+            continue;
         };
         let prunes = prune_stats(&path);
         let decisions = decision_stats(&path);
@@ -270,6 +270,7 @@ fn decision_stats(task_dir: &Path) -> DecisionStats {
     stats
 }
 
+#[must_use]
 /// Sums every row into one [`Totals`] value.
 pub fn fold_totals(rows: &[TaskRow]) -> Totals {
     let mut totals = Totals::default();
@@ -334,6 +335,7 @@ fn merge_countmaps(into: &mut BTreeMap<String, u64>, from: &BTreeMap<String, u64
     }
 }
 
+#[must_use]
 /// The JSON block for one task.
 pub fn task_json(row: &TaskRow) -> Value {
     serde_json::json!({
@@ -378,6 +380,7 @@ fn agg_json(agg: &PruneAgg) -> Value {
     })
 }
 
+#[must_use]
 /// The JSON totals block.
 pub fn totals_json(totals: &Totals) -> Value {
     serde_json::json!({
@@ -406,6 +409,7 @@ pub fn totals_json(totals: &Totals) -> Value {
     })
 }
 
+#[must_use]
 /// One human-readable task line.
 pub fn human_task(row: &TaskRow) -> String {
     let label = row.task_id.clone().unwrap_or_else(|| row.dir_name.clone());
@@ -434,6 +438,7 @@ pub fn human_task(row: &TaskRow) -> String {
     }
 }
 
+#[must_use]
 /// One human-readable totals line.
 pub fn human_totals(totals: &Totals) -> String {
     let statuses: Vec<String> = totals
@@ -461,6 +466,7 @@ pub fn human_totals(totals: &Totals) -> String {
     )
 }
 
+#[must_use]
 /// The human attribution summary: triggers first, then reasons.
 pub fn attribution_line(totals: &Totals) -> String {
     let mut parts: Vec<String> = totals
@@ -501,12 +507,12 @@ mod tests {
         dir
     }
 
-    fn write_task(base: &Path, dir: &str, manifest: serde_json::Value, events: &str) {
+    fn write_task(base: &Path, dir: &str, manifest: &serde_json::Value, events: &str) {
         let task = base.join(dir);
         fs::create_dir_all(&task).unwrap();
         fs::write(
             task.join(MANIFEST_FILE_NAME),
-            serde_json::to_string_pretty(&manifest).unwrap(),
+            serde_json::to_string_pretty(manifest).unwrap(),
         )
         .unwrap();
         fs::write(task.join(EVENTS_FILE_NAME), events).unwrap();
@@ -590,8 +596,8 @@ mod tests {
 
     fn fixture(name: &str) -> PathBuf {
         let base = temp_base(name);
-        write_task(&base, "task-a", completed_manifest(), TASK_A_EVENTS);
-        write_task(&base, "task-b", cancelled_manifest(), TASK_B_EVENTS);
+        write_task(&base, "task-a", &completed_manifest(), TASK_A_EVENTS);
+        write_task(&base, "task-b", &cancelled_manifest(), TASK_B_EVENTS);
         // A directory without a manifest is not a trace and is skipped.
         fs::create_dir_all(base.join("not-a-trace")).unwrap();
         // A manifest that will not parse counts as corrupt.

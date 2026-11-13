@@ -1,7 +1,7 @@
-//! Shared OpenAI chat-completions wire mapping.
+//! Shared `OpenAI` chat-completions wire mapping.
 //!
 //! Everything here is provider-neutral *wire mechanics*: translating a
-//! [`ModelRequest`] into an OpenAI chat-completions JSON body, parsing
+//! [`ModelRequest`] into an `OpenAI` chat-completions JSON body, parsing
 //! streamed chunks back, accumulating tool-call fragments by `index`,
 //! and normalizing stop signals per architecture §5.1. Provider-specific
 //! policy — error classification, in-stream failure reasons, thinking

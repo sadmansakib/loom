@@ -6,6 +6,9 @@
 //! down. No credentials are involved — no `session/new` is sent, so
 //! the engine never opens.
 
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
@@ -28,8 +31,8 @@ fn stdout_carries_only_jsonrpc_and_shutdown_is_clean() {
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}"#;
     stdin
         .write_all(initialize.as_bytes())
-        .and_then(|_| stdin.write_all(b"\n"))
-        .and_then(|_| stdin.flush())
+        .and_then(|()| stdin.write_all(b"\n"))
+        .and_then(|()| stdin.flush())
         .expect("send initialize");
 
     let mut reader = BufReader::new(stdout);
@@ -38,7 +41,7 @@ fn stdout_carries_only_jsonrpc_and_shutdown_is_clean() {
     assert!(bytes > 0, "the agent must answer initialize on stdout");
     let reply: serde_json::Value = serde_json::from_str(line.trim())
         .expect("stdout carries only JSON-RPC: every line must parse");
-    assert_eq!(reply.get("id").and_then(|id| id.as_i64()), Some(1));
+    assert_eq!(reply.get("id").and_then(serde_json::Value::as_i64), Some(1));
     assert!(
         reply.get("result").is_some() || reply.get("error").is_some(),
         "a well-formed response or error, got {reply}"

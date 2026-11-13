@@ -54,13 +54,15 @@ fn primary_span(message: &serde_json::Value) -> Option<Location> {
     let spans = message.get("spans")?.as_array()?;
     let span = spans
         .iter()
-        .find(|span| span.get("is_primary").and_then(|flag| flag.as_bool()) == Some(true))
+        .find(|span| span.get("is_primary").and_then(serde_json::Value::as_bool) == Some(true))
         .or_else(|| spans.first())?;
-    let file = span.get("file_name").and_then(|file| file.as_str())?;
-    let line = span.get("line_start").and_then(|line| line.as_u64())? as u32;
+    let file = span.get("file_name").and_then(serde_json::Value::as_str)?;
+    #[allow(clippy::cast_possible_truncation)] // rustc JSON line/column numbers fit u32
+    let line = span.get("line_start").and_then(serde_json::Value::as_u64)? as u32;
+    #[allow(clippy::cast_possible_truncation)] // rustc JSON line/column numbers fit u32
     let column = span
         .get("column_start")
-        .and_then(|column| column.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .unwrap_or(1) as u32;
     Some(Location::new(file, line, column))
 }

@@ -227,7 +227,7 @@ fn seatbelt_blocks_control_state_writes_but_not_git() {
     }
 }
 
-/// F-08 regression: `open -g -j ./P.app` reached LaunchServices
+/// F-08 regression: `open -g -j ./P.app` reached `LaunchServices`
 /// through `(allow default)` and started the bundle *outside* the
 /// sandbox (verified in the review with a real bundle). The
 /// blanket mach deny must seal it: the launch fails and the
@@ -699,7 +699,7 @@ fn preflight_is_ok_where_no_wrapper_is_needed() {
     }
 }
 
-/// Ubuntu 24.04+'s AppArmor denial, verbatim in shape: the wrapper
+/// Ubuntu 24.04+'s `AppArmor` denial, verbatim in shape: the wrapper
 /// dies at uid-map setup and the command never runs.
 #[test]
 fn remediation_maps_the_apparmor_userns_denial() {

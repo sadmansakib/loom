@@ -53,9 +53,18 @@ pub trait SessionStore: Send + Sync {
     /// Records that a session exists, before its first item is appended.
     ///
     /// Idempotent: calling it again for a known session succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the storage backend fails to record
+    /// the session row.
     fn ensure_session(&self, session: &SessionId) -> Result<(), StoreError>;
 
     /// Appends one non-turn item (the task's user input) at `index`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the backend cannot persist the item.
     fn append_item(
         &self,
         session: &SessionId,
@@ -65,17 +74,36 @@ pub trait SessionStore: Send + Sync {
 
     /// Atomically appends a committed turn: the assistant item and one result
     /// per tool call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the backend cannot persist the turn
+    /// atomically.
     fn append_turn(&self, session: &SessionId, turn: &PlannedTurn) -> Result<(), StoreError>;
 
     /// Inserts or updates a task record (start, progress, and terminal state).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the backend cannot persist the record.
     fn upsert_task(&self, session: &SessionId, record: &TaskRecord) -> Result<(), StoreError>;
 
     /// Loads a session by rebuilding it from stored items and task records.
     ///
     /// Returns `None` when the session is unknown.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the backend fails or the stored
+    /// history cannot be rebuilt (a corrupt transcript).
     fn load(&self, session: &SessionId) -> Result<Option<Session>, StoreError>;
 
     /// Lists known session ids, ordered by id (v7, i.e. creation order).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the backend cannot enumerate the
+    /// sessions.
     fn session_ids(&self) -> Result<Vec<SessionId>, StoreError>;
 
     /// Forks `source` into `new_id`, copying transcript items
@@ -97,6 +125,13 @@ pub trait SessionStore: Send + Sync {
     /// The source's [`StartCheckpoint`], if any, travels with the fork:
     /// it describes the workspace the session lineage started in, which
     /// is the tier-1 restore point for the fork as well.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Corrupt`] when `source` is unknown,
+    /// `boundary` is past the transcript tip, or `new_id` already
+    /// exists; [`StoreError::Leased`] when a live writer holds the
+    /// source; [`StoreError::Backend`] on persistence failure.
     fn fork(
         &self,
         source: &SessionId,
@@ -108,6 +143,11 @@ pub trait SessionStore: Send + Sync {
     ///
     /// Listings use this to show lineage (`loom sessions`) without
     /// guessing from ids.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the backend cannot read the fork
+    /// provenance.
     fn fork_of(&self, session: &SessionId) -> Result<Option<ForkProvenance>, StoreError>;
 
     /// Records the workspace state at the start of `session`'s first
@@ -117,6 +157,11 @@ pub trait SessionStore: Send + Sync {
     /// describes a tree the task has not touched yet. Idempotent: a
     /// re-record replaces the row (the honest baseline is whichever run
     /// actually started the session).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the backend cannot persist the
+    /// checkpoint.
     fn record_start_checkpoint(
         &self,
         session: &SessionId,
@@ -128,6 +173,11 @@ pub trait SessionStore: Send + Sync {
     /// `None` means the session predates the checkpoint feature or was
     /// never run through a frontend that records one — a tier-0
     /// refusal for `--restore-workspace`, never a guess.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the backend cannot read the
+    /// checkpoint.
     fn start_checkpoint(&self, session: &SessionId) -> Result<Option<StartCheckpoint>, StoreError>;
 
     /// Acquires the single-writer lease over `session` (ADR-008),
@@ -142,6 +192,11 @@ pub trait SessionStore: Send + Sync {
     /// The default grants trivially: stores without cross-process
     /// visibility (in-memory) cannot be raced by a second process and
     /// need no lock.
+    ///
+    /// # Errors
+    ///
+    /// Never returns `Err` in the default implementation: it grants
+    /// unconditionally.
     fn acquire_lease(
         &self,
         session: &SessionId,
@@ -150,7 +205,13 @@ pub trait SessionStore: Send + Sync {
     ) -> Result<Option<Lease>, StoreError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_millis() as u64)
+            .map(|elapsed| {
+                // Millis since the epoch fits `u64` for any real clock
+                // (the limit is ~year 584 million); truncation is
+                // unreachable.
+                #[allow(clippy::cast_possible_truncation)]
+                (elapsed.as_millis() as u64)
+            })
             .unwrap_or_default();
         let expires_at_millis = now.saturating_add(ttl_millis);
         Ok(Some(Lease::new(
@@ -165,6 +226,10 @@ pub trait SessionStore: Send + Sync {
     ///
     /// The default reports success: nothing can steal a trivially
     /// granted lease.
+    ///
+    /// # Errors
+    ///
+    /// Never returns `Err` in the default implementation.
     fn renew_lease(
         &self,
         _session: &SessionId,
@@ -178,6 +243,10 @@ pub trait SessionStore: Send + Sync {
     /// hold it.
     ///
     /// The default reports success, matching the trivial grant.
+    ///
+    /// # Errors
+    ///
+    /// Never returns `Err` in the default implementation.
     fn release_lease(&self, _session: &SessionId, _owner: &str) -> Result<bool, StoreError> {
         Ok(true)
     }
@@ -188,6 +257,10 @@ pub trait SessionStore: Send + Sync {
     /// Diagnostic only — the truth is whatever [`SessionStore::acquire_lease`]
     /// returns; this just fills the refusal message. The default cannot
     /// say (`None`).
+    ///
+    /// # Errors
+    ///
+    /// Never returns `Err` in the default implementation.
     fn lease_holder(&self, _session: &SessionId) -> Result<Option<(String, u64)>, StoreError> {
         Ok(None)
     }

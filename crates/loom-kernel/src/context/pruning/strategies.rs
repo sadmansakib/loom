@@ -38,7 +38,7 @@ impl DecisionSet {
     ) {
         self.reclaim_tokens += u64::from(facts.tokens.saturating_sub(stub_tokens(
             &facts.call_id,
-            &facts.status,
+            facts.status,
             reason,
             estimator,
         )));
@@ -115,12 +115,15 @@ fn supersede_reads(
         let Some(meta) = facts.read_meta(earlier) else {
             continue;
         };
-        let superseded = facts.writes.iter().any(|(index, changed)| {
+        let superseded = facts.writes.iter().any(|(index, effects)| {
             *index > earlier.index
-                && meta
-                    .reads
-                    .iter()
-                    .any(|read| changed.iter().any(|path| paths_overlap(read, path)))
+                && meta.reads.iter().any(|read| {
+                    effects
+                        .files_written
+                        .iter()
+                        .chain(effects.files_deleted.iter())
+                        .any(|path| paths_overlap(read, path))
+                })
         });
         if superseded {
             pass.add(earlier, StubReason::SupersededRead, estimator);

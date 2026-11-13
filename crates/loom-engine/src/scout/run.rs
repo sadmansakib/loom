@@ -3,6 +3,7 @@
 //! escalation, cross-check, and fan-out layered on top
 //! (docs/subagents-design.md).
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -111,7 +112,7 @@ pub(super) async fn run_scout_task(
     let mut out = String::new();
     for (index, section) in sections.into_iter().enumerate() {
         if total > 1 {
-            out.push_str(&format!("[scout {}/{}]\n", index + 1, total));
+            let _ = writeln!(out, "[scout {}/{}]", index + 1, total);
         }
         out.push_str(&section);
         if index + 1 < total {
@@ -198,12 +199,12 @@ async fn ask(
 
     tokio::select! {
         biased;
-        _ = tokio::time::sleep(timeout) => ScoutOutcome {
+        () = tokio::time::sleep(timeout) => ScoutOutcome {
             answer: String::new(),
             status: Status::TimedOut,
             turns: turn_count(&session),
         },
-        _ = parent_cancelled => ScoutOutcome {
+        () = parent_cancelled => ScoutOutcome {
             answer: String::new(),
             status: Status::Cancelled,
             turns: turn_count(&session),

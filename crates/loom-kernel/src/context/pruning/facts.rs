@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::model::StopReason;
 use crate::session::Session;
-use crate::tool::{PathAccess, ToolRegistry};
+use crate::tool::{PathAccess, ToolEffects, ToolRegistry};
 use crate::transcript::{Item, ToolArguments, ToolCallId, ToolStatus};
 
 use super::config::PruneConfig;
@@ -98,8 +98,10 @@ pub(super) struct TranscriptFacts<'a> {
     /// Transcript indexes of user items, in order — the position in
     /// this list *is* the ordinal the checkpoint freezes.
     pub(super) user_at: Vec<usize>,
-    /// `(index, changed paths)` per tool result that wrote or deleted.
-    pub(super) writes: Vec<(usize, Vec<String>)>,
+    /// `(index, effects)` per tool result that wrote or deleted; the
+    /// effects borrow the transcript, which is append-only for this
+    /// compile (consumers read the paths, never own them).
+    pub(super) writes: Vec<(usize, &'a ToolEffects)>,
     /// Assistant turn of the most recent write/delete, for writing-phase
     /// detection.
     pub(super) last_write_turn: Option<usize>,
@@ -107,6 +109,9 @@ pub(super) struct TranscriptFacts<'a> {
 
 impl<'a> TranscriptFacts<'a> {
     /// The two fact-gathering scans behind [`decide`](super::strategies::decide).
+    // The two scans are one walk over the transcript in lockstep;
+    // splitting them would clone the walk skeleton twice.
+    #[allow(clippy::too_many_lines)]
     pub(super) fn collect(
         session: &'a Session,
         registry: &ToolRegistry,
@@ -133,7 +138,11 @@ impl<'a> TranscriptFacts<'a> {
                 }
             }
         }
-        let is_read_only = |name: &str| registry.get(name).is_some_and(|tool| tool.is_read_only());
+        let is_read_only = |name: &str| {
+            registry
+                .get(name)
+                .is_some_and(crate::tool::Tool::is_read_only)
+        };
 
         // Scan 2 — tool-result and call facts, assistant turn
         // boundaries, user ordinals, later writes.
@@ -143,7 +152,7 @@ impl<'a> TranscriptFacts<'a> {
         let mut reasoning_at: Vec<ReasoningFacts> = Vec::new();
         let mut assistant_text_at: Vec<AssistantTextFacts> = Vec::new();
         let mut user_at: Vec<usize> = Vec::new();
-        let mut writes: Vec<(usize, Vec<String>)> = Vec::new();
+        let mut writes: Vec<(usize, &ToolEffects)> = Vec::new();
         let mut last_write_turn: Option<usize> = None;
         let mut turn = 0usize;
         let mut assistant_ordinal = 0usize;
@@ -192,9 +201,7 @@ impl<'a> TranscriptFacts<'a> {
                     if !result.effects.files_written.is_empty()
                         || !result.effects.files_deleted.is_empty()
                     {
-                        let mut changed = result.effects.files_written.clone();
-                        changed.extend(result.effects.files_deleted.iter().cloned());
-                        writes.push((index, changed));
+                        writes.push((index, &result.effects));
                         last_write_turn = Some(turn);
                     }
                     results.push(ResultFacts {

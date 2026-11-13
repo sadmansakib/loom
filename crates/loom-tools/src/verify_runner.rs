@@ -160,23 +160,18 @@ impl VerifyRunner {
 
     /// Expands the template against one planned command. Validation
     /// happened at parse time ([`Self::new`]); this stays defensive.
-    pub(crate) fn expand(
-        &self,
-        workspace: &Path,
-        program: &str,
-        args: &[String],
-    ) -> Result<Vec<String>, String> {
+    pub(crate) fn expand(&self, workspace: &Path, program: &str, args: &[String]) -> Vec<String> {
         let workspace = workspace.display().to_string();
-        let mut argv = Vec::with_capacity(self.tokens.len() + args.len());
+        let mut command = Vec::with_capacity(self.tokens.len() + args.len());
         for token in &self.tokens {
             match token.as_str() {
-                "{workspace}" => argv.push(workspace.clone()),
-                "{program}" => argv.push(program.to_owned()),
-                "{args}" => argv.extend(args.iter().cloned()),
-                _ => argv.push(token.replace("{workspace}", &workspace)),
+                "{workspace}" => command.push(workspace.clone()),
+                "{program}" => command.push(program.to_owned()),
+                "{args}" => command.extend(args.iter().cloned()),
+                _ => command.push(token.replace("{workspace}", &workspace)),
             }
         }
-        Ok(argv)
+        command
     }
 
     /// Executes the planned command through the runner, unconfined.
@@ -190,10 +185,8 @@ impl VerifyRunner {
         program: &str,
         args: &[String],
     ) -> Result<(RunnerOutcome, ToolNotice), ToolError> {
-        let argv = self
-            .expand(&ctx.workspace_root, program, args)
-            .map_err(ToolError::Execution)?;
-        let Some((runner_program, runner_args)) = argv.split_first() else {
+        let command = self.expand(&ctx.workspace_root, program, args);
+        let Some((runner_program, runner_args)) = command.split_first() else {
             return Err(ToolError::Execution(format!(
                 "invalid {MANIFEST}: expanded to an empty command"
             )));
@@ -300,13 +293,11 @@ mod tests {
     fn expand_spreads_args_and_embeds_workspace() {
         let runner = runner("docker run -v {workspace}:/ws img {program} {args}")
             .expect("docker mount template validates");
-        let argv = runner
-            .expand(
-                Path::new("/tmp/repo"),
-                "cargo",
-                &["test".to_owned(), "--message-format=json".to_owned()],
-            )
-            .expect("expands");
+        let argv = runner.expand(
+            Path::new("/tmp/repo"),
+            "cargo",
+            &["test".to_owned(), "--message-format=json".to_owned()],
+        );
         assert_eq!(
             argv,
             vec![
@@ -333,9 +324,7 @@ mod tests {
     #[test]
     fn expand_allows_braceless_and_programless_templates() {
         let runner = runner("remote-verify --workspace {workspace}").expect("valid");
-        let argv = runner
-            .expand(Path::new("/w"), "cargo", &["test".to_owned()])
-            .expect("expands");
+        let argv = runner.expand(Path::new("/w"), "cargo", &["test".to_owned()]);
         // The planned command need not appear; a wrapper script may
         // derive it from the workspace itself.
         assert_eq!(

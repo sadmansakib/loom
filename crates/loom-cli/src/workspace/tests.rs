@@ -88,7 +88,7 @@ fn plan_restore_refuses_everything_it_cannot_prove() {
 
     let gone = StartCheckpoint {
         workspace: dir.path().join("gone"),
-        head: Some(head.clone()),
+        head: Some(head),
         reason: None,
     };
     assert!(plan_restore(&gone).is_err(), "missing workspace");

@@ -7,6 +7,11 @@ use super::knobs::Overlay;
 /// the same knob abort the merge with the conflict named — Harness²
 /// composes selectively, and a silent last-write-wins would hide which
 /// won. (The binary re-probes the merged overlay either way.)
+///
+/// # Errors
+///
+/// Returns the conflict as a `String` when two overlays assign
+/// different values to the same knob env var.
 pub fn merge_overlays(overlays: &[&Overlay]) -> Result<Overlay, String> {
     let mut merged = Overlay::new();
     for overlay in overlays.iter().copied() {

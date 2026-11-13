@@ -37,6 +37,7 @@ impl EventSink for SessionUpdateSink {
 /// died of something that is not a client-facing stop condition
 /// (model, protocol, or engine-internal failure) and should surface
 /// as a JSON-RPC error instead.
+#[allow(clippy::wildcard_enum_match_arm)] // TaskError is #[non_exhaustive]
 pub(crate) fn stop_reason(error: &TaskError) -> Option<acp::StopReason> {
     match error {
         TaskError::Cancelled => Some(acp::StopReason::Cancelled),
@@ -45,6 +46,8 @@ pub(crate) fn stop_reason(error: &TaskError) -> Option<acp::StopReason> {
         // Pause is a loom-internal boundary no ACP client triggers;
         // the committed turns read as a normal end of turn.
         TaskError::Paused => Some(acp::StopReason::EndTurn),
+        // Context/model/protocol/internal errors carry no ACP stop
+        // reason; the task error itself is reported upstream.
         _ => None,
     }
 }
@@ -71,6 +74,7 @@ pub(crate) fn prompt_text(blocks: &[acp::ContentBlock]) -> String {
 /// autofix bookkeeping, steering, budget extensions, loop nudges,
 /// terminal task state. An editor sees message chunks, thoughts, tool
 /// activity, and the plan — the things a human reads.
+#[allow(clippy::wildcard_enum_match_arm)] // EventKind is #[non_exhaustive]; unknown kinds forward nothing
 pub(crate) fn updates_for(kind: &EventKind) -> Vec<acp::SessionUpdate> {
     let text_block = |text: &str| acp::ContentBlock::Text(acp::TextContent::new(text.to_owned()));
     match kind {
@@ -119,6 +123,7 @@ pub(crate) fn updates_for(kind: &EventKind) -> Vec<acp::SessionUpdate> {
         EventKind::TodoUpdated { items, .. } => vec![acp::SessionUpdate::Plan(acp::Plan::new(
             items.iter().map(plan_entry).collect(),
         ))],
+        // Unknown future event kinds forward nothing to the client.
         _ => Vec::new(),
     }
 }
@@ -138,6 +143,7 @@ pub(crate) fn tool_kind(name: &str) -> acp::ToolKind {
 /// Maps a tool outcome status; a cancelled call reads as failed — ACP
 /// has no cancelled tool status, and the cancelled task's stop reason
 /// already says it.
+#[allow(clippy::wildcard_enum_match_arm)] // ToolStatus is #[non_exhaustive]; unknown statuses read as failed
 fn tool_status(status: ToolStatus) -> acp::ToolCallStatus {
     match status {
         ToolStatus::Success => acp::ToolCallStatus::Completed,
@@ -149,6 +155,7 @@ fn tool_status(status: ToolStatus) -> acp::ToolCallStatus {
 /// (`Cancelled`) reads as completed: ACP plans have no abandoned
 /// state, and leaving it pending would resurrect work the loop gave
 /// up on.
+#[allow(clippy::wildcard_enum_match_arm)] // TodoStatus is #[non_exhaustive]
 fn plan_entry(item: &TodoItem) -> acp::PlanEntry {
     acp::PlanEntry::new(
         item.text.clone(),

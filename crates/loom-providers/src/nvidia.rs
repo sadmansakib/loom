@@ -15,7 +15,7 @@
 //! exact open models the eval backlog wants (roadmap, item 1): GLM-5.3
 //! at 1M context, no credit card. Free-tier rate limits apply per
 //! model, so N ≥ 5 sweeps must pace themselves, but the funding
-//! blocker for measured claims is gone. The DeepSeek V4 deployments
+//! blocker for measured claims is gone. The `DeepSeek` V4 deployments
 //! that shared the catalog have since hit end-of-life (HTTP 410 on
 //! live verification, 2026-08/2026-09) and are gone from the table.
 //!
@@ -30,7 +30,7 @@
 //! - GLM-5.3 family: thinking is always on; `low`/`high`/`max` with a
 //!   `max` default, so Loom's `none` clamps to `low` (the closest
 //!   available depth; there is no off switch to map onto).
-//! - Any non-forced deployment (the DeepSeek V4 rows, before their
+//! - Any non-forced deployment (the `DeepSeek` V4 rows, before their
 //!   end-of-life, were the case study): `none`/`low`/`high`/`max`,
 //!   with `none` disabling thinking — all four of Loom's efforts pass
 //!   through unchanged.
@@ -129,7 +129,10 @@ pub struct NvidiaProvider {
 impl NvidiaProvider {
     /// Creates a provider with a connection-pooled HTTP client.
     ///
-    /// Fails only when the TLS backend cannot be initialized.
+    /// # Errors
+    ///
+    /// Returns [`reqwest::Error`] when the TLS backend cannot be
+    /// initialized.
     pub fn new(config: NvidiaConfig) -> Result<Self, reqwest::Error> {
         let client = build_client(&config.timeouts)?;
         Ok(Self {
@@ -153,27 +156,26 @@ impl NvidiaProvider {
 /// tools and reasoning, output capped at Z.ai's documented 131,072
 /// (for Nemotron the cap is a conservative ceiling — NIM accepted a
 /// 200k `max_tokens` request). Parallel tool calls are not
-/// documented, so calls serialize. The DeepSeek V4 deployments that
+/// documented, so calls serialize. The `DeepSeek` V4 deployments that
 /// once shared the catalog returned HTTP 410 (end-of-life
 /// 2026-08/2026-09) on live verification and are deliberately
 /// absent. Unknown ids resolve to `None` (loud unknown-model
 /// failure, not a silently wrong row).
+#[must_use]
 pub fn model_capabilities(model: &str) -> Option<ModelCapabilities> {
     let limits = match model {
-        "z-ai/glm-5.3" | "z-ai/glm-5.3-flash" => ModelCapabilities::new(1_048_576)
-            .with_max_output_tokens(131_072)
-            .with_tool_calls(true)
-            .with_parallel_tool_calls(false)
-            .with_reasoning(true),
         // Nemotron 3 Super (120B total / 12B active): 1M context per
         // the NIM model page, reasoning on by default, tool calling
         // trained and live-verified. Measured ~2.4 s per call on NIM,
-        // which is what makes it usable as a bulk eval model.
-        "nvidia/nemotron-3-super-120b-a12b" => ModelCapabilities::new(1_048_576)
-            .with_max_output_tokens(131_072)
-            .with_tool_calls(true)
-            .with_parallel_tool_calls(false)
-            .with_reasoning(true),
+        // which is what makes it usable as a bulk eval model. The
+        // GLM-5.3 deployments ship the identical capability row.
+        "z-ai/glm-5.3" | "z-ai/glm-5.3-flash" | "nvidia/nemotron-3-super-120b-a12b" => {
+            ModelCapabilities::new(1_048_576)
+                .with_max_output_tokens(131_072)
+                .with_tool_calls(true)
+                .with_parallel_tool_calls(false)
+                .with_reasoning(true)
+        }
         // Nemotron 3.5 Lightning (30B total / 3B active): live-verified
         // callable on NIM 2026-10-23 when the 3 Super slug 404'd for the
         // test account. Same family contract — reasoning-first (content
@@ -200,7 +202,7 @@ fn thinking_is_forced(model: &str) -> bool {
 /// Resolves the `reasoning_effort` string for `model` at `effort`.
 ///
 /// Forced-thinking GLM models clamp `none` onto `low` — the request
-/// would otherwise ask for a mode the deployment cannot serve. DeepSeek
+/// would otherwise ask for a mode the deployment cannot serve. `DeepSeek`
 /// V4 deployments accept all four documented values, including `none`
 /// (their non-think mode), so every effort passes through unchanged.
 fn effort_for(model: &str, effort: ReasoningEffort) -> &'static str {

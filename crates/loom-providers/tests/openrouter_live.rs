@@ -1,4 +1,4 @@
-//! Live OpenRouter API verification.
+//! Live `OpenRouter` API verification.
 //!
 //! These tests hit `https://openrouter.ai/api/v1` and use the live model
 //! catalog. They are `#[ignore]`d, so the default `cargo test` never
@@ -20,6 +20,9 @@
 
 // Live diagnostics: these tests are run with `--nocapture` precisely so
 // their observations are printed for manual verification.
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![allow(clippy::print_stdout)]
 
 use futures::StreamExt;
@@ -185,6 +188,9 @@ async fn catalog_reports_free_and_paid_models() {
 
 #[tokio::test]
 #[ignore = "live API: free; requires OPENROUTER_API_KEY"]
+// The cost check compares against the exact `0.0` sentinel a free
+// model reports — not a computed float.
+#[allow(clippy::float_cmp)]
 async fn free_model_plain_roundtrip() {
     let catalog = catalog().await;
     let Some(model) = free_tool_model(&catalog).map(str::to_owned) else {

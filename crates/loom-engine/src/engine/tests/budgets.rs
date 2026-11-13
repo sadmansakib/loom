@@ -80,7 +80,12 @@ async fn a_mutation_at_the_grant_limit_extends_the_turn_budget() {
     let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
     let mut session = engine.new_session();
     let summary = engine
-        .run_task(&mut session, "Write a note.", &sink, &Default::default())
+        .run_task(
+            &mut session,
+            "Write a note.",
+            &sink,
+            &crate::TaskControl::default(),
+        )
         .await
         .expect("agent task");
 
@@ -124,7 +129,12 @@ async fn an_idle_run_at_the_grant_limit_stops() {
     let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
     let mut session = engine.new_session();
     let error = engine
-        .run_task(&mut session, "Say hi.", &sink, &Default::default())
+        .run_task(
+            &mut session,
+            "Say hi.",
+            &sink,
+            &crate::TaskControl::default(),
+        )
         .await
         .expect_err("no evidence, no extension");
     let TaskError::MaxTurns { max_turns } = error else {
@@ -163,7 +173,12 @@ async fn the_default_turn_budget_is_inert() {
     let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();
     let mut session = engine.new_session();
     let summary = engine
-        .run_task(&mut session, "Say hi.", &sink, &Default::default())
+        .run_task(
+            &mut session,
+            "Say hi.",
+            &sink,
+            &crate::TaskControl::default(),
+        )
         .await
         .expect("agent task");
     assert_eq!(summary.model_requests, 2);
@@ -179,7 +194,7 @@ async fn the_default_turn_budget_is_inert() {
 /// for GLM (drops only a cache benefit) and Anthropic (never
 /// forwards reasoning on replay), off for the OpenAI-vocabulary
 /// backends where a tool-bearing request must echo
-/// `reasoning_content` verbatim (DeepSeek 400s otherwise).
+/// `reasoning_content` verbatim (`DeepSeek` 400s otherwise).
 #[test]
 fn prune_config_gates_reasoning_elision_by_provider() {
     let glm = prune_config_for(loom_providers::GLM_PROVIDER_NAME);

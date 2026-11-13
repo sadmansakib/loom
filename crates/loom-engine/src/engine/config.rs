@@ -60,6 +60,7 @@ pub(crate) fn reasoning_schedule_from_env() -> ReasoningSchedule {
 ///
 /// The database location is the frontend's decision: the engine never
 /// consults the environment for it.
+#[allow(clippy::struct_excessive_bools)] // flat operator config; each bool is an independent CLI flag
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Provider adapter to use — `deepseek` or `openrouter`. Adding one

@@ -47,6 +47,8 @@ use loom_core::kernel::analytics::{
     SessionStats, SessionsOverview, SkillVerdict, Spill, mechanisms_json, mechanisms_line,
     mechanisms_overview, sessions_overview,
 };
+use std::fmt::Write as _;
+
 use loom_core::kernel::artifact_gc::{self, GcBounds};
 use loom_core::kernel::store::ArtifactStore;
 use loom_core::store::SqliteStore;
@@ -54,7 +56,7 @@ use loom_core::store::SqliteStore;
 use crate::args::StatsArgs;
 
 /// Runs `loom stats`.
-pub fn run(args: StatsArgs) -> anyhow::Result<ExitCode> {
+pub fn run(args: &StatsArgs) -> anyhow::Result<ExitCode> {
     if let Some(base) = &args.trace {
         return trace_report(base, args.json);
     }
@@ -247,13 +249,14 @@ fn skills_line(stats: &SessionStats) -> Option<String> {
                 plural(s.resources, "resource", "resources"),
             );
             if s.failures > 0 {
-                part.push_str(&format!(
+                let _ = write!(
+                    part,
                     ", {} {}",
                     s.failures,
                     plural(s.failures, "failure", "failures")
-                ));
+                );
             }
-            part.push_str(&format!(", {} bytes delivered", s.delivered_bytes));
+            let _ = write!(part, ", {} bytes delivered", s.delivered_bytes);
             // The item-20.4 lifecycle verdict rides the same line: the
             // numbers already say how a skill is used; this says what
             // the evidence argues for. `keep` stays silent — the line
@@ -341,6 +344,9 @@ fn artifacts_json(section: &ArtifactsSection) -> serde_json::Value {
 
 /// The JSON totals block: counts plus the derived rates.
 fn summarize(overview: &SessionsOverview) -> serde_json::Value {
+    // Rates are display rounding, not exact math: the f64 conversion
+    // is the point.
+    #[allow(clippy::cast_precision_loss)]
     let rate = |n: u64, d: u64| -> serde_json::Value {
         if d == 0 {
             serde_json::json!(null)

@@ -16,6 +16,11 @@ use super::bubblewrap::find_bwrap;
 /// On macOS (`/usr/bin/sandbox-exec` ships with the OS) and on targets
 /// where [`Sandbox::wrap`] passes through unchanged, the probe is a
 /// no-op. See `docs/linux-sandbox.md` for the distro matrix.
+///
+/// # Errors
+/// Returns the remediation message when the Linux sandbox cannot be
+/// created on this kernel (see `docs/linux-sandbox.md`); a no-op
+/// target always returns `Ok(())`.
 pub fn preflight() -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
@@ -85,6 +90,7 @@ fn linux_preflight() -> Result<(), String> {
 /// raw `bwrap:` line alone would otherwise read as a defect in the
 /// agent's command rather than a host-policy denial. The full distro
 /// matrix lives in `docs/linux-sandbox.md`.
+#[must_use]
 pub fn bwrap_remediation(stderr: &str) -> Option<String> {
     // Only the wrapper speaks with this prefix; a command that merely
     // mentions bubblewrap in its own output must not be annotated.

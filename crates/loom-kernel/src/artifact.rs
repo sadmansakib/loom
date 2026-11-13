@@ -59,6 +59,10 @@ impl ArtifactRef {
 /// transcript is never dangling: the worst a crash between the write and the
 /// referencing turn's commit can leave is an orphaned body, which is
 /// harmless because bodies are immutable and content-addressed.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] when the store cannot persist the body.
 pub fn store_artifact(
     store: &dyn ArtifactStore,
     kind: &str,
@@ -72,12 +76,13 @@ pub fn store_artifact(
 }
 
 /// Lowercase hex SHA-256 of `body`.
+#[must_use]
 pub fn sha256_hex(body: &[u8]) -> String {
     let digest = Sha256::digest(body);
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        out.push(char::from_digit((byte >> 4) as u32, 16).unwrap_or('0'));
-        out.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap_or('0'));
+        out.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
+        out.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
     }
     out
 }

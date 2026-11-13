@@ -1,14 +1,17 @@
-//! OpenRouter adapter over a mocked HTTP server.
+//! `OpenRouter` adapter over a mocked HTTP server.
 //!
 //! Covers what the adapter adds on top of the shared OpenAI-compatible
 //! driver: attribution headers, the plain-OpenAI request body (no
 //! provider-specific reasoning object), catalog-driven capabilities,
-//! the OpenRouter error table (credits, rate limits, context overflow),
+//! the `OpenRouter` error table (credits, rate limits, context overflow),
 //! mid-stream error objects, provider-reported cost passthrough, and the
 //! `finish_reason: "error"` retry path. The shared driver's own
 //! behaviours (EOF tolerance, idle timeouts, stop normalization) are
-//! covered against DeepSeek and are not duplicated here.
+//! covered against `DeepSeek` and are not duplicated here.
 
+// Integration tests sit outside Clippy.toml's allow-*-in-tests reach
+// (rust-clippy#13981); unwrap/expect/panic are correct test behavior.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -79,7 +82,7 @@ fn plain_request(model: &str) -> ModelRequest {
     }
 }
 
-fn data_event(payload: Value) -> String {
+fn data_event(payload: &Value) -> String {
     payload.to_string()
 }
 
@@ -110,8 +113,8 @@ async fn mount_sse(server: &MockServer, body: String) {
 /// A complete text response: one delta, then a finish with usage.
 fn text_response(text: &str) -> String {
     sse(&[
-        data_event(json!({"choices": [{"delta": {"content": text}}]})),
-        data_event(json!({
+        data_event(&json!({"choices": [{"delta": {"content": text}}]})),
+        data_event(&json!({
             "choices": [{"delta": {}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 11, "completion_tokens": 4}
         })),
@@ -126,7 +129,7 @@ async fn collect(
 }
 
 fn expect_completed(
-    events: Vec<Result<ModelEvent, ModelError>>,
+    events: &[Result<ModelEvent, ModelError>],
 ) -> loom_kernel::model::ModelResponse {
     let Some(Ok(ModelEvent::Completed(response))) = events.last() else {
         panic!("expected a completed response, got {events:?}");
@@ -160,7 +163,7 @@ async fn streamed_text_completes_with_usage() {
     let events = collect(provider.stream(&plain_request("vendor/free-model:free"))).await;
 
     assert_eq!(joined_text(&events), "Hello from OpenRouter");
-    let response = expect_completed(events);
+    let response = expect_completed(&events);
     assert_eq!(response.message.stop_reason, StopReason::EndTurn);
     assert_eq!(response.usage.input_tokens, 11);
     assert_eq!(response.usage.output_tokens, 4);
@@ -174,13 +177,13 @@ async fn reported_cost_passes_through_for_paid_models() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({"choices": [{"delta": {"content": "paid"}}]})),
-            data_event(json!({
+            data_event(&json!({"choices": [{"delta": {"content": "paid"}}]})),
+            data_event(&json!({
                 "choices": [{"delta": {}, "finish_reason": "stop"}],
                 "usage": {
                     "prompt_tokens": 1000,
                     "completion_tokens": 200,
-                    "cost": 0.000018
+                    "cost": 0.000_018
                 }
             })),
             done(),
@@ -191,8 +194,8 @@ async fn reported_cost_passes_through_for_paid_models() {
     let provider = provider_at(&server.uri());
     let events = collect(provider.stream(&plain_request("vendor/paid-model"))).await;
 
-    let response = expect_completed(events);
-    assert_eq!(response.usage.cost_usd, Some(0.000018));
+    let response = expect_completed(&events);
+    assert_eq!(response.usage.cost_usd, Some(0.000_018));
 }
 
 #[tokio::test]
@@ -347,8 +350,8 @@ async fn mid_stream_error_object_is_classified() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({"choices": [{"delta": {"content": "partial"}}]})),
-            data_event(json!({
+            data_event(&json!({"choices": [{"delta": {"content": "partial"}}]})),
+            data_event(&json!({
                 "error": {"message": "upstream exploded", "code": 503}
             })),
             done(),
@@ -371,8 +374,8 @@ async fn error_finish_reason_is_retryable() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({"choices": [{"delta": {"content": "x"}}]})),
-            data_event(json!({"choices": [{"delta": {}, "finish_reason": "error"}]})),
+            data_event(&json!({"choices": [{"delta": {"content": "x"}}]})),
+            data_event(&json!({"choices": [{"delta": {}, "finish_reason": "error"}]})),
             done(),
         ]),
     )
@@ -414,20 +417,20 @@ async fn tool_calls_stream_through_with_synthesized_ids() {
     mount_sse(
         &server,
         sse(&[
-            data_event(json!({
+            data_event(&json!({
                 "choices": [{"delta": {"tool_calls": [{
                     "index": 0,
                     "id": "call_abc",
                     "function": {"name": "list_files", "arguments": "{\"path\":"}
                 }]}}]
             })),
-            data_event(json!({
+            data_event(&json!({
                 "choices": [{"delta": {"tool_calls": [{
                     "index": 0,
                     "function": {"arguments": "\".\"}"}
                 }]}}]
             })),
-            data_event(json!({
+            data_event(&json!({
                 "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
                 "usage": {"prompt_tokens": 5, "completion_tokens": 3}
             })),
@@ -447,7 +450,7 @@ async fn tool_calls_stream_through_with_synthesized_ids() {
     let provider = provider_at(&server.uri());
     let events = collect(provider.stream(&request)).await;
 
-    let response = expect_completed(events);
+    let response = expect_completed(&events);
     assert_eq!(response.message.stop_reason, StopReason::ToolCalls);
     assert_eq!(response.message.tool_calls.len(), 1);
     let call = &response.message.tool_calls[0];

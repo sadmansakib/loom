@@ -9,7 +9,7 @@ use loom_tools::ToolBudgets;
 /// provider-gated (roadmap item 12, deterministic half).
 ///
 /// Replaying stored reasoning verbatim is a provider contract, not an
-/// optimisation, on the OpenAI wire: DeepSeek rejects a tool-bearing
+/// optimisation, on the `OpenAI` wire: `DeepSeek` rejects a tool-bearing
 /// request whose prior assistant turns lack `reasoning_content`
 /// (live-verified 2026-10-03), so reasoning elision stays off for the
 /// OpenAI-vocabulary backends. GLM's Preserved Thinking merely gets

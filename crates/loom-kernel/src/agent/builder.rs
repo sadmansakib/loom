@@ -183,7 +183,7 @@ impl Agent {
     }
 
     /// Disables the loop's evidence-shaped feedback (the bare-loop arm,
-    /// roadmap item 1): the completion gate stops refusing EndTurns with
+    /// roadmap item 1): the completion gate stops refusing `EndTurns` with
     /// unverified mutations, the failure ledger stops refusing identical
     /// repeats of failed calls, and tools stop receiving the
     /// recent-changes list. The default (`true`) is the production loop.
@@ -204,6 +204,11 @@ impl Agent {
     /// Returns `Ok(None)` when no store is attached or the session is unknown,
     /// so a frontend can treat "no persistence" and "not found" alike when
     /// deciding whether to start fresh.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the attached store fails to load
+    /// (backend failure or a corrupt stored session).
     pub fn load_session(&self, id: &SessionId) -> Result<Option<Session>, StoreError> {
         match &self.store {
             Some(store) => store.load(id),
@@ -212,6 +217,11 @@ impl Agent {
     }
 
     /// Lists persisted session ids (creation order), empty without a store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the attached store cannot enumerate
+    /// the sessions.
     pub fn session_ids(&self) -> Result<Vec<SessionId>, StoreError> {
         match &self.store {
             Some(store) => store.session_ids(),
