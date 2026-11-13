@@ -14,7 +14,7 @@ This document has three layers:
 1. **Vision** — goals, principles, and the iteration sequence (stable;
    changes need an ADR-level reason).
 2. **Status** — what is shipped and verified in the codebase today.
-3. **Backlog** — numbered, evidence-gated items (1–39), each mapped to an
+3. **Backlog** — numbered, evidence-gated items (1–40), each mapped to an
    iteration, the goals it serves, and the seam it plugs into.
 
 It is a roadmap, not a promise. The companion `architecture.md` describes
@@ -131,7 +131,7 @@ iterations may start early where a backlog item is cheap and measured.
 | 7 | Plugin system | Future scope | — |
 | 8 | Intelligent model routing | **Shipped 2026-11-08** (effort schedule + task-start tier routing; funded A/Bs open) | 9✓ᴬ, 14✓ |
 | 9 | Learning & self-optimization | Not started; data path partial | 1, 20 (20.2 sweepable set shipped) |
-| — | Product surface (cross-cutting) | **CLI shipped** (`loom run` + interactive `loom chat`); 22⏸ (TUI/frontends) | 15✓, 22⏸, 25✓ |
+| — | Product surface (cross-cutting) | **CLI shipped** (`loom run` + interactive `loom chat`); TUI foundation shipped, parity work open | 15✓, 22, 25✓, 40 |
 
 Legend: ✓ shipped · ✓ᴬ phase A shipped, remainder open · ✗ skipped on
 evidence · ⏸ deferred on evidence (revisit trigger recorded in the item).
@@ -1534,6 +1534,8 @@ adds four more framing findings and backlog items 26–31 below.
     official `loom-tui` crate (`crates/loom-tui`) now renders events and
     supports interactive steering, pause, and cancel; UI crates are isolated
     from the facade's dependency surface. Resume + steering are both shipped.
+    Screenshot-driven workflow parity and auditable run actions remain open
+    under item 40.
 23. **Distributed verification.** Remote or containerized `verify`
     runners with the same evidence contract. **Shipped 2026-10-23** —
     `.loom/verify.toml` declares the runner argv (docker, ssh, …) with
@@ -2131,15 +2133,76 @@ model tier under them (arXiv 2607.06906).
     key before repro re-run (fewer failures, then label — no spend),
     `LedgerEntry` needs no schema change. No code changed.
 
+40. **Interactive harness TUI parity and auditable runs** (G1, G2, G3,
+    G8, G9). Bring the official `loom-tui` from its current event viewer
+    to the live-task, cancellation, retry, and run-record workflow shown
+    in `docs/screenshots/`. This is **not** a parallel-execution item:
+    `ToolBatch` already runs conflict-free calls concurrently (bounded
+    at 8 by default), preserves model order for conflicts, and returns
+    results in call order. The UI gap is that it emits all starts before
+    batch execution and renders completions only after the batch returns;
+    it cannot show actual per-call completion timing or live in-flight
+    progress.
+
+    Scope, in order:
+    - **Honest live batch and cancellation view.** Emit/render lifecycle
+      updates as calls actually start and finish, with elapsed time and
+      active/queued/completed counts. Show cancellation truthfully:
+      completed results remain committed, started calls are interrupted,
+      and calls never started are marked not run. Never imply that calls
+      ran concurrently when path conflicts or wildcard access serialized
+      them. Keep transcript result ordering and replay semantics stable.
+    - **Visible, enforceable run profiles.** Allow selecting a
+      read-only profile (the screenshots' B1 mode) that restricts the
+      exposed tool set in the engine, rather than merely labeling the
+      display; show the selected profile and its task/tool/time budgets.
+      Surface reasoning-effort controls only for models that support
+      them, with the effective setting visible before the first request.
+    - **Decision-relevant live telemetry.** Show request/turn and retry
+      state (including eligible retry countdown and an explicit retry-now
+      action), per-source context census, current and next-request context
+      budget bars, remaining task/tool/time budgets, and
+      provider-reported cost when available. Unknown cost or unsupported
+      telemetry stays explicitly unavailable; do not estimate it as fact.
+      Include per-call duration and useful failure/cancellation reasons.
+    - **Useful finished-run record.** Keep completed task summaries
+      available when starting a follow-up task; add copy-answer and
+      NDJSON run-record export actions, including task/run ids, final
+      status, usage/cost availability, retries, tool outcomes, and timing.
+      Persist or export from the existing event/session seams without
+      making the TUI the owner of engine state.
+    - **Keyboard and terminal ergonomics.** Publish the actual key map
+      in help, including pause/resume, cancel, steer, retry, copy, and
+      export; handle narrow terminals and terminal color capability
+      fallbacks without corrupting the timeline.
+    - **Crate seam.** Drive the UI through the stable `loom-core`
+      frontend contract from item 22; keep engine construction in the
+      composition root and avoid making UI behavior depend on kernel
+      internals. Add event/render tests for interleaved concurrent
+      completions, serialized waves, retry reset, cancellation, narrow
+      layouts, and exported records.
+
+    Gate: offline event-stream and terminal-render tests must prove the
+    display agrees with committed task/tool outcomes, including partial
+    cancellation; exported records must round-trip and remain useful
+    without a live provider. Benchmark any claim that a richer display
+    changes task success, turns, or cost under item 1; visual parity alone
+    is not a task-performance claim. Seam: item 22's `loom-core` facade,
+    typed events and task summaries, `loom-tui`, and the CLI composition
+    root. Parallel execution itself is shipped; live progress reporting
+    is the missing capability.
+
 ### 2026-12 meta-harness sweep — gap check
 
 A vendor/blog/benchmark sweep (Anthropic engineering, Claude Code docs,
 Amp, Codex CLI, tmustier harness-benchmarks, plus late-2026 arXiv:
 ACon 2510.00615, PAACE 2512.16970, GCC 2508.00031, context-folding
 2510.11967, AgentRouter 2609.22951) was mapped against the ranked
-top-15 harness features from that literature. Result: **no new backlog
-items required** — every technique with evidence either ships, has a
-numbered home, or is already declined with reason:
+top-15 harness features from that literature. Every technique with
+evidence either ships, has a numbered home, or is already declined with
+reason. The screenshot review adds one concrete product-surface item,
+40, for the remaining TUI workflow and run-record gaps; it does not add a
+new runtime orchestration capability:
 
 - Compaction/tool-result clearing, cache discipline, todo state,
   completion gate, skills with progressive disclosure, sandbox +
