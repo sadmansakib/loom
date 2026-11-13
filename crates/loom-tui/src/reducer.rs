@@ -64,6 +64,19 @@ pub struct TaskLifecycle {
     pub completed_at_millis: Option<u64>,
     /// Human-readable failure reason, where one was provided.
     pub failure_reason: Option<String>,
+    /// Workspace files expanded into the request, shown separately from model output.
+    pub attachments: Vec<FileAttachment>,
+    /// User-authored prompts before any mentioned files are expanded.
+    pub display_prompts: Vec<String>,
+}
+
+/// A workspace file included in a user-authored prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileAttachment {
+    /// Workspace-relative file path.
+    pub path: String,
+    /// Number of bytes included in the model request.
+    pub bytes: u64,
 }
 
 /// State for a tool call observed on the event stream.
@@ -138,8 +151,36 @@ impl Reducer {
     /// Adds the user-authored task to the live projection before engine events
     /// arrive. Session reconciliation later replaces this with committed data.
     pub fn begin_task(&mut self, task: impl Into<String>) {
+        let task = task.into();
+        self.task.display_prompts.push(task.clone());
         self.committed_transcript
-            .push(TranscriptItem::User { text: task.into() });
+            .push(TranscriptItem::User { text: task });
+    }
+
+    /// Records files expanded from `@path` mentions for distinct thread rendering.
+    pub fn set_attachments(&mut self, attachments: Vec<FileAttachment>) {
+        self.task.attachments = attachments;
+    }
+
+    /// Preserves the visible text for a queued follow-up prompt.
+    pub fn push_display_prompt(&mut self, prompt: impl Into<String>) {
+        self.task.display_prompts.push(prompt.into());
+    }
+
+    /// Replaces only the first visible user prompt with the pre-expansion text.
+    ///
+    /// The engine/session transcript retains the expanded request for durable
+    /// history and model context; the interactive thread should show the
+    /// user's authored prompt instead.
+    pub fn restore_display_prompt(&mut self) {
+        let mut prompts = self.task.display_prompts.iter();
+        for item in &mut self.committed_transcript {
+            if let TranscriptItem::User { text } = item
+                && let Some(display_prompt) = prompts.next()
+            {
+                *text = display_prompt.clone();
+            }
+        }
     }
 
     /// Applies one event using the caller's explicit Unix epoch timestamp.
@@ -308,6 +349,7 @@ impl Reducer {
     pub fn reconcile_session(&mut self, session: &loom_core::Session) {
         self.committed_transcript.clone_from(&session.transcript);
         self.provisional.clear();
+        self.restore_display_prompt();
     }
 
     /// Whether the reducer currently has any provisional model output.
@@ -618,5 +660,47 @@ mod tests {
 
         assert_eq!(reducer.committed_transcript, session.transcript);
         assert!(!reducer.has_provisional_output());
+    }
+
+    #[test]
+    fn restore_display_prompt_hides_expanded_attachment_body() {
+        let mut reducer = Reducer::default();
+        reducer.begin_task("Please read @README.md");
+        reducer.committed_transcript[0] = Item::User {
+            text: "Please read @README.md\n\n<attached file: README.md>\nlarge file body".into(),
+        };
+
+        reducer.restore_display_prompt();
+
+        assert!(matches!(
+            &reducer.committed_transcript[0],
+            Item::User { text } if text == "Please read @README.md"
+        ));
+    }
+
+    #[test]
+    fn restore_display_prompts_keeps_multiple_attachment_prompts_compact() {
+        let mut reducer = Reducer::default();
+        reducer.begin_task("Read @README.md");
+        reducer.push_display_prompt("Now inspect @src/lib.rs");
+        reducer.committed_transcript = vec![
+            Item::User {
+                text: "Read @README.md\n<attached file: README.md> huge contents".into(),
+            },
+            Item::User {
+                text: "Now inspect @src/lib.rs\n<attached file: src/lib.rs> huge contents".into(),
+            },
+        ];
+
+        reducer.restore_display_prompt();
+
+        assert!(matches!(
+            &reducer.committed_transcript[0],
+            Item::User { text } if text == "Read @README.md"
+        ));
+        assert!(matches!(
+            &reducer.committed_transcript[1],
+            Item::User { text } if text == "Now inspect @src/lib.rs"
+        ));
     }
 }
