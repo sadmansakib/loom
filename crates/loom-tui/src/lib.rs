@@ -18,23 +18,20 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, pol
 use loom_core::{Engine, EngineConfig, EventEnvelope, SessionId, TaskControl, TaskSummary};
 use loom_kernel::event::{ChannelEventSink, EventKind};
 use loom_kernel::transcript::ToolStatus;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::style::Color;
 
 const EVENT_LOG_LIMIT: usize = 240;
-const BG: Color = Color::Rgb(18, 16, 14);
-const PANEL: Color = Color::Rgb(26, 22, 18);
-const BORDER: Color = Color::Rgb(57, 51, 40);
-const IVORY: Color = Color::Rgb(233, 227, 215);
-const DIM: Color = Color::Rgb(154, 146, 133);
-const AMBER: Color = Color::Rgb(227, 168, 87);
-const SAGE: Color = Color::Rgb(134, 193, 159);
-const CORAL: Color = Color::Rgb(238, 130, 114);
-const VIOLET: Color = Color::Rgb(169, 155, 214);
-const BLUE: Color = Color::Rgb(141, 180, 232);
-const TEAL: Color = Color::Rgb(111, 196, 196);
+pub(crate) const BG: Color = Color::Rgb(18, 16, 14);
+pub(crate) const PANEL: Color = Color::Rgb(26, 22, 18);
+pub(crate) const BORDER: Color = Color::Rgb(57, 51, 40);
+pub(crate) const IVORY: Color = Color::Rgb(233, 227, 215);
+pub(crate) const DIM: Color = Color::Rgb(154, 146, 133);
+pub(crate) const AMBER: Color = Color::Rgb(227, 168, 87);
+pub(crate) const SAGE: Color = Color::Rgb(134, 193, 159);
+pub(crate) const CORAL: Color = Color::Rgb(238, 130, 114);
+pub(crate) const VIOLET: Color = Color::Rgb(169, 155, 214);
+pub(crate) const BLUE: Color = Color::Rgb(141, 180, 232);
+pub(crate) const TEAL: Color = Color::Rgb(111, 196, 196);
 
 enum WorkerMessage {
     Started(SessionId),
@@ -47,35 +44,35 @@ enum TaskCommand {
 }
 
 #[derive(Clone)]
-struct LogItem {
-    marker: &'static str,
-    color: Color,
-    text: String,
-    provisional: bool,
-    italic: bool,
-    detail: Option<String>,
-    expanded: bool,
+pub(crate) struct LogItem {
+    pub(crate) marker: &'static str,
+    pub(crate) color: Color,
+    pub(crate) text: String,
+    pub(crate) provisional: bool,
+    pub(crate) italic: bool,
+    pub(crate) detail: Option<String>,
+    pub(crate) expanded: bool,
 }
 
 #[derive(Clone)]
-struct RetryRecord {
-    attempt: u32,
-    kind: String,
-    delay_ms: u64,
-    response_started: bool,
+pub(crate) struct RetryRecord {
+    pub(crate) attempt: u32,
+    pub(crate) kind: String,
+    pub(crate) delay_ms: u64,
+    pub(crate) response_started: bool,
 }
 
 #[derive(Clone)]
-struct ToolRecord {
-    name: String,
+pub(crate) struct ToolRecord {
+    pub(crate) name: String,
     #[allow(dead_code)]
-    call_id: String,
-    state: ToolRecordState,
-    detail: String,
+    pub(crate) call_id: String,
+    pub(crate) state: ToolRecordState,
+    pub(crate) detail: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ToolRecordState {
+pub(crate) enum ToolRecordState {
     Running,
     Success,
     Failed,
@@ -84,49 +81,49 @@ enum ToolRecordState {
 }
 
 #[derive(Default)]
-struct App {
-    task: String,
-    model: String,
-    session: Option<SessionId>,
-    run_id: u32,
-    timeline: VecDeque<LogItem>,
-    recent_events: VecDeque<String>,
-    status: String,
-    status_color: Color,
-    input: String,
-    editing: bool,
-    finished: bool,
-    quit_after_finish: bool,
-    turns: u32,
-    requests: u32,
-    retries: u32,
-    max_attempts: u32,
-    tools_ok: u32,
-    tools_failed: u32,
-    tools_cancelled: u32,
-    input_tokens: u64,
-    cached_tokens: u64,
-    output_tokens: u64,
-    wall_time: Duration,
-    events_seen: u64,
-    events_dropped: u64,
-    provisional_index: Option<usize>,
-    provisional_reasoning_index: Option<usize>,
-    current_turn_index: Option<usize>,
-    current_turn_input: u64,
-    current_turn_output: u64,
-    reasoning_chars: usize,
-    started_at: Option<Instant>,
-    elapsed: Duration,
-    sidebar_visible: bool,
-    show_help: bool,
-    show_reasoning: bool,
-    selected_item: Option<usize>,
-    retries_log: Vec<RetryRecord>,
-    tools: Vec<ToolRecord>,
-    tool_indices: HashMap<String, usize>,
-    last_cache_pct: String,
-    last_interrupt: Option<Instant>,
+pub(crate) struct App {
+    pub(crate) task: String,
+    pub(crate) model: String,
+    pub(crate) session: Option<SessionId>,
+    pub(crate) run_id: u32,
+    pub(crate) timeline: VecDeque<LogItem>,
+    pub(crate) recent_events: VecDeque<String>,
+    pub(crate) status: String,
+    pub(crate) status_color: Color,
+    pub(crate) input: String,
+    pub(crate) editing: bool,
+    pub(crate) finished: bool,
+    pub(crate) quit_after_finish: bool,
+    pub(crate) turns: u32,
+    pub(crate) requests: u32,
+    pub(crate) retries: u32,
+    pub(crate) max_attempts: u32,
+    pub(crate) tools_ok: u32,
+    pub(crate) tools_failed: u32,
+    pub(crate) tools_cancelled: u32,
+    pub(crate) input_tokens: u64,
+    pub(crate) cached_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) wall_time: Duration,
+    pub(crate) events_seen: u64,
+    pub(crate) events_dropped: u64,
+    pub(crate) provisional_index: Option<usize>,
+    pub(crate) provisional_reasoning_index: Option<usize>,
+    pub(crate) current_turn_index: Option<usize>,
+    pub(crate) current_turn_input: u64,
+    pub(crate) current_turn_output: u64,
+    pub(crate) reasoning_chars: usize,
+    pub(crate) started_at: Option<Instant>,
+    pub(crate) elapsed: Duration,
+    pub(crate) sidebar_visible: bool,
+    pub(crate) show_help: bool,
+    pub(crate) show_reasoning: bool,
+    pub(crate) selected_item: Option<usize>,
+    pub(crate) retries_log: Vec<RetryRecord>,
+    pub(crate) tools: Vec<ToolRecord>,
+    pub(crate) tool_indices: HashMap<String, usize>,
+    pub(crate) last_cache_pct: String,
+    pub(crate) last_interrupt: Option<Instant>,
 }
 
 /// Run the official interactive terminal frontend.
@@ -168,13 +165,13 @@ pub fn run() -> anyhow::Result<()> {
     let result = ratatui::run(|terminal| {
         loop {
             drain_worker(&worker_rx, &mut app);
-            drain_events(&mut event_rx, &mut app);
+            events::drain_events(&mut event_rx, &mut app);
             if !app.finished {
                 app.elapsed = app
                     .started_at
                     .map_or(Duration::ZERO, |start| start.elapsed());
             }
-            terminal.draw(|frame| draw(frame, &app))?;
+            terminal.draw(|frame| ui::draw(frame, &app))?;
 
             if app.finished && app.quit_after_finish {
                 break Ok(());
@@ -336,7 +333,7 @@ fn drain_worker(receiver: &mpsc::Receiver<WorkerMessage>, app: &mut App) {
                     .iter()
                     .any(|item| item.text.starts_with("Task failed"))
                 {
-                    push_log(app, "×", CORAL, format!("Task failed · {error}"), false);
+                    events::push_log(app, "×", CORAL, format!("Task failed · {error}"), false);
                 }
             }
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
@@ -344,426 +341,7 @@ fn drain_worker(receiver: &mpsc::Receiver<WorkerMessage>, app: &mut App) {
     }
 }
 
-fn drain_events(receiver: &mut tokio::sync::mpsc::UnboundedReceiver<EventEnvelope>, app: &mut App) {
-    while let Ok(envelope) = receiver.try_recv() {
-        app.events_seen = envelope.sequence;
-        reduce_event(&envelope, app);
-        app.recent_events.push_front(format!(
-            "#{:<5} {}",
-            envelope.sequence,
-            event_name(&envelope.kind)
-        ));
-        app.recent_events.truncate(5);
-    }
-}
-
-fn reduce_event(envelope: &EventEnvelope, app: &mut App) {
-    match &envelope.kind {
-        EventKind::TaskStarted => push_log(app, "›", BLUE, "Task accepted", false),
-        EventKind::TurnStarted { turn } => {
-            app.turns = *turn;
-            app.current_turn_input = 0;
-            app.current_turn_output = 0;
-            app.started_at.get_or_insert_with(Instant::now);
-            push_log(app, "●", AMBER, format!("turn {turn}"), false);
-            app.current_turn_index = Some(app.timeline.len().saturating_sub(1));
-        }
-        EventKind::ModelRequestStarted { attempt } => {
-            app.requests += 1;
-            app.reasoning_chars = 0;
-            app.provisional_index = None;
-            app.status = format!("Streaming · attempt {attempt}");
-            app.status_color = AMBER;
-            app.timeline.push_back(LogItem {
-                marker: "▸",
-                color: AMBER,
-                text: format!(
-                    "attempt {attempt} / {} · streaming",
-                    app.max_attempts.max(1)
-                ),
-                provisional: true,
-                italic: false,
-                detail: None,
-                expanded: false,
-            });
-            app.provisional_index = Some(app.timeline.len() - 1);
-            push_log(
-                app,
-                "⁙",
-                AMBER,
-                format!("request · attempt {attempt}"),
-                false,
-            );
-        }
-        EventKind::ReasoningDelta { text } => {
-            app.reasoning_chars += text.chars().count();
-            let index = match app.provisional_reasoning_index {
-                Some(index) => index,
-                None => {
-                    push_log(app, "▸", VIOLET, "reasoning · provisional", true);
-                    let index = app.timeline.len() - 1;
-                    app.provisional_reasoning_index = Some(index);
-                    index
-                }
-            };
-            if let Some(item) = app.timeline.get_mut(index) {
-                item.text.push_str(text);
-                item.italic = true;
-            }
-        }
-        EventKind::TextDelta { text } => {
-            let index = match app.provisional_index {
-                Some(index) => index,
-                None => {
-                    push_log(app, "┆", VIOLET, "streaming · provisional", true);
-                    let index = app.timeline.len() - 1;
-                    app.provisional_index = Some(index);
-                    index
-                }
-            };
-            if let Some(item) = app.timeline.get_mut(index) {
-                item.text.push_str(text);
-            }
-        }
-        EventKind::ModelRetry {
-            attempt,
-            kind,
-            delay_ms,
-            response_started,
-        } => {
-            app.retries += 1;
-            app.reasoning_chars = 0;
-            discard_provisional(app);
-            discard_provisional_reasoning(app);
-            app.status = format!("Retrying · attempt {attempt}");
-            app.status_color = AMBER;
-            app.retries_log.push(RetryRecord {
-                attempt: *attempt,
-                kind: format!("{kind:?}"),
-                delay_ms: *delay_ms,
-                response_started: *response_started,
-            });
-            push_log(
-                app,
-                "↻",
-                AMBER,
-                format!("attempt {attempt} failed · {kind:?}"),
-                false,
-            );
-            if let Some(item) = app.timeline.back_mut() {
-                item.detail = Some(format!(
-                    "{} · discarded · next in {} ms",
-                    if *response_started {
-                        "response started"
-                    } else {
-                        "no response"
-                    },
-                    delay_ms
-                ));
-            }
-        }
-        EventKind::ModelCompleted { response } => {
-            discard_provisional(app);
-            discard_provisional_reasoning(app);
-            app.status = "Running".into();
-            app.status_color = AMBER;
-            app.input_tokens += response.usage.input_tokens;
-            app.output_tokens += response.usage.output_tokens;
-            app.cached_tokens += response.usage.cached_input_tokens.unwrap_or_default();
-            app.current_turn_input += response.usage.input_tokens;
-            app.current_turn_output += response.usage.output_tokens;
-            if let Some(index) = app.current_turn_index
-                && let Some(turn) = app.timeline.get_mut(index)
-            {
-                turn.detail = Some(format!(
-                    "{} in · {} out",
-                    compact(app.current_turn_input),
-                    compact(app.current_turn_output)
-                ));
-            }
-            let cached = response.usage.cached_input_tokens.unwrap_or_default();
-            app.last_cache_pct = if response.usage.input_tokens == 0 {
-                "—".into()
-            } else {
-                format!(
-                    "{:.0}%",
-                    100.0 * cached as f64 / response.usage.input_tokens as f64
-                )
-            };
-            let mut committed = Vec::new();
-            if let Some(reasoning) = response.message.reasoning.as_ref()
-                && !reasoning.text.trim().is_empty()
-            {
-                committed.push(("▸", VIOLET, reasoning.text.clone(), true));
-            }
-            let body = response.message.content.trim();
-            if !body.is_empty() {
-                committed.push(("│", IVORY, body.to_owned(), false));
-            }
-            if let Some(index) = app.provisional_index.take()
-                && let Some(item) = app.timeline.get_mut(index)
-            {
-                item.text = "response committed".into();
-                item.provisional = false;
-                item.detail = Some(format!(
-                    "{} in · {} out · {} cached",
-                    compact(response.usage.input_tokens),
-                    compact(response.usage.output_tokens),
-                    compact(cached)
-                ));
-            }
-            app.provisional_reasoning_index = None;
-            for (marker, color, text, italic) in committed {
-                push_log(app, marker, color, text, false);
-                if let Some(item) = app.timeline.back_mut() {
-                    item.italic = italic;
-                }
-            }
-            for call in &response.message.tool_calls {
-                push_log(
-                    app,
-                    "├",
-                    BLUE,
-                    format!("{} · {}", call.name, *call.arguments),
-                    false,
-                );
-            }
-        }
-        EventKind::ToolStarted {
-            name,
-            call_id,
-            arguments,
-        } => {
-            let id = call_id.to_string();
-            let index = app.tools.len();
-            app.tools.push(ToolRecord {
-                name: name.clone(),
-                call_id: id.clone(),
-                state: ToolRecordState::Running,
-                detail: arguments.clone(),
-            });
-            app.tool_indices.insert(id, index);
-            push_log(app, "⋮", BLUE, name.clone(), false);
-            if let Some(item) = app.timeline.back_mut() {
-                item.detail = Some(arguments.clone());
-            }
-        }
-        EventKind::ToolCompleted {
-            name,
-            call_id,
-            status,
-            content_head,
-            ..
-        } => {
-            let (marker, color, outcome, outcome_state) = match status {
-                ToolStatus::Success => {
-                    app.tools_ok += 1;
-                    ("✓", SAGE, "completed", ToolRecordState::Success)
-                }
-                ToolStatus::Error(_) => {
-                    app.tools_failed += 1;
-                    ("×", CORAL, "failed", ToolRecordState::Failed)
-                }
-                ToolStatus::Cancelled { started } => {
-                    app.tools_cancelled += 1;
-                    if *started {
-                        ("△", AMBER, "interrupted", ToolRecordState::Interrupted)
-                    } else {
-                        ("○", DIM, "not run", ToolRecordState::NotRun)
-                    }
-                }
-                _ => ("·", DIM, "finished", ToolRecordState::Failed),
-            };
-            let detail = content_head.lines().next().unwrap_or_default();
-            let call_key = call_id.to_string();
-            if let Some(index) = app.tool_indices.get(&call_key).copied()
-                && let Some(tool) = app.tools.get_mut(index)
-            {
-                tool.state = outcome_state;
-                tool.detail = detail.to_owned();
-            }
-            push_log(
-                app,
-                marker,
-                color,
-                format!("{name} · {outcome}  {detail}"),
-                false,
-            );
-            if let Some(item) = app.timeline.back_mut() {
-                item.detail = Some(detail.to_owned());
-                item.expanded = true;
-            }
-        }
-        EventKind::SteeringApplied { messages, .. } => push_log(
-            app,
-            "›",
-            AMBER,
-            format!("applied {messages} steering message(s)"),
-            false,
-        ),
-        EventKind::TaskCompleted => {
-            app.status = "Completed".into();
-            app.status_color = SAGE;
-            if app.current_turn_index.is_some()
-                && let Some(turn) = app.current_turn_index.and_then(|i| app.timeline.get_mut(i))
-            {
-                turn.detail = Some(format!(
-                    "{} · {}",
-                    turn.detail.as_deref().unwrap_or(""),
-                    format_duration(app.elapsed)
-                ));
-            }
-            push_log(app, "✓", SAGE, "Task completed", false);
-        }
-        EventKind::TaskFailed { reason } => {
-            app.status = "Failed".into();
-            app.status_color = CORAL;
-            if let Some(index) = app.provisional_index.take()
-                && let Some(item) = app.timeline.get_mut(index)
-            {
-                item.text = "attempt failed · provisional output discarded".into();
-                item.provisional = false;
-                item.color = CORAL;
-                item.detail = Some("partial response is not committed".into());
-            }
-            discard_provisional_reasoning(app);
-            push_log(app, "×", CORAL, format!("Task failed · {reason}"), false);
-        }
-        EventKind::TaskCancelled => {
-            app.status = "Cancelled".into();
-            app.status_color = AMBER;
-            app.last_interrupt = Some(Instant::now());
-            if let Some(index) = app.provisional_index.take()
-                && let Some(item) = app.timeline.get_mut(index)
-            {
-                item.text = "attempt interrupted · provisional output discarded".into();
-                item.provisional = false;
-                item.color = AMBER;
-                item.detail = Some("partial response is not committed".into());
-            }
-            discard_provisional_reasoning(app);
-            for tool in &mut app.tools {
-                if tool.state == ToolRecordState::Running {
-                    tool.state = ToolRecordState::Interrupted;
-                    app.tools_cancelled += 1;
-                }
-            }
-            if let Some(index) = app.current_turn_index.take()
-                && let Some(turn) = app.timeline.get_mut(index)
-            {
-                turn.detail = Some(format!(
-                    "partial · {} in · {} out · {}",
-                    compact(app.current_turn_input),
-                    compact(app.current_turn_output),
-                    format_duration(app.elapsed)
-                ));
-            }
-            push_log(app, "⊘", AMBER, "Task cancelled", false);
-        }
-        EventKind::TaskPaused => {
-            app.status = "Paused".into();
-            app.status_color = AMBER;
-            push_log(app, "Ⅱ", AMBER, "Paused at turn boundary", false);
-        }
-        EventKind::HarnessNotice { category, detail } => {
-            push_log(app, "!", AMBER, format!("{category} · {detail}"), false)
-        }
-        _ => {}
-    }
-}
-
-fn push_log(
-    app: &mut App,
-    marker: &'static str,
-    color: Color,
-    text: impl Into<String>,
-    provisional: bool,
-) {
-    let marker = display_marker(marker, std::env::var_os("LOOM_ASCII").is_some());
-    app.timeline.push_back(LogItem {
-        marker,
-        color,
-        text: text.into(),
-        provisional,
-        italic: false,
-        detail: None,
-        expanded: false,
-    });
-    while app.timeline.len() > EVENT_LOG_LIMIT {
-        app.timeline.pop_front();
-        app.provisional_index = app.provisional_index.and_then(|index| index.checked_sub(1));
-        app.provisional_reasoning_index = app
-            .provisional_reasoning_index
-            .and_then(|index| index.checked_sub(1));
-        app.current_turn_index = app
-            .current_turn_index
-            .and_then(|index| index.checked_sub(1));
-    }
-}
-
-fn display_marker(marker: &'static str, ascii: bool) -> &'static str {
-    if ascii {
-        match marker {
-            "›" | "▸" => ">",
-            "●" => "*",
-            "⁙" => "!",
-            "┆" | "│" | "├" | "⋮" => "|",
-            "↻" => "~",
-            "✓" => "+",
-            "×" => "x",
-            "⊘" => "/",
-            "Ⅱ" => "||",
-            other => other,
-        }
-    } else {
-        marker
-    }
-}
-
-fn discard_provisional_reasoning(app: &mut App) {
-    if let Some(index) = app.provisional_reasoning_index.take()
-        && index < app.timeline.len()
-    {
-        app.timeline.remove(index);
-        if let Some(text_index) = app.provisional_index {
-            app.provisional_index = text_index.checked_sub(usize::from(text_index > index));
-        }
-    }
-}
-
-fn discard_provisional(app: &mut App) {
-    let mut removed_index = None;
-    if let Some(index) = app.provisional_index.take()
-        && index < app.timeline.len()
-    {
-        app.timeline.remove(index);
-        removed_index = Some(index);
-    }
-    if let Some(removed) = removed_index
-        && let Some(reasoning_index) = app.provisional_reasoning_index
-    {
-        app.provisional_reasoning_index =
-            reasoning_index.checked_sub(usize::from(reasoning_index > removed));
-    }
-}
-
-fn event_name(kind: &EventKind) -> &'static str {
-    match kind {
-        EventKind::TaskStarted => "TaskStarted",
-        EventKind::TurnStarted { .. } => "TurnStarted",
-        EventKind::ModelRequestStarted { .. } => "ModelRequestStarted",
-        EventKind::TextDelta { .. } => "TextDelta",
-        EventKind::ReasoningDelta { .. } => "ReasoningDelta",
-        EventKind::ModelRetry { .. } => "ModelRetry",
-        EventKind::ModelCompleted { .. } => "ModelCompleted",
-        EventKind::ToolStarted { .. } => "ToolStarted",
-        EventKind::ToolCompleted { .. } => "ToolCompleted",
-        EventKind::TaskCompleted => "TaskCompleted",
-        EventKind::TaskFailed { .. } => "TaskFailed",
-        EventKind::TaskCancelled => "TaskCancelled",
-        _ => "Event",
-    }
-}
+mod events;
 
 fn handle_key(
     key: KeyEvent,
@@ -836,7 +414,7 @@ fn handle_key(
                         app.task = message.clone();
                         app.timeline.clear();
                         app.recent_events.clear();
-                        push_log(app, "›", BLUE, format!("next task · {}", message), false);
+                        events::push_log(app, "›", BLUE, format!("next task · {}", message), false);
                         let _ = commands.send(TaskCommand::Run(message, control.clone()));
                     } else {
                         control.steer(message);
@@ -914,567 +492,12 @@ fn toggle_expanded(app: &mut App) {
     }
 }
 
-fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
-    let area = frame.area();
-    frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
-    if area.width < 44 || area.height < 12 {
-        frame.render_widget(
-            Paragraph::new("Terminal too small · resize to at least 44×12")
-                .style(Style::default().fg(AMBER).bg(BG)),
-            area,
-        );
-        return;
-    }
-    let rows = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Min(6),
-        Constraint::Length(3),
-        Constraint::Length(1),
-    ])
-    .split(area);
-    draw_header(frame, rows[0], app);
-    let show_inline_sidebar = app.sidebar_visible && area.width >= 120;
-    let show_sidebar_overlay = app.sidebar_visible && (90..120).contains(&area.width);
-    let (timeline_area, sidebar_area) = if show_inline_sidebar {
-        let columns =
-            Layout::horizontal([Constraint::Min(60), Constraint::Length(36)]).split(rows[1]);
-        (columns[0], Some(columns[1]))
-    } else {
-        (rows[1], None)
-    };
-    draw_timeline(frame, timeline_area, app);
-    if let Some(sidebar) = sidebar_area {
-        draw_sidebar(frame, sidebar, app);
-    }
-    if show_sidebar_overlay {
-        let overlay = centered_rect(42, rows[1].height.saturating_sub(2), rows[1]);
-        frame.render_widget(Clear, overlay);
-        draw_sidebar(frame, overlay, app);
-    }
-    draw_composer(frame, rows[2], app);
-    draw_help(frame, rows[3], app);
-}
-
-fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let session = app
-        .session
-        .map(|id| id.to_string())
-        .unwrap_or_else(|| "opening session".into());
-    let workspace = std::env::current_dir()
-        .ok()
-        .map(|path| {
-            let rendered = path.to_string_lossy().into_owned();
-            std::env::var("HOME")
-                .map(|home| rendered.replacen(&home, "~", 1))
-                .unwrap_or(rendered)
-        })
-        .unwrap_or_else(|| "workspace".into());
-    let left = Line::from(vec![
-        Span::styled(
-            " ◆ Loom ",
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("{workspace} · {}", short_id(&session)),
-            Style::default().fg(DIM),
-        ),
-    ]);
-    let right = Line::from(vec![
-        Span::styled("● ", Style::default().fg(app.status_color)),
-        Span::styled(
-            &app.status,
-            Style::default()
-                .fg(app.status_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!("  {}", app.model), Style::default().fg(BLUE)),
-    ]);
-    let right_width = (right.width() as u16 + 1).min(area.width.saturating_sub(16));
-    let split =
-        Layout::horizontal([Constraint::Min(16), Constraint::Length(right_width)]).split(area);
-    frame.render_widget(
-        Paragraph::new(left).style(Style::default().bg(BG)),
-        split[0],
-    );
-    frame.render_widget(
-        Paragraph::new(right).alignment(ratatui::layout::Alignment::Right),
-        split[1],
-    );
-}
-
-fn draw_timeline(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    if app.timeline.is_empty() {
-        let empty = Paragraph::new(vec![
-            Line::from(Span::styled("Loom is ready", Style::default().fg(IVORY))),
-            Line::from(Span::styled(
-                "task events will appear here",
-                Style::default().fg(DIM),
-            )),
-        ])
-        .alignment(ratatui::layout::Alignment::Center)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(BORDER))
-                .style(Style::default().bg(BG)),
-        );
-        frame.render_widget(empty, area);
-        return;
-    }
-    let task = Line::from(vec![
-        Span::styled(
-            "› ",
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            &app.task,
-            Style::default().fg(IVORY).add_modifier(Modifier::BOLD),
-        ),
-    ]);
-    let mut lines = vec![task, Line::from("")];
-    for (index, item) in app.timeline.iter().enumerate() {
-        if item.marker == "●" {
-            let elapsed = format_duration(app.elapsed);
-            lines.push(Line::from(vec![
-                Span::styled("● ", Style::default().fg(AMBER)),
-                Span::styled(item.text.as_str(), Style::default().fg(DIM)),
-                Span::styled(" ───────────────────────── ", Style::default().fg(BORDER)),
-                Span::styled(
-                    format!(
-                        "{} · {elapsed}",
-                        item.detail.as_deref().unwrap_or("in progress")
-                    ),
-                    Style::default().fg(DIM),
-                ),
-            ]));
-            continue;
-        }
-        let marker_style = Style::default().fg(item.color).add_modifier(Modifier::BOLD);
-        let text_style = if item.provisional || item.italic {
-            Style::default().fg(VIOLET).add_modifier(Modifier::ITALIC)
-        } else {
-            Style::default().fg(IVORY)
-        };
-        let selected = app.selected_item == Some(index);
-        let mut spans = vec![
-            Span::styled(
-                if item.provisional { "┆ " } else { "│ " },
-                Style::default().fg(if item.provisional { DIM } else { BORDER }),
-            ),
-            Span::styled(format!("{} ", item.marker), marker_style),
-            Span::styled(item.text.as_str(), text_style),
-        ];
-        if let Some(detail) = &item.detail
-            && item.expanded
-            && item.marker != "●"
-        {
-            spans.push(Span::styled(
-                format!("  {detail}"),
-                Style::default().fg(DIM),
-            ));
-        }
-        lines.push(Line::from(spans).style(if selected {
-            Style::default().bg(PANEL)
-        } else {
-            Style::default()
-        }));
-        if item.italic && !app.show_reasoning {
-            lines.pop();
-        }
-    }
-    if app.reasoning_chars > 0 && !app.finished {
-        lines.push(Line::from(Span::styled(
-            format!("  ▸ reasoning · {} chars", app.reasoning_chars),
-            Style::default().fg(VIOLET).add_modifier(Modifier::ITALIC),
-        )));
-    }
-    let visible = area.height.saturating_sub(1) as usize;
-    let scroll = lines.len().saturating_sub(visible).min(u16::MAX as usize) as u16;
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
-        area,
-    );
-}
-
-fn draw_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let blocks = Layout::vertical([
-        Constraint::Length(5),
-        Constraint::Length(6),
-        Constraint::Length(7),
-        Constraint::Min(5),
-    ])
-    .split(area);
-    let session = app
-        .session
-        .map(|id| id.to_string())
-        .unwrap_or_else(|| "waiting".into());
-    panel(
-        frame,
-        blocks[0],
-        if app.finished { "RUN RECORD" } else { "TASK" },
-        vec![
-            styled_line(
-                &format!("{} ", status_glyph(&app.status)),
-                &app.status,
-                app.status_color,
-            ),
-            styled_line("id ", &session, DIM),
-            styled_line("run ", &format!("{:02}", app.run_id.max(1)), AMBER),
-            styled_line(
-                "wall ",
-                &format_duration(if app.finished {
-                    app.wall_time
-                } else {
-                    app.elapsed
-                }),
-                DIM,
-            ),
-        ],
-    );
-    panel(
-        frame,
-        blocks[1],
-        if app.status.starts_with("Retrying") || !app.retries_log.is_empty() {
-            "RETRY HISTORY"
-        } else {
-            "RUN SO FAR"
-        },
-        vec![
-            metric("turns", app.turns.to_string(), AMBER),
-            metric("requests", app.requests.to_string(), BLUE),
-            metric("retries", app.retries.to_string(), AMBER),
-            metric(
-                "wall",
-                format_duration(if app.finished {
-                    app.wall_time
-                } else {
-                    app.elapsed
-                }),
-                DIM,
-            ),
-            metric(
-                "tools",
-                format!(
-                    "{} ok · {} err · {} stop",
-                    app.tools_ok, app.tools_failed, app.tools_cancelled
-                ),
-                SAGE,
-            ),
-        ],
-    );
-    panel(
-        frame,
-        blocks[2],
-        "TOKENS",
-        vec![
-            metric("input", compact(app.input_tokens), IVORY),
-            metric("cached", compact(app.cached_tokens), TEAL),
-            metric("cache %", app.last_cache_pct.clone(), TEAL),
-            metric("output", compact(app.output_tokens), IVORY),
-            metric("events", app.events_seen.to_string(), DIM),
-        ],
-    );
-    let recent = if app.recent_events.is_empty() {
-        vec![Line::from(Span::styled(
-            "waiting for events…",
-            Style::default().fg(DIM),
-        ))]
-    } else {
-        app.recent_events
-            .iter()
-            .map(|event| Line::from(Span::styled(event.clone(), Style::default().fg(DIM))))
-            .collect()
-    };
-    if app.status.starts_with("Retrying") || !app.retries_log.is_empty() {
-        let retry_lines = app
-            .retries_log
-            .iter()
-            .rev()
-            .take(4)
-            .map(|record| {
-                Line::from(vec![
-                    Span::styled(
-                        format!("↻ {} · ", record.attempt),
-                        Style::default().fg(CORAL),
-                    ),
-                    Span::styled(record.kind.clone(), Style::default().fg(IVORY)),
-                    Span::styled(
-                        format!(
-                            " {} ms · {}",
-                            record.delay_ms,
-                            if record.response_started {
-                                "response started"
-                            } else {
-                                "no response"
-                            }
-                        ),
-                        Style::default().fg(AMBER),
-                    ),
-                ])
-            })
-            .collect();
-        let (attempt, maximum) = retry_progress(&app.retries_log, app.max_attempts.max(1));
-        panel(
-            frame,
-            blocks[3],
-            &format!("ATTEMPTS · {attempt} / {maximum}"),
-            retry_lines,
-        );
-    } else if app.status == "Cancelled" || app.status.starts_with("Cancelled by you") {
-        let completed = app
-            .tools
-            .iter()
-            .filter(|tool| {
-                matches!(
-                    tool.state,
-                    ToolRecordState::Success | ToolRecordState::Failed
-                )
-            })
-            .count();
-        let interrupted = app
-            .tools
-            .iter()
-            .filter(|tool| tool.state == ToolRecordState::Interrupted)
-            .count();
-        let not_run = app
-            .tools
-            .iter()
-            .filter(|tool| tool.state == ToolRecordState::NotRun)
-            .count();
-        panel(
-            frame,
-            blocks[3],
-            &format!("CANCELLATION LEDGER · {} CALLS", app.tools.len()),
-            vec![
-                metric("completed", completed.to_string(), SAGE),
-                metric("interrupted", interrupted.to_string(), AMBER),
-                metric("not run", not_run.to_string(), DIM),
-                Line::from(Span::styled(
-                    "Interrupted calls may have side effects",
-                    Style::default().fg(DIM),
-                )),
-                Line::from(Span::styled(
-                    "Previous turn results remain in the session",
-                    Style::default().fg(DIM),
-                )),
-            ],
-        );
-    } else {
-        let tool_lines: Vec<_> = app
-            .tools
-            .iter()
-            .rev()
-            .take(4)
-            .map(|tool| {
-                let (glyph, color) = match tool.state {
-                    ToolRecordState::Running => ("◌", AMBER),
-                    ToolRecordState::Success => ("✓", SAGE),
-                    ToolRecordState::Failed => ("×", CORAL),
-                    ToolRecordState::Interrupted => ("△", AMBER),
-                    ToolRecordState::NotRun => ("○", DIM),
-                };
-                Line::from(vec![
-                    Span::styled(format!("{glyph} "), Style::default().fg(color)),
-                    Span::styled(tool.name.clone(), Style::default().fg(BLUE)),
-                    Span::styled(format!(" · {}", tool.detail), Style::default().fg(DIM)),
-                ])
-            })
-            .collect();
-        panel(
-            frame,
-            blocks[3],
-            if tool_lines.is_empty() {
-                if app.finished {
-                    "FINAL EVENTS"
-                } else {
-                    "EVENTS"
-                }
-            } else {
-                "RECENT CALLS"
-            },
-            if tool_lines.is_empty() {
-                recent
-            } else {
-                tool_lines
-            },
-        );
-    }
-}
-
-fn panel(frame: &mut ratatui::Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'static>>) {
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .title(Span::styled(title, Style::default().fg(DIM)))
-                    .borders(Borders::LEFT | Borders::TOP)
-                    .border_style(Style::default().fg(BORDER))
-                    .style(Style::default().bg(PANEL)),
-            )
-            .wrap(Wrap { trim: true }),
-        area,
-    );
-}
-
-fn styled_line(label: &str, value: &str, color: Color) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(label.to_owned(), Style::default().fg(DIM)),
-        Span::styled(
-            value.to_owned(),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-    ])
-}
-
-fn metric(label: &str, value: String, color: Color) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("{label:<9}"), Style::default().fg(DIM)),
-        Span::styled(value, Style::default().fg(color)),
-    ])
-}
-
-fn compact(value: u64) -> String {
-    if value >= 1_000_000 {
-        format!("{:.1}M", value as f64 / 1_000_000.0)
-    } else if value >= 1_000 {
-        format!("{:.1}K", value as f64 / 1_000.0)
-    } else {
-        value.to_string()
-    }
-}
-
-fn draw_composer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let (title, text, color) = if app.editing {
-        (
-            "STEER · ENTER SENDS · ESC CANCELS",
-            app.input.as_str(),
-            AMBER,
-        )
-    } else if app.finished {
-        (
-            "NEXT TASK IN THIS SESSION",
-            "Session keeps completed tasks in history · i starts another",
-            app.status_color,
-        )
-    } else {
-        ("INPUT", "Task running. Press i to queue a follow-up.", DIM)
-    };
-    frame.render_widget(
-        Paragraph::new(text)
-            .style(Style::default().fg(color).bg(PANEL))
-            .block(
-                Block::default()
-                    .title(Span::styled(title, Style::default().fg(color)))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(if app.editing { AMBER } else { BORDER }))
-                    .style(Style::default().bg(PANEL)),
-            ),
-        area,
-    );
-}
-
-fn draw_help(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    if app.show_help {
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from("ONE THREAD PER TASK · SETTLED DETAILS STAY QUIET"),
-                Line::from("i steer / next task · ↑ edit last task · Enter sends · p pause at turn boundary"),
-                Line::from("Esc cancel · q cancel + exit · Ctrl-C cancel / twice exit"),
-                Line::from("↑/↓ select · Ctrl-O expand · Ctrl-R reasoning · Tab sidebar · ? help"),
-            ])
-            .block(
-                Block::default()
-                    .title("HELP")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(AMBER))
-                    .style(Style::default().bg(PANEL)),
-            )
-            .style(Style::default().fg(IVORY)),
-            centered_rect(60, 9, frame.area()),
-        );
-    }
-    let hint = if app.finished {
-        " Task finished   ·   i new task   ·   ↑ edit last task   ·   Enter send   ·   q/Esc exit   ·   ? help"
-    } else {
-        " i steer   ·   Esc cancel   ·   p pause   ·   q cancel + exit   ·   ↑/↓ select   ·   ^O expand   ·   ^R reasoning   ·   Tab sidebar   ·   ? help"
-    };
-    let footer = Line::from(vec![
-        Span::styled(hint, Style::default().fg(DIM)),
-        Span::raw("   "),
-        Span::styled(
-            format!(
-                "events {} · dropped {}",
-                app.events_seen, app.events_dropped
-            ),
-            Style::default().fg(if app.events_dropped == 0 { DIM } else { CORAL }),
-        ),
-    ]);
-    frame.render_widget(
-        Paragraph::new(footer).alignment(ratatui::layout::Alignment::Center),
-        area,
-    );
-}
-
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let width = width.min(area.width.saturating_sub(4));
-    let height = height.min(area.height.saturating_sub(2));
-    Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    }
-}
-
-fn status_glyph(status: &str) -> &'static str {
-    if std::env::var_os("LOOM_ASCII").is_some() {
-        return if status.starts_with("Completed") {
-            "+"
-        } else if status.starts_with("Failed") {
-            "x"
-        } else if status.starts_with("Cancelled") || status.starts_with("Cancelling") {
-            "/"
-        } else if status.starts_with("Retrying") {
-            "~"
-        } else if status.starts_with("Paused") {
-            "||"
-        } else {
-            "*"
-        };
-    }
-    if status.starts_with("Completed") {
-        "✓"
-    } else if status.starts_with("Failed") {
-        "×"
-    } else if status.starts_with("Cancelled") || status.starts_with("Cancelling") {
-        "⊘"
-    } else if status.starts_with("Retrying") {
-        "↻"
-    } else if status.starts_with("Paused") {
-        "Ⅱ"
-    } else {
-        "●"
-    }
-}
-
-fn retry_progress(retries: &[RetryRecord], maximum: u32) -> (u32, u32) {
-    let used = retries.last().map_or(0, |retry| retry.attempt).min(maximum);
-    (used, maximum)
-}
-
-fn format_duration(duration: Duration) -> String {
-    let seconds = duration.as_secs();
-    format!("{:02}:{:02}", seconds / 60, seconds % 60)
-}
-
-fn short_id(id: &str) -> &str {
-    id.get(..8).unwrap_or(id)
-}
+mod ui;
 
 #[cfg(test)]
 mod tests {
+    use super::events::{display_marker, reduce_event};
+    use super::ui::{retry_progress, short_id, status_glyph};
     use super::*;
     use loom_kernel::id::TaskId;
     use loom_kernel::model::StopReason;
@@ -1569,7 +592,7 @@ mod tests {
         assert_eq!(status_glyph("Completed"), "✓");
         assert_eq!(status_glyph("Failed"), "×");
         assert_eq!(status_glyph("Cancelled"), "⊘");
-        assert_eq!(format_duration(Duration::from_secs(125)), "02:05");
+        assert_eq!(ui::format_duration(Duration::from_secs(125)), "02:05");
     }
 
     #[test]

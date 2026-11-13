@@ -37,6 +37,8 @@
 //! ([`SqliteStore::acquire_lease`]) guards against a second process writing
 //! the same session.
 
+mod artifact_store;
+mod event_store;
 mod schema;
 mod store;
 
