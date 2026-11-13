@@ -297,6 +297,7 @@ async fn run_interactive(
                         Some(started_at.elapsed()),
                         Some(sink.dropped()),
                         thread_scroll_back,
+                        picker_state.selected().pricing,
                         &input,
                         &file_index,
                     );
@@ -367,6 +368,7 @@ async fn run_interactive(
                 last_elapsed,
                 last_dropped,
                 thread_scroll_back,
+                picker_state.selected().pricing,
                 &input,
                 &file_index,
             );
@@ -425,7 +427,40 @@ pub(crate) struct ModelChoice {
     pub(crate) provider: String,
     pub(crate) model: String,
     pub(crate) capabilities: Option<ModelCapabilities>,
+    pub(crate) pricing: Option<ModelPricing>,
     pub(crate) efforts: Vec<ReasoningEffort>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ModelPricing {
+    /// USD per million input tokens.
+    pub(crate) input_per_million: Option<f64>,
+    /// USD per million output tokens.
+    pub(crate) output_per_million: Option<f64>,
+}
+
+impl ModelPricing {
+    fn from_per_token(input: Option<f64>, output: Option<f64>) -> Option<Self> {
+        (input.is_some() || output.is_some()).then(|| Self {
+            input_per_million: input.map(|price| price * 1_000_000.0),
+            output_per_million: output.map(|price| price * 1_000_000.0),
+        })
+    }
+
+    #[allow(clippy::cast_precision_loss)] // estimates are inherently floating-point
+    pub(crate) fn estimate(self, input_tokens: u64, output_tokens: u64) -> Option<f64> {
+        let input_cost = match (self.input_per_million, input_tokens) {
+            (Some(rate), tokens) => rate * tokens as f64 / 1_000_000.0,
+            (None, 0) => 0.0,
+            (None, _) => return None,
+        };
+        let output_cost = match (self.output_per_million, output_tokens) {
+            (Some(rate), tokens) => rate * tokens as f64 / 1_000_000.0,
+            (None, 0) => 0.0,
+            (None, _) => return None,
+        };
+        Some(input_cost + output_cost)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -497,6 +532,7 @@ impl PickerState {
             config.provider.clone(),
             config.model.clone(),
             capabilities_for(&config.provider, &config.model),
+            None,
         );
         let mut state = Self {
             choices: vec![choice],
@@ -656,6 +692,10 @@ impl PickerState {
                                 provider.clone(),
                                 model.id.clone(),
                                 catalog.capabilities(&model.id),
+                                ModelPricing::from_per_token(
+                                    model.prompt_price,
+                                    model.completion_price,
+                                ),
                             )
                         }));
                     }
@@ -669,6 +709,10 @@ impl PickerState {
                                 provider.clone(),
                                 model.id.clone(),
                                 catalog.capabilities(&model.id),
+                                ModelPricing::from_per_token(
+                                    model.prompt_price,
+                                    model.completion_price,
+                                ),
                             )
                         }));
                     }
@@ -695,7 +739,7 @@ impl PickerState {
                 Ok(models) => {
                     choices.extend(models.into_iter().map(|model| {
                         let capabilities = capabilities_for(&provider, &model);
-                        model_choice(provider.clone(), model, capabilities)
+                        model_choice(provider.clone(), model, capabilities, None)
                     }));
                 }
                 Err(error) => failures.push(format!("{provider}: {error}")),
@@ -714,6 +758,7 @@ impl PickerState {
                 config.provider.clone(),
                 config.model.clone(),
                 capabilities,
+                None,
             ));
         }
 
@@ -846,10 +891,11 @@ impl PickerState {
     }
 }
 
-fn model_choice(
+pub(crate) fn model_choice(
     provider: String,
     model: String,
     capabilities: Option<ModelCapabilities>,
+    pricing: Option<ModelPricing>,
 ) -> ModelChoice {
     let efforts = capabilities.map_or_else(Vec::new, |capabilities| {
         capabilities
@@ -868,6 +914,7 @@ fn model_choice(
         provider,
         model,
         capabilities,
+        pricing,
         efforts,
     }
 }
@@ -1251,6 +1298,7 @@ fn draw_live(
     elapsed: Option<Duration>,
     dropped: Option<u64>,
     thread_scroll_back: usize,
+    pricing: Option<ModelPricing>,
     input_editor: &PromptEditor,
     file_index: &[String],
 ) {
@@ -1273,6 +1321,7 @@ fn draw_live(
                 dropped,
                 thread_scroll_back,
                 file_suggestions: &suggestions,
+                pricing,
                 scene: None,
             },
         );
@@ -1415,7 +1464,7 @@ mod tests {
             ("openrouter", "deepseek/deepseek-chat"),
         ]
         .into_iter()
-        .map(|(provider, model)| model_choice(provider.into(), model.into(), None))
+        .map(|(provider, model)| model_choice(provider.into(), model.into(), None, None))
         .collect();
         PickerState {
             choices,

@@ -14,7 +14,7 @@ use ratatui::{
 };
 
 use crate::{
-    PickerState,
+    ModelPricing, PickerState,
     glyphs::{self, Glyph, GlyphSet},
     reducer::Reducer,
     theme,
@@ -64,6 +64,7 @@ pub struct LiveViewOptions<'a> {
     pub dropped: Option<u64>,
     pub thread_scroll_back: usize,
     pub file_suggestions: &'a [String],
+    pub pricing: Option<ModelPricing>,
     pub scene: Option<Scene>,
 }
 
@@ -91,6 +92,7 @@ pub fn draw_live_scrolled(
         dropped,
         thread_scroll_back,
         file_suggestions,
+        pricing,
         scene,
     } = options;
     let area = design_area(frame.area());
@@ -189,7 +191,7 @@ pub fn draw_live_scrolled(
         footer[2],
     );
     if wide {
-        draw_live_sidebar(frame, body[1], reducer, elapsed, dropped, scene);
+        draw_live_sidebar(frame, body[1], reducer, elapsed, dropped, pricing, scene);
     } else if show_sidebar {
         let overlay = Rect::new(
             area.x + area.width.saturating_sub(42),
@@ -197,7 +199,7 @@ pub fn draw_live_scrolled(
             area.width.min(42),
             rows[1].height.min(12),
         );
-        draw_live_sidebar(frame, overlay, reducer, elapsed, dropped, scene);
+        draw_live_sidebar(frame, overlay, reducer, elapsed, dropped, pricing, scene);
     }
 }
 
@@ -715,7 +717,9 @@ fn draw_reducer_thread(
             let summary = tool
                 .content_head
                 .as_deref()
-                .map_or_else(String::new, |head| format!("  {head}"));
+                .map_or_else(String::new, |head| {
+                    format!("  {}", tool_result_summary(head))
+                });
             lines.push(Line::from(vec![
                 Span::styled(branch, fg(theme::DIM)),
                 Span::styled(
@@ -904,6 +908,7 @@ fn draw_live_sidebar(
     reducer: &Reducer,
     elapsed: Option<Duration>,
     dropped: Option<u64>,
+    pricing: Option<ModelPricing>,
     scene: Option<Scene>,
 ) {
     let reported = |value: Option<u64>| {
@@ -913,10 +918,11 @@ fn draw_live_sidebar(
             "not reported".to_owned()
         }
     };
-    let cost = reducer
-        .usage
-        .cost_usd
-        .map_or_else(|| "not reported".to_owned(), |value| format!("${value:.4}"));
+    let cost = if scene.is_some() {
+        Some("not reported".to_owned())
+    } else {
+        format_run_cost(reducer, pricing)
+    };
     let elapsed = elapsed.map_or_else(
         || "not available".to_owned(),
         |value| format!("{:02}:{:02}", value.as_secs() / 60, value.as_secs() % 60),
@@ -1013,7 +1019,6 @@ fn draw_live_sidebar(
             "output  {}",
             reported(Some(reducer.usage.output_tokens))
         )),
-        muted(&format!("cost    {cost}")),
         muted(&format!("elapsed {elapsed}")),
         muted(&format!(
             "tools   {}",
@@ -1025,6 +1030,12 @@ fn draw_live_sidebar(
         )),
         muted(""),
     ]);
+    if let Some(cost) = cost {
+        lines.insert(
+            lines.len().saturating_sub(3),
+            muted(&format!("cost    {cost}")),
+        );
+    }
     match scene {
         Some(Scene::Cancel) => {
             lines.push(heading("CANCELLATION LEDGER"));
@@ -1112,6 +1123,25 @@ fn draw_live_sidebar(
         (None, None) => muted("event counters not available"),
     });
     render_panel(frame, area, "run state", lines);
+}
+
+fn format_run_cost(reducer: &Reducer, pricing: Option<ModelPricing>) -> Option<String> {
+    if let Some(reported) = reducer.usage.cost_usd
+        && reported > 0.0
+    {
+        return Some(format!("${reported:.4}"));
+    }
+    if let Some(estimated) = pricing.and_then(|pricing| {
+        pricing.estimate(reducer.usage.input_tokens, reducer.usage.output_tokens)
+    }) {
+        if estimated > 0.0 {
+            return Some(format!("~${estimated:.4} est."));
+        }
+        if reducer.usage.input_tokens > 0 || reducer.usage.output_tokens > 0 {
+            return Some("$0.0000 (free)".to_owned());
+        }
+    }
+    reducer.usage.cost_usd.map(|value| format!("${value:.4}"))
 }
 
 fn render_panel(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_>>) {
@@ -1391,6 +1421,71 @@ mod tests {
         assert!(rendered.contains("live task provided by user"));
         assert!(rendered.contains("model-from-event"));
         assert!(rendered.contains("not reported"));
+        assert!(!rendered.contains("cost    "));
+    }
+
+    #[test]
+    fn live_read_file_result_shows_only_a_one_line_summary() {
+        let mut reducer = Reducer::default();
+        reducer.begin_task("inspect the file");
+        reducer.tools.insert(
+            "read-1".to_owned(),
+            crate::reducer::ToolState {
+                name: "read_file".to_owned(),
+                arguments: Some(r#"{"path":"src/lib.rs"}"#.to_owned()),
+                status: Some(loom_core::kernel::transcript::ToolStatus::Success),
+                content_head: Some(
+                    "src/lib.rs: 42 lines\n1\tfn main() {\n2\t    secret_file_content()".to_owned(),
+                ),
+            },
+        );
+        let mut terminal = Terminal::new(TestBackend::new(154, 40)).unwrap();
+        terminal
+            .draw(|frame| draw_test_live(frame, &reducer, "inspect the file"))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(rendered.contains("src/lib.rs: 42 lines"));
+        assert!(!rendered.contains("fn main()"));
+        assert!(!rendered.contains("secret_file_content"));
+    }
+
+    #[test]
+    fn run_cost_uses_catalog_per_million_prices_when_provider_cost_is_missing() {
+        let mut reducer = Reducer::default();
+        reducer.usage.input_tokens = 2_000;
+        reducer.usage.output_tokens = 1_000;
+        let pricing = ModelPricing {
+            input_per_million: Some(3.0),
+            output_per_million: Some(15.0),
+        };
+
+        assert_eq!(
+            format_run_cost(&reducer, Some(pricing)),
+            Some("~$0.0210 est.".to_owned())
+        );
+    }
+
+    #[test]
+    fn reported_run_cost_takes_precedence_over_catalog_estimate() {
+        let mut reducer = Reducer::default();
+        reducer.usage.input_tokens = 2_000;
+        reducer.usage.cost_usd = Some(0.0042);
+        let pricing = ModelPricing {
+            input_per_million: Some(3.0),
+            output_per_million: Some(15.0),
+        };
+
+        assert_eq!(
+            format_run_cost(&reducer, Some(pricing)),
+            Some("$0.0042".to_owned())
+        );
     }
 
     #[test]
@@ -1466,6 +1561,10 @@ mod tests {
         assert_eq!(
             tool_result_summary("Found README.md\nextra output"),
             "Found README.md"
+        );
+        assert_eq!(
+            tool_result_summary("src/a.rs: 42 lines\n1\tsecret_file_content"),
+            "src/a.rs: 42 lines"
         );
     }
 
