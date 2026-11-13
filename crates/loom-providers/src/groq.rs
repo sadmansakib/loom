@@ -401,6 +401,7 @@ mod tests {
             "replay must use Groq's field name"
         );
         assert!(
+            session_id: None,
             assistant.get("reasoning_content").is_none(),
             "Groq rejects reasoning_content on an assistant message"
         );

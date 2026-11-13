@@ -37,6 +37,7 @@ fn plain_request(model: &str) -> ModelRequest {
         stable_prefix_messages: None,
         context_editing: None,
         reasoning_effort: None,
+        session_id: Some("0192e4c1-7f8a-7abc-8def-0123456789ab".to_owned()),
     }
 }
 
@@ -204,6 +205,14 @@ async fn auth_headers_and_the_wire_shape_are_sent() {
     };
     assert_eq!(header("x-api-key"), "test-key");
     assert_eq!(header("anthropic-version"), "2023-06-01");
+    assert_eq!(
+        header("x-session-id"),
+        "0192e4c1-7f8a-7abc-8def-0123456789ab"
+    );
+    assert_eq!(
+        header("x-session-affinity"),
+        "0192e4c1-7f8a-7abc-8def-0123456789ab"
+    );
     let body: serde_json::Value = serde_json::from_slice(&request.body).expect("json body");
     // Anthropic requires max_tokens; the adapter fills a default.
     assert_eq!(body["max_tokens"], 8_192);

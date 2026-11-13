@@ -60,6 +60,7 @@ impl crate::context::ContextCompiler for DefaultContextCompiler {
             // the census and budget check below stay hint-blind.
             context_editing: input.config.context_editing.clone(),
             reasoning_effort: effort_for_turn(&input),
+            session_id: Some(input.session.id.to_string()),
         };
         let census = census(&request, facts_tokens, &*self.estimator);
         if census.total > input.budget.max_input_tokens {

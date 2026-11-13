@@ -110,6 +110,7 @@ fn plain_request(model: &str, prompt: &str) -> ModelRequest {
         stable_prefix_messages: None,
         context_editing: None,
         reasoning_effort: None,
+        session_id: None,
     }
 }
 

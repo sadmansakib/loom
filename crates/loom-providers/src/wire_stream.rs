@@ -96,7 +96,20 @@ pub(crate) fn stream_endpoint<'a, P: WireEndpoint>(
     let state = State::<P>::Send {
         provider: provider.clone(),
         url: provider.endpoint_url(),
-        headers: provider.extra_headers(),
+        headers: {
+            let mut headers = provider.extra_headers();
+            if let Some(session_id) = &request.session_id {
+                headers.push((
+                    reqwest::header::HeaderName::from_static("x-session-id"),
+                    session_id.clone(),
+                ));
+                headers.push((
+                    reqwest::header::HeaderName::from_static("x-session-affinity"),
+                    session_id.clone(),
+                ));
+            }
+            headers
+        },
         body: provider.request_body(request),
     };
     Box::pin(futures::stream::unfold(state, step::<P>).filter_map(

@@ -67,6 +67,7 @@ fn request_for(model: &str) -> ModelRequest {
         stable_prefix_messages: None,
         context_editing: None,
         reasoning_effort: None,
+        session_id: None,
     }
 }
 
@@ -359,6 +360,7 @@ async fn tool_results_round_trip_through_the_wire_body() {
         stable_prefix_messages: None,
         context_editing: None,
         reasoning_effort: None,
+        session_id: None,
     };
     let provider = provider_at(&server.uri());
     let _events: Vec<Result<ModelEvent, ModelError>> = provider.stream(&request).collect().await;

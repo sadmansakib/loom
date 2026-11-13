@@ -99,6 +99,7 @@ fn plain_request(prompt: &str) -> ModelRequest {
         stable_prefix_messages: None,
         context_editing: None,
         reasoning_effort: None,
+        session_id: None,
     }
 }
 
@@ -161,6 +162,7 @@ async fn effort_none_tools_two_turns() {
         stable_prefix_messages: None,
         context_editing: None,
         reasoning_effort: None,
+        session_id: None,
     };
     let events = collect(provider.stream(&turn1)).await;
     let first = expect_completed(events);
@@ -198,6 +200,7 @@ async fn effort_none_tools_two_turns() {
         stable_prefix_messages: None,
         context_editing: None,
         reasoning_effort: None,
+        session_id: None,
     };
     let events = collect(provider.stream(&turn2)).await;
     let second = expect_completed(events);
@@ -226,6 +229,7 @@ async fn effort_none_tools_two_turns() {
         stable_prefix_messages: None,
         context_editing: None,
         reasoning_effort: None,
+        session_id: None,
     };
     let events = collect(provider.stream(&turn3)).await;
     let third = expect_completed(events);
@@ -300,6 +304,7 @@ async fn parallel_calls_replay_roundtrip() {
         stable_prefix_messages: None,
         context_editing: None,
         reasoning_effort: None,
+        session_id: None,
     };
     let events = collect(provider.stream(&turn1)).await;
     let first = expect_completed(events);
@@ -337,6 +342,7 @@ async fn parallel_calls_replay_roundtrip() {
         stable_prefix_messages: None,
         context_editing: None,
         reasoning_effort: None,
+        session_id: None,
     };
     let events = collect(provider.stream(&turn2)).await;
     let second = expect_completed(events);
@@ -359,6 +365,7 @@ async fn invalid_model_error_body() {
         stable_prefix_messages: None,
         context_editing: None,
         reasoning_effort: None,
+        session_id: None,
     };
     let events = collect(provider.stream(&request)).await;
     let error = events

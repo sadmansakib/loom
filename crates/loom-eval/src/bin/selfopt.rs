@@ -237,6 +237,7 @@ fn model_proposals(
             stable_prefix_messages: None,
             context_editing: None,
             reasoning_effort: None,
+            session_id: None,
         };
         let mut stream = handle.provider.stream(&request);
         let mut text = String::new();

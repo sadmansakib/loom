@@ -51,6 +51,7 @@ impl Agent {
             // schedule applies (compression, not reasoning work).
             context_editing: None,
             reasoning_effort: None,
+            session_id: Some(session.id.to_string()),
         };
         let response = self
             .stream_with_retry(&request, task_id, sink, cancellation, accounting)

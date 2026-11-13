@@ -414,6 +414,8 @@ mod tests {
                     tool_calls: true,
                     parallel_tool_calls: true,
                     reasoning: true,
+                    supported_efforts: &[],
+                    can_disable_thinking: false,
                 })
             } else {
                 None
@@ -432,6 +434,33 @@ mod tests {
         assert!(provider.capabilities("known").is_some());
         // Unknown model -> None (agent fails before the first request).
         assert!(provider.capabilities("nope").is_none());
+    }
+
+    #[test]
+    fn model_capabilities_effort_metadata_defaults_conservatively_and_builds() {
+        const EFFORTS: &[ReasoningEffort] = &[
+            ReasoningEffort::None,
+            ReasoningEffort::Low,
+            ReasoningEffort::High,
+            ReasoningEffort::Max,
+        ];
+        let defaults = ModelCapabilities::new(32_000);
+        assert_eq!(defaults.supported_efforts, []);
+        assert!(!defaults.can_disable_thinking);
+
+        let capabilities = defaults
+            .with_supported_efforts(EFFORTS)
+            .with_can_disable_thinking(true);
+        assert_eq!(capabilities.supported_efforts, EFFORTS);
+        assert!(capabilities.can_disable_thinking);
+    }
+
+    #[test]
+    fn reasoning_effort_strings_cover_picker_values() {
+        assert_eq!(ReasoningEffort::None.as_str(), "none");
+        assert_eq!(ReasoningEffort::Low.as_str(), "low");
+        assert_eq!(ReasoningEffort::High.as_str(), "high");
+        assert_eq!(ReasoningEffort::Max.as_str(), "max");
     }
 
     #[test]
@@ -484,6 +513,7 @@ mod tests {
             stable_prefix_messages: None,
             context_editing: None,
             reasoning_effort: Some(ReasoningEffort::High),
+            session_id: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         let back: ModelRequest = serde_json::from_str(&json).unwrap();
@@ -520,6 +550,7 @@ mod tests {
                 exclude_tools: vec![String::from("scout")],
             }),
             reasoning_effort: Some(ReasoningEffort::Medium),
+            session_id: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         let back: ModelRequest = serde_json::from_str(&json).unwrap();
@@ -540,6 +571,7 @@ mod tests {
             stable_prefix_messages: Some(2),
             context_editing: None,
             reasoning_effort: None,
+            session_id: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(!json.contains("context_editing"));

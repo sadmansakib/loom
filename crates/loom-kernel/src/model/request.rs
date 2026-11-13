@@ -133,6 +133,11 @@ pub struct ModelRequest {
 ///
 /// Names carry *intent*, never provider wire details — the Anthropic
 /// adapter is the only place these become
+    /// Durable conversation identity for provider-side routing and
+    /// correlation. Adapters send this as both `x-session-id` and
+    /// `x-session-affinity` when present. Direct one-off requests may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 /// `context_management.edits[clear_tool_uses_20250919]` (plus its beta
 /// header). Every knob maps one-to-one onto that strategy today, which
 /// is why the struct is provider-agnostic without being vague: an

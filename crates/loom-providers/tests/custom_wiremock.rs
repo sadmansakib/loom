@@ -44,6 +44,7 @@ fn request_for(model: &str) -> ModelRequest {
         stable_prefix_messages: None,
         context_editing: None,
         reasoning_effort: None,
+        session_id: Some("0192e4c1-7f8a-7abc-8def-0123456789ab".to_owned()),
     }
 }
 
@@ -338,6 +339,11 @@ async fn config_headers_ride_on_the_wire() {
     };
     assert_eq!(get("x-title"), "loom eval");
     assert_eq!(get("x-loom-run-id"), "django__django-11239");
+    assert_eq!(get("x-session-id"), "0192e4c1-7f8a-7abc-8def-0123456789ab");
+    assert_eq!(
+        get("x-session-affinity"),
+        "0192e4c1-7f8a-7abc-8def-0123456789ab"
+    );
     assert!(get("user-agent").starts_with("loom/"));
 }
 

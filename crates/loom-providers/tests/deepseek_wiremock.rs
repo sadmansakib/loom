@@ -87,6 +87,7 @@ fn plain_request() -> ModelRequest {
         stable_prefix_messages: None,
         context_editing: None,
         reasoning_effort: None,
+        session_id: None,
     }
 }
 

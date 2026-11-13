@@ -45,6 +45,7 @@ fn request() -> ModelRequest {
         stable_prefix_messages: None,
         context_editing: None,
         reasoning_effort: None,
+        session_id: None,
     }
 }
 
@@ -134,6 +135,7 @@ async fn ping_only_anthropic_stream_trips_the_content_stall_window() {
         stable_prefix_messages: None,
         context_editing: None,
         reasoning_effort: None,
+        session_id: None,
     };
     let mut stream = provider.stream(&request);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);

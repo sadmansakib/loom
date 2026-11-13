@@ -121,6 +121,7 @@ impl ModelProvider for AnthropicProvider {
     fn stream<'a>(&'a self, request: &'a ModelRequest) -> ModelStream<'a> {
         let state = State::Send {
             provider: self.clone(),
+            session_id: request.session_id.clone(),
             body: build_request_body(request),
         };
         Box::pin(futures::stream::unfold(state, step).filter_map(
@@ -176,6 +177,7 @@ enum State {
     /// Request built, not yet sent.
     Send {
         provider: AnthropicProvider,
+        session_id: Option<String>,
         body: serde_json::Value,
     },
     /// Headers received; body streaming. `pending` holds display
@@ -203,7 +205,11 @@ enum State {
 #[allow(clippy::too_many_lines)]
 async fn step(state: State) -> Option<(Result<Option<ModelEvent>, ModelError>, State)> {
     match state {
-        State::Send { provider, body } => {
+        State::Send {
+            provider,
+            session_id,
+            body,
+        } => {
             let timeouts = provider.config.timeouts;
             let mut headers = vec![
                 (
@@ -215,6 +221,16 @@ async fn step(state: State) -> Option<(Result<Option<ModelEvent>, ModelError>, S
                     ANTHROPIC_VERSION.to_owned(),
                 ),
             ];
+            if let Some(session_id) = session_id {
+                headers.push((
+                    reqwest::header::HeaderName::from_static("x-session-id"),
+                    session_id.clone(),
+                ));
+                headers.push((
+                    reqwest::header::HeaderName::from_static("x-session-affinity"),
+                    session_id.clone(),
+                ));
+            }
             // Server-side context editing rides a dated beta header;
             // detection is on the built body so the header can never
             // drift from the `context_management` key it serves.
