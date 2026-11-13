@@ -77,13 +77,13 @@ mod tests {
         let dir = tempdir();
         let root = dir.path();
         // Missing store: empty.
-        assert!(scan_lessons(root).is_empty());
+        assert_eq!(scan_lessons(root).len(), 0);
 
         let loom = root.join(".loom");
         fs::create_dir_all(&loom).unwrap();
         // Corrupt JSON: empty.
         fs::write(loom.join("lessons.json"), "not json").unwrap();
-        assert!(scan_lessons(root).is_empty());
+        assert_eq!(scan_lessons(root).len(), 0);
 
         // Dead entry (below thresholds) and unknown failure kind are
         // dropped; the live entry survives.
@@ -155,7 +155,7 @@ mod tests {
 
         // Default source: the frozen protocol is unchanged — no lessons.
         let default = FsFactsSource::new(root).scan();
-        assert!(default.lessons.is_empty());
+        assert_eq!(default.lessons.len(), 0);
 
         // Opted in: the store rides the block.
         let opted = FsFactsSource::new(root).with_lessons(true).scan();
@@ -197,7 +197,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(scan_skills(root).is_empty());
+        assert_eq!(scan_skills(root).len(), 0);
     }
 
     #[test]
@@ -337,7 +337,7 @@ mod tests {
         let facts = scan(dir.path());
         assert_eq!(facts.languages, vec!["Go".to_owned()]);
         assert!(facts.git.branch.is_none());
-        assert!(facts.git.changed_files.is_empty());
+        assert_eq!(facts.git.changed_files.len(), 0);
     }
 
     #[test]

@@ -145,8 +145,7 @@ impl McpServerProcess {
     pub fn stderr_tail(&self) -> String {
         self.stderr_tail
             .lock()
-            .map(|tail| String::from_utf8_lossy(&tail).into_owned())
-            .unwrap_or_default()
+            .map_or_default(|tail| String::from_utf8_lossy(&tail).into_owned())
     }
 }
 

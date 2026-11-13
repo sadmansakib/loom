@@ -50,7 +50,7 @@ async fn replaces_unique_occurrence() {
         output.content
     );
     assert_eq!(output.effects.files_written, vec!["f.rs".to_string()]);
-    assert!(output.effects.repairs.is_empty());
+    assert_eq!(output.effects.repairs.len(), 0);
     assert_eq!(
         std::fs::read_to_string(guard.path().join("f.rs")).expect("read"),
         "fn add() { 1 }\n"

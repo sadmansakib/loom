@@ -246,8 +246,7 @@ pub fn apply_boundary_restore(
 ) -> Result<PathBuf> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_millis())
-        .unwrap_or_default();
+        .map_or_default(|since| since.as_millis());
     // `.files` directories hold per-file copies; `.patch` files (tier 1)
     // never collide with them.
     let snapshot_dir = plan

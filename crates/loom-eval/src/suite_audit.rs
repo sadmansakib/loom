@@ -591,7 +591,10 @@ index 333..444 100644
         let mutants = mutant_patches(TWO_FILE_PATCH);
         assert_eq!(mutants.len(), 3);
         assert!(mutants.iter().all(|m| count_hunks(m) == 2));
-        assert!(mutant_patches("@@ -1,1 +1,2 @@\n+x\n").is_empty());
+        assert_eq!(
+            mutant_patches("@@ -1,1 +1,2 @@\n+x\n"),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -710,8 +713,8 @@ index 333..444 100644
         assert!(!weak.weak_reasons.contains_key("org/two-2"));
         assert!(weak.unconfirmed, "no official mutant verdict supplied");
         assert_eq!(weak.weak_unassessed_ids, vec!["org/one-1".to_owned()]);
-        assert!(weak.weak_confirmed_ids.is_empty());
-        assert!(weak.weak_refuted_ids.is_empty());
+        assert_eq!(weak.weak_confirmed_ids, [] as [std::string::String; 0]);
+        assert_eq!(weak.weak_refuted_ids, [] as [std::string::String; 0]);
         assert_eq!(weak.method_version, "1");
         assert_eq!(weak.dataset_sha256, "0".repeat(64));
         assert_eq!(
@@ -728,8 +731,8 @@ index 333..444 100644
         let weak = sweep_weak_suite_with_results(audit.as_bytes(), Some(results.as_bytes()), &ids)
             .expect("matching complete re-grade");
         assert_eq!(weak.weak_refuted_ids, vec!["org/one-1".to_owned()]);
-        assert!(weak.weak_confirmed_ids.is_empty());
-        assert!(weak.weak_inconclusive_ids.is_empty());
+        assert_eq!(weak.weak_confirmed_ids, [] as [std::string::String; 0]);
+        assert_eq!(weak.weak_inconclusive_ids, [] as [std::string::String; 0]);
         assert_eq!(weak.weak_unassessed_ids, vec!["org/three-3".to_owned()]);
         assert!(weak.unconfirmed, "single-hunk hypotheses are unassessed");
         assert_eq!(
@@ -796,7 +799,7 @@ index 333..444 100644
         let bytes = audit_artifact_json();
         let weak = sweep_weak_suite(bytes.as_bytes(), &["org/other-9".to_owned()])
             .expect("audit artifact readable");
-        assert!(weak.weak_ids.is_empty());
+        assert_eq!(weak.weak_ids, [] as [std::string::String; 0]);
         assert!(weak.weak_reasons.is_empty());
         assert_eq!(weak.weak_total, 2);
     }

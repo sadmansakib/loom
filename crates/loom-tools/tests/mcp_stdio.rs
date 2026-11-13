@@ -416,7 +416,7 @@ fn bad_command_degrades_to_zero_tools() {
     )
     .unwrap();
     let names: Vec<String> = attach(&dir).into_iter().map(|(n, _)| n).collect();
-    assert!(names.is_empty());
+    assert_eq!(names, [] as [std::string::String; 0]);
 }
 
 #[test]

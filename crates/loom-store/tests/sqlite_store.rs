@@ -484,7 +484,10 @@ fn a_session_without_events_still_loads_and_reads_empty() {
     // The additive seam: no event rows, no change to the session load.
     let loaded = store.load(&id).unwrap().expect("session present");
     assert_eq!(loaded.transcript.len(), 1);
-    assert!(store.load_events(&id).unwrap().is_empty());
+    assert_eq!(
+        store.load_events(&id).unwrap(),
+        [] as [loom_kernel::event::EventEnvelope; 0]
+    );
 }
 
 #[test]
@@ -521,7 +524,7 @@ fn fork_copies_a_prefix_keeps_indices_and_records_lineage() {
     let forked = store.load(&fork_id).unwrap().expect("forked session");
     assert_eq!(forked.transcript.len(), 2);
     assert_eq!(forked.transcript[0], user, "indices survive the copy");
-    assert!(forked.tasks.is_empty(), "task records stay with the source");
+    assert_eq!(forked.tasks.len(), 0, "task records stay with the source");
     assert_eq!(store.fork_of(&fork_id).unwrap(), Some(provenance));
     assert_eq!(store.fork_of(&id).unwrap(), None);
 
@@ -675,7 +678,10 @@ fn a_v1_database_migrates_in_place_and_keeps_its_sessions() {
     assert_eq!(ids.len(), 1);
     let loaded = store.load(&ids[0]).unwrap().expect("old session loads");
     assert_eq!(loaded.transcript.len(), 1, "the v1 rows survived");
-    assert!(store.load_events(&ids[0]).unwrap().is_empty());
+    assert_eq!(
+        store.load_events(&ids[0]).unwrap(),
+        [] as [loom_kernel::event::EventEnvelope; 0]
+    );
 
     // The migrated table accepts events.
     store.ensure_session(&ids[0]).unwrap();

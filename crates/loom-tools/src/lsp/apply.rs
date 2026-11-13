@@ -44,9 +44,6 @@ use loom_kernel::tool::{BeforeImage, ToolEffects};
 use crate::lsp::client::LspServer;
 use crate::pre_image::capture_before_image;
 
-/// Converts an LSP range (zero-based line/character, utf-16 chars by
-/// default) into byte offsets against the current file text.
-
 /// One fully validated, not-yet-performed operation. Overwrite and
 /// ignore-if-not-exists flags are resolved at plan time (errors there,
 /// skips never become ops), so the op carries only what IO needs.

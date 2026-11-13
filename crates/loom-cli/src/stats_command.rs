@@ -76,8 +76,7 @@ pub fn run(args: &StatsArgs) -> anyhow::Result<ExitCode> {
             "no stored sessions{} in {} — run `loom run` first",
             args.session
                 .as_deref()
-                .map(|f| format!(" matching `{f}`"))
-                .unwrap_or_default(),
+                .map_or_default(|f| format!(" matching `{f}`")),
             path.display()
         );
         return Ok(ExitCode::SUCCESS);

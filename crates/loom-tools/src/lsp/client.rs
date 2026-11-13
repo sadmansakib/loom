@@ -91,16 +91,14 @@ impl LspServer {
         self.state
             .diagnostics
             .lock()
-            .map(|m| m.get(path).cloned().unwrap_or_default())
-            .unwrap_or_default()
+            .map_or_default(|m| m.get(path).cloned().unwrap_or_default())
     }
 
     /// Files currently open (didOpen sent) — exposed for tests.
     pub fn open_file_paths(&self) -> Vec<String> {
         self.open_files
             .lock()
-            .map(|m| m.keys().cloned().collect())
-            .unwrap_or_default()
+            .map_or_default(|m| m.keys().cloned().collect())
     }
 
     /// Language id for a file path, from the table's suffix map.

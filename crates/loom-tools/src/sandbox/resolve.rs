@@ -162,17 +162,7 @@ impl Sandbox {
     /// platform has no wrapper at all — a fact the trace surfaces as a
     /// `sandbox.passthrough` notice rather than a silent difference.
     pub(crate) fn confined(&self) -> bool {
-        if !self.grants.enabled {
-            return false;
-        }
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        {
-            true
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            false
-        }
+        self.grants.enabled && cfg!(any(target_os = "macos", target_os = "linux"))
     }
 
     /// Wraps `program args...` into the sandbox wrapper's argv, or

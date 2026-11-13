@@ -438,7 +438,7 @@ fn recent_assistant_text_is_never_elided() {
         .compile(input(&session, None))
         .expect("compiles");
     let checkpoint = compiled.prune_checkpoint.as_ref().expect("fired");
-    assert!(checkpoint.elided_assistant_text.is_empty());
+    assert_eq!(checkpoint.elided_assistant_text.as_slice(), &[] as &[usize]);
     assert!(
         messages_serialized(&compiled.request.messages).contains(&"x".repeat(220)),
         "recent prose intact"

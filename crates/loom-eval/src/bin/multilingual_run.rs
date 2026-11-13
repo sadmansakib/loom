@@ -66,10 +66,7 @@ fn csv(value: &str) -> Vec<String> {
 }
 
 fn env_csv(name: &str) -> Vec<String> {
-    std::env::var(name)
-        .ok()
-        .map(|v| csv(&v))
-        .unwrap_or_default()
+    std::env::var(name).ok().map_or_default(|v| csv(&v))
 }
 
 fn usage() -> ! {

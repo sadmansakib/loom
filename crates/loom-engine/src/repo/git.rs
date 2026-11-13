@@ -12,9 +12,8 @@ pub(super) fn git_state(root: &Path) -> GitState {
     let branch = run_git(root, &["rev-parse", "--abbrev-ref", "HEAD"])
         .map(|out| out.trim().to_owned())
         .filter(|branch| !branch.is_empty());
-    let changed_files = run_git(root, &["status", "--porcelain"])
-        .map(|out| parse_porcelain(&out))
-        .unwrap_or_default();
+    let changed_files =
+        run_git(root, &["status", "--porcelain"]).map_or_default(|out| parse_porcelain(&out));
     GitState::new(branch, changed_files)
 }
 

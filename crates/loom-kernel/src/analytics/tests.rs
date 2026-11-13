@@ -335,7 +335,7 @@ fn an_empty_transcript_yields_zeroed_stats() {
     assert_eq!(stats.turns, 0);
     assert_eq!(stats.totals.calls, 0);
     assert!(stats.tools.is_empty());
-    assert!(stats.spills.is_empty());
+    assert_eq!(stats.spills, Vec::new());
 }
 
 #[test]
@@ -397,7 +397,7 @@ fn sessions_overview_filters_by_id_substring() {
     assert_eq!(overview.rows[0].id, only.id);
 
     let none = sessions_overview(&store, Some("no-such-id")).unwrap();
-    assert!(none.rows.is_empty());
+    assert_eq!(none.rows, Vec::new());
     assert_eq!(none.totals.turns, 0);
 }
 

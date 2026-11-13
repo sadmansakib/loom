@@ -74,7 +74,7 @@ fn before_images_round_trip_and_default_for_old_transcripts() {
         "repairs": [],
     });
     let effects: ToolEffects = serde_json::from_value(legacy).expect("legacy effects parse");
-    assert!(effects.before_images.is_empty());
+    assert_eq!(effects.before_images, Vec::new());
 
     // A captured image and an absent-file image both survive a
     // round trip verbatim — the absent one is a positive claim

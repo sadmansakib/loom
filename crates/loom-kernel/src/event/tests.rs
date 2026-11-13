@@ -170,7 +170,7 @@ fn surfaced_decisions_serialize_and_round_trip() {
             schema_version: EVENT_SCHEMA_VERSION,
             sequence: 7,
             task_id: TaskId::new(),
-            kind: kind.clone(),
+            kind,
         };
         let value = serde_json::to_value(&envelope).expect("serializes");
         assert_eq!(value["kind"]["type"], tag);

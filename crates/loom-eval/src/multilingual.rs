@@ -615,7 +615,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].fail_to_pass, ["a::b"]);
         assert_eq!(rows[1].fail_to_pass, ["c"]);
-        assert!(rows[1].pass_to_pass.is_empty());
+        assert_eq!(rows[1].pass_to_pass, [] as [std::string::String; 0]);
         assert_eq!(rows[0].version, "");
         assert_eq!(rows[0].hints_text, "");
         // The scorer-side extras arrive and are skipped without error.

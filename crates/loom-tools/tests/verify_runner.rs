@@ -205,7 +205,7 @@ fn fused_verify_runs_through_the_declared_runner() {
         output.content
     );
     // Two effects: the file write and the runner command.
-    assert!(!output.effects.files_written.is_empty());
+    assert_ne!(output.effects.files_written, [] as [std::string::String; 0]);
     assert_eq!(output.effects.commands_run.len(), 1);
     assert!(
         output

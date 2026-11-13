@@ -81,6 +81,10 @@ pub(crate) enum ToolRecordState {
 }
 
 #[derive(Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent UI toggles and lifecycle flags are intentionally explicit"
+)]
 pub(crate) struct App {
     pub(crate) task: String,
     pub(crate) model: String,
@@ -127,6 +131,9 @@ pub(crate) struct App {
 }
 
 /// Run the official interactive terminal frontend.
+///
+/// # Errors
+/// Returns an error if terminal setup, task-thread startup, or event polling fails.
 pub fn run() -> anyhow::Result<()> {
     let (provider, model, task) = parse_args()?;
     let (sink, mut event_rx) = ChannelEventSink::new();
@@ -144,10 +151,10 @@ pub fn run() -> anyhow::Result<()> {
                 provider,
                 model,
                 task,
-                sink,
+                &sink,
                 worker_control,
                 &worker_tx,
-                command_rx,
+                &command_rx,
             );
         })
         .context("start Loom task thread")?;
@@ -219,10 +226,10 @@ fn run_session(
     provider: String,
     model: String,
     task: String,
-    sink: ChannelEventSink,
+    sink: &ChannelEventSink,
     control: TaskControl,
     messages: &mpsc::Sender<WorkerMessage>,
-    commands: mpsc::Receiver<TaskCommand>,
+    commands: &mpsc::Receiver<TaskCommand>,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -242,12 +249,12 @@ fn run_session(
             base_url: None,
             models_url: None,
             headers: Vec::new(),
-            reasoning_effort: Default::default(),
+            reasoning_effort: loom_core::ReasoningEffort::default(),
             account: None,
             workspace: std::env::current_dir().map_err(|error| error.to_string())?,
             system_prompt: None,
             max_turns: 50,
-            turn_budget: Default::default(),
+            turn_budget: loom_kernel::agent::TurnBudget::default(),
             context_editing: None,
             db_path: loom_core::paths::db_path(),
             persist: false,
@@ -281,13 +288,13 @@ fn run_session(
     let mut next = Some((task, control));
     while let Some((task, control)) = next.take() {
         let result = runtime
-            .block_on(engine.run_task(&mut session, task, &sink, &control))
+            .block_on(engine.run_task(&mut session, task, &sink.clone(), &control))
             .map_err(|error| error.to_string());
         let _ = messages.send(WorkerMessage::Finished(result));
         match commands.recv() {
-            Ok(TaskCommand::Run(task, control)) => {
+            Ok(TaskCommand::Run(task, next_control)) => {
                 let _ = messages.send(WorkerMessage::Started(session.id));
-                next = Some((task, control));
+                next = Some((task, next_control));
             }
             Ok(TaskCommand::Shutdown) | Err(_) => break,
         }
@@ -343,6 +350,14 @@ fn drain_worker(receiver: &mpsc::Receiver<WorkerMessage>, app: &mut App) {
 
 mod events;
 
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "terminal backends may add key codes; unhandled keys are ignored"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "central key dispatch keeps modal and task-control precedence explicit"
+)]
 fn handle_key(
     key: KeyEvent,
     app: &mut App,
@@ -411,10 +426,10 @@ fn handle_key(
                         app.current_turn_index = None;
                         app.provisional_index = None;
                         app.provisional_reasoning_index = None;
-                        app.task = message.clone();
+                        app.task.clone_from(&message);
                         app.timeline.clear();
                         app.recent_events.clear();
-                        events::push_log(app, "›", BLUE, format!("next task · {}", message), false);
+                        events::push_log(app, "›", BLUE, format!("next task · {message}"), false);
                         let _ = commands.send(TaskCommand::Run(message, control.clone()));
                     } else {
                         control.steer(message);
@@ -462,7 +477,7 @@ fn handle_key(
             app.status_color = AMBER;
         }
         KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter if app.finished => {
-            app.quit_after_finish = true
+            app.quit_after_finish = true;
         }
         KeyCode::Tab => app.sidebar_visible = !app.sidebar_visible,
         KeyCode::Char('?') => app.show_help = !app.show_help,

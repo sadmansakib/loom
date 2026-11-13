@@ -2596,7 +2596,10 @@ async fn record_fast_path_books_a_zero_request_completion() {
         Item::Assistant(message) => {
             assert!(message.content.contains("parse_options"));
             assert_eq!(message.stop_reason, StopReason::EndTurn);
-            assert!(message.tool_calls.is_empty());
+            assert_eq!(
+                message.tool_calls,
+                [] as [loom_kernel::transcript::ToolCall; 0]
+            );
         }
         other => panic!("expected an assistant item, got {other:?}"),
     }

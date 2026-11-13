@@ -23,7 +23,7 @@ use loom_providers::{self, CustomCatalog, OpenRouterCatalog};
 use crate::engine::EngineError;
 
 /// How long a fetched catalog is considered fresh.
-const CATALOG_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const CATALOG_TTL: Duration = Duration::from_hours(24);
 
 /// Catalog fetch budgets: a `/models` list is one small JSON response,
 /// not a minutes-long stream — a wedged gateway must not hold an

@@ -90,10 +90,7 @@ impl LspInner {
 }
 
 pub(super) fn recent_changes(ctx: &ToolContext) -> Vec<String> {
-    ctx.recent_changes
-        .lock()
-        .map(|c| c.clone())
-        .unwrap_or_default()
+    ctx.recent_changes.lock().map_or_default(|c| c.clone())
 }
 
 #[derive(Deserialize, JsonSchema)]

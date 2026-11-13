@@ -204,7 +204,7 @@ async fn free_model_plain_roundtrip() {
     let Some(completed) = free_completed(events) else {
         return;
     };
-    assert!(!completed.message.content.is_empty());
+    assert_ne!(completed.message.content, "");
     assert!(completed.usage.input_tokens > 0);
     assert!(completed.usage.output_tokens > 0);
     // Free usage reports zero or nothing at all — never a charge.

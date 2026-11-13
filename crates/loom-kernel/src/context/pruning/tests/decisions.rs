@@ -123,7 +123,7 @@ fn a_compile_below_every_trigger_reports_no_stubbed_calls() {
         .compile(input(&session, None))
         .expect("compiles");
     assert!(compiled.prune_checkpoint.is_none());
-    assert!(compiled.stubbed_calls.is_empty());
+    assert_eq!(compiled.stubbed_calls.as_slice(), &[] as &[String]);
 }
 
 /// A tiny old read reclaims less than `min_reclaim_tokens`, so the

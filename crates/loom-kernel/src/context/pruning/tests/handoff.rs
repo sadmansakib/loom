@@ -119,5 +119,5 @@ fn old_checkpoint_json_defaults_handoff_none() {
     let checkpoint: PruneCheckpoint =
         serde_json::from_value(legacy).expect("legacy checkpoint replays");
     assert_eq!(checkpoint.handoff, None);
-    assert!(checkpoint.elided_assistant_text.is_empty());
+    assert_eq!(checkpoint.elided_assistant_text.as_slice(), &[] as &[usize]);
 }

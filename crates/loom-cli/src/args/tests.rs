@@ -146,7 +146,7 @@ fn provider_subcommands_parse() {
             assert_eq!(name, "orcarouter");
             assert_eq!(base_url, "https://api.orcarouter.ai/v1");
             assert_eq!(models_url, None);
-            assert!(headers.is_empty());
+            assert_eq!(headers.len(), 0);
         }
         ProviderCommand::List | ProviderCommand::Remove { .. } => panic!("expected `add`"),
     }
@@ -303,7 +303,7 @@ fn chat_takes_an_optional_task_and_shares_the_run_flags() {
     let Command::Chat(args) = cli.command else {
         panic!("expected `chat`");
     };
-    assert!(args.task.is_empty());
+    assert_eq!(args.task.len(), 0);
     assert_eq!(args.flags.provider, "glm");
     assert!(args.flags.json);
 

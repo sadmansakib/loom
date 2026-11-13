@@ -44,8 +44,7 @@ fn login(auth: &Auth, args: &LoginArgs) -> anyhow::Result<()> {
         account
             .last4
             .as_deref()
-            .map(|last4| format!(" ...{last4}"))
-            .unwrap_or_default()
+            .map_or_default(|last4| format!(" ...{last4}"))
     );
     Ok(())
 }
@@ -69,8 +68,7 @@ fn list(auth: &Auth, args: &ListArgs) -> anyhow::Result<()> {
                 account
                     .last4
                     .as_deref()
-                    .map(|last4| format!("...{last4}"))
-                    .unwrap_or_default(),
+                    .map_or_default(|last4| format!("...{last4}")),
             );
         }
     }

@@ -29,8 +29,8 @@ pub(super) async fn program_ok(
     let rule = policy.rule(program);
     let limits = ExecLimits {
         stream_window: rule.and_then(|rule| rule.max_output_bytes),
-        scrub: rule.map(|rule| rule.env_scrub.clone()).unwrap_or_default(),
-        env_allow: rule.map(|rule| rule.env_allow.clone()).unwrap_or_default(),
+        scrub: rule.map_or_default(|rule| rule.env_scrub.clone()),
+        env_allow: rule.map_or_default(|rule| rule.env_allow.clone()),
     };
     let grants = SandboxGrants::from_rule(rule);
     let sandbox = Sandbox::resolve(workspace, grants);
@@ -68,8 +68,8 @@ pub(super) async fn program_output(
     let rule = policy.rule(program);
     let limits = ExecLimits {
         stream_window: rule.and_then(|rule| rule.max_output_bytes),
-        scrub: rule.map(|rule| rule.env_scrub.clone()).unwrap_or_default(),
-        env_allow: rule.map(|rule| rule.env_allow.clone()).unwrap_or_default(),
+        scrub: rule.map_or_default(|rule| rule.env_scrub.clone()),
+        env_allow: rule.map_or_default(|rule| rule.env_allow.clone()),
     };
     let grants = SandboxGrants::from_rule(rule);
     let sandbox = Sandbox::resolve(workspace, grants);

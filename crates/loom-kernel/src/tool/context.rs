@@ -261,8 +261,7 @@ impl ToolContext {
     pub fn recent_changes(&self) -> Vec<String> {
         self.recent_changes
             .lock()
-            .map(|paths| paths.clone())
-            .unwrap_or_default()
+            .map_or_default(|paths| paths.clone())
     }
 
     /// Records a completed call's file effects so calls later in the same

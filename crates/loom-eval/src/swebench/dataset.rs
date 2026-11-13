@@ -299,7 +299,7 @@ fn dataset_parses_both_test_list_encodings() {
     assert_eq!(instances[0].fail_to_pass, ["test_one::fails"]);
     assert_eq!(instances[0].pass_to_pass, ["test_two::passes"]);
     assert_eq!(instances[1].fail_to_pass, ["test_a"]);
-    assert!(instances[1].pass_to_pass.is_empty());
+    assert_eq!(instances[1].pass_to_pass, [] as [std::string::String; 0]);
     // Optional fields default rather than reject.
     assert_eq!(instances[1].hints_text, "");
     assert_eq!(instances[1].patch, "");

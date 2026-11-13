@@ -91,8 +91,7 @@ fn expect_completed(events: Vec<Result<ModelEvent, ModelError>>) -> ModelRespons
             .message
             .reasoning
             .as_ref()
-            .map(|r| r.text.as_str())
-            .unwrap_or_default()
+            .map_or_default(|r| r.text.as_str())
     );
     println!("usage:        {:?}", completed.usage);
     println!("cost_usd:     {:?}", completed.usage.cost_usd);
@@ -148,7 +147,7 @@ async fn plain_roundtrip_reports_reasoning_and_usage() {
     let request = plain_request(&model, "Reply with exactly one word: pong");
     let events = collect(provider.stream(&request)).await;
     let completed = expect_completed(events);
-    assert!(!completed.message.content.is_empty());
+    assert_ne!(completed.message.content, "");
     assert!(completed.usage.input_tokens > 0);
     assert!(completed.usage.output_tokens > 0);
     // The free plan is unbilled, so a charge would be an upstream change

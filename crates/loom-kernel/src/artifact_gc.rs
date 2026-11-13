@@ -279,7 +279,7 @@ mod tests {
         .unwrap();
         assert_eq!(report.scanned, 0);
         assert_eq!(report.referenced, 0);
-        assert!(report.deleted.is_empty());
+        assert_eq!(report.deleted, Vec::new());
         assert_eq!(report.bytes_before, 0);
         assert_eq!(report.bytes_after, 0);
     }
@@ -309,7 +309,7 @@ mod tests {
         let report = collect(&artifacts, &referenced, now, bounds).unwrap();
         assert_eq!(report.scanned, 1);
         assert_eq!(report.referenced, 1);
-        assert!(report.deleted.is_empty());
+        assert_eq!(report.deleted, Vec::new());
         assert!(artifacts.get(&id).unwrap().is_some());
     }
 
@@ -348,7 +348,7 @@ mod tests {
             GcBounds::default(),
         )
         .unwrap();
-        assert!(report.deleted.is_empty());
+        assert_eq!(report.deleted, Vec::new());
         assert!(artifacts.get(&id).unwrap().is_some());
     }
 
@@ -389,7 +389,7 @@ mod tests {
             max_total_bytes: 1,
         };
         let report = collect(&artifacts, &referenced, now_millis(), bounds).unwrap();
-        assert!(report.deleted.is_empty());
+        assert_eq!(report.deleted, Vec::new());
         assert!(artifacts.get(&id).unwrap().is_some());
     }
 
@@ -410,7 +410,7 @@ mod tests {
         };
         let now = now_millis() + bounds.max_age_millis + 1;
         let report = collect(&artifacts, &referenced, now, bounds).unwrap();
-        assert!(report.deleted.is_empty());
+        assert_eq!(report.deleted, Vec::new());
         assert!(artifacts.get(&id).unwrap().is_some());
     }
 }

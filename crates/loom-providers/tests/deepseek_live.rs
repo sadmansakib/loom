@@ -122,7 +122,7 @@ async fn plain_roundtrip_default_effort() {
     let events = collect(provider.stream(&request)).await;
     let completed = expect_completed(events);
     assert_eq!(completed.message.stop_reason, StopReason::EndTurn);
-    assert!(!completed.message.content.is_empty());
+    assert_ne!(completed.message.content, "");
     assert!(completed.usage.input_tokens > 0);
     assert!(completed.usage.output_tokens > 0);
 }
@@ -138,7 +138,7 @@ async fn effort_none_plain_roundtrip() {
     let events = collect(provider.stream(&request)).await;
     let completed = expect_completed(events);
     assert_eq!(completed.message.stop_reason, StopReason::EndTurn);
-    assert!(!completed.message.content.is_empty());
+    assert_ne!(completed.message.content, "");
 }
 
 #[tokio::test]
@@ -202,7 +202,7 @@ async fn effort_none_tools_two_turns() {
     let events = collect(provider.stream(&turn2)).await;
     let second = expect_completed(events);
     assert_eq!(second.message.stop_reason, StopReason::EndTurn);
-    assert!(!second.message.content.is_empty());
+    assert_ne!(second.message.content, "");
 
     // Turn 3: replay the no-reasoning assistant turn (finalize stored it
     // as `reasoning: None`, so build_request_body omits reasoning_content
@@ -230,7 +230,7 @@ async fn effort_none_tools_two_turns() {
     let events = collect(provider.stream(&turn3)).await;
     let third = expect_completed(events);
     assert_eq!(third.message.stop_reason, StopReason::EndTurn);
-    assert!(!third.message.content.is_empty());
+    assert_ne!(third.message.content, "");
 }
 
 #[tokio::test]
@@ -256,7 +256,7 @@ async fn thinking_disabled_plain_roundtrip() {
     }
     let completed = expect_completed(events);
     assert_eq!(completed.message.stop_reason, StopReason::EndTurn);
-    assert!(!completed.message.content.is_empty());
+    assert_ne!(completed.message.content, "");
     assert!(completed.usage.output_tokens > 0);
 }
 
@@ -277,7 +277,7 @@ async fn effort_low_and_max_roundtrips() {
         println!("effort {effort:?}: {reasoning_deltas} reasoning deltas");
         let completed = expect_completed(events);
         assert_eq!(completed.message.stop_reason, StopReason::EndTurn);
-        assert!(!completed.message.content.is_empty());
+        assert_ne!(completed.message.content, "");
     }
 }
 
@@ -341,7 +341,7 @@ async fn parallel_calls_replay_roundtrip() {
     let events = collect(provider.stream(&turn2)).await;
     let second = expect_completed(events);
     assert_eq!(second.message.stop_reason, StopReason::EndTurn);
-    assert!(!second.message.content.is_empty());
+    assert_ne!(second.message.content, "");
 }
 
 #[tokio::test]

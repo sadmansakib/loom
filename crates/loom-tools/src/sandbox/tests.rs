@@ -414,7 +414,7 @@ fn grants_default_to_sandboxed_without_network() {
     let grants = SandboxGrants::from_rule(None);
     assert!(grants.enabled);
     assert!(!grants.network);
-    assert!(grants.extra_writable.is_empty());
+    assert_eq!(grants.extra_writable.len(), 0);
 }
 
 /// The bwrap argv for a `cargo build --release` shaped command, with

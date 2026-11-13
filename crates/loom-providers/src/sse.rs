@@ -253,7 +253,7 @@ mod tests {
         assert_eq!(decoder.push_bytes(b"data: x\n\n").unwrap().len(), 1);
         assert_eq!(decoder.pending_event(), None);
         assert_eq!(decoder.pending_line(), b"");
-        assert!(decoder.push_bytes(b"data: [DONE]").unwrap().is_empty());
+        assert_eq!(decoder.push_bytes(b"data: [DONE]").unwrap(), Vec::new());
         assert_eq!(decoder.pending_line(), b"data: [DONE]");
     }
 
@@ -309,7 +309,7 @@ mod tests {
     fn utf8_split_across_chunks() {
         // "ü" is 0xC3 0xBC; split it across chunks.
         let mut decoder = SseDecoder::new();
-        assert!(decoder.push_bytes(b"data: \xc3").unwrap().is_empty());
+        assert_eq!(decoder.push_bytes(b"data: \xc3").unwrap(), Vec::new());
         let events = decoder.push_bytes(b"\xbc\n\n").unwrap();
         assert_eq!(events, [SseEvent { data: "ü".into() }]);
     }
@@ -339,7 +339,7 @@ mod tests {
         // shape changes, without relying on the exact ratio.
         for _ in 0..(MAX_EVENT_BYTES / 8) {
             match decoder.push_bytes(line) {
-                Ok(events) => assert!(events.is_empty()),
+                Ok(events) => assert_eq!(events, Vec::new()),
                 Err(found) => {
                     error = Some(found);
                     break;

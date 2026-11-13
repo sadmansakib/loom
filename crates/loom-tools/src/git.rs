@@ -461,7 +461,7 @@ mod tests {
     fn porcelain_handles_detached_head_and_empty() {
         let parsed = parse_porcelain("");
         assert_eq!(parsed.branch, "HEAD");
-        assert!(parsed.entries.is_empty());
+        assert_eq!(parsed.entries.len(), 0);
         let parsed = parse_porcelain("## HEAD (no branch)\0 M x\0");
         assert_eq!(parsed.branch, "HEAD");
         assert_eq!(parsed.entries.len(), 1);

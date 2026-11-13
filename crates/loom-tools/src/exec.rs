@@ -502,8 +502,8 @@ mod tests {
         assert!(outcome.output.status.success());
         // The reap closed the pipes, so EOF arrived naturally: the stream is
         // whole (empty), not marked truncated.
-        assert!(outcome.output.stdout.is_empty());
-        assert!(outcome.output.stderr.is_empty());
+        assert_eq!(outcome.output.stdout.len(), 0);
+        assert_eq!(outcome.output.stderr.len(), 0);
         assert!(
             !outcome.pipe_hold_truncated,
             "a reaped group is not an escaped holder"

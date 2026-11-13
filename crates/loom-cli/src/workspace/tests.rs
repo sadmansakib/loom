@@ -219,7 +219,7 @@ fn boundary_plan_refuses_paths_it_cannot_prove_or_trust() {
             .collect::<Vec<_>>(),
         vec![("notes.txt", None), ("src/lib.rs", Some(lib_sha.as_str())),]
     );
-    assert!(plan.commands.is_empty());
+    assert_eq!(plan.commands.len(), 0);
 
     // The summary agrees with the plan.
     let summary = boundary_restore_summary(&session, 2);

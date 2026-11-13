@@ -62,7 +62,7 @@ fn parse_ignores_non_machine_applicable_and_noise() {
         }),
         "not json at all"
     );
-    assert!(machine_applicable(&lines).is_empty());
+    assert_eq!(machine_applicable(&lines).len(), 0);
 }
 
 #[test]
@@ -333,8 +333,8 @@ async fn attempt_reverts_when_rerun_is_worse() {
     assert_eq!(record.diagnostics_after, 3);
     assert_eq!(outcome.notice_category, "autofix.reverted");
     assert!(outcome.summary.contains("reverted"));
-    assert!(outcome.effects.files_written.is_empty());
-    assert!(outcome.effects.before_images.is_empty());
+    assert_eq!(outcome.effects.files_written.len(), 0);
+    assert_eq!(outcome.effects.before_images.len(), 0);
     assert!(
         outcome
             .effects

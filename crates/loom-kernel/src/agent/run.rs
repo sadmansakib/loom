@@ -776,8 +776,9 @@ impl Agent {
                             let sample = results
                                 .iter()
                                 .find(|result| result.status != ToolStatus::Success)
-                                .map(|result| result.content.chars().take(300).collect::<String>())
-                                .unwrap_or_default();
+                                .map_or_default(|result| {
+                                    result.content.chars().take(300).collect::<String>()
+                                });
                             // Applied after this turn commits, so the
                             // transcript keeps assistant-then-nudge order.
                             failed_call_nudge = Some(format!(

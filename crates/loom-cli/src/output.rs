@@ -199,8 +199,7 @@ pub fn print_summary(summary: &TaskSummary, end_reason: &str, session_id: &Sessi
     );
     let cached = summary
         .cached_input_tokens
-        .map(|tokens| format!(" / {} cached", thousands(tokens)))
-        .unwrap_or_default();
+        .map_or_default(|tokens| format!(" / {} cached", thousands(tokens)));
     let _ = writeln!(
         err,
         "  tokens {} in{} / {} out",

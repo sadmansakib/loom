@@ -213,7 +213,7 @@ fn collect_children(
                 ));
             }
             let path = if prefix.is_empty() {
-                name.clone()
+                name
             } else {
                 format!("{prefix}/{name}")
             };

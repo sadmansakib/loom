@@ -351,16 +351,16 @@ fn edit_manifest_leaves_complex_entries_and_reports_no_changes() {
     let manifest = "[dependencies]\nserde = { version = \"1.0.100\", features = [\"derive\"] }\n\
             other.workspace = true\nother.default-features = false\n";
     let (out, changes) = edit_manifest(manifest, "serde", "1.0.300");
-    assert!(changes.is_empty());
+    assert_eq!(changes.len(), 0);
     assert_eq!(out, manifest);
 
     let (out, changes) = edit_manifest(manifest, "other", "2");
-    assert!(changes.is_empty());
+    assert_eq!(changes.len(), 0);
     assert_eq!(out, manifest);
 
     // A plain entry elsewhere under the same name does not leak in.
     let (out, changes) = edit_manifest(manifest, "version", "9");
-    assert!(changes.is_empty());
+    assert_eq!(changes.len(), 0);
     assert_eq!(out, manifest);
 }
 

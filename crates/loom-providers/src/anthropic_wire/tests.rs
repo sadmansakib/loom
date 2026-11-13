@@ -454,7 +454,7 @@ fn max_tokens_discards_partial_calls() {
     }
     let response = assembler.finalize().unwrap();
     assert_eq!(response.message.stop_reason, StopReason::MaxTokens);
-    assert!(response.message.tool_calls.is_empty());
+    assert_eq!(response.message.tool_calls, Vec::new());
 }
 
 #[test]

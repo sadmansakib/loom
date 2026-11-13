@@ -91,8 +91,7 @@ pub async fn best_of_n(
     exclude_state_from_git(&repo_root, &[".loom/worktrees/"]);
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or_default();
+        .map_or_default(|d| d.as_millis());
     let root = repo_root.join(".loom").join("worktrees").join(format!(
         "best-of-{}-{}",
         stamp,

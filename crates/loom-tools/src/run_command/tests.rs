@@ -71,7 +71,7 @@ async fn allowed_program_runs_and_captures_stdout() {
             Some(0)
         )]
     );
-    assert!(output.effects.files_written.is_empty());
+    assert_eq!(output.effects.files_written.len(), 0);
 }
 
 #[tokio::test]

@@ -148,6 +148,9 @@ mod tests {
             ]
         );
         // Unknown or non-filter keys and blank lines are ignored.
-        assert!(filter_neutralizer_args("core.fsmonitor x\n\nremote.origin.url y\n").is_empty());
+        assert_eq!(
+            filter_neutralizer_args("core.fsmonitor x\n\nremote.origin.url y\n").len(),
+            0
+        );
     }
 }

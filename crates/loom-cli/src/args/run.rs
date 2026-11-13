@@ -252,7 +252,6 @@ pub struct RunFlags {
     /// the config while later children cycle terse/verbose tool budgets and
     /// reasoning effort — diversity without a second model. Off by default.
     #[arg(long)]
-    #[arg(long)]
     pub best_of_vary: bool,
 
     /// Execution-based selection (roadmap item 29): with --best-of, run

@@ -826,7 +826,7 @@ fn usage_only_chunk_produces_no_deltas_but_sets_usage() {
         error: None,
         x_groq: None,
     });
-    assert!(deltas.is_empty());
+    assert_eq!(deltas, Vec::new());
     let response = acc.finalize(true, &policy("test")).unwrap();
     assert_eq!(response.usage.cached_input_tokens, None);
 }

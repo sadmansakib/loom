@@ -492,7 +492,10 @@ async fn a_truncated_stream_reports_length_without_calls() {
 
     let response = expect_completed(&events);
     assert_eq!(response.message.stop_reason, StopReason::MaxTokens);
-    assert!(response.message.tool_calls.is_empty());
+    assert_eq!(
+        response.message.tool_calls,
+        [] as [loom_kernel::transcript::ToolCall; 0]
+    );
     assert_eq!(response.usage.output_tokens, 8);
 }
 

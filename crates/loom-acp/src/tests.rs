@@ -271,7 +271,7 @@ fn forwarded_stdio_servers_map_to_decls() {
         "the forwarded environment rides the scrubbed spawn"
     );
     assert!(decl.network, "the operator grant implies network");
-    assert!(decl.always_load.is_empty());
+    assert_eq!(decl.always_load, [] as [std::string::String; 0]);
 }
 
 #[test]

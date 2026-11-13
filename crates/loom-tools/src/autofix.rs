@@ -71,8 +71,7 @@ fn machine_applicable(output: &str) -> Vec<FixSpan> {
             message
                 .get("children")
                 .and_then(|children| children.as_array())
-                .map(Vec::as_slice)
-                .unwrap_or_default(),
+                .map_or_default(Vec::as_slice),
         );
         for source in sources {
             let Some(span_list) = source.get("spans").and_then(|spans| spans.as_array()) else {

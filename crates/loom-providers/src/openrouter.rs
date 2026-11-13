@@ -495,7 +495,7 @@ mod tests {
 
         let bare =
             OpenRouterProvider::new(OpenRouterConfig::new("k"), catalog()).expect("provider");
-        assert!(bare.extra_headers().is_empty());
+        assert_eq!(bare.extra_headers(), Vec::new());
     }
 
     #[test]

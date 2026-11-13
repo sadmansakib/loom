@@ -64,10 +64,9 @@ pub fn integrity_flags(run_json: &Path) -> Vec<String> {
                 // sweeps for shell-wrapped invocations (`bash -c …`).
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(arguments) {
                     let program = parsed["program"].as_str().unwrap_or_default();
-                    let args: Vec<&str> = parsed["args"]
-                        .as_array()
-                        .map(|entries| entries.iter().filter_map(|entry| entry.as_str()).collect())
-                        .unwrap_or_default();
+                    let args: Vec<&str> = parsed["args"].as_array().map_or_default(|entries| {
+                        entries.iter().filter_map(|entry| entry.as_str()).collect()
+                    });
                     let subcommand = args.iter().find(|arg| !arg.starts_with('-'));
                     let sub = *subcommand.unwrap_or(&"");
                     // Global flags (`-C dir`) shift the subcommand, so
@@ -339,7 +338,7 @@ fn integrity_flags_catch_retrieval_routes() {
     let path = dir.join("run.json");
 
     // Missing file: never started, nothing to flag.
-    assert!(integrity_flags(&path).is_empty());
+    assert_eq!(integrity_flags(&path), [] as [std::string::String; 0]);
 
     // Clean trajectory: reads, tests, plain git status — no flags.
     std::fs::write(
@@ -391,7 +390,7 @@ fn integrity_flags_catch_retrieval_routes() {
         "{\"kind\":{\"type\":\"tool_started\",\"arguments\":\"{\\\"program\\\":\\\"pip\\\",\\\"args\\\":[\\\"list\\\"]}\"}}\n",
     )
     .unwrap();
-    assert!(integrity_flags(&path).is_empty());
+    assert_eq!(integrity_flags(&path), [] as [std::string::String; 0]);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

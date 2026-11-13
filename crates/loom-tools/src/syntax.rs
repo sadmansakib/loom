@@ -158,11 +158,7 @@ impl SyntaxGuardError {
     /// byte-columned — tree-sitter's `start_position`), carrying the
     /// offending source line as the excerpt.
     fn at(point: Point, source: &str) -> Self {
-        let excerpt = source
-            .lines()
-            .nth(point.row)
-            .map(excerpt_of)
-            .unwrap_or_default();
+        let excerpt = source.lines().nth(point.row).map_or_default(excerpt_of);
         Self {
             line: point.row + 1,
             column: point.column + 1,

@@ -407,7 +407,7 @@ fn no_tools_when_model_lacks_tool_calls() {
             &config(),
         ))
         .expect("within budget");
-    assert!(compiled.request.tools.is_empty());
+    assert_eq!(compiled.request.tools, Vec::new());
 }
 
 #[test]

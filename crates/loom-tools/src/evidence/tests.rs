@@ -35,7 +35,7 @@ Compiling app
 {\"reason\":\"compiler-message\",\"message\":{\"level\":\"note\",\"message\":\"fyi\",\"spans\":[]}}
 not json at all
 ";
-    assert!(cargo_diagnostics(output).is_empty());
+    assert_eq!(cargo_diagnostics(output).len(), 0);
 }
 
 #[test]

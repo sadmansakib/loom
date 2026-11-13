@@ -245,8 +245,8 @@ mod tests {
             output.effects.files_written,
             vec!["nested/dir/note.txt".to_string()]
         );
-        assert!(output.effects.files_deleted.is_empty());
-        assert!(output.effects.commands_run.is_empty());
+        assert_eq!(output.effects.files_deleted.len(), 0);
+        assert_eq!(output.effects.commands_run.len(), 0);
         assert_eq!(
             std::fs::read_to_string(guard.path().join("nested/dir/note.txt")).expect("read"),
             "hello loom"

@@ -234,14 +234,13 @@ fn reduce_entry(entry: &Value) -> Option<CustomModel> {
     let parameters = object
         .get("supported_parameters")
         .and_then(Value::as_array)
-        .map(|entries| {
+        .map_or_default(|entries| {
             entries
                 .iter()
                 .filter_map(Value::as_str)
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        });
     let supports = |name: &str| parameters.iter().any(|entry| entry == name);
 
     let context_length = first_u32(object, CONTEXT_FIELDS);

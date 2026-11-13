@@ -146,7 +146,7 @@ impl BackgroundJobs {
         let ctx = ToolContext::new(
             workspace_root,
             CancellationToken::new(),
-            Duration::from_secs(24 * 60 * 60),
+            Duration::from_hours(24),
         )
         .with_artifacts(artifacts);
         let exec_job = Arc::clone(&job);
@@ -447,8 +447,8 @@ pub(crate) async fn prepare_exec(
     let rule = policy.rule(program);
     let limits = crate::exec::ExecLimits {
         stream_window: rule.and_then(|rule| rule.max_output_bytes),
-        scrub: rule.map(|rule| rule.env_scrub.clone()).unwrap_or_default(),
-        env_allow: rule.map(|rule| rule.env_allow.clone()).unwrap_or_default(),
+        scrub: rule.map_or_default(|rule| rule.env_scrub.clone()),
+        env_allow: rule.map_or_default(|rule| rule.env_allow.clone()),
     };
     let grants = crate::sandbox::SandboxGrants::from_rule(rule);
     let sandbox = crate::sandbox::Sandbox::resolve(workspace_root, grants);

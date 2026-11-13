@@ -17,18 +17,15 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-# Raised from 1.85 for the `keyring-core` 1.x stack (1.88 MSRV), the CLI's
-# OS-keychain backend (ADR-009). Raised again from 1.88 because `uuid` 1.27
-# (v7 ids) declares rust-version 1.89, so the floor was unsatisfiable: a
-# 1.88 toolchain failed at dependency resolution, not at compilation.
-# Verified by building the workspace on 1.89.
-rust-version = "1.89"
+# Rust 1.100 is the current project baseline; keep this aligned with the
+# toolchain used to develop and lint the workspace.
+rust-version = "1.100"
 
 [workspace.dependencies]
 # syntax guard (roadmap item 5 phase B): parse-before-write refusal for
 # edit_file/write_file; grammars are per-language, Rust first.
-tree-sitter = "0.25"
-tree-sitter-python = "0.23"
+tree-sitter = "0.27.2"
+tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
 # internal crates
@@ -38,7 +35,6 @@ loom-providers = { path = "crates/loom-providers", version = "0.1.0" }
 loom-tools = { path = "crates/loom-tools", version = "0.1.0" }
 loom-engine = { path = "crates/loom-engine", version = "0.1.0" }
 loom-core = { path = "crates/loom-core", version = "0.1.0" }
-loom-tui = { path = "crates/loom-tui", version = "0.1.0" }
 
 # async runtime (research.md §2: tokio 1.x + tokio-util CancellationToken).
 # Version pinned here only — crates add the features they need, so the
@@ -83,15 +79,9 @@ httpdate = "1"
 # identifiers: UUID v7, time-ordered (architecture.md §2 `id` module)
 uuid = { version = "1.27.0", features = ["v7", "serde"] }
 
-# LSP slice E: typed protocol types + the async client framework used
-# by Helix. tokio runtime + omni-trait typed request methods +
-# client-monitor exit tracking; stdio framing is done by hand over the
-# sandboxed child's pipes (tokio-util compat), so async-lsp's own
-# transport features stay off.
+# LSP protocol types. `async-lsp` is a direct dependency of `loom-tools`.
 lsp-types = "0.95"
-async-lsp = { version = "0.2.4", default-features = false, features = ["tokio", "omni-trait", "client-monitor"] }
-# ServiceBuilder + Layer for stacking async-lsp's Concurrency/CatchUnwind
-# layers over the Router (the client pattern from Helix)
+# ServiceBuilder + Layer for stacking async-lsp's Concurrency/CatchUnwind layers.
 tower = { version = "0.5", default-features = false }
 
 # content addressing (ADR-012 decision 3): artifact bodies are keyed by the
@@ -117,7 +107,7 @@ clap = { version = "4.6.7", features = ["derive"] }
 # not depend on the system library. `keyring-core` with explicit stores:
 # the macOS Keychain directly, and on Linux the Secret Service with a
 # kernel-keyutils fallback for headless hosts (no session D-Bus).
-rusqlite = { version = "0.41.1", features = ["bundled"] }
+rusqlite = { version = "0.42.0", features = ["bundled"] }
 keyring-core = "1"
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
 dbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }

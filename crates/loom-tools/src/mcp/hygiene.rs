@@ -141,8 +141,7 @@ pub(super) fn warn_if_unpinned_runner(name: &str, command: &[String]) {
     };
     let runner = std::path::Path::new(program)
         .file_name()
-        .map(|file| file.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|file| file.to_string_lossy().into_owned());
     if !matches!(runner.as_str(), "npx" | "uvx" | "pnpx") {
         return;
     }

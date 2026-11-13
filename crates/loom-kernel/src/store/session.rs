@@ -205,14 +205,13 @@ pub trait SessionStore: Send + Sync {
     ) -> Result<Option<Lease>, StoreError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| {
+            .map_or_default(|elapsed| {
                 // Millis since the epoch fits `u64` for any real clock
                 // (the limit is ~year 584 million); truncation is
                 // unreachable.
                 #[allow(clippy::cast_possible_truncation)]
                 (elapsed.as_millis() as u64)
-            })
-            .unwrap_or_default();
+            });
         let expires_at_millis = now.saturating_add(ttl_millis);
         Ok(Some(Lease::new(
             *session,

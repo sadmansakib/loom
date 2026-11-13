@@ -80,8 +80,7 @@ pub fn plan_restore(checkpoint: &StartCheckpoint) -> Result<RestorePlan> {
 pub fn apply_restore(plan: &RestorePlan) -> Result<PathBuf> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_millis())
-        .unwrap_or_default();
+        .map_or_default(|since| since.as_millis());
     let rewind_dir = plan.workspace.join(".loom").join("rewind");
     std::fs::create_dir_all(&rewind_dir)
         .with_context(|| format!("creating {}", rewind_dir.display()))?;

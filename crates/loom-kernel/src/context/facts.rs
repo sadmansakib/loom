@@ -585,8 +585,8 @@ mod tests {
             "git": {"branch": null, "changed_files": []}
         }"#;
         let facts: KnownFacts = serde_json::from_str(old).expect("old facts must deserialize");
-        assert!(facts.lessons.is_empty());
-        assert!(facts.skills.is_empty());
+        assert_eq!(facts.lessons, Vec::new());
+        assert_eq!(facts.skills, Vec::new());
         assert!(facts.is_empty());
     }
 
@@ -619,7 +619,7 @@ mod tests {
             "git": {"branch": null, "changed_files": []}
         }"#;
         let facts: KnownFacts = serde_json::from_str(old).expect("old facts must deserialize");
-        assert!(facts.skills.is_empty());
+        assert_eq!(facts.skills, Vec::new());
         assert!(facts.is_empty());
     }
 

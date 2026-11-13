@@ -369,7 +369,7 @@ mod tests {
     fn pinning_without_manifests_writes_nothing() {
         let (dir, gate) = gate_and_workspace();
         let pinned = gate.pin(dir.path()).expect("pin");
-        assert!(pinned.is_empty());
+        assert_eq!(pinned.len(), 0);
         assert!(!gate.path.exists(), "empty store must not be created");
     }
 }

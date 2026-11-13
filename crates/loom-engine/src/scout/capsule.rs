@@ -10,9 +10,7 @@ use super::config::ANSWER_BUDGET_BYTES;
 /// The capsule task the child receives: goal, scope, constraints, and
 /// the output contract — everything a bounded delegation needs.
 pub fn capsule(question: &str, focus: Option<&str>) -> String {
-    let focus = focus
-        .map(|hint| format!("Focus hint from the caller: {hint}\n"))
-        .unwrap_or_default();
+    let focus = focus.map_or_default(|hint| format!("Focus hint from the caller: {hint}\n"));
     format!(
         "You are a read-only scout. Answer ONE question about this \
          workspace so a parent agent can proceed without reading the \

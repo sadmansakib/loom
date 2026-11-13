@@ -1,6 +1,9 @@
 //! Rendering for the interactive terminal frontend.
 
-use super::*;
+use super::{
+    AMBER, App, BG, BLUE, BORDER, CORAL, DIM, Duration, IVORY, PANEL, RetryRecord, SAGE, TEAL,
+    ToolRecordState, VIOLET,
+};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -50,17 +53,16 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
 fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let session = app
         .session
-        .map(|id| id.to_string())
-        .unwrap_or_else(|| "opening session".into());
-    let workspace = std::env::current_dir()
-        .ok()
-        .map(|path| {
+        .map_or_else(|| "opening session".into(), |id| id.to_string());
+    let workspace = std::env::current_dir().ok().map_or_else(
+        || "workspace".into(),
+        |path| {
             let rendered = path.to_string_lossy().into_owned();
             std::env::var("HOME")
                 .map(|home| rendered.replacen(&home, "~", 1))
                 .unwrap_or(rendered)
-        })
-        .unwrap_or_else(|| "workspace".into());
+        },
+    );
     let left = Line::from(vec![
         Span::styled(
             " ◆ Loom ",
@@ -81,7 +83,10 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         ),
         Span::styled(format!("  {}", app.model), Style::default().fg(BLUE)),
     ]);
-    let right_width = (right.width() as u16 + 1).min(area.width.saturating_sub(16));
+    let right_width = u16::try_from(right.width())
+        .unwrap_or(u16::MAX)
+        .saturating_add(1)
+        .min(area.width.saturating_sub(16));
     let split =
         Layout::horizontal([Constraint::Min(16), Constraint::Length(right_width)]).split(area);
     frame.render_widget(
@@ -94,6 +99,10 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     );
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "timeline rows are rendered in one pass to preserve ordering and scroll behavior"
+)]
 fn draw_timeline(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     if app.timeline.is_empty() {
         let empty = Paragraph::new(vec![
@@ -180,8 +189,14 @@ fn draw_timeline(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(VIOLET).add_modifier(Modifier::ITALIC),
         )));
     }
-    let visible = area.height.saturating_sub(1) as usize;
-    let scroll = lines.len().saturating_sub(visible).min(u16::MAX as usize) as u16;
+    let visible = usize::from(area.height.saturating_sub(1));
+    let scroll = u16::try_from(
+        lines
+            .len()
+            .saturating_sub(visible)
+            .min(usize::from(u16::MAX)),
+    )
+    .unwrap_or_default();
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: false })
@@ -190,6 +205,10 @@ fn draw_timeline(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     );
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "sidebar sections share one vertical layout and are rendered as a single widget tree"
+)]
 fn draw_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let blocks = Layout::vertical([
         Constraint::Length(5),
@@ -200,8 +219,7 @@ fn draw_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     .split(area);
     let session = app
         .session
-        .map(|id| id.to_string())
-        .unwrap_or_else(|| "waiting".into());
+        .map_or_else(|| "waiting".into(), |id| id.to_string());
     panel(
         frame,
         blocks[0],
@@ -429,12 +447,25 @@ fn metric(label: &str, value: String, color: Color) -> Line<'static> {
 
 pub(super) fn compact(value: u64) -> String {
     if value >= 1_000_000 {
-        format!("{:.1}M", value as f64 / 1_000_000.0)
+        format!(
+            "{}.{:01}M",
+            rounded_tenths(value, 100_000) / 10,
+            rounded_tenths(value, 100_000) % 10
+        )
     } else if value >= 1_000 {
-        format!("{:.1}K", value as f64 / 1_000.0)
+        format!(
+            "{}.{:01}K",
+            rounded_tenths(value, 100) / 10,
+            rounded_tenths(value, 100) % 10
+        )
     } else {
         value.to_string()
     }
+}
+
+fn rounded_tenths(value: u64, divisor: u64) -> u64 {
+    let quotient = value / divisor;
+    quotient + u64::from(value % divisor >= divisor / 2)
 }
 
 fn draw_composer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {

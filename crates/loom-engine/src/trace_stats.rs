@@ -177,8 +177,7 @@ pub fn collect(base: &Path) -> io::Result<Vec<TaskRow>> {
             let mut row = TaskRow::corrupt();
             row.dir_name = path
                 .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
+                .map_or_default(|n| n.to_string_lossy().into_owned());
             rows.push(row);
             continue;
         };
@@ -221,7 +220,7 @@ fn prune_stats(task_dir: &Path) -> PruneStats {
         }
         let report = &event["report"];
         let trigger = report["trigger"].as_str().unwrap_or("unknown").to_owned();
-        let agg = stats.by_trigger.entry(trigger.clone()).or_default();
+        let agg = stats.by_trigger.entry(trigger).or_default();
         agg.events += 1;
         if let Some(calls) = report["calls"].as_array() {
             for call in calls {

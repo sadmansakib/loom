@@ -366,7 +366,7 @@ mod tests {
             ("edit_file", err(ToolFailure::InvalidInput)),
             ("edit_file", ToolStatus::Success),
         ])];
-        assert!(mine_lessons(&one).is_empty());
+        assert_eq!(mine_lessons(&one), Vec::new());
 
         // Three failures but none recovered within the window.
         let unrecovered: Vec<Session> = (0..3)
@@ -377,7 +377,7 @@ mod tests {
                 ])
             })
             .collect();
-        assert!(mine_lessons(&unrecovered).is_empty());
+        assert_eq!(mine_lessons(&unrecovered), Vec::new());
     }
 
     #[test]
@@ -483,6 +483,6 @@ mod tests {
                 ("edit_file", ToolStatus::Cancelled { started: true }),
             ]),
         ];
-        assert!(mine_lessons(&sessions).is_empty());
+        assert_eq!(mine_lessons(&sessions), Vec::new());
     }
 }

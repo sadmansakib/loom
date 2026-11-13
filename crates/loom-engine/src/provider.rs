@@ -649,7 +649,10 @@ mod tests {
                 ),
             ]
         );
-        assert!(merge_headers(&std::collections::BTreeMap::new(), &[]).is_empty());
+        assert_eq!(
+            merge_headers(&std::collections::BTreeMap::new(), &[]).len(),
+            0
+        );
     }
 
     #[test]

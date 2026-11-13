@@ -449,7 +449,7 @@ mod tests {
             err,
             SessionError::AssistantToolCallsNeedAppendTurn
         ));
-        assert!(session.transcript.is_empty(), "nothing appended");
+        assert_eq!(session.transcript.len(), 0, "nothing appended");
     }
 
     #[test]
@@ -585,6 +585,6 @@ mod tests {
         let mut value = serde_json::to_value(&session).unwrap();
         value.as_object_mut().unwrap().remove("todos");
         let old: Session = serde_json::from_value(value).unwrap();
-        assert!(old.todos.is_empty());
+        assert_eq!(old.todos.items.len(), 0);
     }
 }

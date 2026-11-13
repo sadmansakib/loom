@@ -374,10 +374,9 @@ mod tests {
             "adopted": [], "merged": {}, "lessons": []
         }]);
         std::fs::write(dir.join("legacy.json"), legacy.to_string()).unwrap();
-        assert!(
-            load_ledger(&dir.join("legacy.json")).unwrap()[0]
-                .promoted
-                .is_empty()
+        assert_eq!(
+            load_ledger(&dir.join("legacy.json")).unwrap()[0].promoted,
+            [] as [std::string::String; 0]
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -487,7 +486,7 @@ mod tests {
                 stop_reason: StopReason::ToolCalls,
             }));
             items.push(Item::ToolResult(ToolResult::new(
-                call.id.clone(),
+                call.id,
                 ToolStatus::Success,
                 body.clone(),
                 false,

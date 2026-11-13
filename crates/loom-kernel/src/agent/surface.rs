@@ -301,7 +301,7 @@ mod tests {
         assert_eq!(surface.loaded_names(), vec!["mcp_a_b".to_owned()]);
         surface.begin_turn(4);
         surface.end_turn();
-        assert!(surface.loaded_names().is_empty());
+        assert_eq!(surface.loaded_names(), Vec::<String>::new());
     }
 
     #[test]

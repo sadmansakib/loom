@@ -245,8 +245,7 @@ impl Tool for EditFileTool {
                 let verify_target = outcome
                     .files
                     .first()
-                    .map(|(relative, _)| relative.clone())
-                    .unwrap_or_default();
+                    .map_or_default(|(relative, _)| relative.clone());
                 let (rendered, fused_effects) = crate::fusion::run_fused(
                     scope,
                     ctx,

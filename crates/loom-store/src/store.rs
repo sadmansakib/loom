@@ -562,8 +562,7 @@ impl SessionStore for SqliteStore {
 pub(super) fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or_default())
-        .unwrap_or_default()
+        .map_or_default(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or_default())
 }
 
 /// Stores a `u64` column value (unix milliseconds, byte counts) in a SQLite

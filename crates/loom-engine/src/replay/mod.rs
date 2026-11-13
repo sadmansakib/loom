@@ -409,7 +409,7 @@ mod tests {
             .unwrap();
         let options = ReplayOptions::new("scripted");
         let replay = replay_session(&session, &task, &options, PruneConfig::default()).unwrap();
-        assert!(replay.turns.is_empty());
+        assert_eq!(replay.turns.len(), 0);
         assert_eq!(replay.total_input_tokens, 0);
     }
 

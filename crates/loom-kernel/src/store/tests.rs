@@ -135,8 +135,8 @@ fn fork_copies_a_prefix_preserves_indices_and_records_lineage() {
     // user item, not a renumbered one.
     assert_eq!(forked.transcript[0], Item::User { text: "fix".into() });
     // Run state stays with the source; the fork is conversation only.
-    assert!(forked.tasks.is_empty());
-    assert!(forked.todos.is_empty());
+    assert_eq!(forked.tasks, Vec::new());
+    assert_eq!(forked.todos.items.as_slice(), &[]);
 
     // The source is intact — a fork never truncates.
     let source = store.load(&id).unwrap().expect("source session");

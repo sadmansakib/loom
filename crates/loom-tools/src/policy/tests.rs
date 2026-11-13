@@ -10,7 +10,7 @@ fn shipped_policy_is_cargo_only_with_default_limits() {
     let rule = policy.rule("cargo").expect("cargo admitted");
     assert_eq!(rule.timeout_secs, None);
     assert_eq!(rule.max_output_bytes, None);
-    assert!(rule.env_scrub.is_empty());
+    assert_eq!(rule.env_scrub.len(), 0);
     assert!(policy.rule("rm").is_none());
 }
 
@@ -189,7 +189,7 @@ fn env_allow_entries_must_be_credential_shaped() {
 fn the_shipped_policy_stays_allow_unknown() {
     let policy = CommandPolicy::cargo_only();
     assert_eq!(policy.unknown_verdict(), PolicyVerdict::Allow);
-    assert!(policy.denied_names().is_empty());
+    assert_eq!(policy.denied_names().len(), 0);
     assert_eq!(policy.verdict("rm"), PolicyVerdict::Allow);
     assert_eq!(policy.verdict("cargo"), PolicyVerdict::Allow);
 }

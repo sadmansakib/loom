@@ -1013,7 +1013,7 @@ async fn batch_empty_calls_return_empty() {
     let ctx = test_ctx(Duration::from_secs(1), &token);
     let batch = ToolBatch::new(&registry, &exposure);
     let results = batch.execute(&[], &ctx).await;
-    assert!(results.is_empty());
+    assert_eq!(results, Vec::new());
 }
 
 #[tokio::test]

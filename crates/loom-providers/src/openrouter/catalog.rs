@@ -1,4 +1,4 @@
-//! Catalog snapshots, fetching, and parsing for OpenRouter.
+//! Catalog snapshots, fetching, and parsing for `OpenRouter`.
 
 use loom_kernel::model::ModelCapabilities;
 use serde::{Deserialize, Serialize};

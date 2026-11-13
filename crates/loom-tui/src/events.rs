@@ -1,6 +1,9 @@
 //! Event projection and log maintenance for the terminal frontend.
 
-use super::*;
+use super::{
+    AMBER, App, BLUE, CORAL, Color, DIM, EVENT_LOG_LIMIT, EventEnvelope, EventKind, IVORY, Instant,
+    LogItem, RetryRecord, SAGE, ToolRecord, ToolRecordState, ToolStatus, VIOLET, ui,
+};
 
 pub(super) fn drain_events(
     receiver: &mut tokio::sync::mpsc::UnboundedReceiver<EventEnvelope>,
@@ -18,6 +21,13 @@ pub(super) fn drain_events(
     }
 }
 
+// Keep this projection exhaustive for the event families owned by the TUI;
+// `EventKind` is non-exhaustive so `_` intentionally ignores newer events.
+#[allow(
+    clippy::too_many_lines,
+    clippy::wildcard_enum_match_arm,
+    reason = "event projection keeps state transitions together and ignores future non-exhaustive variants"
+)]
 pub(super) fn reduce_event(envelope: &EventEnvelope, app: &mut App) {
     match &envelope.kind {
         EventKind::TaskStarted => push_log(app, "›", BLUE, "Task accepted", false),
@@ -58,14 +68,13 @@ pub(super) fn reduce_event(envelope: &EventEnvelope, app: &mut App) {
         }
         EventKind::ReasoningDelta { text } => {
             app.reasoning_chars += text.chars().count();
-            let index = match app.provisional_reasoning_index {
-                Some(index) => index,
-                None => {
-                    push_log(app, "▸", VIOLET, "reasoning · provisional", true);
-                    let index = app.timeline.len() - 1;
-                    app.provisional_reasoning_index = Some(index);
-                    index
-                }
+            let index = if let Some(index) = app.provisional_reasoning_index {
+                index
+            } else {
+                push_log(app, "▸", VIOLET, "reasoning · provisional", true);
+                let index = app.timeline.len() - 1;
+                app.provisional_reasoning_index = Some(index);
+                index
             };
             if let Some(item) = app.timeline.get_mut(index) {
                 item.text.push_str(text);
@@ -73,14 +82,13 @@ pub(super) fn reduce_event(envelope: &EventEnvelope, app: &mut App) {
             }
         }
         EventKind::TextDelta { text } => {
-            let index = match app.provisional_index {
-                Some(index) => index,
-                None => {
-                    push_log(app, "┆", VIOLET, "streaming · provisional", true);
-                    let index = app.timeline.len() - 1;
-                    app.provisional_index = Some(index);
-                    index
-                }
+            let index = if let Some(index) = app.provisional_index {
+                index
+            } else {
+                push_log(app, "┆", VIOLET, "streaming · provisional", true);
+                let index = app.timeline.len() - 1;
+                app.provisional_index = Some(index);
+                index
             };
             if let Some(item) = app.timeline.get_mut(index) {
                 item.text.push_str(text);
@@ -143,14 +151,11 @@ pub(super) fn reduce_event(envelope: &EventEnvelope, app: &mut App) {
                 ));
             }
             let cached = response.usage.cached_input_tokens.unwrap_or_default();
-            app.last_cache_pct = if response.usage.input_tokens == 0 {
-                "—".into()
-            } else {
-                format!(
-                    "{:.0}%",
-                    100.0 * cached as f64 / response.usage.input_tokens as f64
-                )
-            };
+            let cache_percentage =
+                u128::from(cached) * 100 + u128::from(response.usage.input_tokens) / 2;
+            app.last_cache_pct = cache_percentage
+                .checked_div(u128::from(response.usage.input_tokens))
+                .map_or_else(|| "—".into(), |percentage| format!("{percentage}%"));
             let mut committed = Vec::new();
             if let Some(reasoning) = response.message.reasoning.as_ref()
                 && !reasoning.text.trim().is_empty()
@@ -241,7 +246,7 @@ pub(super) fn reduce_event(envelope: &EventEnvelope, app: &mut App) {
                 && let Some(tool) = app.tools.get_mut(index)
             {
                 tool.state = outcome_state;
-                tool.detail = detail.to_owned();
+                detail.clone_into(&mut tool.detail);
             }
             push_log(
                 app,
@@ -327,7 +332,7 @@ pub(super) fn reduce_event(envelope: &EventEnvelope, app: &mut App) {
             push_log(app, "Ⅱ", AMBER, "Paused at turn boundary", false);
         }
         EventKind::HarnessNotice { category, detail } => {
-            push_log(app, "!", AMBER, format!("{category} · {detail}"), false)
+            push_log(app, "!", AMBER, format!("{category} · {detail}"), false);
         }
         _ => {}
     }
@@ -408,6 +413,10 @@ pub(super) fn discard_provisional(app: &mut App) {
     }
 }
 
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "EventKind is non-exhaustive and unknown events are summarized"
+)]
 pub(super) fn event_name(kind: &EventKind) -> &'static str {
     match kind {
         EventKind::TaskStarted => "TaskStarted",
