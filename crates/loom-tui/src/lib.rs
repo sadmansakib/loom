@@ -179,82 +179,95 @@ async fn run_interactive(
             if should_quit {
                 return Ok(());
             }
-            if event::poll(FRAME_TICK)?
-                && let Event::Key(key) = event::read()?
-            {
-                match key.code {
-                    code if navigate_picker(&mut picker_state, code) => {}
-                    KeyCode::Esc if picker_state.searching => {
-                        picker_state.searching = false;
-                        picker_state.set_query(String::new());
-                    }
-                    KeyCode::Esc if active.is_some() => picker = false,
-                    KeyCode::Esc => return Ok(()),
-                    KeyCode::Char('/') if !picker_state.searching => {
-                        picker_state.searching = true;
-                    }
-                    KeyCode::Backspace if picker_state.searching => {
-                        picker_state.search_query.pop();
+            if event::poll(FRAME_TICK)? {
+                match event::read()? {
+                    Event::Paste(text) if picker_state.searching => {
+                        picker_state
+                            .search_query
+                            .extend(text.chars().filter(|ch| !ch.is_control()));
                         picker_state.refresh_filter_selection();
                     }
-                    KeyCode::Char(ch)
-                        if picker_state.searching
-                            && !key.modifiers.intersects(
-                                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                            ) =>
-                    {
-                        picker_state.search_query.push(ch);
-                        picker_state.refresh_filter_selection();
-                    }
-                    KeyCode::Tab if picker_state.has_supported_effort() => {
-                        picker_state.next_effort();
-                    }
-                    KeyCode::Enter if !picker_state.filtered_indices().is_empty() => {
-                        picker_state.searching = false;
-                        picker_state.apply(&mut config);
-                        let previous_session = active.take().map(|(_, session)| session);
-                        if let Some(catalog) = picker_state.catalogs.get(&config.provider) {
-                            config.catalog = Some(catalog.clone());
+                    Event::Key(key) => match key.code {
+                        code if navigate_picker(&mut picker_state, code) => {}
+                        KeyCode::Esc if picker_state.searching => {
+                            picker_state.searching = false;
+                            picker_state.set_query(String::new());
                         }
-                        let mut engine_overrides = overrides.take().unwrap_or_default();
-                        if let Some(credential) = picker_state.credentials.get(&config.provider) {
-                            engine_overrides = engine_overrides.with_credential(credential.clone());
+                        KeyCode::Esc if active.is_some() => picker = false,
+                        KeyCode::Esc => return Ok(()),
+                        KeyCode::Char('/') if !picker_state.searching => {
+                            picker_state.searching = true;
                         }
-                        let (engine, session) = open_engine(&config, engine_overrides).await?;
-                        active = Some((engine, previous_session.unwrap_or(session)));
-                        picker = false;
-                    }
-                    KeyCode::Char('r') if !picker_state.searching => {
-                        picker_state = PickerState::discover(&config).await?;
-                        picker_loaded = true;
-                    }
-                    KeyCode::F(1) => help = !help,
-                    KeyCode::Backspace
-                    | KeyCode::Left
-                    | KeyCode::Right
-                    | KeyCode::Home
-                    | KeyCode::End
-                    | KeyCode::PageUp
-                    | KeyCode::PageDown
-                    | KeyCode::Up
-                    | KeyCode::Down
-                    | KeyCode::Tab
-                    | KeyCode::BackTab
-                    | KeyCode::Delete
-                    | KeyCode::Insert
-                    | KeyCode::F(_)
-                    | KeyCode::Char(_)
-                    | KeyCode::Null
-                    | KeyCode::CapsLock
-                    | KeyCode::ScrollLock
-                    | KeyCode::NumLock
-                    | KeyCode::PrintScreen
-                    | KeyCode::Pause
-                    | KeyCode::Menu
-                    | KeyCode::KeypadBegin
-                    | KeyCode::Media(_)
-                    | KeyCode::Modifier(_)
-                    | KeyCode::Enter => {}
+                        KeyCode::Backspace if picker_state.searching => {
+                            picker_state.search_query.pop();
+                            picker_state.refresh_filter_selection();
+                        }
+                        KeyCode::Char(ch)
+                            if picker_state.searching
+                                && !key.modifiers.intersects(
+                                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                                ) =>
+                        {
+                            picker_state.search_query.push(ch);
+                            picker_state.refresh_filter_selection();
+                        }
+                        KeyCode::Tab if picker_state.has_supported_effort() => {
+                            picker_state.next_effort();
+                        }
+                        KeyCode::Enter if !picker_state.filtered_indices().is_empty() => {
+                            picker_state.searching = false;
+                            picker_state.apply(&mut config);
+                            let previous_session = active.take().map(|(_, session)| session);
+                            if let Some(catalog) = picker_state.catalogs.get(&config.provider) {
+                                config.catalog = Some(catalog.clone());
+                            }
+                            let mut engine_overrides = overrides.take().unwrap_or_default();
+                            if let Some(credential) = picker_state.credentials.get(&config.provider)
+                            {
+                                engine_overrides =
+                                    engine_overrides.with_credential(credential.clone());
+                            }
+                            let (engine, session) = open_engine(&config, engine_overrides).await?;
+                            active = Some((engine, previous_session.unwrap_or(session)));
+                            picker = false;
+                        }
+                        KeyCode::Char('r') if !picker_state.searching => {
+                            picker_state = PickerState::discover(&config).await?;
+                            picker_loaded = true;
+                        }
+                        KeyCode::F(1) => help = !help,
+                        KeyCode::Backspace
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::Home
+                        | KeyCode::End
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                        | KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::Tab
+                        | KeyCode::BackTab
+                        | KeyCode::Delete
+                        | KeyCode::Insert
+                        | KeyCode::F(_)
+                        | KeyCode::Char(_)
+                        | KeyCode::Null
+                        | KeyCode::CapsLock
+                        | KeyCode::ScrollLock
+                        | KeyCode::NumLock
+                        | KeyCode::PrintScreen
+                        | KeyCode::Pause
+                        | KeyCode::Menu
+                        | KeyCode::KeypadBegin
+                        | KeyCode::Media(_)
+                        | KeyCode::Modifier(_)
+                        | KeyCode::Enter => {}
+                    },
+                    Event::Paste(_)
+                    | Event::Mouse(_)
+                    | Event::FocusGained
+                    | Event::FocusLost
+                    | Event::Resize(..) => {}
                 }
             }
             continue;
@@ -331,10 +344,8 @@ async fn run_interactive(
                                     }
                                 }
                                 Event::Mouse(mouse) => update_thread_mouse(mouse, &mut thread_scroll_back),
-                                Event::FocusGained
-                                | Event::FocusLost
-                                | Event::Paste(_)
-                                | Event::Resize(..) => {}
+                                Event::Paste(text) => input.insert_paste(&text),
+                                Event::FocusGained | Event::FocusLost | Event::Resize(..) => {}
                             }
                         }
                     }
@@ -401,7 +412,8 @@ async fn run_interactive(
                     }
                 }
                 Event::Mouse(mouse) => update_thread_mouse(mouse, &mut thread_scroll_back),
-                Event::FocusGained | Event::FocusLost | Event::Paste(_) | Event::Resize(..) => {}
+                Event::Paste(text) => input.insert_paste(&text),
+                Event::FocusGained | Event::FocusLost | Event::Resize(..) => {}
             }
         }
         if let Some(task) = pending_task.take() {
@@ -1103,6 +1115,16 @@ impl PromptEditor {
         self.cursor += c.len_utf8();
     }
 
+    fn insert_paste(&mut self, text: &str) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let pasted: String = normalized
+            .chars()
+            .filter(|ch| !ch.is_control() || *ch == '\n')
+            .collect();
+        self.text.insert_str(self.cursor, &pasted);
+        self.cursor += pasted.len();
+    }
+
     fn backspace(&mut self) {
         if self.cursor == 0 {
             return;
@@ -1347,6 +1369,10 @@ fn terminal_session<T>(
         .context("enter alternate screen")?;
     guard.alternate_screen = true;
     crossterm::execute!(io::stdout(), event::EnableMouseCapture).context("enable mouse capture")?;
+    guard.mouse_capture = true;
+    crossterm::execute!(io::stdout(), event::EnableBracketedPaste)
+        .context("enable bracketed paste")?;
+    guard.bracketed_paste = true;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("initialize terminal")?;
     let result = f(&mut terminal);
@@ -1358,21 +1384,30 @@ fn terminal_session<T>(
 }
 
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)] // independent terminal modes must be restored after partial setup
 struct TerminalGuard {
     raw_mode: bool,
     alternate_screen: bool,
+    mouse_capture: bool,
+    bracketed_paste: bool,
 }
 
 impl TerminalGuard {
     fn restore(&mut self, output: &mut impl io::Write) -> Result<()> {
         if self.alternate_screen {
-            crossterm::execute!(
-                output,
-                crossterm::terminal::LeaveAlternateScreen,
-                event::DisableMouseCapture
-            )
-            .context("restore terminal screen")?;
+            crossterm::execute!(output, crossterm::terminal::LeaveAlternateScreen)
+                .context("restore terminal screen")?;
             self.alternate_screen = false;
+        }
+        if self.mouse_capture {
+            crossterm::execute!(output, event::DisableMouseCapture)
+                .context("disable mouse capture")?;
+            self.mouse_capture = false;
+        }
+        if self.bracketed_paste {
+            crossterm::execute!(output, event::DisableBracketedPaste)
+                .context("disable bracketed paste")?;
+            self.bracketed_paste = false;
         }
         if self.raw_mode {
             crossterm::terminal::disable_raw_mode().context("disable terminal raw mode")?;
@@ -1385,11 +1420,13 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         if self.alternate_screen {
-            let _ = crossterm::execute!(
-                io::stdout(),
-                crossterm::terminal::LeaveAlternateScreen,
-                event::DisableMouseCapture
-            );
+            let _ = crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        }
+        if self.mouse_capture {
+            let _ = crossterm::execute!(io::stdout(), event::DisableMouseCapture);
+        }
+        if self.bracketed_paste {
+            let _ = crossterm::execute!(io::stdout(), event::DisableBracketedPaste);
         }
         if self.raw_mode {
             let _ = crossterm::terminal::disable_raw_mode();
@@ -1762,5 +1799,18 @@ mod tests {
         assert_eq!(input.text, "first\n\n");
         assert_eq!(input.cursor, input.text.len());
         assert!(next.is_none());
+    }
+
+    #[test]
+    fn bracketed_paste_inserts_multiline_text_without_submitting() {
+        let mut input = PromptEditor {
+            text: "beforeafter".into(),
+            cursor: "before".len(),
+        };
+
+        input.insert_paste("one\r\ntwo\rthree\u{1b}four");
+
+        assert_eq!(input.text, "beforeone\ntwo\nthreefourafter");
+        assert_eq!(input.cursor, "beforeone\ntwo\nthreefour".len());
     }
 }
