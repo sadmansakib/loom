@@ -13,15 +13,11 @@ pub const SAGE: Color = Color::Rgb(134, 193, 159);
 pub const CORAL: Color = Color::Rgb(238, 130, 114);
 pub const VIOLET: Color = Color::Rgb(169, 155, 214);
 pub const BLUE: Color = Color::Rgb(141, 180, 232);
-pub const TEAL: Color = Color::Rgb(111, 196, 196);
 
 pub const SELECTED: ratatui::style::Style = ratatui::style::Style::new()
     .fg(IVORY)
     .bg(PANEL)
     .add_modifier(ratatui::style::Modifier::BOLD);
-
-/// Thread rail color used to connect task-turn rows.
-pub const THREAD_STYLE: ratatui::style::Style = ratatui::style::Style::new().fg(THREAD);
 
 #[cfg(test)]
 mod tests {
@@ -39,7 +35,6 @@ mod tests {
         assert_eq!(CORAL, Color::Rgb(238, 130, 114));
         assert_eq!(VIOLET, Color::Rgb(169, 155, 214));
         assert_eq!(BLUE, Color::Rgb(141, 180, 232));
-        assert_eq!(TEAL, Color::Rgb(111, 196, 196));
         assert_eq!(THREAD, Color::Rgb(140, 107, 51));
     }
 }

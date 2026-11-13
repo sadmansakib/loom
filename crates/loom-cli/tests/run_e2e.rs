@@ -49,7 +49,7 @@ async fn server_with_catalog() -> MockServer {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": [{
                 "id": MODEL,
-                "context_window": 131072,
+                "context_window": 131_072,
                 "supported_parameters": ["tools"]
             }]
         })))

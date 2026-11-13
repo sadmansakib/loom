@@ -97,6 +97,23 @@ pub async fn load(
     account: Option<&str>,
     base_url: Option<&str>,
 ) -> Result<OpenRouterCatalog, EngineError> {
+    load_with_credential(db_path, provider, account, base_url, None).await
+}
+
+/// Like [`load`], using a credential already resolved by the caller when a
+/// refresh is needed. Fresh cache hits still avoid credential access entirely.
+///
+/// # Errors
+///
+/// Returns [`EngineError`] when credential resolution fails or when the
+/// catalog fetch fails and no cached catalog is available.
+pub async fn load_with_credential(
+    db_path: &Path,
+    provider: &str,
+    account: Option<&str>,
+    base_url: Option<&str>,
+    resolved: Option<&loom_providers::SecretString>,
+) -> Result<OpenRouterCatalog, EngineError> {
     let path = catalog_path(db_path);
     let cached = read_cache(&path);
 
@@ -109,14 +126,17 @@ pub async fn load(
     // The auth handle wraps a sqlite connection (`!Sync`); resolving in
     // a scope that ends before the fetch keeps this future `Send` for
     // embedders that spawn it (loom-acp).
-    let credential = {
-        let auth = crate::auth::Auth::open(db_path)?;
-        auth.resolve(provider, account)?
+    let credential = if let Some(credential) = resolved {
+        credential.clone()
+    } else {
+        crate::auth::Auth::open(db_path)?
+            .resolve(provider, account)?
+            .secret
     };
     let base = base_url.unwrap_or(loom_providers::OPENROUTER_DEFAULT_BASE_URL);
 
     match fetch_with_retries(
-        || loom_providers::fetch_catalog(base, credential.secret.expose(), CATALOG_TIMEOUTS),
+        || loom_providers::fetch_catalog(base, credential.expose(), CATALOG_TIMEOUTS),
         CATALOG_RETRY_DELAY,
     )
     .await
@@ -173,6 +193,23 @@ pub async fn load_custom(
     account: Option<&str>,
     models_url: &str,
 ) -> Result<CustomCatalog, EngineError> {
+    load_custom_with_credential(db_path, provider, account, models_url, None).await
+}
+
+/// Like [`load_custom`], with an optional credential already resolved by the
+/// caller so discovery and engine opening can share one keychain read.
+///
+/// # Errors
+///
+/// Returns [`EngineError`] when credential resolution fails or when the
+/// catalog fetch fails and no usable cached catalog is available.
+pub async fn load_custom_with_credential(
+    db_path: &Path,
+    provider: &str,
+    account: Option<&str>,
+    models_url: &str,
+    resolved: Option<&loom_providers::SecretString>,
+) -> Result<CustomCatalog, EngineError> {
     let path = custom_catalog_path(db_path, provider);
     let cached = read_custom_cache(&path);
 
@@ -184,19 +221,16 @@ pub async fn load_custom(
 
     // Same Send discipline as [`load`]: the auth handle is scoped to
     // end before the fetch.
-    let credential = {
-        let auth = crate::auth::Auth::open(db_path)?;
-        auth.resolve(provider, account)?
+    let credential = if let Some(credential) = resolved {
+        credential.clone()
+    } else {
+        crate::auth::Auth::open(db_path)?
+            .resolve(provider, account)?
+            .secret
     };
 
     match fetch_with_retries(
-        || {
-            loom_providers::fetch_custom_catalog(
-                models_url,
-                credential.secret.expose(),
-                CATALOG_TIMEOUTS,
-            )
-        },
+        || loom_providers::fetch_custom_catalog(models_url, credential.expose(), CATALOG_TIMEOUTS),
         CATALOG_RETRY_DELAY,
     )
     .await
@@ -239,6 +273,15 @@ fn read_custom_cache(path: &Path) -> Option<CustomCatalog> {
     }
 }
 
+/// Reads a cached custom catalog for `models_url` without resolving a
+/// credential or contacting the provider. A matching stale snapshot is
+/// returned so frontends can populate model pickers without keychain access.
+#[must_use]
+pub fn cached_custom(db_path: &Path, provider: &str, models_url: &str) -> Option<CustomCatalog> {
+    let catalog = read_custom_cache(&custom_catalog_path(db_path, provider))?;
+    (catalog.source == models_url).then_some(catalog)
+}
+
 /// Writes the custom catalog cache, creating the parent directory as
 /// needed.
 fn write_custom_cache(path: &Path, catalog: &CustomCatalog) -> std::io::Result<()> {
@@ -260,6 +303,13 @@ fn read_cache(path: &Path) -> Option<OpenRouterCatalog> {
             None
         }
     }
+}
+
+/// Reads the cached `OpenRouter` catalog without resolving a credential or
+/// contacting the provider. Stale snapshots are useful for picker display.
+#[must_use]
+pub fn cached_openrouter(db_path: &Path) -> Option<OpenRouterCatalog> {
+    read_cache(&catalog_path(db_path))
 }
 
 /// Writes the catalog cache, creating the parent directory as needed.

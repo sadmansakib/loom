@@ -114,6 +114,8 @@ impl Engine {
         // both paths.
         let provider: Box<dyn ModelProvider> = if let Some(provider) = overrides.provider {
             provider
+        } else if let Some(credential) = overrides.credential {
+            crate::provider::build(&config, credential.expose())?.provider
         } else {
             // Credential resolution: --account → active saved account →
             // env (§18.3). The secret never leaves a `SecretString`.
@@ -545,6 +547,20 @@ impl Engine {
     /// Returns [`EngineError`] when a catalog-driven provider's catalog
     /// cannot be fetched or parsed.
     pub async fn resolve_catalog(config: EngineConfig) -> Result<EngineConfig, EngineError> {
+        Self::resolve_catalog_with_credential(config, None).await
+    }
+
+    /// Resolves model metadata, optionally reusing a credential already
+    /// obtained by a frontend during model discovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] when required provider metadata cannot be
+    /// resolved or a catalog cannot be loaded.
+    pub async fn resolve_catalog_with_credential(
+        config: EngineConfig,
+        credential: Option<&loom_providers::SecretString>,
+    ) -> Result<EngineConfig, EngineError> {
         // `custom` is described entirely by user-supplied URLs: the
         // chat base URL is mandatory and the catalog comes from the
         // models URL (explicit or defaulted from the base). Its cache
@@ -574,11 +590,14 @@ impl Engine {
                     .clone()
                     .or_else(|| named.and_then(|entry| entry.models_url.clone()))
                     .unwrap_or_else(|| format!("{}/models", base_url.trim_end_matches('/')));
-                let catalog = crate::catalog::load_custom(
+                let catalog_credential = credential
+                    .filter(|_| config.provider == CUSTOM_PROVIDER_NAME || named.is_some());
+                let catalog = crate::catalog::load_custom_with_credential(
                     &config.db_path,
                     &config.provider,
                     config.account.as_deref(),
                     &models_url,
+                    catalog_credential,
                 )
                 .await?;
                 EngineConfig {
@@ -591,35 +610,39 @@ impl Engine {
         } else {
             config
         };
-        // The catalog is fetched for every provider, not just the
-        // catalog-driven one: capability resolution is catalog-first for
-        // the table adapters too, so a model the adapter's static table
-        // never heard of runs after a catalog refresh with no code
-        // change. The fetch always uses the OpenRouter credential of its
-        // own — a run against any other provider must not have its
-        // account or base URL steer the catalog request — and when the
-        // fetch fails, only `openrouter` runs propagate the error (their
-        // adapter cannot resolve models without a catalog); table-driven
-        // adapters fall back to their built-in rows. `custom` already
-        // carried its own catalog past this branch.
+        // A fresh OpenRouter catalog is fetched for an OpenRouter run;
+        // other providers may use an existing cache for capability metadata,
+        // but must not resolve OpenRouter credentials as a side effect.
         let config = if config.catalog.is_none() {
             let is_openrouter = config.provider == OPENROUTER_PROVIDER_NAME;
-            let account = is_openrouter.then(|| config.account.clone()).flatten();
-            let base_url = is_openrouter.then(|| config.base_url.clone()).flatten();
-            match crate::catalog::load(
-                &config.db_path,
-                OPENROUTER_PROVIDER_NAME,
-                account.as_deref(),
-                base_url.as_deref(),
-            )
-            .await
-            {
-                Ok(catalog) => EngineConfig {
+            if is_openrouter {
+                let account = config.account.clone();
+                let base_url = config.base_url.clone();
+                match crate::catalog::load_with_credential(
+                    &config.db_path,
+                    OPENROUTER_PROVIDER_NAME,
+                    account.as_deref(),
+                    base_url.as_deref(),
+                    credential,
+                )
+                .await
+                {
+                    Ok(catalog) => EngineConfig {
+                        catalog: Some(ProviderCatalog::OpenRouter(catalog)),
+                        ..config
+                    },
+                    Err(error) => return Err(error),
+                }
+            } else if let Some(catalog) = crate::catalog::cached_openrouter(&config.db_path) {
+                // Capability metadata from another provider's catalog is
+                // useful when already cached, but opening this provider must
+                // never resolve the unrelated OpenRouter keychain entry.
+                EngineConfig {
                     catalog: Some(ProviderCatalog::OpenRouter(catalog)),
                     ..config
-                },
-                Err(_) if !is_openrouter => config,
-                Err(error) => return Err(error),
+                }
+            } else {
+                config
             }
         } else {
             config
@@ -662,9 +685,22 @@ impl Engine {
     /// [`Engine::open_with_extra_tools`].
     pub async fn open_async_with(
         config: EngineConfig,
-        overrides: EngineOverrides,
+        mut overrides: EngineOverrides,
     ) -> Result<Self, EngineError> {
-        let config = Self::resolve_catalog(config).await?;
+        if overrides.provider.is_none() && overrides.credential.is_none() {
+            let store = SqliteAuthStore::open(&config.db_path).map_err(EngineError::Store)?;
+            let secrets = KeychainBackend::default();
+            let credential = auth::resolve(
+                &store,
+                &secrets,
+                &config.provider,
+                config.account.as_deref(),
+                |name| std::env::var(name).ok(),
+            )?;
+            overrides.credential = Some(credential.secret);
+        }
+        let config =
+            Self::resolve_catalog_with_credential(config, overrides.credential.as_ref()).await?;
         // Slice D2: deferred MCP attach. Spawning stdio servers and
         // handshaking is async I/O, so it lives here — the sync
         // constructor receives the attachment (eager meta-tools +

@@ -50,7 +50,7 @@ fn run_tui_accepts_a_missing_task_and_parses_the_switch() {
         panic!("expected `run`");
     };
     assert!(args.tui);
-    assert!(args.task.is_empty());
+    assert_eq!(args.task, [] as [std::string::String; 0]);
 }
 
 #[test]

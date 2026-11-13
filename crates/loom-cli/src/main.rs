@@ -36,7 +36,15 @@ fn main() -> ExitCode {
     let owns_terminal = match &cli.command {
         Command::Tui(_) => true,
         Command::Run(args) => args.tui,
-        _ => false,
+        Command::Chat(_)
+        | Command::Auth(_)
+        | Command::Provider(_)
+        | Command::Sessions
+        | Command::Rewind(_)
+        | Command::Stats(_)
+        | Command::Lessons(_)
+        | Command::ReplayContext(_)
+        | Command::Trust(_) => false,
     };
     if !owns_terminal {
         init_tracing();

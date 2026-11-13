@@ -65,7 +65,7 @@ impl ScriptedProvider {
 }
 
 impl ModelProvider for ScriptedProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "scripted-integration-test"
     }
 
@@ -131,6 +131,7 @@ fn config(workspace: std::path::PathBuf, db_path: std::path::PathBuf) -> EngineC
     }
 }
 
+#[allow(clippy::expect_used)] // test setup must fail immediately with a useful cause
 fn open_engine(base: &tempfile::TempDir, provider: ScriptedProvider) -> Engine {
     let workspace = base.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("create workspace");
@@ -142,6 +143,7 @@ fn open_engine(base: &tempfile::TempDir, provider: ScriptedProvider) -> Engine {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one end-to-end persistence/resume scenario with ordered assertions
 async fn built_in_tool_result_survives_reload_and_session_resume() {
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
         let base = tempfile::tempdir().expect("temporary directory");

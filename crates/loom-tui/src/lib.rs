@@ -30,6 +30,10 @@ pub use scene_views::Scene;
 const FRAME_TICK: Duration = Duration::from_millis(35);
 
 /// Renders one of the six fixed reference scenes and restores the terminal.
+///
+/// # Errors
+///
+/// Returns an error if terminal setup, drawing, or restoration fails.
 pub fn render_scene(scene: Scene) -> Result<()> {
     terminal_session(|terminal| {
         terminal.draw(|frame| scene_views::draw(frame, scene))?;
@@ -39,6 +43,10 @@ pub fn render_scene(scene: Scene) -> Result<()> {
 
 /// Open the interactive TUI using the compact settings surface shared by
 /// `loom tui` and `loom run --tui`.
+///
+/// # Errors
+///
+/// Returns an error if configuration, terminal setup, or runtime initialization fails.
 pub fn run_with_options(
     task: Option<String>,
     provider: Option<String>,
@@ -53,11 +61,19 @@ pub fn run_with_options(
 
 /// Drive the TUI with a fully composed engine configuration. CLI callers
 /// should use this to preserve all `loom run` flags.
+///
+/// # Errors
+///
+/// Returns an error if runtime initialization or terminal interaction fails.
 pub fn run_with_config(task: Option<String>, config: EngineConfig) -> Result<()> {
     run_with_config_and_overrides(task, config, loom_core::EngineOverrides::default())
 }
 
 /// Drive the TUI with configuration and engine overrides composed by the CLI.
+///
+/// # Errors
+///
+/// Returns an error if runtime initialization or terminal interaction fails.
 pub fn run_with_config_and_overrides(
     task: Option<String>,
     config: EngineConfig,
@@ -116,6 +132,7 @@ fn default_config(
     })
 }
 
+#[allow(clippy::too_many_lines)] // terminal lifecycle and task event loop are intentionally serialized
 async fn run_interactive(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     mut config: EngineConfig,
@@ -166,23 +183,53 @@ async fn run_interactive(
                 && let Event::Key(key) = event::read()?
             {
                 match key.code {
+                    KeyCode::Esc if picker_state.searching => {
+                        picker_state.searching = false;
+                        picker_state.set_query(String::new());
+                    }
                     KeyCode::Esc if active.is_some() => picker = false,
                     KeyCode::Esc => return Ok(()),
-                    KeyCode::Up | KeyCode::Char('k') => picker_state.move_model(-1),
-                    KeyCode::Down | KeyCode::Char('j') => picker_state.move_model(1),
-                    KeyCode::Tab if picker_state.has_supported_effort() => {
-                        picker_state.next_effort()
+                    KeyCode::Char('/') if !picker_state.searching => {
+                        picker_state.searching = true;
                     }
-                    KeyCode::Enter if !picker_state.choices.is_empty() => {
+                    KeyCode::Backspace if picker_state.searching => {
+                        picker_state.search_query.pop();
+                        picker_state.refresh_filter_selection();
+                    }
+                    KeyCode::Char(ch)
+                        if picker_state.searching
+                            && !key.modifiers.intersects(
+                                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                            ) =>
+                    {
+                        picker_state.search_query.push(ch);
+                        picker_state.refresh_filter_selection();
+                    }
+                    KeyCode::Up | KeyCode::Char('k') if !picker_state.searching => {
+                        picker_state.move_model(-1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if !picker_state.searching => {
+                        picker_state.move_model(1);
+                    }
+                    KeyCode::Tab if picker_state.has_supported_effort() => {
+                        picker_state.next_effort();
+                    }
+                    KeyCode::Enter if !picker_state.filtered_indices().is_empty() => {
+                        picker_state.searching = false;
                         picker_state.apply(&mut config);
                         let previous_session = active.take().map(|(_, session)| session);
-                        let (engine, session) =
-                            open_engine(&config, overrides.take().unwrap_or_default()).await?;
+                        if let Some(catalog) = picker_state.catalogs.get(&config.provider) {
+                            config.catalog = Some(catalog.clone());
+                        }
+                        let mut engine_overrides = overrides.take().unwrap_or_default();
+                        if let Some(credential) = picker_state.credentials.get(&config.provider) {
+                            engine_overrides = engine_overrides.with_credential(credential.clone());
+                        }
+                        let (engine, session) = open_engine(&config, engine_overrides).await?;
                         active = Some((engine, previous_session.unwrap_or(session)));
                         picker = false;
                     }
-                    KeyCode::Enter => {}
-                    KeyCode::Char('r') => {
+                    KeyCode::Char('r') if !picker_state.searching => {
                         picker_state = PickerState::discover(&config).await?;
                         picker_loaded = true;
                     }
@@ -194,6 +241,8 @@ async fn run_interactive(
                     | KeyCode::End
                     | KeyCode::PageUp
                     | KeyCode::PageDown
+                    | KeyCode::Up
+                    | KeyCode::Down
                     | KeyCode::Tab
                     | KeyCode::BackTab
                     | KeyCode::Delete
@@ -209,7 +258,8 @@ async fn run_interactive(
                     | KeyCode::Menu
                     | KeyCode::KeypadBegin
                     | KeyCode::Media(_)
-                    | KeyCode::Modifier(_) => {}
+                    | KeyCode::Modifier(_)
+                    | KeyCode::Enter => {}
                 }
             }
             continue;
@@ -254,7 +304,7 @@ async fn run_interactive(
                         thread_scroll_back,
                         &input,
                         &file_index,
-                    )
+                    );
                 })?;
                 tokio::select! {
                     event = events.recv() => {
@@ -265,16 +315,30 @@ async fn run_interactive(
                     result = &mut run => {
                         break result;
                     }
-                    _ = tokio::time::sleep(FRAME_TICK) => {
+                    () = tokio::time::sleep(FRAME_TICK) => {
                         if event::poll(Duration::ZERO)? {
                             match event::read()? {
                                 Event::Key(key) => {
                                     if !update_thread_scroll(key, &mut thread_scroll_back) {
-                                        handle_key(key, &mut input, &config.workspace, &mut help, &mut picker, &mut sidebar, &mut should_quit, &mut pending_task, &mut pending_display_prompt, Some(&task_control), &mut reducer);
+                                        handle_key(key, &mut KeyContext {
+                                            input: &mut input,
+                                            workspace: &config.workspace,
+                                            help: &mut help,
+                                            picker: &mut picker,
+                                            sidebar: &mut sidebar,
+                                            quit: &mut should_quit,
+                                            pending_task: &mut pending_task,
+                                            pending_display_prompt: &mut pending_display_prompt,
+                                            control: Some(&task_control),
+                                            reducer: &mut reducer,
+                                        });
                                     }
                                 }
                                 Event::Mouse(mouse) => update_thread_mouse(mouse, &mut thread_scroll_back),
-                                _ => {}
+                                Event::FocusGained
+                                | Event::FocusLost
+                                | Event::Paste(_)
+                                | Event::Resize(..) => {}
                             }
                         }
                     }
@@ -310,7 +374,7 @@ async fn run_interactive(
                 thread_scroll_back,
                 &input,
                 &file_index,
-            )
+            );
         })?;
         if should_quit {
             return Ok(());
@@ -321,16 +385,18 @@ async fn run_interactive(
                     if !update_thread_scroll(key, &mut thread_scroll_back) {
                         handle_key(
                             key,
-                            &mut input,
-                            &config.workspace,
-                            &mut help,
-                            &mut picker,
-                            &mut sidebar,
-                            &mut should_quit,
-                            &mut pending_task,
-                            &mut pending_display_prompt,
-                            None,
-                            &mut reducer,
+                            &mut KeyContext {
+                                input: &mut input,
+                                workspace: &config.workspace,
+                                help: &mut help,
+                                picker: &mut picker,
+                                sidebar: &mut sidebar,
+                                quit: &mut should_quit,
+                                pending_task: &mut pending_task,
+                                pending_display_prompt: &mut pending_display_prompt,
+                                control: None,
+                                reducer: &mut reducer,
+                            },
                         );
                     }
                     if picker {
@@ -338,7 +404,7 @@ async fn run_interactive(
                     }
                 }
                 Event::Mouse(mouse) => update_thread_mouse(mouse, &mut thread_scroll_back),
-                _ => {}
+                Event::FocusGained | Event::FocusLost | Event::Paste(_) | Event::Resize(..) => {}
             }
         }
         if let Some(task) = pending_task.take() {
@@ -371,6 +437,10 @@ pub(crate) struct ModelChoice {
 pub(crate) struct PickerState {
     pub(crate) choices: Vec<ModelChoice>,
     pub(crate) selected: usize,
+    pub(crate) search_query: String,
+    pub(crate) searching: bool,
+    credentials: std::collections::HashMap<String, loom_core::providers::SecretString>,
+    catalogs: std::collections::HashMap<String, loom_core::providers::ProviderCatalog>,
     pub(crate) effort: ReasoningEffort,
     pub(crate) notice: Option<String>,
 }
@@ -380,6 +450,10 @@ impl PickerState {
         Self {
             choices: Vec::new(),
             selected: 0,
+            search_query: String::new(),
+            searching: false,
+            credentials: std::collections::HashMap::new(),
+            catalogs: std::collections::HashMap::new(),
             effort: ReasoningEffort::default(),
             notice: None,
         }
@@ -394,6 +468,10 @@ impl PickerState {
         let mut state = Self {
             choices: vec![choice],
             selected: 0,
+            search_query: String::new(),
+            searching: false,
+            credentials: std::collections::HashMap::new(),
+            catalogs: std::collections::HashMap::new(),
             effort: config.reasoning_effort,
             notice: None,
         };
@@ -401,6 +479,7 @@ impl PickerState {
         state
     }
 
+    #[allow(clippy::too_many_lines)] // discovery is a sequential provider/catalog reconciliation pipeline
     async fn discover(config: &EngineConfig) -> Result<Self> {
         use loom_core::engine::registry::{BUILTIN_PROVIDERS, ProviderRegistry};
         use loom_core::providers::ProviderCatalog;
@@ -415,7 +494,10 @@ impl PickerState {
         providers.dedup();
 
         let mut choices = Vec::new();
+        let mut catalogs = std::collections::HashMap::new();
+        let mut credentials = std::collections::HashMap::new();
         let mut failures = Vec::new();
+        let credential_provider = catalog_credential_provider(&config.provider, &registry);
         for provider in providers {
             let mut provider_config = config.clone();
             provider_config.provider.clone_from(&provider);
@@ -431,61 +513,177 @@ impl PickerState {
                     .collect();
             }
 
-            if provider == "openrouter" || provider == "custom" || registry.get(&provider).is_some()
-            {
-                match Engine::resolve_catalog(provider_config).await {
-                    Ok(resolved) => match resolved.catalog {
-                        Some(ProviderCatalog::OpenRouter(catalog)) => {
-                            choices.extend(catalog.models.iter().map(|model| {
-                                model_choice(
-                                    provider.clone(),
-                                    model.id.clone(),
-                                    catalog.capabilities(&model.id),
-                                )
-                            }));
+            let catalog_driven = provider == "openrouter"
+                || provider == "custom"
+                || registry.get(&provider).is_some();
+            let mut credential = environment_credential(&provider);
+            // Resolve only the selected/configured custom provider, or the
+            // sole registered gateway when the current provider is built in.
+            // This supports the common single-gateway setup (such as bKash)
+            // without prompting for every provider during picker discovery.
+            let should_resolve_saved_credential = credential_provider == Some(provider.as_str());
+            let mut saved_credential_attempted = false;
+            let mut has_saved_account = false;
+            if credential.is_none() && catalog_driven && should_resolve_saved_credential {
+                saved_credential_attempted = true;
+                match loom_core::engine::auth::Auth::open(&config.db_path) {
+                    Ok(auth) => {
+                        has_saved_account = auth
+                            .list(Some(&provider))
+                            .is_ok_and(|accounts| !accounts.is_empty());
+                        match auth.resolve(&provider, config.account.as_deref()) {
+                            Ok(resolved) => credential = Some(resolved.secret),
+                            Err(error) => {
+                                tracing::debug!(%provider, %error, "saved provider credential unavailable during picker discovery");
+                            }
                         }
-                        Some(ProviderCatalog::Custom(catalog)) => {
-                            choices.extend(catalog.models.iter().map(|model| {
-                                model_choice(
-                                    provider.clone(),
-                                    model.id.clone(),
-                                    catalog.capabilities(&model.id),
-                                )
-                            }));
+                    }
+                    Err(error) => {
+                        tracing::debug!(%provider, %error, "could not open provider auth store during picker discovery");
+                    }
+                }
+            }
+            if catalog_driven {
+                // Show a cached catalog even when its credential is not
+                // available. This path never reads the keychain.
+                let models_url = registry.get(&provider).map(catalog_models_url).or_else(|| {
+                    provider_config.models_url.clone().or_else(|| {
+                        provider_config
+                            .base_url
+                            .as_deref()
+                            .map(|base_url| format!("{}/models", base_url.trim_end_matches('/')))
+                    })
+                });
+                let cached = match provider.as_str() {
+                    "openrouter" => loom_core::engine::catalog::cached_openrouter(&config.db_path)
+                        .map(ProviderCatalog::OpenRouter),
+                    _ => models_url
+                        .as_deref()
+                        .and_then(|url| {
+                            loom_core::engine::catalog::cached_custom(
+                                &config.db_path,
+                                &provider,
+                                url,
+                            )
+                        })
+                        .map(ProviderCatalog::Custom),
+                };
+
+                let resolved_catalog = if credential.is_some() {
+                    match Engine::resolve_catalog_with_credential(
+                        provider_config.clone(),
+                        credential.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(resolved) => resolved.catalog.or(cached.clone()),
+                        Err(error) => {
+                            if cached.is_none() {
+                                failures.push(format!("{provider}: {error}"));
+                            }
+                            cached.clone()
                         }
-                        None => failures.push(format!("{provider}: catalog unavailable")),
-                    },
-                    Err(error) => failures.push(format!("{provider}: {error}")),
+                    }
+                } else if saved_credential_attempted && has_saved_account {
+                    // Saved accounts can have keychain secrets even when
+                    // the initial lookup failed transiently. Avoid a
+                    // second keychain access; keep the cache instead.
+                    cached.clone()
+                } else if should_resolve_saved_credential {
+                    // No saved secret can be prompted for. Allow public or
+                    // anonymous custom model endpoints to populate the
+                    // catalog; if the registry endpoint needs auth, its
+                    // failure is shown in the picker notice.
+                    match Engine::resolve_catalog_with_credential(provider_config.clone(), None)
+                        .await
+                    {
+                        Ok(resolved) => resolved.catalog.or(cached.clone()),
+                        Err(error) => {
+                            if cached.is_none() {
+                                failures.push(format!("{provider}: {error}"));
+                            }
+                            cached.clone()
+                        }
+                    }
+                } else {
+                    cached.clone()
+                };
+
+                match resolved_catalog {
+                    Some(ProviderCatalog::OpenRouter(catalog)) => {
+                        if let Some(secret) = credential.clone() {
+                            credentials.insert(provider.clone(), secret);
+                        }
+                        catalogs.insert(
+                            provider.clone(),
+                            ProviderCatalog::OpenRouter(catalog.clone()),
+                        );
+                        choices.extend(catalog.models.iter().map(|model| {
+                            model_choice(
+                                provider.clone(),
+                                model.id.clone(),
+                                catalog.capabilities(&model.id),
+                            )
+                        }));
+                    }
+                    Some(ProviderCatalog::Custom(catalog)) => {
+                        if let Some(secret) = credential.clone() {
+                            credentials.insert(provider.clone(), secret);
+                        }
+                        catalogs.insert(provider.clone(), ProviderCatalog::Custom(catalog.clone()));
+                        choices.extend(catalog.models.iter().map(|model| {
+                            model_choice(
+                                provider.clone(),
+                                model.id.clone(),
+                                catalog.capabilities(&model.id),
+                            )
+                        }));
+                    }
+                    None => {
+                        if cached.is_none() {
+                            failures.push(format!("{provider}: catalog unavailable"));
+                        }
+                    }
                 }
                 continue;
             }
 
-            let api_key = {
-                let auth = loom_core::engine::auth::Auth::open(&config.db_path)
-                    .context("open account store for model discovery")?;
-                match auth.resolve(&provider, config.account.as_deref()) {
-                    Ok(credential) => Some(credential.secret.expose().to_owned()),
-                    Err(_) => None,
-                }
-            };
-            let Some(api_key) = api_key else {
+            let Some(credential) = credential else {
                 continue;
             };
 
             match loom_core::providers::discover_builtin_models(
                 &provider,
-                config.base_url.as_deref(),
-                &api_key,
+                provider_config.base_url.as_deref(),
+                credential.expose(),
             )
             .await
             {
-                Ok(models) => choices.extend(models.into_iter().map(|model| {
-                    let capabilities = capabilities_for(&provider, &model);
-                    model_choice(provider.clone(), model, capabilities)
-                })),
+                Ok(models) => {
+                    choices.extend(models.into_iter().map(|model| {
+                        let capabilities = capabilities_for(&provider, &model);
+                        model_choice(provider.clone(), model, capabilities)
+                    }));
+                }
                 Err(error) => failures.push(format!("{provider}: {error}")),
             }
         }
+        // Keep the currently configured model selectable even when its
+        // provider has no cached catalog or environment credential. The
+        // engine resolves the saved credential only after model selection.
+        if !config.model.is_empty()
+            && !choices
+                .iter()
+                .any(|choice| choice.provider == config.provider)
+        {
+            let capabilities = capabilities_for(&config.provider, &config.model);
+            choices.push(model_choice(
+                config.provider.clone(),
+                config.model.clone(),
+                capabilities,
+            ));
+        }
+
         choices.sort_by(|left, right| {
             left.provider
                 .cmp(&right.provider)
@@ -500,6 +698,10 @@ impl PickerState {
         let mut state = Self {
             choices,
             selected,
+            search_query: String::new(),
+            searching: false,
+            credentials,
+            catalogs,
             effort: config.reasoning_effort,
             notice: if failures.is_empty() {
                 None
@@ -521,11 +723,46 @@ impl PickerState {
     }
 
     fn move_model(&mut self, delta: isize) {
-        let len = self.choices.len();
+        let indices = self.filtered_indices();
+        let len = indices.len();
         if len == 0 {
             return;
         }
-        self.selected = (self.selected as isize + delta).rem_euclid(len as isize) as usize;
+        let current = indices
+            .iter()
+            .position(|index| *index == self.selected)
+            .unwrap_or(0);
+        let next = current.wrapping_add_signed(delta) % len;
+        self.selected = indices[next];
+        self.normalize_effort();
+    }
+
+    fn filtered_indices(&self) -> Vec<usize> {
+        let query = self.search_query.trim().to_lowercase();
+        self.choices
+            .iter()
+            .enumerate()
+            .filter_map(|(index, choice)| {
+                (query.is_empty()
+                    || choice.provider.to_lowercase().contains(&query)
+                    || choice.model.to_lowercase().contains(&query))
+                .then_some(index)
+            })
+            .collect()
+    }
+
+    fn set_query(&mut self, query: String) {
+        self.search_query = query;
+        self.refresh_filter_selection();
+    }
+
+    fn refresh_filter_selection(&mut self) {
+        let indices = self.filtered_indices();
+        if !indices.contains(&self.selected)
+            && let Some(index) = indices.first()
+        {
+            self.selected = *index;
+        }
         self.normalize_effort();
     }
 
@@ -564,7 +801,7 @@ impl PickerState {
     }
 
     fn apply(&self, config: &mut EngineConfig) {
-        if self.choices.is_empty() {
+        if !self.filtered_indices().contains(&self.selected) {
             return;
         }
         let choice = self.selected();
@@ -616,19 +853,11 @@ fn capabilities_for(provider: &str, model: &str) -> Option<ModelCapabilities> {
 #[allow(clippy::too_many_arguments)]
 fn update_thread_scroll(key: KeyEvent, scroll_back: &mut usize) -> bool {
     match (key.code, key.modifiers) {
-        (KeyCode::PageUp, _) => {
+        (KeyCode::PageUp, _) | (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
             *scroll_back = scroll_back.saturating_add(8);
             true
         }
-        (KeyCode::PageDown, _) => {
-            *scroll_back = scroll_back.saturating_sub(8);
-            true
-        }
-        (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-            *scroll_back = scroll_back.saturating_add(8);
-            true
-        }
-        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+        (KeyCode::PageDown, _) | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
             *scroll_back = scroll_back.saturating_sub(8);
             true
         }
@@ -644,8 +873,46 @@ fn update_thread_mouse(mouse: MouseEvent, scroll_back: &mut usize) {
     match mouse.kind {
         MouseEventKind::ScrollUp => *scroll_back = scroll_back.saturating_add(3),
         MouseEventKind::ScrollDown => *scroll_back = scroll_back.saturating_sub(3),
-        _ => {}
+        MouseEventKind::Down(_)
+        | MouseEventKind::Up(_)
+        | MouseEventKind::Drag(_)
+        | MouseEventKind::Moved
+        | MouseEventKind::ScrollLeft
+        | MouseEventKind::ScrollRight => {}
     }
+}
+
+fn environment_credential(provider: &str) -> Option<loom_core::providers::SecretString> {
+    loom_core::engine::auth::provider_env_names(provider)
+        .into_iter()
+        .find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(loom_core::providers::SecretString::new)
+        })
+}
+
+fn catalog_credential_provider<'a>(
+    configured_provider: &'a str,
+    registry: &'a loom_core::engine::registry::ProviderRegistry,
+) -> Option<&'a str> {
+    if configured_provider == "custom" || registry.get(configured_provider).is_some() {
+        return Some(configured_provider);
+    }
+
+    if configured_provider.is_empty() && registry.entries().count() == 1 {
+        return registry.entries().next().map(|(name, _)| name);
+    }
+
+    None
+}
+
+fn catalog_models_url(entry: &loom_core::engine::registry::RegistryEntry) -> String {
+    entry
+        .models_url
+        .clone()
+        .unwrap_or_else(|| format!("{}/models", entry.base_url.trim_end_matches('/')))
 }
 
 #[cfg(test)]
@@ -661,32 +928,32 @@ fn scroll_from_mouse(kind: MouseEventKind, scroll_back: &mut usize) {
     );
 }
 
-fn handle_key(
-    key: KeyEvent,
-    input: &mut PromptEditor,
-    workspace: &Path,
-    help: &mut bool,
-    picker: &mut bool,
-    sidebar: &mut bool,
-    quit: &mut bool,
-    pending_task: &mut Option<String>,
-    pending_display_prompt: &mut Option<String>,
-    control: Option<&TaskControl>,
-    reducer: &mut Reducer,
-) {
+fn handle_key(key: KeyEvent, context: &mut KeyContext<'_>) {
+    let KeyContext {
+        input,
+        workspace,
+        help,
+        picker,
+        sidebar,
+        quit,
+        pending_task,
+        pending_display_prompt,
+        control,
+        reducer,
+    } = context;
     match (key.code, key.modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
             if let Some(control) = control {
                 control.cancel();
             } else {
-                *quit = true;
+                **quit = true;
             }
         }
-        (KeyCode::F(1), _) => *help = !*help,
+        (KeyCode::F(1), _) => **help = !**help,
         (KeyCode::F(2), _) if control.is_none() => {
-            *picker = true;
+            **picker = true;
         }
-        (KeyCode::Char('b'), KeyModifiers::CONTROL) => *sidebar = !*sidebar,
+        (KeyCode::Char('b'), KeyModifiers::CONTROL) => **sidebar = !**sidebar,
         (KeyCode::Tab, _) if input.has_file_mention() => input.complete_file(workspace),
         (KeyCode::Enter, modifiers)
             if modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
@@ -706,10 +973,10 @@ fn handle_key(
                     reducer.push_display_prompt(display_prompt);
                     reducer.task.attachments.extend(attachments);
                 } else {
-                    *pending_display_prompt = Some(original_message);
+                    **pending_display_prompt = Some(original_message);
                     reducer.set_attachments(attachments);
-                    *pending_task = Some(message);
-                    *picker = false;
+                    **pending_task = Some(message);
+                    **picker = false;
                 }
             }
         }
@@ -729,6 +996,19 @@ fn handle_key(
         }
         _ => {}
     }
+}
+
+struct KeyContext<'a> {
+    input: &'a mut PromptEditor,
+    workspace: &'a Path,
+    help: &'a mut bool,
+    picker: &'a mut bool,
+    sidebar: &'a mut bool,
+    quit: &'a mut bool,
+    pending_task: &'a mut Option<String>,
+    pending_display_prompt: &'a mut Option<String>,
+    control: Option<&'a TaskControl>,
+    reducer: &'a mut Reducer,
 }
 
 #[derive(Debug, Default)]
@@ -948,19 +1228,20 @@ fn draw_live(
     } else {
         let suggestions = input_editor
             .mention_query()
-            .map(|query| matching_file_suggestions(file_index, query))
-            .unwrap_or_default();
+            .map_or_default(|query| matching_file_suggestions(file_index, query));
         scene_views::draw_live_scrolled(
             frame,
             reducer,
             input,
             cursor,
-            sidebar,
-            elapsed,
-            dropped,
-            thread_scroll_back,
-            suggestions,
-            None,
+            scene_views::LiveViewOptions {
+                sidebar_visible: sidebar,
+                elapsed,
+                dropped,
+                thread_scroll_back,
+                file_suggestions: &suggestions,
+                scene: None,
+            },
         );
     }
 }
@@ -989,8 +1270,7 @@ fn terminal_session<T>(
     let result = f(&mut terminal);
     let restore = guard.restore(terminal.backend_mut());
     match (result, restore) {
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
         (Ok(value), Ok(())) => Ok(value),
     }
 }
@@ -1039,7 +1319,9 @@ fn epoch_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn init_tui_logging() {
@@ -1082,16 +1364,113 @@ mod tests {
         config.provider = "catalog-provider".to_owned();
         config.model = "catalog-model".to_owned();
         let mut picker = PickerState::configured(&config);
-        assert!(picker.selected().efforts.is_empty());
+        assert_eq!(
+            picker.selected().efforts,
+            [] as [loom_core::ReasoningEffort; 0]
+        );
         picker.next_effort();
-        assert!(picker.selected().efforts.is_empty());
+        assert_eq!(
+            picker.selected().efforts,
+            [] as [loom_core::ReasoningEffort; 0]
+        );
+    }
+
+    fn picker_with_models() -> PickerState {
+        let choices = [
+            ("anthropic", "claude-sonnet"),
+            ("deepseek", "deepseek-chat"),
+            ("openrouter", "deepseek/deepseek-chat"),
+        ]
+        .into_iter()
+        .map(|(provider, model)| model_choice(provider.into(), model.into(), None))
+        .collect();
+        PickerState {
+            choices,
+            selected: 0,
+            search_query: String::new(),
+            searching: false,
+            credentials: std::collections::HashMap::new(),
+            catalogs: std::collections::HashMap::new(),
+            effort: ReasoningEffort::default(),
+            notice: None,
+        }
+    }
+
+    #[test]
+    fn picker_search_filters_provider_and_model_case_insensitively() {
+        let mut picker = picker_with_models();
+        picker.set_query("DEEPSEEK".into());
+        assert_eq!(picker.filtered_indices(), vec![1, 2]);
+        assert_eq!(picker.selected().provider, "deepseek");
+        picker.move_model(1);
+        assert_eq!(picker.selected().provider, "openrouter");
+    }
+
+    #[test]
+    fn custom_cache_uses_derived_models_url_when_registry_omits_one() {
+        let base_url = "https://gateway.example/v1";
+        let entry = loom_core::engine::registry::RegistryEntry {
+            base_url: base_url.to_owned(),
+            models_url: None,
+            headers: std::collections::BTreeMap::default(),
+        };
+        let derived = catalog_models_url(&entry);
+        assert_eq!(derived, "https://gateway.example/v1/models");
+    }
+
+    #[test]
+    fn picker_discovery_selects_only_configured_or_unambiguous_custom_credential() {
+        let mut registry = loom_core::engine::registry::ProviderRegistry::default();
+        registry.upsert(
+            "bkash",
+            loom_core::engine::registry::RegistryEntry {
+                base_url: "https://gateway.example/v1".to_owned(),
+                models_url: None,
+                headers: std::collections::BTreeMap::default(),
+            },
+        );
+        assert_eq!(catalog_credential_provider("", &registry), Some("bkash"));
+        assert_eq!(catalog_credential_provider("deepseek", &registry), None);
+        assert_eq!(
+            catalog_credential_provider("bkash", &registry),
+            Some("bkash")
+        );
+
+        registry.upsert(
+            "other-gateway",
+            loom_core::engine::registry::RegistryEntry {
+                base_url: "https://other.example/v1".to_owned(),
+                models_url: None,
+                headers: std::collections::BTreeMap::default(),
+            },
+        );
+        assert_eq!(catalog_credential_provider("", &registry), None);
+    }
+
+    #[test]
+    fn picker_search_with_no_matches_is_safe_and_cannot_apply() {
+        let mut picker = picker_with_models();
+        picker.set_query("not-a-model".into());
+        assert_eq!(picker.filtered_indices(), [] as [usize; 0]);
+        picker.move_model(1);
+        let mut config = default_config(None, None, None, None, None).unwrap();
+        picker.apply(&mut config);
+        assert_eq!(config.provider, "");
+        assert_eq!(config.model, "");
+    }
+
+    #[test]
+    fn environment_credential_ignores_empty_values_and_does_not_resolve_accounts() {
+        // The helper is deliberately environment-only; account/keychain
+        // resolution belongs to engine opening after model selection.
+        assert!(environment_credential("provider-with-no-env-credential").is_none());
     }
 
     #[test]
     fn default_config_leaves_model_selection_to_discovery() {
         let config = default_config(None, None, None, None, None).unwrap();
-        assert!(config.provider.is_empty());
-        assert!(config.model.is_empty());
+        assert_eq!(config.provider, "");
+        assert_eq!(config.model, "");
         assert!(!config.mcp);
         assert!(!config.lsp);
         assert!(!config.autofix);
@@ -1112,16 +1491,18 @@ mod tests {
         let mut reducer = Reducer::default();
         handle_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &mut text,
-            Path::new("."),
-            &mut help,
-            &mut picker,
-            &mut sidebar,
-            &mut quit,
-            &mut next,
-            &mut display_prompt,
-            None,
-            &mut reducer,
+            &mut KeyContext {
+                input: &mut text,
+                workspace: Path::new("."),
+                help: &mut help,
+                picker: &mut picker,
+                sidebar: &mut sidebar,
+                quit: &mut quit,
+                pending_task: &mut next,
+                pending_display_prompt: &mut display_prompt,
+                control: None,
+                reducer: &mut reducer,
+            },
         );
         assert_eq!(next.as_deref(), Some("fix the test"));
     }
@@ -1138,32 +1519,36 @@ mod tests {
         let mut reducer = Reducer::default();
         handle_key(
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
-            &mut input,
-            Path::new("."),
-            &mut help,
-            &mut picker,
-            &mut sidebar,
-            &mut quit,
-            &mut next,
-            &mut display_prompt,
-            None,
-            &mut reducer,
+            &mut KeyContext {
+                input: &mut input,
+                workspace: Path::new("."),
+                help: &mut help,
+                picker: &mut picker,
+                sidebar: &mut sidebar,
+                quit: &mut quit,
+                pending_task: &mut next,
+                pending_display_prompt: &mut display_prompt,
+                control: None,
+                reducer: &mut reducer,
+            },
         );
         assert_eq!(input.text, "p");
         assert!(!quit);
         for character in ['m', '?', 'q'] {
             handle_key(
                 KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
-                &mut input,
-                Path::new("."),
-                &mut help,
-                &mut picker,
-                &mut sidebar,
-                &mut quit,
-                &mut next,
-                &mut display_prompt,
-                None,
-                &mut reducer,
+                &mut KeyContext {
+                    input: &mut input,
+                    workspace: Path::new("."),
+                    help: &mut help,
+                    picker: &mut picker,
+                    sidebar: &mut sidebar,
+                    quit: &mut quit,
+                    pending_task: &mut next,
+                    pending_display_prompt: &mut display_prompt,
+                    control: None,
+                    reducer: &mut reducer,
+                },
             );
         }
         assert_eq!(input.text, "pm?q");
@@ -1232,7 +1617,10 @@ mod tests {
             matching_file_suggestions(&files, "src/m"),
             vec!["src/main.rs"]
         );
-        assert!(matching_file_suggestions(&files, "missing").is_empty());
+        assert_eq!(
+            matching_file_suggestions(&files, "missing"),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -1251,16 +1639,18 @@ mod tests {
         for modifiers in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
             handle_key(
                 KeyEvent::new(KeyCode::Enter, modifiers),
-                &mut input,
-                Path::new("."),
-                &mut help,
-                &mut picker,
-                &mut sidebar,
-                &mut quit,
-                &mut next,
-                &mut display_prompt,
-                None,
-                &mut reducer,
+                &mut KeyContext {
+                    input: &mut input,
+                    workspace: Path::new("."),
+                    help: &mut help,
+                    picker: &mut picker,
+                    sidebar: &mut sidebar,
+                    quit: &mut quit,
+                    pending_task: &mut next,
+                    pending_display_prompt: &mut display_prompt,
+                    control: None,
+                    reducer: &mut reducer,
+                },
             );
         }
         assert_eq!(input.text, "first\n\n");

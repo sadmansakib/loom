@@ -178,7 +178,7 @@ impl Reducer {
             if let TranscriptItem::User { text } = item
                 && let Some(display_prompt) = prompts.next()
             {
-                *text = display_prompt.clone();
+                text.clone_from(display_prompt);
             }
         }
     }
@@ -187,6 +187,7 @@ impl Reducer {
     ///
     /// `timestamp_millis` is used only for task lifecycle timestamps; all
     /// other state comes solely from the event and current reducer state.
+    #[allow(clippy::too_many_lines)] // one exhaustive event-to-state transition table
     pub fn reduce(&mut self, event: &EventEnvelope, timestamp_millis: u64) {
         self.sequence = event.sequence;
         self.event_count = self.event_count.saturating_add(1);
@@ -324,7 +325,17 @@ impl Reducer {
             EventKind::TaskPaused => {
                 self.finish_task(event, TaskStatus::Paused, timestamp_millis, None);
             }
-            _ => {}
+            EventKind::ContextPruned { .. }
+            | EventKind::FastPathHit { .. }
+            | EventKind::FastPathDeclined { .. }
+            | EventKind::HarnessNotice { .. }
+            | EventKind::ContextHandoff { .. }
+            | EventKind::AutofixApplied { .. }
+            | EventKind::TodoUpdated { .. }
+            | EventKind::TurnBudgetExtended { .. }
+            | EventKind::LoopNudge { .. }
+            | EventKind::AwaitingInput { .. }
+            | _ => {}
         }
     }
 
@@ -390,6 +401,17 @@ fn event_name(kind: &EventKind) -> &'static str {
         EventKind::TaskFailed { .. } => "TaskFailed",
         EventKind::TaskCancelled => "TaskCancelled",
         EventKind::TaskPaused => "TaskPaused",
+        EventKind::ContextPruned { .. } => "ContextPruned",
+        EventKind::FastPathHit { .. } => "FastPathHit",
+        EventKind::FastPathDeclined { .. } => "FastPathDeclined",
+        EventKind::CapabilitiesResolved { .. } => "CapabilitiesResolved",
+        EventKind::HarnessNotice { .. } => "HarnessNotice",
+        EventKind::ContextHandoff { .. } => "ContextHandoff",
+        EventKind::AutofixApplied { .. } => "AutofixApplied",
+        EventKind::TodoUpdated { .. } => "TodoUpdated",
+        EventKind::TurnBudgetExtended { .. } => "TurnBudgetExtended",
+        EventKind::LoopNudge { .. } => "LoopNudge",
+        EventKind::AwaitingInput { .. } => "AwaitingInput",
         _ => "Other",
     }
 }

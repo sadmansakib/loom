@@ -127,8 +127,8 @@ mod tests {
     fn every_glyph_has_both_representations() {
         assert_eq!(TABLE.len(), 14);
         for pair in TABLE {
-            assert!(!pair.unicode.is_empty());
-            assert!(!pair.ascii.is_empty());
+            assert_ne!(pair.unicode, "");
+            assert_ne!(pair.ascii, "");
             assert_eq!(glyph(pair.glyph, GlyphSet::Unicode), pair.unicode);
             assert_eq!(glyph(pair.glyph, GlyphSet::Ascii), pair.ascii);
         }

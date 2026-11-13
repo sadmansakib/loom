@@ -1,7 +1,10 @@
 use std::env;
 use std::time::Duration;
 
-use loom_core::kernel::{session::TaskStatus, transcript::Item};
+use loom_core::kernel::{
+    session::TaskStatus,
+    transcript::{Item, ToolStatus},
+};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -43,10 +46,10 @@ pub fn draw(frame: &mut Frame<'_>, scene: Scene) {
                 &Reducer::default(),
                 "",
                 0,
-                false,
-                None,
-                None,
-                Some(scene),
+                LiveViewOptions {
+                    scene: Some(scene),
+                    ..LiveViewOptions::default()
+                },
             );
         }
         Scene::Help => draw_help(frame),
@@ -54,50 +57,50 @@ pub fn draw(frame: &mut Frame<'_>, scene: Scene) {
     }
 }
 
+#[derive(Default, Clone, Copy)]
+pub struct LiveViewOptions<'a> {
+    pub sidebar_visible: bool,
+    pub elapsed: Option<Duration>,
+    pub dropped: Option<u64>,
+    pub thread_scroll_back: usize,
+    pub file_suggestions: &'a [String],
+    pub scene: Option<Scene>,
+}
+
 pub fn draw_live(
     frame: &mut Frame<'_>,
     reducer: &Reducer,
     input: &str,
     cursor: usize,
-    sidebar_visible: bool,
-    elapsed: Option<Duration>,
-    dropped: Option<u64>,
-    scene: Option<Scene>,
+    options: LiveViewOptions<'_>,
 ) {
-    draw_live_scrolled(
-        frame,
-        reducer,
-        input,
-        cursor,
-        sidebar_visible,
-        elapsed,
-        dropped,
-        0,
-        Vec::new(),
-        scene,
-    );
+    draw_live_scrolled(frame, reducer, input, cursor, options);
 }
 
+#[allow(clippy::too_many_lines)] // ordered layout composition for the live screen
 pub fn draw_live_scrolled(
     frame: &mut Frame<'_>,
     reducer: &Reducer,
     input: &str,
     cursor: usize,
-    sidebar_visible: bool,
-    elapsed: Option<Duration>,
-    dropped: Option<u64>,
-    thread_scroll_back: usize,
-    file_suggestions: Vec<String>,
-    scene: Option<Scene>,
+    options: LiveViewOptions<'_>,
 ) {
+    let LiveViewOptions {
+        sidebar_visible,
+        elapsed,
+        dropped,
+        thread_scroll_back,
+        file_suggestions,
+        scene,
+    } = options;
     let area = design_area(frame.area());
     let compact = area.width < 90;
     let wide = area.width >= 120;
-    let input_rows = input.lines().count().clamp(2, 4) as u16;
+    let input_rows = u16::try_from(input.lines().count().clamp(2, 4)).unwrap_or(4);
     let suggestion_height = if file_suggestions.is_empty() {
         0
     } else {
-        file_suggestions.len().min(5) as u16 + 2
+        u16::try_from(file_suggestions.len().min(5)).unwrap_or(5) + 2
     };
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -220,15 +223,17 @@ fn prompt_cursor(input: &str, cursor: usize, area: Rect) -> (u16, u16, u16) {
         row += 1;
         column = 0;
     }
-    let visible_rows = area.height.saturating_sub(2).max(1) as usize;
+    let visible_rows = usize::from(area.height.saturating_sub(2).max(1));
     let scroll = row.saturating_sub(visible_rows.saturating_sub(1));
     (
-        inner_x.saturating_add(column.min(width.saturating_sub(1)) as u16),
-        inner_y.saturating_add(row.saturating_sub(scroll) as u16),
-        scroll.min(u16::MAX as usize) as u16,
+        inner_x
+            .saturating_add(u16::try_from(column.min(width.saturating_sub(1))).unwrap_or(u16::MAX)),
+        inner_y.saturating_add(u16::try_from(row.saturating_sub(scroll)).unwrap_or(u16::MAX)),
+        u16::try_from(scroll.min(usize::from(u16::MAX))).unwrap_or(u16::MAX),
     )
 }
 
+#[allow(clippy::too_many_lines)] // assembles picker rows and responsive detail pane together
 pub fn draw_picker(frame: &mut Frame<'_>, picker: &PickerState) {
     let area = design_area(frame.area());
     let wide = area.width >= 120;
@@ -253,7 +258,22 @@ pub fn draw_picker(frame: &mut Frame<'_>, picker: &PickerState) {
             .split(rows[1])
     };
     let mut lines = vec![heading("AVAILABLE MODELS")];
-    for (index, choice) in picker.choices.iter().enumerate() {
+    lines.push(Line::from(vec![
+        Span::styled("SEARCH / ", fg(theme::DIM)),
+        Span::styled(
+            if picker.searching {
+                format!("{}▏", picker.search_query)
+            } else if picker.search_query.is_empty() {
+                "type / to filter provider or model".to_owned()
+            } else {
+                picker.search_query.clone()
+            },
+            fg(theme::IVORY),
+        ),
+    ]));
+    let filtered = picker.filtered_indices();
+    for index in filtered {
+        let choice = &picker.choices[index];
         let selected = index == picker.selected;
         let capability = choice.capabilities.map_or_else(
             || "capabilities not reported".to_owned(),
@@ -281,10 +301,12 @@ pub fn draw_picker(frame: &mut Frame<'_>, picker: &PickerState) {
             Span::styled(format!("  {capability}"), fg(theme::DIM)),
         ]));
     }
-    if picker.choices.is_empty() {
-        lines.push(muted(
-            picker.notice.as_deref().unwrap_or("No models discovered."),
-        ));
+    if picker.filtered_indices().is_empty() {
+        lines.push(muted(if picker.choices.is_empty() {
+            picker.notice.as_deref().unwrap_or("No models discovered.")
+        } else {
+            "No models match this search. Press Esc to clear it."
+        }));
     }
     let effort_text = picker
         .choices
@@ -333,7 +355,7 @@ pub fn draw_picker(frame: &mut Frame<'_>, picker: &PickerState) {
     }
     frame.render_widget(
         Paragraph::new(
-            "↑/↓ choose model · Tab cycle reported effort · Enter apply · Esc back · r refresh",
+            "↑/↓ choose · / search · Tab effort · Enter apply · Esc clear/back · r refresh",
         )
         .style(fg(theme::DIM)),
         rows[2],
@@ -459,6 +481,7 @@ fn draw_live_header(frame: &mut Frame<'_>, area: Rect, reducer: &Reducer, scene:
     );
 }
 
+#[allow(clippy::too_many_lines)] // transcript rendering preserves event and tool ordering
 fn draw_reducer_thread(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -586,10 +609,9 @@ fn draw_reducer_thread(
             }
             Item::ToolResult(result) => {
                 let color = match result.status {
-                    loom_core::kernel::transcript::ToolStatus::Success => theme::DIM,
-                    loom_core::kernel::transcript::ToolStatus::Error(_) => theme::CORAL,
-                    loom_core::kernel::transcript::ToolStatus::Cancelled { .. } => theme::AMBER,
-                    _ => theme::DIM,
+                    ToolStatus::Error(_) => theme::CORAL,
+                    ToolStatus::Cancelled { .. } => theme::AMBER,
+                    ToolStatus::Success | _ => theme::DIM,
                 };
                 lines.push(Line::from(vec![
                     Span::styled("      ↳ ", fg(theme::DIM)),
@@ -653,14 +675,12 @@ fn draw_reducer_thread(
             ),
         ]));
     }
-    let transcript_tool_ids = reducer
-        .committed_transcript
-        .iter()
-        .filter_map(|item| match item {
-            Item::ToolResult(result) => Some(result.call_id.to_string()),
-            _ => None,
-        })
-        .collect::<std::collections::BTreeSet<_>>();
+    let mut transcript_tool_ids = std::collections::BTreeSet::new();
+    for item in &reducer.committed_transcript {
+        if let Item::ToolResult(result) = item {
+            transcript_tool_ids.insert(result.call_id.to_string());
+        }
+    }
     let live_tools = reducer
         .tools
         .iter()
@@ -759,7 +779,8 @@ fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
     } else {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
+        let tenths = u128::from(bytes) * 10 / 1024;
+        format!("{}.{:01} KB", tenths / 10, tenths % 10)
     }
 }
 
@@ -772,7 +793,7 @@ fn concise_arguments(raw: &str) -> String {
     };
     object
         .iter()
-        .filter_map(|(key, value)| {
+        .map(|(key, value)| {
             let scalar = match value {
                 serde_json::Value::String(value) => value.as_str().to_owned(),
                 serde_json::Value::Number(value) => value.to_string(),
@@ -781,10 +802,7 @@ fn concise_arguments(raw: &str) -> String {
                 serde_json::Value::Array(_) => "[…]".to_owned(),
                 serde_json::Value::Object(_) => "{…}".to_owned(),
             };
-            Some(format!(
-                "{key}={}",
-                scalar.chars().take(48).collect::<String>()
-            ))
+            format!("{key}={}", scalar.chars().take(48).collect::<String>())
         })
         .take(3)
         .collect::<Vec<_>>()
@@ -792,10 +810,10 @@ fn concise_arguments(raw: &str) -> String {
 }
 
 fn tool_result_summary(raw: &str) -> String {
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
-        if value.is_object() || value.is_array() {
-            return format!("result · {}", raw.chars().count());
-        }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw)
+        && (value.is_object() || value.is_array())
+    {
+        return format!("result · {}", raw.chars().count());
     }
     let first_line = raw
         .lines()
@@ -838,15 +856,15 @@ fn render_thread_scrolled(
         })
         .sum::<usize>();
     let max_scroll = visual_lines.saturating_sub(inner_height);
-    let scroll = max_scroll
-        .saturating_sub(thread_scroll_back)
-        .min(u16::MAX as usize) as u16;
+    let scroll = u16::try_from(
+        max_scroll
+            .saturating_sub(thread_scroll_back)
+            .min(usize::from(u16::MAX)),
+    )
+    .unwrap_or(u16::MAX);
     let is_lagging = thread_scroll_back > 0;
     let title = if is_lagging {
-        format!(
-            " THREAD  ↑ {} lines · PgDn resume follow ",
-            thread_scroll_back
-        )
+        format!(" THREAD  ↑ {thread_scroll_back} lines · PgDn resume follow ")
     } else {
         " THREAD  ↓ following latest ".to_owned()
     };
@@ -867,9 +885,19 @@ fn render_thread_scrolled(
 
 #[cfg(test)]
 fn draw_test_live(frame: &mut Frame<'_>, reducer: &Reducer, input: &str) {
-    draw_live(frame, reducer, input, input.len(), true, None, None, None);
+    draw_live(
+        frame,
+        reducer,
+        input,
+        input.len(),
+        LiveViewOptions {
+            sidebar_visible: true,
+            ..LiveViewOptions::default()
+        },
+    );
 }
 
+#[allow(clippy::too_many_lines)] // ordered dashboard sections share the same panel state
 fn draw_live_sidebar(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1086,19 +1114,19 @@ fn draw_live_sidebar(
     render_panel(frame, area, "run state", lines);
 }
 
-fn render_panel<'a>(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'a>>) {
+fn render_panel(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_>>) {
     render_panel_scrolled(frame, area, title, lines, false);
 }
 
-fn render_panel_scrolled<'a>(
+fn render_panel_scrolled(
     frame: &mut Frame<'_>,
     area: Rect,
     title: &str,
-    lines: Vec<Line<'a>>,
+    lines: Vec<Line<'_>>,
     follow_tail: bool,
 ) {
-    let inner_width = area.width.saturating_sub(2).max(1) as usize;
-    let inner_height = area.height.saturating_sub(2) as usize;
+    let inner_width = usize::from(area.width.saturating_sub(2).max(1));
+    let inner_height = usize::from(area.height.saturating_sub(2));
     let visual_lines = lines
         .iter()
         .map(|line| {
@@ -1111,9 +1139,12 @@ fn render_panel_scrolled<'a>(
         })
         .sum::<usize>();
     let vertical_scroll = if follow_tail {
-        visual_lines
-            .saturating_sub(inner_height)
-            .min(u16::MAX as usize) as u16
+        u16::try_from(
+            visual_lines
+                .saturating_sub(inner_height)
+                .min(usize::from(u16::MAX)),
+        )
+        .unwrap_or(u16::MAX)
     } else {
         0
     };
@@ -1316,7 +1347,7 @@ mod tests {
             let rendered = render(scene)
                 .content
                 .iter()
-                .map(|cell| cell.symbol())
+                .map(ratatui::buffer::Cell::symbol)
                 .collect::<String>();
             assert!(rendered.contains("not available in static preview"));
             match scene {
@@ -1341,11 +1372,11 @@ mod tests {
                     &reducer,
                     "",
                     0,
-                    false,
-                    Some(Duration::ZERO),
-                    None,
-                    None,
-                )
+                    LiveViewOptions {
+                        elapsed: Some(Duration::ZERO),
+                        ..LiveViewOptions::default()
+                    },
+                );
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
@@ -1382,7 +1413,7 @@ mod tests {
         let rendered = buffer
             .content
             .iter()
-            .map(|cell| cell.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(rendered.contains("MESSAGE · @path to mention a file"));
         assert!(rendered.contains("final answer"));
@@ -1397,18 +1428,17 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 36)).unwrap();
         terminal
             .draw(|frame| {
+                let suggestions = ["README.md".to_owned()];
                 draw_live_scrolled(
                     frame,
                     &reducer,
                     "inspect @REA",
                     12,
-                    false,
-                    None,
-                    None,
-                    0,
-                    vec!["README.md".to_owned()],
-                    None,
-                )
+                    LiveViewOptions {
+                        file_suggestions: &suggestions,
+                        ..LiveViewOptions::default()
+                    },
+                );
             })
             .unwrap();
         let text = terminal
@@ -1416,7 +1446,7 @@ mod tests {
             .buffer()
             .content
             .iter()
-            .map(|cell| cell.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(text.contains("FILES · Tab completes"));
         assert!(text.contains("@README.md"));
@@ -1486,11 +1516,11 @@ mod tests {
                     &reducer,
                     "",
                     0,
-                    false,
-                    Some(Duration::ZERO),
-                    None,
-                    None,
-                )
+                    LiveViewOptions {
+                        elapsed: Some(Duration::ZERO),
+                        ..LiveViewOptions::default()
+                    },
+                );
             })
             .unwrap();
         let text = terminal
@@ -1498,7 +1528,7 @@ mod tests {
             .buffer()
             .content
             .iter()
-            .map(|cell| cell.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(text.contains("800 remaining"));
         assert!(text.contains("unbounded"));
@@ -1526,11 +1556,11 @@ mod tests {
                     &reducer,
                     "",
                     0,
-                    false,
-                    Some(Duration::ZERO),
-                    None,
-                    None,
-                )
+                    LiveViewOptions {
+                        elapsed: Some(Duration::ZERO),
+                        ..LiveViewOptions::default()
+                    },
+                );
             })
             .unwrap();
         let rendered = terminal
@@ -1538,7 +1568,7 @@ mod tests {
             .buffer()
             .content
             .iter()
-            .map(|cell| cell.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(rendered.contains("unbounded"));
         assert!(rendered.contains("estimated 0/20000"));
@@ -1571,11 +1601,11 @@ mod tests {
                     &reducer,
                     "",
                     0,
-                    false,
-                    Some(Duration::from_secs(2)),
-                    None,
-                    None,
-                )
+                    LiveViewOptions {
+                        elapsed: Some(Duration::from_secs(2)),
+                        ..LiveViewOptions::default()
+                    },
+                );
             })
             .unwrap();
         let rendered = terminal
@@ -1583,7 +1613,7 @@ mod tests {
             .buffer()
             .content
             .iter()
-            .map(|cell| cell.symbol())
+            .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(rendered.contains("COMPLETED RUN RECORD"));
         assert!(rendered.contains("turns 4 · model requests 5"));
@@ -1601,7 +1631,7 @@ mod tests {
             let rendered = buffer
                 .content
                 .iter()
-                .map(|cell| cell.symbol())
+                .map(ratatui::buffer::Cell::symbol)
                 .collect::<String>();
             assert!(rendered.contains("preview · no live data"));
             assert!(!rendered.contains("· Ready"));

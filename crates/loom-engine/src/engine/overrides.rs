@@ -32,6 +32,10 @@ pub struct EngineOverrides {
     /// credential → adapter build entirely. Offline replay uses this
     /// (no secret is resolved, no network client is built).
     pub provider: Option<Box<dyn ModelProvider>>,
+    /// Credential resolved by a frontend while presenting model discovery.
+    /// Supplying it avoids a second OS-keychain access when the selected
+    /// model's engine is opened.
+    pub credential: Option<loom_providers::SecretString>,
     /// Wraps whichever provider results — built from credentials, or
     /// supplied via [`Self::provider`] — so an embedder can record or
     /// shadow the model traffic without duplicating the build path.
@@ -87,6 +91,13 @@ impl EngineOverrides {
     #[must_use]
     pub fn with_provider(mut self, provider: Box<dyn ModelProvider>) -> Self {
         self.provider = Some(provider);
+        self
+    }
+
+    /// Supplies a credential already resolved by the frontend.
+    #[must_use]
+    pub fn with_credential(mut self, credential: loom_providers::SecretString) -> Self {
+        self.credential = Some(credential);
         self
     }
 
