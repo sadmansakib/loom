@@ -26,16 +26,24 @@ mod run;
 mod sessions_command;
 mod stats_command;
 mod trust_command;
+mod tui_command;
 mod workspace;
 
 use args::{Cli, Command};
 
 fn main() -> ExitCode {
-    init_tracing();
-
     let cli = Cli::parse();
+    let owns_terminal = match &cli.command {
+        Command::Tui(_) => true,
+        Command::Run(args) => args.tui,
+        _ => false,
+    };
+    if !owns_terminal {
+        init_tracing();
+    }
     let outcome = match cli.command {
         Command::Run(args) => run::run(&args),
+        Command::Tui(args) => tui_command::run(&args).map(|()| ExitCode::SUCCESS),
         Command::Chat(args) => chat::chat(&args),
         Command::Auth(args) => auth_command::run(args.command).map(|()| ExitCode::SUCCESS),
         Command::Provider(args) => provider_command::run(args.command).map(|()| ExitCode::SUCCESS),

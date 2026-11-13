@@ -183,6 +183,57 @@ fn surfaced_decisions_serialize_and_round_trip() {
 }
 
 #[test]
+fn context_progress_serializes_budget_census_and_unbounded_resources() {
+    use crate::{
+        agent::RemainingBudget,
+        context::{ContextBudget, ContextCensus},
+    };
+
+    let census: ContextCensus = serde_json::from_value(serde_json::json!({
+        "system_prompt": 10,
+        "repo_facts": 20,
+        "user_items": 30,
+        "assistant_history": 40,
+        "reasoning_replay": 50,
+        "tool_results": 60,
+        "tool_specs": 70,
+        "total": 280
+    }))
+    .expect("census fixture");
+    let remaining: RemainingBudget = serde_json::from_value(serde_json::json!({
+        "input_tokens": 0,
+        "output_tokens": null,
+        "total_tokens": 7,
+        "tool_calls": null,
+        "wall_time": null
+    }))
+    .expect("remaining-budget fixture");
+    let envelope = EventEnvelope {
+        schema_version: EVENT_SCHEMA_VERSION,
+        sequence: 0,
+        task_id: TaskId::new(),
+        kind: EventKind::ContextProgress {
+            turn: 2,
+            context_budget: ContextBudget {
+                max_input_tokens: 900,
+                reserved_output_tokens: 100,
+            },
+            census,
+            remaining_budget: remaining,
+        },
+    };
+
+    let encoded = serde_json::to_value(&envelope).expect("event serializes");
+    assert_eq!(encoded["schema_version"], EVENT_SCHEMA_VERSION);
+    assert_eq!(encoded["kind"]["type"], "context_progress");
+    assert_eq!(encoded["kind"]["census"]["total"], 280);
+    assert_eq!(encoded["kind"]["remaining_budget"]["input_tokens"], 0);
+    assert!(encoded["kind"]["remaining_budget"]["output_tokens"].is_null());
+    let decoded: EventEnvelope = serde_json::from_value(encoded).expect("event round-trips");
+    assert_eq!(decoded, envelope);
+}
+
+#[test]
 fn dyn_sink_reports_real_drop_count() {
     // The agent loop will hold `&dyn EventSink`; the default
     // `dropped() == 0` must not mask a dropping sink's count.

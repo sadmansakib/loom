@@ -99,7 +99,7 @@ pub(crate) fn messages_serialized(messages: &[crate::model::Message]) -> String 
 /// reserved_output_tokens` (§8). The compiler compares its token estimate
 /// against this budget and refuses to compile a request that would exceed
 /// it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextBudget {
     /// Maximum input tokens the compiled request may consume.
     pub max_input_tokens: u32,
@@ -294,7 +294,7 @@ impl AgentConfig {
 /// once, ÷ 3, plus one token per message for framing) and is exactly what
 /// [`ContextError::BudgetExceeded`] reports.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ContextCensus {
     /// The static system prompt (§8.1.1).
     pub system_prompt: u32,

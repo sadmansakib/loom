@@ -165,13 +165,28 @@ impl GlmProvider {
 #[must_use]
 pub fn model_capabilities(model: &str) -> Option<ModelCapabilities> {
     let limits = match model {
-        "glm-5.3" | "glm-5.3-flash" | "glm-5.3-flashx" | "glm-5.2" => {
-            ModelCapabilities::new(1_048_576)
-                .with_max_output_tokens(131_072)
-                .with_tool_calls(true)
-                .with_parallel_tool_calls(false)
-                .with_reasoning(true)
-        }
+        "glm-5.3" | "glm-5.3-flash" | "glm-5.3-flashx" => ModelCapabilities::new(1_048_576)
+            .with_max_output_tokens(131_072)
+            .with_tool_calls(true)
+            .with_parallel_tool_calls(false)
+            .with_reasoning(true)
+            .with_supported_efforts(&[
+                loom_kernel::model::ReasoningEffort::Low,
+                loom_kernel::model::ReasoningEffort::High,
+                loom_kernel::model::ReasoningEffort::Max,
+            ]),
+        "glm-5.2" => ModelCapabilities::new(1_048_576)
+            .with_max_output_tokens(131_072)
+            .with_tool_calls(true)
+            .with_parallel_tool_calls(false)
+            .with_reasoning(true)
+            .with_supported_efforts(&[
+                loom_kernel::model::ReasoningEffort::None,
+                loom_kernel::model::ReasoningEffort::Low,
+                loom_kernel::model::ReasoningEffort::High,
+                loom_kernel::model::ReasoningEffort::Max,
+            ])
+            .with_can_disable_thinking(true),
         _ => return None,
     };
     Some(limits)

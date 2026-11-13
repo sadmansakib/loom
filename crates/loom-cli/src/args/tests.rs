@@ -36,6 +36,33 @@ fn run_defaults_and_collects_task_words() {
 }
 
 #[test]
+fn run_tui_accepts_a_missing_task_and_parses_the_switch() {
+    let cli = parse(&[
+        "loom",
+        "run",
+        "--tui",
+        "--provider",
+        "glm",
+        "--model",
+        "glm-5",
+    ]);
+    let Command::Run(args) = cli.command else {
+        panic!("expected `run`");
+    };
+    assert!(args.tui);
+    assert!(args.task.is_empty());
+}
+
+#[test]
+fn tui_command_parses_picker_and_named_static_scenes() {
+    assert!(matches!(parse(&["loom", "tui"]).command, Command::Tui(args) if args.scene.is_none()));
+    assert!(
+        matches!(parse(&["loom", "tui", "--scene", "retry"]).command, Command::Tui(args) if args.scene == Some(TuiScene::Retry))
+    );
+    assert!(Cli::try_parse_from(["loom", "tui", "--scene", "unknown"]).is_err());
+}
+
+#[test]
 fn run_accepts_custom_provider_urls() {
     let cli = parse(&[
         "loom",

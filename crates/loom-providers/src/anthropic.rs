@@ -115,7 +115,7 @@ impl ModelProvider for AnthropicProvider {
     }
 
     fn capabilities(&self, model: &str) -> Option<ModelCapabilities> {
-        capabilities(model)
+        model_capabilities(model)
     }
 
     fn stream<'a>(&'a self, request: &'a ModelRequest) -> ModelStream<'a> {
@@ -149,7 +149,8 @@ impl ModelProvider for AnthropicProvider {
 /// tokenizer models bill 1M with a 128K output cap. `reasoning` is
 /// `true` for everything here — adaptive thinking ships on the whole
 /// current lineup, Haiku included.
-fn capabilities(model: &str) -> Option<ModelCapabilities> {
+#[must_use]
+pub fn model_capabilities(model: &str) -> Option<ModelCapabilities> {
     let (context, output, reasoning) = match model {
         // Claude 5.5 family (2026): 1M context, 128K output, adaptive
         // thinking. Opus 5.5 and Fable 5.1 additionally always think
@@ -228,7 +229,7 @@ async fn step(state: State) -> Option<(Result<Option<ModelEvent>, ModelError>, S
                 ));
                 headers.push((
                     reqwest::header::HeaderName::from_static("x-session-affinity"),
-                    session_id.clone(),
+                    session_id,
                 ));
             }
             // Server-side context editing rides a dated beta header;
@@ -422,7 +423,7 @@ mod tests {
             "claude-sonnet-5-5",
             "claude-haiku-5-5",
         ] {
-            let caps = capabilities(model).unwrap_or_else(|| panic!("{model} must resolve"));
+            let caps = model_capabilities(model).unwrap_or_else(|| panic!("{model} must resolve"));
             assert_eq!(caps.max_context_tokens, 1_000_000, "{model}");
             assert_eq!(caps.max_output_tokens, Some(128_000), "{model}");
             assert!(caps.reasoning, "{model}: adaptive thinking");
@@ -433,14 +434,18 @@ mod tests {
     #[test]
     fn legacy_models_keep_their_windows() {
         assert_eq!(
-            capabilities("claude-opus-4-1").unwrap().max_context_tokens,
+            model_capabilities("claude-opus-4-1")
+                .unwrap()
+                .max_context_tokens,
             200_000
         );
         assert_eq!(
-            capabilities("claude-sonnet-4-5").unwrap().max_output_tokens,
+            model_capabilities("claude-sonnet-4-5")
+                .unwrap()
+                .max_output_tokens,
             Some(64_000)
         );
-        assert!(!capabilities("claude-haiku-4-5").unwrap().reasoning);
+        assert!(!model_capabilities("claude-haiku-4-5").unwrap().reasoning);
     }
 
     #[test]
@@ -448,7 +453,10 @@ mod tests {
         // Dateless aliases float to new snapshots with different windows;
         // resolving them would be a guess.
         for model in ["claude-opus-5", "claude-sonnet", "gpt-5", ""] {
-            assert!(capabilities(model).is_none(), "{model:?} must not resolve");
+            assert!(
+                model_capabilities(model).is_none(),
+                "{model:?} must not resolve"
+            );
         }
     }
 }

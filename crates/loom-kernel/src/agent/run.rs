@@ -631,6 +631,15 @@ impl Agent {
             if let Some(report) = compiled.prune_report {
                 sink.emit(task_id, EventKind::ContextPruned { turn, report });
             }
+            sink.emit(
+                task_id,
+                EventKind::ContextProgress {
+                    turn,
+                    context_budget: budget,
+                    census: compiled.census,
+                    remaining_budget: self.budget.remaining(accounting, started.elapsed()),
+                },
+            );
             // Partial move: `request` moves out, `census` (Copy) stays readable
             // for the `EndTurn` return.
             let stubbed_calls = compiled.stubbed_calls;

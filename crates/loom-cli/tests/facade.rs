@@ -1,5 +1,5 @@
 //! The ADR-021 boundary guard: `loom-cli` may depend on `loom-core` and
-//! nothing else from this workspace.
+//! the terminal frontend adapter (`loom-tui`), but no other workspace crate.
 //!
 //! The facade rule (architecture.md, §9) keeps domain logic out of the
 //! binary: if a change needs `loom-kernel`, `loom-engine`, or any other
@@ -23,12 +23,13 @@ fn the_binary_depends_on_the_facade_alone() {
         .expect("reading loom-cli's own manifest");
 
     // Every workspace-crate dependency line (`loom-… = …`) must be the
-    // facade. Comments are skipped; dependency keys never start with `#`.
+    // facade or the explicitly allowed presentation frontend. Comments are
+    // skipped; dependency keys never start with `#`.
     let offenders: Vec<&str> = manifest
         .lines()
         .map(str::trim_start)
         .filter(|line| line.starts_with("loom-"))
-        .filter(|line| !line.starts_with("loom-core"))
+        .filter(|line| !line.starts_with("loom-core") && !line.starts_with("loom-tui"))
         .collect();
 
     assert!(

@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 
 use super::{
     AuthArgs, ChatArgs, LessonsArgs, ProviderArgs, ReplayContextArgs, RewindArgs, RunArgs,
-    StatsArgs, TrustArgs,
+    StatsArgs, TrustArgs, TuiArgs,
 };
 
 /// `loom`: a minimal, deterministic coding agent.
@@ -21,6 +21,8 @@ pub struct Cli {
 pub enum Command {
     /// Run one task against the model.
     Run(Box<RunArgs>),
+    /// Open the interactive terminal interface or render a fixed scene.
+    Tui(TuiArgs),
     /// Interactive session: tasks at the prompt continue one session;
     /// typed lines steer a running task; `/rewind`, `/stats`, and
     /// `/sessions` work in place.

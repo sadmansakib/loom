@@ -1783,12 +1783,14 @@ dependencies = [
  "anyhow",
  "clap",
  "loom-core",
+ "loom-tui",
  "rpassword",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]
@@ -1922,9 +1924,11 @@ dependencies = [
  "anyhow",
  "crossterm",
  "loom-core",
- "loom-kernel",
  "ratatui",
+ "serde_json",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

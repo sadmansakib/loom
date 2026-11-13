@@ -246,7 +246,14 @@ pub fn model_capabilities(model: &str) -> Option<ModelCapabilities> {
             .with_max_output_tokens(393_216)
             .with_tool_calls(true)
             .with_parallel_tool_calls(true)
-            .with_reasoning(true),
+            .with_reasoning(true)
+            .with_supported_efforts(&[
+                loom_kernel::model::ReasoningEffort::None,
+                loom_kernel::model::ReasoningEffort::Low,
+                loom_kernel::model::ReasoningEffort::High,
+                loom_kernel::model::ReasoningEffort::Max,
+            ])
+            .with_can_disable_thinking(true),
         _ => return None,
     };
     Some(limits)

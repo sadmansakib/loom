@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 loom-core = { workspace = true }
+loom-tui = { path = "../loom-tui" }
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 serde_json = { workspace = true }
@@ -25,6 +26,8 @@ rpassword = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "process"] }
+wiremock = { workspace = true }
 
 [lints]
 workspace = true

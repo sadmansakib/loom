@@ -1,7 +1,8 @@
 //! The event wire model: the protocol version, serialization budgets,
 //! the envelope, and the event kinds that cross the wire.
 
-use crate::context::PruneReport;
+use crate::agent::RemainingBudget;
+use crate::context::{ContextBudget, ContextCensus, PruneReport};
 use crate::id::{SessionId, TaskId};
 use crate::model::{ModelErrorKind, ModelResponse};
 use crate::session::TodoItem;
@@ -61,7 +62,9 @@ use serde::{Deserialize, Serialize};
 /// `intent-rename-too-many-occurrences`, `intent-rename-verify-failed`,
 /// and `intent-rename-write-failed`. The field stays a free string, so
 /// older payloads and readers are unaffected.
-pub const EVENT_SCHEMA_VERSION: u16 = 15;
+/// v16 adds `ContextProgress`: the compiler's per-request context budget and
+/// census plus the agent's remaining task-budget headroom at compile time.
+pub const EVENT_SCHEMA_VERSION: u16 = 16;
 
 /// The evidence that justified a [`EventKind::TurnBudgetExtended`] grant
 /// (item 26): state the loop already tracks, never a model call.
@@ -172,6 +175,21 @@ pub enum EventKind {
         turn: u32,
         /// Trigger arm plus per-call attribution.
         report: PruneReport,
+    },
+    /// Successful compilation of the request about to be sent to the model.
+    /// Emitted after context pruning/handoff and before streaming, once per
+    /// compile (not once per retry attempt). `remaining_budget` is sampled at
+    /// this compile boundary; `None` fields mean the task has no configured
+    /// ceiling for that resource.
+    ContextProgress {
+        /// 1-based task turn for this compiled request.
+        turn: u32,
+        /// Context window split between input allowance and output reserve.
+        context_budget: ContextBudget,
+        /// Compiler's estimates for the request projection.
+        census: ContextCensus,
+        /// Remaining task-level resource headroom at this point.
+        remaining_budget: RemainingBudget,
     },
     /// A deterministic fast path solved the task with zero model calls
     /// (roadmap item 3): the engine analyzed the instruction, applied

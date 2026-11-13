@@ -184,14 +184,23 @@ pub fn model_capabilities(model: &str) -> Option<ModelCapabilities> {
             .with_max_output_tokens(65_536)
             .with_tool_calls(true)
             .with_parallel_tool_calls(false)
-            .with_reasoning(true),
+            .with_reasoning(true)
+            .with_supported_efforts(&[
+                loom_kernel::model::ReasoningEffort::Low,
+                loom_kernel::model::ReasoningEffort::Medium,
+                loom_kernel::model::ReasoningEffort::High,
+            ]),
         // Qwen 3.8 27B: tools and parallel tool calls both live-verified
         // (two calls emitted in one turn).
         "qwen/qwen3.8-27b" => ModelCapabilities::new(131_072)
             .with_max_output_tokens(16_384)
             .with_tool_calls(true)
             .with_parallel_tool_calls(true)
-            .with_reasoning(true),
+            .with_reasoning(true)
+            .with_supported_efforts(&[
+                loom_kernel::model::ReasoningEffort::Low,
+                loom_kernel::model::ReasoningEffort::High,
+            ]),
         _ => return None,
     };
     Some(limits)
@@ -392,6 +401,7 @@ mod tests {
             stable_prefix_messages: None,
             context_editing: None,
             reasoning_effort: None,
+            session_id: None,
         };
         let body = provider.request_body(&request);
         assert_eq!(body["reasoning_effort"], "high", "default effort");
@@ -401,7 +411,6 @@ mod tests {
             "replay must use Groq's field name"
         );
         assert!(
-            session_id: None,
             assistant.get("reasoning_content").is_none(),
             "Groq rejects reasoning_content on an assistant message"
         );

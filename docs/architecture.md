@@ -111,7 +111,7 @@ Invariants the session layer enforces (and tests):
    type; a second finish attempt cannot overwrite the recorded end reason.
 
 **Events** (`event.rs`) are the observation stream: `EventEnvelope`
-(`schema_version: 15`, per-sink monotonically increasing `sequence`,
+(`schema_version: 16`, per-sink monotonically increasing `sequence`,
 snake_case `type` tag). The persisting sink (`PersistingEventSink`)
 stores every kind *except* the per-token streams — `TextDelta` and
 `ReasoningDelta` forward live but are never written (review S4: they
@@ -127,7 +127,9 @@ brief: v2 `Usage.cost_usd`; v3 `ContextPruned`; v4 `AwaitingInput`
 `SteeringApplied`; v11 `LoopNudge` plus tool-event argument/content
 head budgets; v12 `TurnBudgetExtended`; v13 the `WritingPhase` stop
 reason; v14 `AutofixApplied`; v15 the `FastPathDeclined`
-rename-reason split. All new fields are additive, so older payloads
+rename-reason split; v16 `ContextProgress` reports the compiled-request
+census, context allowance/reservation, and remaining task budget at the
+compile boundary. All new fields are additive, so older payloads
 still deserialize. A lock spans numbering and send, so arrival order
 equals sequence order even with concurrent emitters. The channel sink is
 unbounded — a slow consumer queues rather than back-pressures the agent;
@@ -839,6 +841,19 @@ self-describing, `StatusSnapshot` is serializable, and the trace
 formats are byte-stable data contracts.
 
 ## 10. Providers
+
+### Addendum: model reasoning metadata
+
+`ModelCapabilities` additionally exposes `supported_efforts` and
+`can_disable_thinking` for frontends that need to present model-specific
+reasoning controls. These are additive, descriptive facts: an empty effort
+list and `false` are conservative defaults when an adapter has no reliable
+model-level data. `ReasoningEffort::None` is an accepted effort value where
+declared; it does not itself mean thinking is off. `can_disable_thinking`
+describes the independent ability to turn thinking off. Provider adapters
+populate these fields only where their pinned model contract is known; catalog
+adapters that do not advertise this information leave the conservative
+defaults intact. The fields do not change request construction or policy.
 
 Five adapters ship:
 

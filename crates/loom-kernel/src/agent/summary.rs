@@ -41,6 +41,31 @@ pub struct TaskSummary {
     pub last_context_census: ContextCensus,
 }
 
+impl TaskSummary {
+    /// Creates an empty summary for the specified task.
+    ///
+    /// This is useful to construct incremental summaries in frontends and
+    /// tests. A zero `last_context_census` here is only a default value; it is
+    /// measured only when `model_requests` is non-zero.
+    #[must_use]
+    pub fn empty(task_id: TaskId) -> Self {
+        Self {
+            task_id,
+            turns: 0,
+            model_requests: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: None,
+            successful_tool_calls: 0,
+            failed_tool_calls: 0,
+            wall_time: Duration::ZERO,
+            events_dropped: 0,
+            remaining_budget: RemainingBudget::default(),
+            last_context_census: ContextCensus::default(),
+        }
+    }
+}
+
 /// What the engine's fast path proved, handed to
 /// [`Agent::record_fast_path`].
 ///

@@ -27,6 +27,7 @@ mod deepseek;
 mod glm;
 mod groq;
 mod http;
+mod model_discovery;
 mod nvidia;
 mod openai_wire;
 mod openrouter;
@@ -36,7 +37,7 @@ mod wire_stream;
 
 pub use anthropic::{
     AnthropicConfig, AnthropicProvider, DEFAULT_BASE_URL as ANTHROPIC_DEFAULT_BASE_URL,
-    PROVIDER_NAME as ANTHROPIC_PROVIDER_NAME,
+    PROVIDER_NAME as ANTHROPIC_PROVIDER_NAME, model_capabilities as anthropic_model_capabilities,
 };
 pub use anthropic_wire::ANTHROPIC_VERSION as ANTHROPIC_API_VERSION;
 pub use custom::PROVIDER_NAME as CUSTOM_PROVIDER_NAME;
@@ -54,6 +55,7 @@ pub use glm::{GlmConfig, GlmProvider, model_capabilities as glm_model_capabiliti
 pub use groq::PROVIDER_NAME as GROQ_PROVIDER_NAME;
 pub use groq::{GroqConfig, GroqProvider, model_capabilities as groq_model_capabilities};
 pub use http::TimeoutConfig;
+pub use model_discovery::discover_builtin_models;
 pub use nvidia::PROVIDER_NAME as NVIDIA_PROVIDER_NAME;
 pub use nvidia::{NvidiaConfig, NvidiaProvider, model_capabilities as nvidia_model_capabilities};
 pub use openrouter::PROVIDER_NAME as OPENROUTER_PROVIDER_NAME;

@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use loom_core::ReasoningEffort;
 use loom_core::kernel::agent::DEFAULT_MAX_TURNS;
 
@@ -11,12 +11,15 @@ use loom_core::kernel::agent::DEFAULT_MAX_TURNS;
 pub struct RunArgs {
     /// The task text; all remaining words are joined with single spaces.
     #[arg(
-        required = true,
         trailing_var_arg = true,
         allow_hyphen_values = true,
         value_name = "TASK"
     )]
     pub task: Vec<String>,
+
+    /// Use the interactive terminal frontend for this task.
+    #[arg(long)]
+    pub tui: bool,
 
     /// Every knob a one-shot run and an interactive chat share: the
     /// engine assembly reads these verbatim, so `loom run` and
@@ -41,6 +44,25 @@ pub struct ChatArgs {
 
     #[command(flatten)]
     pub flags: RunFlags,
+}
+
+/// Arguments for `loom tui`.
+#[derive(Debug, Args)]
+pub struct TuiArgs {
+    /// Render one static prototype scene instead of opening the interface.
+    #[arg(long, value_enum)]
+    pub scene: Option<TuiScene>,
+}
+
+/// Fixed scenes available to `loom tui --scene`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TuiScene {
+    Main,
+    Cancel,
+    Retry,
+    Complete,
+    Picker,
+    Help,
 }
 
 /// The engine-configuration flags shared by `loom run` and `loom chat`.

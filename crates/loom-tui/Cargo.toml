@@ -15,8 +15,13 @@ anyhow = { workspace = true }
 crossterm = "0.29"
 loom-core = { workspace = true }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
-tokio = { workspace = true, features = ["rt", "time"] }
-loom-kernel = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "macros", "sync"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true

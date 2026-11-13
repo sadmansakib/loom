@@ -57,12 +57,17 @@ impl Message {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
+    /// No requested reasoning effort. This does not imply that reasoning
+    /// can be disabled; that is a separate model capability.
+    None,
     /// Low effort: mid-task turns between the opening and verification.
     Low,
     /// Medium effort (dialects without it snap to the nearest side).
     Medium,
     /// High effort: opening turns and post-verification decisions.
     High,
+    /// Maximum effort where a provider exposes a level above `High`.
+    Max,
 }
 
 impl ReasoningEffort {
@@ -70,9 +75,11 @@ impl ReasoningEffort {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            ReasoningEffort::None => "none",
             ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
+            ReasoningEffort::Max => "max",
         }
     }
 }
@@ -126,6 +133,11 @@ pub struct ModelRequest {
     /// byte-identical until a schedule opts in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Durable conversation identity for provider-side routing and
+    /// correlation. Adapters send this as both `x-session-id` and
+    /// `x-session-affinity` when present. Direct one-off requests may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// Provider-agnostic intent for server-side clearing of stale tool
@@ -133,11 +145,6 @@ pub struct ModelRequest {
 ///
 /// Names carry *intent*, never provider wire details — the Anthropic
 /// adapter is the only place these become
-    /// Durable conversation identity for provider-side routing and
-    /// correlation. Adapters send this as both `x-session-id` and
-    /// `x-session-affinity` when present. Direct one-off requests may omit it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
 /// `context_management.edits[clear_tool_uses_20250919]` (plus its beta
 /// header). Every knob maps one-to-one onto that strategy today, which
 /// is why the struct is provider-agnostic without being vague: an
@@ -169,6 +176,7 @@ pub struct ContextEditingHint {
 /// encodes provider *behaviour* — no retry quirks, no wire details.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // Independent model capability facts, not runtime state.
 pub struct ModelCapabilities {
     /// Maximum tokens the model accepts as request context.
     pub max_context_tokens: u32,
@@ -183,6 +191,12 @@ pub struct ModelCapabilities {
     /// A `bool` for now; grows into a mode enum only when the compiler must
     /// choose between reasoning modes (§6.4).
     pub reasoning: bool,
+    /// Reasoning-effort choices the provider declares for this model.
+    /// An empty slice means no effort choices are known. `None` is an
+    /// effort value, not an assertion that thinking can be disabled.
+    pub supported_efforts: &'static [ReasoningEffort],
+    /// Whether the model supports explicitly disabling reasoning/thinking.
+    pub can_disable_thinking: bool,
 }
 
 impl ModelCapabilities {
@@ -200,6 +214,8 @@ impl ModelCapabilities {
             tool_calls: false,
             parallel_tool_calls: false,
             reasoning: false,
+            supported_efforts: &[],
+            can_disable_thinking: false,
         }
     }
 
@@ -229,6 +245,20 @@ impl ModelCapabilities {
     #[must_use]
     pub const fn with_reasoning(mut self, enabled: bool) -> Self {
         self.reasoning = enabled;
+        self
+    }
+
+    /// Sets the reasoning-effort values supported by this model.
+    #[must_use]
+    pub const fn with_supported_efforts(mut self, efforts: &'static [ReasoningEffort]) -> Self {
+        self.supported_efforts = efforts;
+        self
+    }
+
+    /// Sets whether the model can explicitly disable reasoning/thinking.
+    #[must_use]
+    pub const fn with_can_disable_thinking(mut self, enabled: bool) -> Self {
+        self.can_disable_thinking = enabled;
         self
     }
 }

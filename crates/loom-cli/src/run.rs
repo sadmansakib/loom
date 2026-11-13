@@ -142,6 +142,13 @@ fn run_best_of(
 /// (`130` for a user stop — cancellation or pause — `1` otherwise); only
 /// setup failures propagate as `Err`.
 pub fn run(args: &RunArgs) -> anyhow::Result<ExitCode> {
+    if args.tui {
+        validate_tui_run_args(args)?;
+        return crate::tui_command::run_task(args).map(|()| ExitCode::SUCCESS);
+    }
+    if args.task.is_empty() {
+        anyhow::bail!("`loom run` requires a TASK unless --tui is specified");
+    }
     // The sandbox preflight fails at setup, not mid-task: on a host
     // whose policy denies unprivileged user namespaces (Ubuntu 24.04+
     // by default) every sandboxed `run_command`/`verify` would fail one
@@ -255,6 +262,32 @@ pub fn run(args: &RunArgs) -> anyhow::Result<ExitCode> {
             })
         }
     }
+}
+
+/// Reject flags whose behavior the interactive frontend cannot represent;
+/// silently dropping these would make `loom run --tui` differ from `loom run`.
+fn validate_tui_run_args(args: &RunArgs) -> anyhow::Result<()> {
+    let flags = &args.flags;
+    let unsupported = [
+        (flags.json, "--json"),
+        (flags.trace.is_some(), "--trace"),
+        (flags.session.is_some(), "--session"),
+        (flags.best_of.is_some(), "--best-of"),
+        (
+            flags.best_of_prefix_turns.is_some(),
+            "--best-of-prefix-turns",
+        ),
+        (flags.best_of_vary, "--best-of-vary"),
+        (flags.best_of_no_verify, "--best-of-no-verify"),
+        (
+            args.task.iter().any(|word| word == "--"),
+            "-- task separator",
+        ),
+    ];
+    if let Some((_, flag)) = unsupported.into_iter().find(|(set, _)| *set) {
+        anyhow::bail!("{flag} is not supported with --tui");
+    }
+    Ok(())
 }
 
 /// Renders the parallel-rollout report (roadmap item 21): one block per
@@ -726,13 +759,51 @@ fn finish_trace(
 
 #[cfg(test)]
 mod tests {
-    use super::best_of_ctrl_c_ladder;
+    use super::{best_of_ctrl_c_ladder, run, validate_tui_run_args};
+    use crate::args::Cli;
+    use clap::Parser;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn tui_run_rejects_options_the_frontend_cannot_honor() {
+        let cli = Cli::try_parse_from([
+            "loom",
+            "run",
+            "--tui",
+            "--provider",
+            "glm",
+            "--model",
+            "glm-5",
+            "--trace",
+            "x",
+        ])
+        .expect("arguments parse");
+        let crate::args::Command::Run(args) = cli.command else {
+            panic!("expected run");
+        };
+        assert!(
+            validate_tui_run_args(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("--trace")
+        );
+    }
+
+    #[test]
+    fn run_requires_task_unless_tui_is_enabled() {
+        let cli = Cli::try_parse_from(["loom", "run", "--provider", "glm", "--model", "glm-5"])
+            .expect("provider and model are present");
+        let crate::args::Command::Run(args) = cli.command else {
+            panic!("expected run");
+        };
+        let error = run(&args).expect_err("missing task must fail in dispatch");
+        assert!(error.to_string().contains("requires a TASK"));
+    }
 
     /// A fake signal factory standing in for `tokio::signal::ctrl_c`:
     /// each produced future awaits one channel item — `true` is a

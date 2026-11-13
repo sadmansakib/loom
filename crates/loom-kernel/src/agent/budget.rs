@@ -246,7 +246,7 @@ impl TaskBudget {
 /// Each field is `None` when the corresponding ceiling was not set, and
 /// `Some(0)` when the ceiling was reached (or passed).
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct RemainingBudget {
     /// Input tokens still allowed, when bounded.
     pub input_tokens: Option<u64>,

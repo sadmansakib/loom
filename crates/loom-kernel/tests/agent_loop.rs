@@ -534,11 +534,15 @@ async fn end_turn_completes_the_task_and_commits_the_assistant() {
     assert!(matches!(kinds[1], EventKind::TurnStarted { turn: 1 }));
     assert!(matches!(
         kinds[2],
+        EventKind::ContextProgress { turn: 1, .. }
+    ));
+    assert!(matches!(
+        kinds[3],
         EventKind::ModelRequestStarted { attempt: 1 }
     ));
-    assert!(matches!(kinds[3], EventKind::ModelCompleted { .. }));
-    assert!(matches!(kinds[4], EventKind::TaskCompleted));
-    assert_eq!(kinds.len(), 5);
+    assert!(matches!(kinds[4], EventKind::ModelCompleted { .. }));
+    assert!(matches!(kinds[5], EventKind::TaskCompleted));
+    assert_eq!(kinds.len(), 6);
 }
 
 #[tokio::test]
