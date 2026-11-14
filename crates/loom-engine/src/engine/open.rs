@@ -9,6 +9,7 @@ use loom_kernel::context::{
     AgentConfig, ContextCompiler, DefaultContextCompiler, PruningContextCompiler,
 };
 use loom_kernel::model::ModelProvider;
+use loom_kernel::tool::ToolRegistry;
 use loom_providers::{CUSTOM_PROVIDER_NAME, OPENROUTER_PROVIDER_NAME, ProviderCatalog};
 use loom_store::SqliteStore;
 use loom_tools::policy::CommandPolicy;
@@ -174,12 +175,7 @@ impl Engine {
                     tool = tool.with_escalation(esc_agent, esc.model.clone());
                 }
             }
-            registry
-                .register(Box::new(tool))
-                .map_err(|error| EngineError::RegisterTool {
-                    tool: "scout",
-                    message: error.to_string(),
-                })?;
+            register_tool(&mut registry, "scout", Box::new(tool))?;
         }
         // Roadmap item 13: background commands. Opt-in via
         // `EngineConfig::background_commands`; the bare-loop arm never
@@ -190,21 +186,16 @@ impl Engine {
         // running task's watcher steers them in at a turn boundary.
         let background_jobs = if config.background_commands && !overrides.bare_loop {
             let jobs = BackgroundJobs::default();
-            registry
-                .register(Box::new(RunBackgroundTool::new(
-                    policy.clone(),
-                    jobs.clone(),
-                )))
-                .map_err(|error| EngineError::RegisterTool {
-                    tool: "run_background",
-                    message: error.to_string(),
-                })?;
-            registry
-                .register(Box::new(CommandStatusTool::new(jobs.clone())))
-                .map_err(|error| EngineError::RegisterTool {
-                    tool: "command_status",
-                    message: error.to_string(),
-                })?;
+            register_tool(
+                &mut registry,
+                "run_background",
+                Box::new(RunBackgroundTool::new(policy.clone(), jobs.clone())),
+            )?;
+            register_tool(
+                &mut registry,
+                "command_status",
+                Box::new(CommandStatusTool::new(jobs.clone())),
+            )?;
             Some(jobs)
         } else {
             None
@@ -224,22 +215,16 @@ impl Engine {
             .iter()
             .any(|language| symbol_languages.contains(&language.as_str()));
         if config.symbols && !overrides.bare_loop && symbols_served {
-            registry
-                .register(Box::new(
-                    loom_tools::SymbolsOverviewTool::default().with_budgets(config.budgets),
-                ))
-                .map_err(|error| EngineError::RegisterTool {
-                    tool: "symbols_overview",
-                    message: error.to_string(),
-                })?;
-            registry
-                .register(Box::new(
-                    loom_tools::ReplaceSymbolTool::default().with_budgets(config.budgets),
-                ))
-                .map_err(|error| EngineError::RegisterTool {
-                    tool: "replace_symbol",
-                    message: error.to_string(),
-                })?;
+            register_tool(
+                &mut registry,
+                "symbols_overview",
+                Box::new(loom_tools::SymbolsOverviewTool::default().with_budgets(config.budgets)),
+            )?;
+            register_tool(
+                &mut registry,
+                "replace_symbol",
+                Box::new(loom_tools::ReplaceSymbolTool::default().with_budgets(config.budgets)),
+            )?;
         }
         // Iteration 4: structured git tools. Same opt-in shape as the
         // symbol tools; the bare-loop arm never carries them.
@@ -749,6 +734,22 @@ impl Engine {
         };
         Engine::open_with_extra_tools(config, overrides, mcp, lsp)
     }
+}
+
+/// Registers one tool, mapping a registration failure to the engine error
+/// that names it. Every opt-in tool in `open_with_extra_tools` goes through
+/// here so the error shape stays uniform.
+fn register_tool(
+    registry: &mut ToolRegistry,
+    name: &'static str,
+    tool: Box<dyn loom_kernel::tool::Tool>,
+) -> Result<(), EngineError> {
+    registry
+        .register(tool)
+        .map_err(|error| EngineError::RegisterTool {
+            tool: name,
+            message: error.to_string(),
+        })
 }
 
 /// Resolves the provider for an engine: an injected provider skips the
