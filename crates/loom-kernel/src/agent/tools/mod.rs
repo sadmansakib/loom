@@ -211,6 +211,14 @@ pub async fn execute_call(
             ToolEffects::none(),
             None,
         ),
+        Either::Right((Ok(Err(ToolError::Declined(msg))), _)) => finish(
+            call,
+            ToolStatus::Error(ToolFailure::Declined),
+            format!("error: {msg}"),
+            false,
+            ToolEffects::none(),
+            None,
+        ),
         Either::Right((Err(_elapsed), _)) => finish(
             call,
             ToolStatus::Error(ToolFailure::Timeout),

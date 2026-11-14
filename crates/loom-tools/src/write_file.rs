@@ -150,7 +150,7 @@ impl Tool for WriteFileTool {
                     WriteDecision::Allow => {}
                     WriteDecision::Edit(edited) => content = edited,
                     WriteDecision::Decline => {
-                        return Err(ToolError::Execution(format!(
+                        return Err(ToolError::Declined(format!(
                             "write to \"{relative}\" was declined by the operator"
                         )));
                     }

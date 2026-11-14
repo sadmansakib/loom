@@ -332,4 +332,6 @@ pub enum ToolFailure {
     /// attempt unchanged is not permitted; the model must change its
     /// approach. The call never started, so no side effects occurred.
     RepeatedCall,
+    /// The operator refused the call at its approval gate. Nothing ran.
+    Declined,
 }

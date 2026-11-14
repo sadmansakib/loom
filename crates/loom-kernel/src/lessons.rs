@@ -214,6 +214,7 @@ pub fn failure_name(failure: ToolFailure) -> &'static str {
         ToolFailure::Execution => "execution",
         ToolFailure::Timeout => "timeout",
         ToolFailure::RepeatedCall => "repeated_call",
+        ToolFailure::Declined => "declined",
     }
 }
 

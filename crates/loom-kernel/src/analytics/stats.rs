@@ -27,6 +27,8 @@ pub struct ToolCounts {
     pub timeout: u64,
     /// `RepeatedCall` results (ledger refusal).
     pub repeated: u64,
+    /// `Declined` results (operator refused at the approval gate).
+    pub declined: u64,
     /// `UnknownTool` results (model-side fault).
     pub unknown_tool: u64,
     /// `NotExposed` results (model-side fault).
@@ -53,6 +55,7 @@ impl ToolCounts {
                     ToolFailure::Execution => self.execution += 1,
                     ToolFailure::Timeout => self.timeout += 1,
                     ToolFailure::RepeatedCall => self.repeated += 1,
+                    ToolFailure::Declined => self.declined += 1,
                 }
             }
         }
@@ -73,6 +76,7 @@ impl ToolCounts {
         self.execution += other.execution;
         self.timeout += other.timeout;
         self.repeated += other.repeated;
+        self.declined += other.declined;
         self.unknown_tool += other.unknown_tool;
         self.not_exposed += other.not_exposed;
         self.cancelled += other.cancelled;

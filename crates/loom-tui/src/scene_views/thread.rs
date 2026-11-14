@@ -499,6 +499,7 @@ pub(super) fn failure_category(failure: ToolFailure) -> &'static str {
         ToolFailure::Execution => "execution",
         ToolFailure::Timeout => "timeout",
         ToolFailure::RepeatedCall => "repeated call",
+        ToolFailure::Declined => "declined",
         _ => "error",
     }
 }

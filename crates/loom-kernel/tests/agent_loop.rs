@@ -147,9 +147,12 @@ struct FakeTool {
 }
 
 /// A mutating tool that asks for approval before each call, touching one
-/// path, so the engine's approval events are observable.
+/// path, so the engine's approval events are observable. `outcome` is what
+/// the call returns: `Ok` for an approved write, `Declined` for a refusal,
+/// `Execution` for an approved write that then fails.
 struct GatedTool {
     spec: ToolSpec,
+    outcome: Result<&'static str, ToolError>,
 }
 
 impl Tool for GatedTool {
@@ -174,7 +177,8 @@ impl Tool for GatedTool {
         _input: Value,
         _ctx: &'a ToolContext,
     ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
-        Box::pin(async move { Ok(ToolOutput::new("written".to_owned())) })
+        let outcome = self.outcome.clone();
+        Box::pin(async move { outcome.map(|text| ToolOutput::new(text.to_owned())) })
     }
 }
 
@@ -1004,6 +1008,7 @@ async fn gated_tool_call_emits_approval_events_around_the_call() {
     registry
         .register(Box::new(GatedTool {
             spec: spec("write"),
+            outcome: Ok("written"),
         }))
         .unwrap();
     let agent = agent(provider, registry, 10);
@@ -3395,5 +3400,71 @@ async fn a_recovery_after_the_failed_call_nudge_completes_normally() {
             .count(),
         1,
         "one corrective nudge, not a nag"
+    );
+}
+
+/// Runs one gated `write` call whose tool returns `outcome`, and reports the
+/// `allowed` flag the engine recorded in `ApprovalDecided`.
+async fn approval_decision_for(outcome: Result<&'static str, ToolError>) -> bool {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            completed(
+                assistant(
+                    "",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_1", "write", json!({ "path": "notes.md" }))],
+                ),
+                usage(20, 5, None),
+            ),
+            completed(
+                assistant("done", StopReason::EndTurn, Vec::new()),
+                usage(30, 7, None),
+            ),
+        ],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let control = TaskControl::new();
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(GatedTool {
+            spec: spec("write"),
+            outcome,
+        }))
+        .unwrap();
+    let agent = agent(provider, registry, 10);
+    agent
+        .run_task(&mut session, "write notes", &sink, &control)
+        .await
+        .unwrap();
+
+    drain(&mut receiver)
+        .into_iter()
+        .find_map(|kind| {
+            if let EventKind::ApprovalDecided { allowed, .. } = kind {
+                Some(allowed)
+            } else {
+                None
+            }
+        })
+        .expect("a gated call must record its decision")
+}
+
+#[tokio::test]
+async fn declined_write_records_not_allowed() {
+    let decision = approval_decision_for(Err(ToolError::Declined(
+        "write to \"notes.md\" was declined by the operator".to_owned(),
+    )))
+    .await;
+    assert!(!decision, "a refused write must record allowed: false");
+}
+
+#[tokio::test]
+async fn approved_write_that_fails_still_records_allowed() {
+    let decision = approval_decision_for(Err(ToolError::Execution("disk full".to_owned()))).await;
+    assert!(
+        decision,
+        "the operator approved; a later tool failure is not a refusal"
     );
 }

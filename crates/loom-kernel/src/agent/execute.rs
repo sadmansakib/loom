@@ -222,7 +222,7 @@ impl Agent {
                         task_id,
                         EventKind::ApprovalDecided {
                             call_id: call.id.clone(),
-                            allowed: matches!(status, ToolStatus::Success),
+                            allowed: !matches!(status, ToolStatus::Error(ToolFailure::Declined)),
                         },
                     );
                 }
@@ -361,8 +361,9 @@ pub(super) fn append_failure_hint(
         ToolFailure::UnknownTool | ToolFailure::NotExposed => {
             "Hint: call one of the available tools listed above."
         }
-        // The refusal result already explains itself.
-        ToolFailure::RepeatedCall => return,
+        // The refusal result already explains itself, and so does a decline:
+        // the operator already said no.
+        ToolFailure::RepeatedCall | ToolFailure::Declined => return,
     };
     // A tool that knows the shape of its own governing mistakes says
     // something more specific than the loop's generic text.

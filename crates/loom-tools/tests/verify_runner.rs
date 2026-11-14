@@ -176,8 +176,10 @@ fn broken_manifest_fails_closed() {
         .block_on(tool.call(json!({"scope": "check"}), &context(&root)))
         .expect_err("broken manifest must refuse");
     let message = match &error {
-        ToolError::Execution(message) | ToolError::InvalidInput(message) => message.clone(),
-        _ => String::from("unexpected variant"),
+        ToolError::Execution(message)
+        | ToolError::InvalidInput(message)
+        | ToolError::Declined(message) => message.clone(),
+        other => other.to_string(),
     };
     assert!(message.contains(".loom/verify.toml"), "{message}");
 

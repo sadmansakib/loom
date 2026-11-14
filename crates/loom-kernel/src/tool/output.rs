@@ -133,4 +133,7 @@ pub enum ToolError {
     /// possible.
     #[error("execution failed: {0}")]
     Execution(String),
+    /// The operator refused the call at its approval gate. Nothing ran.
+    #[error("declined: {0}")]
+    Declined(String),
 }
