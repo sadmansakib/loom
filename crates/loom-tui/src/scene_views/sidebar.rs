@@ -426,6 +426,11 @@ pub(super) fn draw_runtime_sidebar(
                 muted("y allow once   a always   n decline"),
             ],
         ));
+        sections_data.push(("PERMISSIONS", vec![muted("write  asks each time")]));
+        sections_data.push((
+            "IF DENIED",
+            vec![muted("the write is skipped; the agent continues")],
+        ));
     }
     // Each bordered section consumes a bottom-rule row in addition to its
     // text. Account for that row so natural section heights do not overrun the
@@ -433,6 +438,8 @@ pub(super) fn draw_runtime_sidebar(
     let mut minimums = vec![4_u16, 6, 5, 3, 3];
     if options.approval.is_some() {
         minimums.insert(4, 3);
+        minimums.insert(5, 3);
+        minimums.insert(6, 3);
     }
     if reducer.task.status.is_none() {
         minimums.insert(4, 3);
