@@ -579,13 +579,8 @@ fn draw_idle_home(frame: &mut Frame<'_>, area: Rect, recent: &[RecentSession]) {
 /// Amber box for a write waiting on the operator: path, a preview line, and
 /// the answer keys. Meaning is carried by text as well as color.
 fn draw_approval_box(frame: &mut Frame<'_>, area: Rect, request: &crate::approval::Request) {
-    let height = 5.min(area.height);
-    let box_area = Rect {
-        x: area.x,
-        y: area.y + area.height.saturating_sub(height),
-        width: area.width,
-        height,
-    };
+    let box_area = crate::modal::centered(area, 5);
+    crate::modal::dim_scene(frame, area, box_area);
     let preview = request.content.lines().next().unwrap_or("");
     let lines = vec![
         Line::from(vec![

@@ -7,6 +7,7 @@ mod approval;
 mod glyphs;
 mod input;
 mod keys;
+mod modal;
 mod picker;
 mod recent;
 mod reducer;
