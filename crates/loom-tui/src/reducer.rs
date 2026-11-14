@@ -624,6 +624,7 @@ fn event_name(kind: &EventKind) -> &'static str {
 mod tests {
     use loom_core::kernel::event::EVENT_SCHEMA_VERSION;
     use loom_core::kernel::model::{ModelResponse, StopReason, Usage};
+    use loom_core::kernel::session::TaskStatus;
     use loom_core::kernel::transcript::{AssistantMessage, Item, ReasoningTrace};
     use loom_core::{EventEnvelope, EventKind, Session, SessionId, TaskId};
 
@@ -796,6 +797,105 @@ mod tests {
         assert_eq!(reducer.recent_events.len(), RECENT_EVENT_LIMIT);
         assert_eq!(reducer.recent_events.first().unwrap(), "#299 TurnStarted");
         assert_eq!(reducer.recent_events.last().unwrap(), "#44 TurnStarted");
+    }
+
+    #[test]
+    fn long_running_multi_turn_task_projects_turns_tools_and_steering() {
+        use loom_core::kernel::transcript::ToolCallId;
+
+        let task_id = TaskId::new();
+        let mut reducer = Reducer::default();
+        reducer.begin_task("refactor the parser");
+        reducer.push_display_prompt("also keep the tests green");
+
+        let call = |n: u32| ToolCallId::try_from(format!("call-{n}")).unwrap();
+        let mut sequence = 0;
+        let mut next = |kind: EventKind| {
+            let envelope = event(sequence, task_id, kind);
+            sequence += 1;
+            envelope
+        };
+
+        reducer.reduce(&next(EventKind::TaskStarted), 1);
+        // Turn 1: model asks for a tool, the tool runs, then the model answers.
+        reducer.reduce(&next(EventKind::TurnStarted { turn: 1 }), 10);
+        reducer.reduce(
+            &next(EventKind::ToolStarted {
+                name: "read_file".into(),
+                call_id: call(1),
+                arguments: "{}".into(),
+            }),
+            11,
+        );
+        reducer.reduce(
+            &next(EventKind::ToolCompleted {
+                name: "read_file".into(),
+                call_id: call(1),
+                status: ToolStatus::Success,
+                content_head: "fn parse()".into(),
+            }),
+            12,
+        );
+        reducer.reduce(
+            &next(EventKind::ModelCompleted {
+                response: response("read it"),
+            }),
+            13,
+        );
+        // Turn 2: the user's follow-up is applied at the boundary and steers it.
+        reducer.reduce(&next(EventKind::TurnStarted { turn: 2 }), 20);
+        reducer.reduce(
+            &next(EventKind::SteeringApplied {
+                turn: 2,
+                messages: 1,
+            }),
+            21,
+        );
+        reducer.reduce(
+            &next(EventKind::ToolStarted {
+                name: "run_command".into(),
+                call_id: call(2),
+                arguments: "{}".into(),
+            }),
+            22,
+        );
+        reducer.reduce(
+            &next(EventKind::ToolCompleted {
+                name: "run_command".into(),
+                call_id: call(2),
+                status: ToolStatus::Success,
+                content_head: "exit 0".into(),
+            }),
+            23,
+        );
+        reducer.reduce(
+            &next(EventKind::ModelCompleted {
+                response: response("tests pass"),
+            }),
+            24,
+        );
+        // Turn 3: the run finishes after a third model response.
+        reducer.reduce(&next(EventKind::TurnStarted { turn: 3 }), 30);
+        reducer.reduce(
+            &next(EventKind::ModelCompleted {
+                response: response("done"),
+            }),
+            31,
+        );
+        reducer.reduce(&next(EventKind::TaskCompleted), 40);
+
+        assert_eq!(reducer.turn, Some(3));
+        assert_eq!(reducer.tool_calls_started, 2);
+        assert_eq!(reducer.event_count, sequence);
+        assert_eq!(reducer.sequence, sequence - 1);
+        assert_eq!(reducer.task.status, Some(TaskStatus::Completed));
+        assert_eq!(
+            reducer.original_instruction.as_deref(),
+            Some("refactor the parser")
+        );
+        let turns: Vec<u32> = reducer.execution_turns.keys().copied().collect();
+        assert_eq!(turns, vec![1, 2, 3]);
+        assert_eq!(reducer.tools.len(), 2);
     }
 
     #[test]
