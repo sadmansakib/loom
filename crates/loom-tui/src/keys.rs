@@ -157,6 +157,39 @@ pub(crate) fn handle_key(key: KeyEvent, context: &mut KeyContext<'_>) {
     }
 }
 
+/// Routes one terminal event that arrived while the UI is not in the picker:
+/// scroll keys first, then prompt/command keys, mouse by column, and paste.
+/// `mouse_split_column` is read only for mouse events, matching the original
+/// timing of the terminal size lookup.
+pub(crate) fn route_event(
+    event: crossterm::event::Event,
+    mouse_split_column: impl FnOnce() -> std::io::Result<u16>,
+    scroll: (&mut usize, &mut usize),
+    context: &mut KeyContext<'_>,
+) -> std::io::Result<()> {
+    use crossterm::event::Event;
+    let (thread_scroll_back, sidebar_scroll_back) = scroll;
+    match event {
+        Event::Key(key) => {
+            if !update_sidebar_scroll(key, sidebar_scroll_back)
+                && !update_thread_scroll(key, thread_scroll_back)
+            {
+                handle_key(key, context);
+            }
+        }
+        Event::Mouse(mouse) => {
+            if mouse.column >= mouse_split_column()? {
+                update_sidebar_mouse(mouse, sidebar_scroll_back);
+            } else {
+                update_thread_mouse(mouse, thread_scroll_back);
+            }
+        }
+        Event::Paste(text) => context.input.insert_paste(&text),
+        Event::FocusGained | Event::FocusLost | Event::Resize(..) => {}
+    }
+    Ok(())
+}
+
 pub(crate) struct KeyContext<'a> {
     pub(crate) input: &'a mut PromptEditor,
     pub(crate) workspace: &'a Path,

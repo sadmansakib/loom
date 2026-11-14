@@ -34,10 +34,9 @@ use input::{PromptEditor, mentioned_file_attachments, workspace_files};
 use input::{expand_file_mentions, matching_file_suggestions};
 #[cfg(test)]
 use keys::scroll_from_mouse;
-use keys::{
-    KeyContext, handle_key, update_sidebar_mouse, update_sidebar_scroll, update_thread_mouse,
-    update_thread_scroll,
-};
+use keys::{KeyContext, route_event};
+#[cfg(test)]
+use keys::{handle_key, update_sidebar_scroll, update_thread_scroll};
 use picker::{PickerState, navigate_picker};
 #[cfg(test)]
 use picker::{
@@ -358,33 +357,24 @@ async fn run_interactive(
                     }
                     () = tokio::time::sleep(FRAME_TICK) => {
                         if event::poll(Duration::ZERO)? {
-                            match event::read()? {
-                                Event::Key(key) => {
-                                    if !update_sidebar_scroll(key, &mut sidebar_scroll_back) && !update_thread_scroll(key, &mut thread_scroll_back) {
-                                        handle_key(key, &mut KeyContext {
-                                            input: &mut input,
-                                            workspace: &config.workspace,
-                                            help: &mut help,
-                                            picker: &mut picker,
-                                            sidebar: &mut sidebar,
-                                            quit: &mut should_quit,
-                                            pending_task: &mut pending_task,
-                                            pending_display_prompt: &mut pending_display_prompt,
-                                            control: Some(&task_control),
-                                            reducer: &mut reducer,
-                                        });
-                                    }
-                                }
-                                Event::Mouse(mouse) => {
-                                    if mouse.column >= terminal.size()?.width.saturating_sub(42) {
-                                        update_sidebar_mouse(mouse, &mut sidebar_scroll_back);
-                                    } else {
-                                        update_thread_mouse(mouse, &mut thread_scroll_back);
-                                    }
-                                }
-                                Event::Paste(text) => input.insert_paste(&text),
-                                Event::FocusGained | Event::FocusLost | Event::Resize(..) => {}
-                            }
+                            let event = event::read()?;
+                            route_event(
+                                event,
+                                || terminal.size().map(|size| size.width.saturating_sub(42)),
+                                (&mut thread_scroll_back, &mut sidebar_scroll_back),
+                                &mut KeyContext {
+                                    input: &mut input,
+                                    workspace: &config.workspace,
+                                    help: &mut help,
+                                    picker: &mut picker,
+                                    sidebar: &mut sidebar,
+                                    quit: &mut should_quit,
+                                    pending_task: &mut pending_task,
+                                    pending_display_prompt: &mut pending_display_prompt,
+                                    control: Some(&task_control),
+                                    reducer: &mut reducer,
+                                },
+                            )?;
                         }
                     }
                 }
@@ -433,40 +423,27 @@ async fn run_interactive(
             return Ok(());
         }
         if event::poll(FRAME_TICK)? {
-            match event::read()? {
-                Event::Key(key) => {
-                    if !update_sidebar_scroll(key, &mut sidebar_scroll_back)
-                        && !update_thread_scroll(key, &mut thread_scroll_back)
-                    {
-                        handle_key(
-                            key,
-                            &mut KeyContext {
-                                input: &mut input,
-                                workspace: &config.workspace,
-                                help: &mut help,
-                                picker: &mut picker,
-                                sidebar: &mut sidebar,
-                                quit: &mut should_quit,
-                                pending_task: &mut pending_task,
-                                pending_display_prompt: &mut pending_display_prompt,
-                                control: None,
-                                reducer: &mut reducer,
-                            },
-                        );
-                    }
-                    if picker {
-                        picker_loaded = false;
-                    }
-                }
-                Event::Mouse(mouse) => {
-                    if mouse.column >= terminal.size()?.width.saturating_sub(42) {
-                        update_sidebar_mouse(mouse, &mut sidebar_scroll_back);
-                    } else {
-                        update_thread_mouse(mouse, &mut thread_scroll_back);
-                    }
-                }
-                Event::Paste(text) => input.insert_paste(&text),
-                Event::FocusGained | Event::FocusLost | Event::Resize(..) => {}
+            let event = event::read()?;
+            let key_pressed = matches!(event, Event::Key(_));
+            route_event(
+                event,
+                || terminal.size().map(|size| size.width.saturating_sub(42)),
+                (&mut thread_scroll_back, &mut sidebar_scroll_back),
+                &mut KeyContext {
+                    input: &mut input,
+                    workspace: &config.workspace,
+                    help: &mut help,
+                    picker: &mut picker,
+                    sidebar: &mut sidebar,
+                    quit: &mut should_quit,
+                    pending_task: &mut pending_task,
+                    pending_display_prompt: &mut pending_display_prompt,
+                    control: None,
+                    reducer: &mut reducer,
+                },
+            )?;
+            if key_pressed && picker {
+                picker_loaded = false;
             }
         }
         if let Some(task) = pending_task.take() {
