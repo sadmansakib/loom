@@ -155,6 +155,10 @@ fn reduced_body(
 
 /// The raw path: both bounded streams inline, nothing teed.
 fn push_streams(text: &mut String, raw: &str, stderr: &str) {
+    if raw.is_empty() && stderr.is_empty() {
+        text.push_str("\n--- output ---\n(no stdout or stderr)");
+        return;
+    }
     if !raw.is_empty() {
         text.push_str("\n--- stdout ---\n");
         text.push_str(raw);

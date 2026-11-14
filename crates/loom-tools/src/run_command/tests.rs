@@ -75,6 +75,25 @@ async fn allowed_program_runs_and_captures_stdout() {
 }
 
 #[tokio::test]
+async fn successful_command_with_empty_streams_says_so_explicitly() {
+    let (_guard, root) = temp_root();
+    let tool = RunCommandTool::with_allowed(["true"]);
+    let output = run(&tool, &root, json!({"program": "true"}))
+        .await
+        .expect("empty successful command output is still a result");
+    assert!(
+        output.content.contains("exit status: 0"),
+        "{}",
+        output.content
+    );
+    assert!(
+        output.content.contains("(no stdout or stderr)"),
+        "{}",
+        output.content
+    );
+}
+
+#[tokio::test]
 async fn writes_outside_the_workspace_are_denied() {
     let (_guard, root) = temp_root();
     // The sandbox's writable set is workspace + temp + cargo home; the
