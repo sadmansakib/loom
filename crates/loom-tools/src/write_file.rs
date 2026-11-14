@@ -125,6 +125,10 @@ impl Tool for WriteFileTool {
         })
     }
 
+    fn requires_approval(&self, _input: &Value) -> bool {
+        self.approval.is_some()
+    }
+
     fn call<'a>(
         &'a self,
         input: Value,

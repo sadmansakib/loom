@@ -92,6 +92,27 @@ impl Agent {
             }
         }
         for call in &runnable {
+            // Gated calls ask the operator before they run (see Tool::requires_approval).
+            let gated = self
+                .registry
+                .get(&call.name)
+                .is_some_and(|tool| tool.requires_approval(&call.arguments));
+            if gated {
+                let path = self
+                    .registry
+                    .get(&call.name)
+                    .and_then(|tool| tool.touched_paths(&call.arguments))
+                    .and_then(|touches| touches.into_iter().next())
+                    .map_or_else(String::new, |touch| touch.path);
+                sink.emit(
+                    task_id,
+                    EventKind::ApprovalRequested {
+                        name: call.name.clone(),
+                        call_id: call.id.clone(),
+                        path,
+                    },
+                );
+            }
             sink.emit(
                 task_id,
                 EventKind::ToolStarted {
@@ -190,6 +211,21 @@ impl Agent {
                 let status = result.status;
                 let content_head =
                     crate::event::text_head(&result.content, crate::event::CONTENT_EVENT_HEAD);
+                if self
+                    .registry
+                    .get(&call.name)
+                    .is_some_and(|tool| tool.requires_approval(&call.arguments))
+                {
+                    // A gated call that ends in error was declined or failed; the
+                    // write tool reports a decline as an execution error.
+                    sink.emit(
+                        task_id,
+                        EventKind::ApprovalDecided {
+                            call_id: call.id.clone(),
+                            allowed: matches!(status, ToolStatus::Success),
+                        },
+                    );
+                }
                 sink.emit(
                     task_id,
                     EventKind::ToolCompleted {

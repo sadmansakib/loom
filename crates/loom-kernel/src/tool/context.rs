@@ -56,6 +56,16 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Whether this call needs the operator's approval before it runs.
+    ///
+    /// The engine emits `ApprovalRequested` before such a call and
+    /// `ApprovalDecided` after it, on the run's own sink. Defaults to
+    /// `false`: a tool gates only when it has an approval hook attached.
+    fn requires_approval(&self, input: &Value) -> bool {
+        let _ = input;
+        false
+    }
+
     /// An optional, tool-specific remediation hint for a failed call.
     ///
     /// The loop always appends a generic next-step hint to a failure the

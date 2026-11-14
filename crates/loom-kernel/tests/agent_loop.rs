@@ -40,6 +40,7 @@ use loom_kernel::session::{PlannedTurn, Session, TaskRecord, TaskStatus, TodoSta
 use loom_kernel::store::{
     ForkProvenance, MemorySessionStore, SessionStore, StartCheckpoint, StoreError,
 };
+use loom_kernel::tool::PathTouch;
 use loom_kernel::tool::{
     CommandEffect, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolRegistry, ToolSpec,
 };
@@ -143,6 +144,38 @@ impl ModelProvider for FakeProvider {
 struct FakeTool {
     spec: ToolSpec,
     read_only: bool,
+}
+
+/// A mutating tool that asks for approval before each call, touching one
+/// path, so the engine's approval events are observable.
+struct GatedTool {
+    spec: ToolSpec,
+}
+
+impl Tool for GatedTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    fn requires_approval(&self, _input: &Value) -> bool {
+        true
+    }
+
+    fn touched_paths(&self, _input: &Value) -> Option<Vec<PathTouch>> {
+        Some(vec![PathTouch::write("notes.md")])
+    }
+
+    fn call<'a>(
+        &'a self,
+        _input: Value,
+        _ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
+        Box::pin(async move { Ok(ToolOutput::new("written".to_owned())) })
+    }
 }
 
 impl Tool for FakeTool {
@@ -943,6 +976,54 @@ async fn tool_round_trip_executes_and_commits_one_turn_per_model_response() {
             .any(|kind| matches!(kind, EventKind::ToolCompleted { name, .. } if name == "echo"))
     );
     assert!(matches!(kinds.last().unwrap(), EventKind::TaskCompleted));
+}
+
+#[tokio::test]
+async fn gated_tool_call_emits_approval_events_around_the_call() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            completed(
+                assistant(
+                    "",
+                    StopReason::ToolCalls,
+                    vec![tool_call("call_1", "write", json!({ "path": "notes.md" }))],
+                ),
+                usage(20, 5, None),
+            ),
+            completed(
+                assistant("done", StopReason::EndTurn, Vec::new()),
+                usage(30, 7, None),
+            ),
+        ],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let control = TaskControl::new();
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(GatedTool {
+            spec: spec("write"),
+        }))
+        .unwrap();
+    let agent = agent(provider, registry, 10);
+    agent
+        .run_task(&mut session, "write notes", &sink, &control)
+        .await
+        .unwrap();
+
+    let kinds = drain(&mut receiver);
+    let index = |wanted: fn(&EventKind) -> bool| kinds.iter().position(wanted).unwrap();
+    let requested = index(
+        |kind| matches!(kind, EventKind::ApprovalRequested { name, path, .. } if name == "write" && path == "notes.md"),
+    );
+    let started =
+        index(|kind| matches!(kind, EventKind::ToolStarted { name, .. } if name == "write"));
+    let decided = index(|kind| matches!(kind, EventKind::ApprovalDecided { allowed: true, .. }));
+    assert!(
+        requested < started && started < decided,
+        "approval must bracket the call"
+    );
 }
 
 #[tokio::test]
