@@ -15,8 +15,8 @@ use ratatui::{
 };
 
 use crate::{
-    ModelPricing, PickerState,
     glyphs::{self, Glyph, GlyphSet},
+    picker::{ModelPricing, PickerState},
     reducer::Reducer,
     theme,
 };
