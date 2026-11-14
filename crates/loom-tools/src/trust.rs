@@ -315,9 +315,6 @@ impl TrustGate {
                 pinned.push(relative.to_owned());
             }
         }
-        if pinned.is_empty() {
-            return Ok(pinned);
-        }
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -447,10 +444,14 @@ mod tests {
     }
 
     #[test]
-    fn pinning_without_manifests_writes_nothing() {
+    fn pinning_without_manifests_records_the_folder() {
         let (dir, gate) = gate_and_workspace();
         let pinned = gate.pin(dir.path()).expect("pin");
         assert_eq!(pinned.len(), 0);
-        assert!(!gate.path.exists(), "empty store must not be created");
+        assert!(
+            gate.load()
+                .workspace
+                .contains_key(&TrustGate::workspace_key(dir.path()))
+        );
     }
 }
