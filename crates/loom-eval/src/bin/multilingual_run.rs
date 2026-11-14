@@ -33,6 +33,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use loom_eval::cli::{csv, env_csv};
 use loom_eval::multilingual::{self, MultilingualInstance, RUST_CONTAINER_SCRIPT, SELECTION_RULE};
 use loom_eval::swebench::{
     self, AgentKind, ContainerSpec, RunUsage, api_key_envs, docker_run_argv, run_outcome, run_usage,
@@ -55,18 +56,6 @@ struct Args {
     max_turns: usize,
     arm: String,
     eval_dir: PathBuf,
-}
-
-fn csv(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(|part| part.trim().to_owned())
-        .filter(|part| !part.is_empty())
-        .collect()
-}
-
-fn env_csv(name: &str) -> Vec<String> {
-    std::env::var(name).ok().map_or_default(|v| csv(&v))
 }
 
 fn usage() -> ! {

@@ -28,6 +28,7 @@
 //! Everything in the library is offline-testable except the two
 //! network edges (dataset fetch, docker), which the binary owns.
 
+pub mod cli;
 pub mod multilingual;
 pub mod selfopt;
 pub mod suite_audit;

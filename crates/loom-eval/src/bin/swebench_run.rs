@@ -26,6 +26,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use loom_eval::cli::{csv, env_csv};
 use loom_eval::swebench::{
     self, AgentKind, ContainerSpec, EXPECTED_ROWS, RunUsage, SweInstance, api_key_envs,
     build_prompt, dataset_cache_path, docker_run_argv, fetch_dataset_verified, load_dataset_cached,
@@ -66,18 +67,6 @@ struct Args {
     reasoning_schedule: String,
     /// Opening turns at high effort under `progressive`.
     reasoning_open_turns: u16,
-}
-
-fn csv(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(|part| part.trim().to_owned())
-        .filter(|part| !part.is_empty())
-        .collect()
-}
-
-fn env_csv(name: &str) -> Vec<String> {
-    std::env::var(name).ok().map_or_default(|v| csv(&v))
 }
 
 fn usage() -> ! {

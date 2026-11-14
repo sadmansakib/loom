@@ -31,6 +31,7 @@
 
 use std::path::PathBuf;
 
+use loom_eval::cli::csv;
 use loom_eval::suite_audit::{audit_dataset, count_hunks, mutant_patches, suite_audit_provenance};
 use loom_eval::swebench::{
     Prediction, SweInstance, parse_dataset, select_instances, write_predictions,
@@ -44,14 +45,6 @@ struct Args {
     /// the same cached dataset file.
     repos: Vec<String>,
     per_repo: Option<usize>,
-}
-
-fn csv(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(|field| field.trim().to_owned())
-        .filter(|field| !field.is_empty())
-        .collect()
 }
 
 fn parse_args() -> Args {
