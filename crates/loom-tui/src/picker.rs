@@ -1,7 +1,7 @@
 //! Model picker state: discovery of providers and models, search, and selection.
 
 use anyhow::Result;
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyModifiers};
 use loom_core::kernel::model::ModelCapabilities;
 use loom_core::{Engine, EngineConfig, ReasoningEffort};
 
@@ -56,6 +56,99 @@ pub(crate) struct PickerState {
     pub(crate) catalogs: std::collections::HashMap<String, loom_core::providers::ProviderCatalog>,
     pub(crate) effort: ReasoningEffort,
     pub(crate) notice: Option<String>,
+}
+
+/// What a key press in the model picker asks the run loop to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PickerAction {
+    /// The key changed picker state (or was ignored) with no loop-level effect.
+    None,
+    /// Leave search mode and clear the query.
+    LeaveSearch,
+    /// Leave the picker and return to the active session.
+    CloseToSession,
+    /// Quit the TUI.
+    Quit,
+    /// Apply the selected model and open an engine.
+    Select,
+    /// Rediscover providers and models.
+    Refresh,
+    /// Toggle the help overlay.
+    ToggleHelp,
+}
+
+/// Maps one picker key to its loop-level action, applying the picker's
+/// own state edits first. Guard order matches the original `match`.
+pub(crate) fn handle_picker_key(
+    picker: &mut PickerState,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    has_active_session: bool,
+) -> PickerAction {
+    if navigate_picker(picker, code) {
+        return PickerAction::None;
+    }
+    match code {
+        KeyCode::Esc if picker.searching => {
+            picker.searching = false;
+            picker.set_query(String::new());
+            PickerAction::LeaveSearch
+        }
+        KeyCode::Esc if has_active_session => PickerAction::CloseToSession,
+        KeyCode::Esc => PickerAction::Quit,
+        KeyCode::Char('/') if !picker.searching => {
+            picker.searching = true;
+            PickerAction::None
+        }
+        KeyCode::Backspace if picker.searching => {
+            picker.search_query.pop();
+            picker.refresh_filter_selection();
+            PickerAction::None
+        }
+        KeyCode::Char(ch)
+            if picker.searching
+                && !modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+        {
+            picker.search_query.push(ch);
+            picker.refresh_filter_selection();
+            PickerAction::None
+        }
+        KeyCode::Tab if picker.has_supported_effort() => {
+            picker.next_effort();
+            PickerAction::None
+        }
+        KeyCode::Enter if !picker.filtered_indices().is_empty() => PickerAction::Select,
+        KeyCode::Char('r') if !picker.searching => PickerAction::Refresh,
+        KeyCode::F(1) => PickerAction::ToggleHelp,
+        KeyCode::Backspace
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Tab
+        | KeyCode::BackTab
+        | KeyCode::Delete
+        | KeyCode::Insert
+        | KeyCode::F(_)
+        | KeyCode::Char(_)
+        | KeyCode::Null
+        | KeyCode::CapsLock
+        | KeyCode::ScrollLock
+        | KeyCode::NumLock
+        | KeyCode::PrintScreen
+        | KeyCode::Pause
+        | KeyCode::Menu
+        | KeyCode::KeypadBegin
+        | KeyCode::Media(_)
+        | KeyCode::Modifier(_)
+        | KeyCode::Enter => PickerAction::None,
+    }
 }
 
 pub(crate) fn navigate_picker(picker: &mut PickerState, code: KeyCode) -> bool {

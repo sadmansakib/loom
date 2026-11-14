@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event};
 use loom_core::kernel::agent::TurnBudget;
 use loom_core::kernel::context::PruneConfig;
 use loom_core::kernel::event::ChannelEventSink;
@@ -28,6 +28,8 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 #[cfg(test)]
+use crossterm::event::{KeyCode, KeyModifiers};
+#[cfg(test)]
 use crossterm::event::{KeyEvent, MouseEventKind};
 use input::{PromptEditor, mentioned_file_attachments, workspace_files};
 #[cfg(test)]
@@ -37,10 +39,11 @@ use keys::scroll_from_mouse;
 use keys::{KeyContext, route_event};
 #[cfg(test)]
 use keys::{handle_key, update_sidebar_scroll, update_thread_scroll};
-use picker::{PickerState, navigate_picker};
+use picker::{PickerAction, PickerState, handle_picker_key};
 #[cfg(test)]
 use picker::{
     catalog_credential_provider, catalog_models_url, environment_credential, model_choice,
+    navigate_picker,
 };
 pub use reducer::Reducer;
 pub use scene_views::Scene;
@@ -209,34 +212,21 @@ async fn run_interactive(
                             .extend(text.chars().filter(|ch| !ch.is_control()));
                         picker_state.refresh_filter_selection();
                     }
-                    Event::Key(key) => match key.code {
-                        code if navigate_picker(&mut picker_state, code) => {}
-                        KeyCode::Esc if picker_state.searching => {
-                            picker_state.searching = false;
-                            picker_state.set_query(String::new());
+                    Event::Key(key) => match handle_picker_key(
+                        &mut picker_state,
+                        key.code,
+                        key.modifiers,
+                        active.is_some(),
+                    ) {
+                        PickerAction::None | PickerAction::LeaveSearch => {}
+                        PickerAction::CloseToSession => picker = false,
+                        PickerAction::Quit => return Ok(()),
+                        PickerAction::ToggleHelp => help = !help,
+                        PickerAction::Refresh => {
+                            picker_state = PickerState::discover(&config).await?;
+                            picker_loaded = true;
                         }
-                        KeyCode::Esc if active.is_some() => picker = false,
-                        KeyCode::Esc => return Ok(()),
-                        KeyCode::Char('/') if !picker_state.searching => {
-                            picker_state.searching = true;
-                        }
-                        KeyCode::Backspace if picker_state.searching => {
-                            picker_state.search_query.pop();
-                            picker_state.refresh_filter_selection();
-                        }
-                        KeyCode::Char(ch)
-                            if picker_state.searching
-                                && !key.modifiers.intersects(
-                                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                                ) =>
-                        {
-                            picker_state.search_query.push(ch);
-                            picker_state.refresh_filter_selection();
-                        }
-                        KeyCode::Tab if picker_state.has_supported_effort() => {
-                            picker_state.next_effort();
-                        }
-                        KeyCode::Enter if !picker_state.filtered_indices().is_empty() => {
+                        PickerAction::Select => {
                             picker_state.searching = false;
                             picker_state.apply(&mut config);
                             let previous_session = active.take().map(|(_, session)| session);
@@ -253,37 +243,6 @@ async fn run_interactive(
                             active = Some((engine, previous_session.unwrap_or(session)));
                             picker = false;
                         }
-                        KeyCode::Char('r') if !picker_state.searching => {
-                            picker_state = PickerState::discover(&config).await?;
-                            picker_loaded = true;
-                        }
-                        KeyCode::F(1) => help = !help,
-                        KeyCode::Backspace
-                        | KeyCode::Left
-                        | KeyCode::Right
-                        | KeyCode::Home
-                        | KeyCode::End
-                        | KeyCode::PageUp
-                        | KeyCode::PageDown
-                        | KeyCode::Up
-                        | KeyCode::Down
-                        | KeyCode::Tab
-                        | KeyCode::BackTab
-                        | KeyCode::Delete
-                        | KeyCode::Insert
-                        | KeyCode::F(_)
-                        | KeyCode::Char(_)
-                        | KeyCode::Null
-                        | KeyCode::CapsLock
-                        | KeyCode::ScrollLock
-                        | KeyCode::NumLock
-                        | KeyCode::PrintScreen
-                        | KeyCode::Pause
-                        | KeyCode::Menu
-                        | KeyCode::KeypadBegin
-                        | KeyCode::Media(_)
-                        | KeyCode::Modifier(_)
-                        | KeyCode::Enter => {}
                     },
                     Event::Paste(_)
                     | Event::Mouse(_)
