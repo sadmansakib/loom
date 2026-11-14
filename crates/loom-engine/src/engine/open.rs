@@ -23,7 +23,7 @@ use super::assembly::{
 };
 use super::budgets::prune_config_for;
 use super::config::{kernel_effort, reasoning_schedule_from_env};
-use super::{Engine, EngineConfig, EngineError, EngineOverrides, RoutedAgent};
+use super::{Engine, EngineConfig, EngineError, EngineOverrides, ProviderHook, RoutedAgent};
 
 impl Engine {
     /// Opens the engine: resolves the credential, builds the provider, and
@@ -108,42 +108,12 @@ impl Engine {
         // rename fallback (item 34); tools and menu flow on below.
         let lsp_servers = lsp.servers;
 
-        // Provider: an overridden provider skips the credential build
-        // entirely (offline replay needs no secret); a hook then wraps
-        // whichever provider resulted, so traffic capture composes with
-        // both paths.
-        let provider: Box<dyn ModelProvider> = if let Some(provider) = overrides.provider {
-            provider
-        } else if let Some(credential) = overrides.credential {
-            crate::provider::build(&config, credential.expose())?.provider
-        } else {
-            // Credential resolution: --account → active saved account →
-            // env (§18.3). The secret never leaves a `SecretString`.
-            let store = SqliteAuthStore::open(&config.db_path).map_err(EngineError::Store)?;
-            let secrets = KeychainBackend::default();
-            let credential = auth::resolve(
-                &store,
-                &secrets,
-                &config.provider,
-                config.account.as_deref(),
-                |name| std::env::var(name).ok(),
-            )?;
-            tracing::debug!(
-                source = credential.source.as_str(),
-                account = credential
-                    .account
-                    .as_ref()
-                    .map_or("-", |account| account.label.as_str()),
-                "credential resolved"
-            );
-            // Provider construction and loud capability validation: all
-            // adapter-specific knowledge lives in `provider`.
-            crate::provider::build(&config, credential.secret.expose())?.provider
-        };
-        let provider = match overrides.provider_hook {
-            Some(hook) => hook(provider),
-            None => provider,
-        };
+        let provider = resolve_provider(
+            &config,
+            overrides.provider,
+            overrides.credential,
+            overrides.provider_hook,
+        )?;
         // The resolution facts the trace surfaces once per engine (v8):
         // which authority — catalog row, provider table, or recording —
         // fixed this model's capabilities.
@@ -779,4 +749,53 @@ impl Engine {
         };
         Engine::open_with_extra_tools(config, overrides, mcp, lsp)
     }
+}
+
+/// Resolves the provider for an engine: an injected provider skips the
+/// credential build entirely, a supplied credential builds directly, and
+/// otherwise the saved account or environment resolves one. The hook then
+/// wraps whichever provider resulted.
+fn resolve_provider(
+    config: &EngineConfig,
+    provider: Option<Box<dyn ModelProvider>>,
+    credential: Option<loom_providers::SecretString>,
+    hook: Option<ProviderHook>,
+) -> Result<Box<dyn ModelProvider>, EngineError> {
+    // Provider: an overridden provider skips the credential build
+    // entirely (offline replay needs no secret); a hook then wraps
+    // whichever provider resulted, so traffic capture composes with
+    // both paths.
+    let provider: Box<dyn ModelProvider> = if let Some(provider) = provider {
+        provider
+    } else if let Some(credential) = credential {
+        crate::provider::build(config, credential.expose())?.provider
+    } else {
+        // Credential resolution: --account → active saved account →
+        // env (§18.3). The secret never leaves a `SecretString`.
+        let store = SqliteAuthStore::open(&config.db_path).map_err(EngineError::Store)?;
+        let secrets = KeychainBackend::default();
+        let credential = auth::resolve(
+            &store,
+            &secrets,
+            &config.provider,
+            config.account.as_deref(),
+            |name| std::env::var(name).ok(),
+        )?;
+        tracing::debug!(
+            source = credential.source.as_str(),
+            account = credential
+                .account
+                .as_ref()
+                .map_or("-", |account| account.label.as_str()),
+            "credential resolved"
+        );
+        // Provider construction and loud capability validation: all
+        // adapter-specific knowledge lives in `provider`.
+        crate::provider::build(config, credential.secret.expose())?.provider
+    };
+    let provider = match hook {
+        Some(hook) => hook(provider),
+        None => provider,
+    };
+    Ok(provider)
 }
