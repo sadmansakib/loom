@@ -402,6 +402,17 @@ async fn run_interactive(
                     () = tokio::time::sleep(FRAME_TICK) => {
                         if event::poll(Duration::ZERO)? {
                             let event = event::read()?;
+                            if let Event::Key(crossterm::event::KeyEvent { code: KeyCode::Char('e'), .. }) = &event
+                                && let Some(request) = pending_approval.take()
+                            {
+                                let decision = match approval::edit_proposal(&request.content) {
+                                    Some(edited) => loom_core::tools::WriteDecision::Edit(edited),
+                                    None => loom_core::tools::WriteDecision::Decline,
+                                };
+                                reducer.note_event(format!("ApprovalDecided {} edited", request.path));
+                                let _ = request.reply.send(decision);
+                                continue;
+                            }
                             if let Event::Key(crossterm::event::KeyEvent { code: KeyCode::Char(answer), .. }) = &event
                                 && let Some(decision) = approval::decision_for_key(*answer)
                                 && let Some(request) = pending_approval.take()

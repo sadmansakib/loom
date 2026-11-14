@@ -58,6 +58,29 @@ pub fn decision_for_key(key: char) -> Option<WriteDecision> {
     }
 }
 
+/// Opens the proposed body in `$EDITOR` and returns the saved text.
+///
+/// The terminal leaves raw mode and the alternate screen for the editor, then
+/// returns to them. Any failure returns `None`, so the caller declines.
+pub fn edit_proposal(content: &str) -> Option<String> {
+    let path = std::env::temp_dir().join(format!("loom-proposal-{}", std::process::id()));
+    std::fs::write(&path, content).ok()?;
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+
+    let _ = crossterm::terminal::disable_raw_mode();
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+    let status = std::process::Command::new(&editor).arg(&path).status();
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
+    let _ = crossterm::terminal::enable_raw_mode();
+
+    let edited = match status {
+        Ok(status) if status.success() => std::fs::read_to_string(&path).ok(),
+        _ => None,
+    };
+    let _ = std::fs::remove_file(&path);
+    edited
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
