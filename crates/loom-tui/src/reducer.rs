@@ -615,6 +615,8 @@ fn event_name(kind: &EventKind) -> &'static str {
         EventKind::TodoUpdated { .. } => "TodoUpdated",
         EventKind::TurnBudgetExtended { .. } => "TurnBudgetExtended",
         EventKind::LoopNudge { .. } => "LoopNudge",
+        EventKind::ApprovalRequested { .. } => "ApprovalRequested",
+        EventKind::ApprovalDecided { .. } => "ApprovalDecided",
         EventKind::AwaitingInput { .. } => "AwaitingInput",
         _ => "Other",
     }

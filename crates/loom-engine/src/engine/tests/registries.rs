@@ -13,6 +13,7 @@ fn todo_tool_is_exposed_in_the_full_registry_and_excluded_from_bare() {
         ToolBudgets::default(),
         false,
         None,
+        None,
     )
     .expect("built-in registry");
     let full: Vec<&str> = built.specs().map(|spec| spec.name.as_str()).collect();

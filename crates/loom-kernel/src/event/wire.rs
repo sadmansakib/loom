@@ -66,7 +66,9 @@ use serde::{Deserialize, Serialize};
 /// census plus the agent's remaining task-budget headroom at compile time.
 /// v17 adds `StopReason::PauseTurn` so provider-paused responses are distinct
 /// from terminal `EndTurn` responses in persisted `ModelCompleted` events.
-pub const EVENT_SCHEMA_VERSION: u16 = 17;
+/// v18 adds `ApprovalRequested` and `ApprovalDecided`: the operator gate for
+/// file writes, so a pending write and the answer to it are on the record.
+pub const EVENT_SCHEMA_VERSION: u16 = 18;
 
 /// The evidence that justified a [`EventKind::TurnBudgetExtended`] grant
 /// (item 26): state the loop already tracks, never a model call.
@@ -316,7 +318,24 @@ pub enum EventKind {
         /// file bodies (schema 11).
         arguments: String,
     },
-    /// The engine finished one tool call (success or failure — the
+    /// The operator was asked to approve a file write before it ran.
+    /// `call_id` correlates with the `ToolStarted` for the same write.
+    ApprovalRequested {
+        /// Name of the write tool asking (`write_file`).
+        name: String,
+        /// Correlation id of the write call awaiting approval.
+        call_id: ToolCallId,
+        /// Workspace-relative path the write would touch.
+        path: String,
+    },
+    /// The operator answered an `ApprovalRequested`. `allowed` is false when
+    /// the write was declined.
+    ApprovalDecided {
+        /// Correlation id of the write call that was asked about.
+        call_id: ToolCallId,
+        /// Whether the write was allowed to proceed.
+        allowed: bool,
+    },
     /// structured outcome lands in the transcript's `ToolResult`; the
     /// next `ModelCompleted` shows what the model did with it).
     ToolCompleted {

@@ -131,6 +131,7 @@ impl Engine {
                 config.budgets,
                 config.autofix,
                 overrides.ask.as_ref(),
+                overrides.write_approval.as_ref(),
             )?;
             // The bare-loop arm keeps the primitive tool set only
             // (read/list/write/edit/shell); a search index, the

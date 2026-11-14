@@ -84,6 +84,11 @@ pub struct EngineOverrides {
     /// `request_permission`, so an editor operator becomes the
     /// approver.
     pub ask: Option<AskResolver>,
+    /// An approval callback for file writes (`write_file`), asked before
+    /// each write runs. `None` keeps writes unattended, as today. The TUI
+    /// supplies one so the operator approves each write unless they chose
+    /// "never ask again" for the workspace.
+    pub write_approval: Option<loom_tools::WriteApproval>,
 }
 
 impl EngineOverrides {
@@ -134,6 +139,14 @@ impl EngineOverrides {
     #[must_use]
     pub fn with_ask_resolver(mut self, ask: AskResolver) -> Self {
         self.ask = Some(ask);
+        self
+    }
+
+    /// Sets the approval callback for file writes
+    /// ([`EngineOverrides::write_approval`]).
+    #[must_use]
+    pub fn with_write_approval(mut self, approval: loom_tools::WriteApproval) -> Self {
+        self.write_approval = Some(approval);
         self
     }
 }

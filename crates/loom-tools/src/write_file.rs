@@ -19,7 +19,7 @@ use crate::policy::CommandPolicy;
 
 /// Creates or overwrites one UTF-8 text file, confined to the workspace
 /// root, creating missing parent directories.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct WriteFileTool {
     /// Whether a failing fused cargo verify attempts one
     /// machine-applicable fix round under a never-worse gate (roadmap
@@ -30,6 +30,27 @@ pub struct WriteFileTool {
     /// the verification. Default = permissive, keeping the
     /// historical auto-allow.
     policy: CommandPolicy,
+    /// Operator approval for a write before it touches disk. `None`
+    /// fails closed: a write with no frontend to ask is refused.
+    approval: Option<WriteApproval>,
+}
+
+/// Asks the operator to approve one write: `true` allows it. The
+/// frontend returns `false` (decline) or `true` (allow, possibly after
+/// recording "never ask again" in the trust store).
+pub type WriteApproval =
+    std::sync::Arc<dyn Fn(String) -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
+
+impl std::fmt::Debug for WriteFileTool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `dyn Fn` has no `Debug`; report only whether a gate is attached.
+        formatter
+            .debug_struct("WriteFileTool")
+            .field("autofix", &self.autofix)
+            .field("policy", &self.policy)
+            .field("approval", &self.approval.is_some())
+            .finish()
+    }
 }
 
 impl WriteFileTool {
@@ -44,6 +65,13 @@ impl WriteFileTool {
     #[must_use]
     pub fn with_policy(mut self, policy: CommandPolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Attaches the operator approval gate for writes.
+    #[must_use]
+    pub fn with_approval(mut self, approval: WriteApproval) -> Self {
+        self.approval = Some(approval);
         self
     }
 }
@@ -100,6 +128,14 @@ impl Tool for WriteFileTool {
             // escalation wearing the operator's signature.
             crate::confinement::ensure_mutable(&ctx.workspace_root, &path)?;
             let relative = workspace_relative(&ctx.workspace_root, &path);
+            if let Some(approval) = &self.approval {
+                let allowed = approval(relative.clone()).await;
+                if !allowed {
+                    return Err(ToolError::Execution(format!(
+                        "write to \"{relative}\" was declined by the operator"
+                    )));
+                }
+            }
             let scope = input.verify;
             let content = input.content;
             let written = content.len();

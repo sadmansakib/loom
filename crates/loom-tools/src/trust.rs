@@ -90,6 +90,9 @@ struct WorkspacePins {
     commands: Option<String>,
     verify: Option<String>,
     mcp: Option<String>,
+    /// Operator chose "never ask again" for file writes in this workspace.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    writes_allowed: bool,
 }
 
 /// What the gate decided about one manifest.
@@ -125,6 +128,26 @@ pub fn is_pinned(workspace: &Path) -> bool {
         .load()
         .workspace
         .contains_key(&TrustGate::workspace_key(workspace))
+}
+
+/// Whether the operator chose "never ask again" for file writes in
+/// `workspace`. Survives restarts: the choice lives in the trust store.
+#[must_use]
+pub fn writes_allowed(workspace: &Path) -> bool {
+    TrustGate::open()
+        .load()
+        .workspace
+        .get(&TrustGate::workspace_key(workspace))
+        .is_some_and(|pins| pins.writes_allowed)
+}
+
+/// Records "never ask again" for file writes in `workspace`.
+///
+/// # Errors
+///
+/// Fails when the trust store cannot be written (permissions, disk).
+pub fn allow_writes(workspace: &Path) -> std::io::Result<()> {
+    TrustGate::open().set_writes_allowed(workspace)
 }
 
 /// One manifest's trust state, for `loom trust --status`.
@@ -257,6 +280,26 @@ impl TrustGate {
     /// threads sharing a store, a harness pinning testbeds while an
     /// engine reads — cannot drop each other's entries or tear a
     /// reader's view.
+    /// Records the "never ask again" write choice for `workspace`, under
+    /// the same lock and atomic rename as [`TrustGate::pin`].
+    pub(crate) fn set_writes_allowed(&self, workspace: &Path) -> std::io::Result<()> {
+        static PIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = PIN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut store = self.load();
+        store
+            .workspace
+            .entry(Self::workspace_key(workspace))
+            .or_default()
+            .writes_allowed = true;
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let text = toml::to_string_pretty(&store).map_err(std::io::Error::other)?;
+        crate::atomic::atomic_write(&self.path, text.as_bytes())
+    }
+
     pub(crate) fn pin(&self, workspace: &Path) -> std::io::Result<Vec<String>> {
         static PIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = PIN_LOCK
@@ -384,6 +427,23 @@ mod tests {
             gate.decide(other.path(), ".loom/mcp.toml"),
             Trust::Untrusted
         );
+    }
+
+    #[test]
+    fn writes_choice_survives_a_reopen() {
+        let (dir, gate) = gate_and_workspace();
+        assert!(
+            !gate
+                .load()
+                .workspace
+                .values()
+                .any(|pins| pins.writes_allowed)
+        );
+        gate.set_writes_allowed(dir.path()).expect("set");
+        // A fresh gate on the same file models a restart.
+        let reopened = TrustGate { path: gate.path };
+        let key = TrustGate::workspace_key(dir.path());
+        assert!(reopened.load().workspace[&key].writes_allowed);
     }
 
     #[test]

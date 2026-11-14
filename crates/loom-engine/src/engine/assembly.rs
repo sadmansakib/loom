@@ -12,7 +12,7 @@ use loom_store::SqliteStore;
 use loom_tools::policy::{AskResolver, CommandPolicy};
 use loom_tools::{
     ArtifactReadTool, EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool,
-    ToolBudgets, VerifyTool, WriteFileTool,
+    ToolBudgets, VerifyTool, WriteApproval, WriteFileTool,
 };
 
 use crate::auth::{self, KeychainBackend, SqliteAuthStore};
@@ -96,7 +96,7 @@ pub(crate) fn compose_scout(
     )?;
     let provider = crate::provider::build(&child, credential.secret.expose())?.provider;
     let registry = ToolRegistry::from_arc_tools(
-        build_registry(policy, child.budgets, false, None)?
+        build_registry(policy, child.budgets, false, None, None)?
             .into_arc_tools()
             .filter(|tool| tool.is_read_only()),
     );
@@ -259,6 +259,7 @@ pub(crate) fn build_registry(
     budgets: ToolBudgets,
     autofix: bool,
     ask: Option<&AskResolver>,
+    write_approval: Option<&WriteApproval>,
 ) -> Result<ToolRegistry, EngineError> {
     let mut registry = ToolRegistry::new();
     let mut register = |name: &'static str, tool: Box<dyn loom_kernel::tool::Tool>| {
@@ -281,11 +282,15 @@ pub(crate) fn build_registry(
     )?;
     register(
         "write_file",
-        Box::new(
-            WriteFileTool::default()
+        Box::new({
+            let mut write = WriteFileTool::default()
                 .with_autofix(autofix)
-                .with_policy(policy.clone()),
-        ),
+                .with_policy(policy.clone());
+            if let Some(approval) = write_approval {
+                write = write.with_approval(Arc::clone(approval));
+            }
+            write
+        }),
     )?;
     register(
         "edit_file",
@@ -339,6 +344,7 @@ pub(crate) fn replay_registry() -> Result<ToolRegistry, EngineError> {
         &CommandPolicy::default(),
         ToolBudgets::default(),
         false,
+        None,
         None,
     )
 }
