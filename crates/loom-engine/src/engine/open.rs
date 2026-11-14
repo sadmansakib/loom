@@ -243,26 +243,18 @@ impl Engine {
                     Box::new(loom_tools::GitLogTool) as Box<dyn loom_kernel::tool::Tool>,
                 ),
             ] {
-                registry
-                    .register(tool)
-                    .map_err(|error| EngineError::RegisterTool {
-                        tool: name,
-                        message: error.to_string(),
-                    })?;
+                register_tool(&mut registry, name, tool)?;
             }
         }
         // Iteration 5: on-demand skills. Same opt-in shape as the symbol
         // tools; the facts block gains the index menu only when the tool
         // that serves the bodies is also present.
         if config.skills && !overrides.bare_loop {
-            registry
-                .register(Box::new(
-                    loom_tools::LoadSkillTool::default().with_budgets(config.budgets),
-                ))
-                .map_err(|error| EngineError::RegisterTool {
-                    tool: "load_skill",
-                    message: error.to_string(),
-                })?;
+            register_tool(
+                &mut registry,
+                "load_skill",
+                Box::new(loom_tools::LoadSkillTool::default().with_budgets(config.budgets)),
+            )?;
         }
         // Slice D (iteration 6): MCP servers over stdio. Opt-in via
         // `EngineConfig::mcp`; the bare-loop arm never carries them.
@@ -289,12 +281,7 @@ impl Engine {
         // spawn degrades that server to nothing (warn + skip), and an
         // invalid `.loom/lsp.toml` degrades all of LSP (fail closed).
         for tool in lsp.tools {
-            registry
-                .register(tool)
-                .map_err(|error| EngineError::RegisterTool {
-                    tool: "lsp",
-                    message: error.to_string(),
-                })?;
+            register_tool(&mut registry, "lsp", tool)?;
         }
         let system_prompt = config
             .system_prompt
@@ -424,7 +411,7 @@ impl Engine {
         // database the frontend chose for accounts. `--no-save` leaves the
         // run in memory only, so nothing spills and `artifact_read` has no
         // store.
-        if config.persist {
+        let (db_path, events) = if config.persist {
             let store = SqliteStore::open(&config.db_path).map_err(EngineError::Session)?;
             let artifacts = SqliteStore::open(&config.db_path).map_err(EngineError::Session)?;
             // The event-stream persistence seam shares the database
@@ -454,41 +441,31 @@ impl Engine {
 
             agent = agent.with_store(Box::new(store));
             agent = agent.with_artifacts(Some(Arc::new(artifacts)));
-            Ok(Self {
-                agent,
-                background: background_jobs,
-                lsp_servers,
-                routing_easy,
-                routing_hard,
-                stall_escalation,
-                db_path: Some(config.db_path.clone()),
-                workspace,
-                policy,
-                // The bare-loop arm measures a basic harness, and a basic
-                // harness does not short-circuit mechanical tasks — the
-                // fast path is a Loom lever, so it flips with the others.
-                fast_paths: overrides.fast_paths.unwrap_or(true) && !overrides.bare_loop,
-                resolution: Some(resolution),
-                notices_flushed: std::sync::OnceLock::new(),
-                events: Some(Arc::new(events)),
-            })
+            (
+                Some(config.db_path.clone()),
+                Some(Arc::new(events) as Arc<dyn loom_kernel::store::EventStore>),
+            )
         } else {
-            Ok(Self {
-                agent,
-                background: background_jobs,
-                lsp_servers,
-                routing_easy,
-                routing_hard,
-                stall_escalation,
-                db_path: None,
-                workspace,
-                policy,
-                fast_paths: overrides.fast_paths.unwrap_or(true) && !overrides.bare_loop,
-                resolution: Some(resolution),
-                notices_flushed: std::sync::OnceLock::new(),
-                events: None,
-            })
-        }
+            (None, None)
+        };
+        Ok(Self {
+            agent,
+            background: background_jobs,
+            lsp_servers,
+            routing_easy,
+            routing_hard,
+            stall_escalation,
+            db_path,
+            workspace,
+            policy,
+            // The bare-loop arm measures a basic harness, and a basic
+            // harness does not short-circuit mechanical tasks — the
+            // fast path is a Loom lever, so it flips with the others.
+            fast_paths: overrides.fast_paths.unwrap_or(true) && !overrides.bare_loop,
+            resolution: Some(resolution),
+            notices_flushed: std::sync::OnceLock::new(),
+            events,
+        })
     }
 
     /// Resolves the config's model catalog exactly the way
