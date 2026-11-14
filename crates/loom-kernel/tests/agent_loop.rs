@@ -986,6 +986,54 @@ async fn max_tokens_past_the_continuation_cap_fails() {
     assert_eq!(record.status, TaskStatus::Failed);
     assert_eq!(record.end_reason.as_deref(), Some("max_tokens"));
 }
+
+#[tokio::test]
+async fn paused_model_turn_is_continued_before_task_completion() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            completed(
+                assistant("Still working.", StopReason::PauseTurn, Vec::new()),
+                usage(8, 3, None),
+            ),
+            completed(
+                assistant("The result is ready.", StopReason::EndTurn, Vec::new()),
+                usage(9, 5, None),
+            ),
+        ],
+    );
+    let requests = provider.requests_handle();
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let control = TaskControl::new();
+    let agent = agent(provider, ToolRegistry::new(), 4);
+
+    let summary = agent
+        .run_task(&mut session, "finish the work", &sink, &control)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.model_requests, 2);
+    assert_eq!(summary.turns, 2);
+    assert!(matches!(
+        &session.transcript[1],
+        Item::Assistant(message)
+            if message.content == "Still working."
+                && message.stop_reason == StopReason::PauseTurn
+    ));
+    assert!(matches!(
+        &session.transcript.last().unwrap(),
+        Item::Assistant(message)
+            if message.content == "The result is ready."
+                && message.stop_reason == StopReason::EndTurn
+    ));
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    assert!(
+        drain(&mut receiver)
+            .iter()
+            .any(|kind| matches!(kind, EventKind::TaskCompleted))
+    );
+}
 #[tokio::test]
 async fn max_tokens_truncation_continues_to_a_real_answer() {
     // The recovery contract: truncate once, get the continue reminder,

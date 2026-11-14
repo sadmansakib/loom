@@ -426,6 +426,22 @@ fn thinking_deltas_become_a_reasoning_trace() {
 }
 
 #[test]
+fn pause_turn_is_not_reported_as_terminal_success() {
+    let mut assembler = AnthropicAssembler::default();
+    for data in [
+        r#"{"type":"message_start","message":{"usage":{"input_tokens":1}}}"#,
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Still working."}}"#,
+        r#"{"type":"message_delta","delta":{"stop_reason":"pause_turn"},"usage":{"output_tokens":2}}"#,
+        r#"{"type":"message_stop"}"#,
+    ] {
+        assembler.ingest(data).unwrap();
+    }
+    let response = assembler.finalize().unwrap();
+    assert_eq!(response.message.content, "Still working.");
+    assert_eq!(response.message.stop_reason, StopReason::PauseTurn);
+}
+
+#[test]
 fn tool_use_with_zero_calls_is_a_protocol_error() {
     let mut assembler = AnthropicAssembler::default();
     for data in [

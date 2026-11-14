@@ -88,7 +88,7 @@ loom provider add orcarouter --base-url https://api.orcarouter.ai/v1 \
     --header 'X-Title=loom' # attribution headers ride on every request
 loom run --provider orcarouter --model deepseek/deepseek-v4.1-flash-free "your task"
 
-# structured events for tooling (NDJSON, event schema 16)
+# structured events for tooling (NDJSON, event schema 17)
 loom run --provider deepseek --model deepseek-flash --json "your task" \
     | jq 'select(.kind.type=="tool_completed")'
 
@@ -243,7 +243,7 @@ so the shortcut set can be audited, not guessed at.
   checked pre-image replay.
 - `loom stats`: per-tool quality, skill retire/watch verdicts,
   `--json`, and trace mode over exported `--trace` directories.
-- `--json` NDJSON event stream (schema 16) for building your own
+- `--json` NDJSON event stream (schema 17) for building your own
   frontends; `loom-core` exposes the same engine for embedding, with
   a full drive loop in `crates/loom-core/examples/frontend.rs`.
 

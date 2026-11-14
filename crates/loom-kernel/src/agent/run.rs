@@ -868,6 +868,39 @@ impl Agent {
                     // idle tools.
                     self.reconcile_surface();
                 }
+                StopReason::PauseTurn if !has_calls && continuations < MAX_TOKENS_CONTINUATIONS => {
+                    // Providers such as Anthropic can pause an assistant
+                    // response that must be continued verbatim. Persist the
+                    // partial response, then explicitly ask the model to
+                    // continue; bounded by the same continuation budget.
+                    continuations += 1;
+                    self.commit(session, assistant, Vec::new())?;
+                    let reminder = Item::User {
+                        text: MAX_TOKENS_CONTINUATION_PROMPT.to_owned(),
+                    };
+                    if let Some(store) = &self.store {
+                        store
+                            .append_item(&session.id, session.next_index(), &reminder)
+                            .map_err(persistence)?;
+                    }
+                    session
+                        .push_item(reminder)
+                        .map_err(|error| TaskError::Internal(error.to_string()))?;
+                    sink.emit(
+                        task_id,
+                        EventKind::LoopNudge {
+                            text: MAX_TOKENS_CONTINUATION_PROMPT.to_owned(),
+                        },
+                    );
+                    accounting.turns = turn;
+                    accounting.sync(session, task_id);
+                    if turn == self.max_turns {
+                        return Err(TaskError::MaxTurns {
+                            max_turns: self.max_turns,
+                        });
+                    }
+                    self.reconcile_surface();
+                }
                 StopReason::MaxTokens if !has_calls && continuations < MAX_TOKENS_CONTINUATIONS => {
                     // Standard continue pattern: commit the truncated
                     // reply, then ask the model to resume exactly where
@@ -905,7 +938,8 @@ impl Agent {
                 // reason), or `max_tokens` past the continuation cap.
                 // The reply is committed first so it stays inspectable,
                 // then the task fails.
-                other @ (StopReason::MaxTokens
+                other @ (StopReason::PauseTurn
+                | StopReason::MaxTokens
                 | StopReason::ContextLimit
                 | StopReason::ContentFilter) => {
                     if has_calls {

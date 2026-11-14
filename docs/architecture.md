@@ -111,7 +111,7 @@ Invariants the session layer enforces (and tests):
    type; a second finish attempt cannot overwrite the recorded end reason.
 
 **Events** (`event.rs`) are the observation stream: `EventEnvelope`
-(`schema_version: 16`, per-sink monotonically increasing `sequence`,
+(`schema_version: 17`, per-sink monotonically increasing `sequence`,
 snake_case `type` tag). The persisting sink (`PersistingEventSink`)
 stores every kind *except* the per-token streams — `TextDelta` and
 `ReasoningDelta` forward live but are never written (review S4: they

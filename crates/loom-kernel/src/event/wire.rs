@@ -64,7 +64,9 @@ use serde::{Deserialize, Serialize};
 /// older payloads and readers are unaffected.
 /// v16 adds `ContextProgress`: the compiler's per-request context budget and
 /// census plus the agent's remaining task-budget headroom at compile time.
-pub const EVENT_SCHEMA_VERSION: u16 = 16;
+/// v17 adds `StopReason::PauseTurn` so provider-paused responses are distinct
+/// from terminal `EndTurn` responses in persisted `ModelCompleted` events.
+pub const EVENT_SCHEMA_VERSION: u16 = 17;
 
 /// The evidence that justified a [`EventKind::TurnBudgetExtended`] grant
 /// (item 26): state the loop already tracks, never a model call.

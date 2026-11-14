@@ -123,6 +123,7 @@ impl std::ops::Add for Usage {
 /// |---|---|
 /// | [`StopReason::EndTurn`] | terminal success |
 /// | [`StopReason::ToolCalls`] | continue the loop, execute the calls |
+/// | [`StopReason::PauseTurn`] | continue the paused response, within the continuation cap |
 /// | [`StopReason::MaxTokens`] | task failure (continuation recovery later) |
 /// | [`StopReason::ContextLimit`] | task failure (compaction recovery later) |
 /// | [`StopReason::ContentFilter`] | task failure |
@@ -145,6 +146,9 @@ pub enum StopReason {
     EndTurn,
     /// The model requested tool executions before continuing.
     ToolCalls,
+    /// The provider paused a long-running assistant response and expects it
+    /// to be continued in a subsequent request.
+    PauseTurn,
     /// Generation hit the output token limit.
     ///
     /// Partial tool-call arguments are discarded by the adapter and never
@@ -386,6 +390,7 @@ mod tests {
         let all = [
             StopReason::EndTurn,
             StopReason::ToolCalls,
+            StopReason::PauseTurn,
             StopReason::MaxTokens,
             StopReason::ContextLimit,
             StopReason::ContentFilter,

@@ -119,6 +119,7 @@ pub(super) fn stop_reason_token(reason: StopReason) -> &'static str {
     match reason {
         StopReason::EndTurn => "end_turn",
         StopReason::ToolCalls => "tool_calls",
+        StopReason::PauseTurn => "pause_turn",
         StopReason::MaxTokens => "max_tokens",
         StopReason::ContextLimit => "context_limit",
         StopReason::ContentFilter => "content_filter",

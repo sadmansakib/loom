@@ -288,7 +288,11 @@ impl AnthropicAssembler {
 /// Maps a Messages API stop reason to the neutral one.
 fn map_stop_reason(reason: &str) -> StopReason {
     match reason {
-        "end_turn" | "stop_sequence" | "pause_turn" => StopReason::EndTurn,
+        "end_turn" | "stop_sequence" => StopReason::EndTurn,
+        // Anthropic may pause a long-running assistant turn without ending
+        // it. Keep that distinct from terminal success so the bounded agent
+        // continuation path can resume it.
+        "pause_turn" => StopReason::PauseTurn,
         "tool_use" => StopReason::ToolCalls,
         "max_tokens" => StopReason::MaxTokens,
         "refusal" => StopReason::ContentFilter,
