@@ -165,7 +165,12 @@ fn run_welcome(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     config: &EngineConfig,
 ) -> Result<bool> {
-    let mut flow = welcome::Welcome::new(&config.provider);
+    let provider = if config.provider.is_empty() {
+        loom_core::engine::auth::DEFAULT_PROVIDER
+    } else {
+        config.provider.as_str()
+    };
+    let mut flow = welcome::Welcome::new(provider);
     loop {
         terminal.draw(|frame| welcome::draw_welcome(frame, &flow))?;
         let Event::Key(key) = event::read()? else {
