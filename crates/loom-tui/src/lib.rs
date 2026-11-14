@@ -5,6 +5,7 @@
 
 mod glyphs;
 mod input;
+mod keys;
 mod picker;
 mod reducer;
 mod scene_views;
@@ -15,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use loom_core::kernel::agent::TurnBudget;
 use loom_core::kernel::context::PruneConfig;
 use loom_core::kernel::event::ChannelEventSink;
@@ -26,9 +27,16 @@ use loom_core::{Engine, EngineConfig, EventSink, ReasoningEffort, TaskControl};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use input::{
-    PromptEditor, expand_file_mentions, matching_file_suggestions, mentioned_file_attachments,
-    workspace_files,
+#[cfg(test)]
+use crossterm::event::{KeyEvent, MouseEventKind};
+#[cfg(test)]
+use input::expand_file_mentions;
+use input::{PromptEditor, matching_file_suggestions, mentioned_file_attachments, workspace_files};
+#[cfg(test)]
+use keys::scroll_from_mouse;
+use keys::{
+    KeyContext, handle_key, update_sidebar_mouse, update_sidebar_scroll, update_thread_mouse,
+    update_thread_scroll,
 };
 use picker::{ModelPricing, PickerState, navigate_picker};
 #[cfg(test)]
@@ -474,167 +482,6 @@ async fn open_engine(
         .context("open Loom engine")?;
     let session = engine.new_session();
     Ok((engine, session))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn update_thread_scroll(key: KeyEvent, scroll_back: &mut usize) -> bool {
-    match (key.code, key.modifiers) {
-        (KeyCode::PageUp, _) | (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-            *scroll_back = scroll_back.saturating_add(8);
-            true
-        }
-        (KeyCode::PageDown, _) | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-            *scroll_back = scroll_back.saturating_sub(8);
-            true
-        }
-        (KeyCode::End, KeyModifiers::CONTROL) => {
-            *scroll_back = 0;
-            true
-        }
-        _ => false,
-    }
-}
-
-fn update_sidebar_scroll(key: KeyEvent, scroll_back: &mut usize) -> bool {
-    match (key.code, key.modifiers) {
-        (KeyCode::PageUp, KeyModifiers::SHIFT) => {
-            *scroll_back = scroll_back.saturating_add(3);
-            true
-        }
-        (KeyCode::PageDown, KeyModifiers::SHIFT) => {
-            *scroll_back = scroll_back.saturating_sub(3);
-            true
-        }
-        (KeyCode::Home, KeyModifiers::SHIFT) => {
-            *scroll_back = 0;
-            true
-        }
-        _ => false,
-    }
-}
-
-fn update_sidebar_mouse(mouse: MouseEvent, scroll_back: &mut usize) {
-    match mouse.kind {
-        MouseEventKind::ScrollUp => *scroll_back = scroll_back.saturating_add(3),
-        MouseEventKind::ScrollDown => *scroll_back = scroll_back.saturating_sub(3),
-        MouseEventKind::Down(_)
-        | MouseEventKind::Up(_)
-        | MouseEventKind::Drag(_)
-        | MouseEventKind::Moved
-        | MouseEventKind::ScrollLeft
-        | MouseEventKind::ScrollRight => {}
-    }
-}
-
-fn update_thread_mouse(mouse: MouseEvent, scroll_back: &mut usize) {
-    match mouse.kind {
-        MouseEventKind::ScrollUp => *scroll_back = scroll_back.saturating_add(3),
-        MouseEventKind::ScrollDown => *scroll_back = scroll_back.saturating_sub(3),
-        MouseEventKind::Down(_)
-        | MouseEventKind::Up(_)
-        | MouseEventKind::Drag(_)
-        | MouseEventKind::Moved
-        | MouseEventKind::ScrollLeft
-        | MouseEventKind::ScrollRight => {}
-    }
-}
-
-#[cfg(test)]
-fn scroll_from_mouse(kind: MouseEventKind, scroll_back: &mut usize) {
-    update_thread_mouse(
-        MouseEvent {
-            kind,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        },
-        scroll_back,
-    );
-}
-
-fn handle_key(key: KeyEvent, context: &mut KeyContext<'_>) {
-    let KeyContext {
-        input,
-        workspace,
-        help,
-        picker,
-        sidebar,
-        quit,
-        pending_task,
-        pending_display_prompt,
-        control,
-        reducer,
-    } = context;
-    match (key.code, key.modifiers) {
-        (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
-            if let Some(control) = control {
-                control.cancel();
-            } else {
-                **quit = true;
-            }
-        }
-        (KeyCode::F(1), _) => **help = !**help,
-        (KeyCode::F(2), _) if control.is_none() => {
-            **picker = true;
-        }
-        (KeyCode::Char('b'), KeyModifiers::CONTROL) => **sidebar = !**sidebar,
-        (KeyCode::Char('r'), KeyModifiers::CONTROL) => reducer.toggle_reasoning(),
-        (KeyCode::Char('o'), KeyModifiers::CONTROL) => reducer.toggle_details(),
-        (KeyCode::Tab, _) if input.has_file_mention() => input.complete_file(workspace),
-        (KeyCode::Enter, modifiers)
-            if modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
-        {
-            input.insert('\n');
-        }
-        (KeyCode::Enter, _) => {
-            let message = std::mem::take(&mut input.text);
-            input.cursor = 0;
-            if !message.trim().is_empty() {
-                let original_message = message;
-                let (message, attachments) = expand_file_mentions(&original_message, workspace);
-                let display_prompt = original_message.clone();
-                if let Some(control) = control {
-                    control.steer(message);
-                    reducer.set_follow_up_queued(true);
-                    reducer.push_display_prompt(display_prompt);
-                    reducer.task.attachments.extend(attachments);
-                } else {
-                    **pending_display_prompt = Some(original_message);
-                    reducer.set_attachments(attachments);
-                    **pending_task = Some(message);
-                    **picker = false;
-                }
-            }
-        }
-        (KeyCode::Backspace, _) => {
-            input.backspace();
-        }
-        (KeyCode::Delete, _) => input.delete(),
-        (KeyCode::Left, _) => input.left(),
-        (KeyCode::Right, _) => input.right(),
-        (KeyCode::Home, _) => input.line_home(),
-        (KeyCode::End, _) => input.line_end(),
-        (KeyCode::Char(c), modifiers)
-            if !c.is_control()
-                && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
-            input.insert(c);
-        }
-        _ => {}
-    }
-}
-
-struct KeyContext<'a> {
-    input: &'a mut PromptEditor,
-    workspace: &'a Path,
-    help: &'a mut bool,
-    picker: &'a mut bool,
-    sidebar: &'a mut bool,
-    quit: &'a mut bool,
-    pending_task: &'a mut Option<String>,
-    pending_display_prompt: &'a mut Option<String>,
-    control: Option<&'a TaskControl>,
-    reducer: &'a mut Reducer,
 }
 
 #[allow(clippy::too_many_arguments)]
