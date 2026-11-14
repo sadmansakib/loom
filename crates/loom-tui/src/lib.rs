@@ -243,7 +243,7 @@ async fn run_interactive(
     let mut sidebar_scroll_back = 0_usize;
     let mut pending_display_prompt = None;
     let mut help = false;
-    let mut picker = pending_task.is_none();
+    let mut picker = config.model.is_empty();
     let mut sidebar = true;
     let mut should_quit = false;
     let mut last_elapsed = None;
@@ -544,7 +544,11 @@ async fn open_engine(
 ) -> Result<(Engine, Session)> {
     let overrides =
         overrides.with_write_approval(approval::hook(config.workspace.clone(), requests.clone()));
-    let engine = Engine::open_async_with(config.clone(), overrides)
+    let mut config = config.clone();
+    if config.provider.is_empty() {
+        loom_core::engine::auth::DEFAULT_PROVIDER.clone_into(&mut config.provider);
+    }
+    let engine = Engine::open_async_with(config, overrides)
         .await
         .context("open Loom engine")?;
     let session = engine.new_session();
