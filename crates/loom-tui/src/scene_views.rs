@@ -234,7 +234,7 @@ pub fn draw_live_scrolled(
     } else if reducer.task.status == Some(TaskStatus::Running) {
         "[Esc] cancel   [^O] details   [^R] reasoning   [^B] sidebar   [F1] help"
     } else {
-        "[Enter] send   [Tab] @file   [F2] models   [F1] help"
+        "[Enter] send   [Tab] @file · sidebar   [F2] models   [F1] help"
     };
     let footer_hint = if compact && scene.is_none() {
         Line::from(vec![
@@ -485,7 +485,10 @@ fn draw_help(frame: &mut Frame<'_>) {
         help_key("Esc / Ctrl-C", "cancel current task"),
         help_key("Enter", "queue follow-up for next turn"),
         help_key("Shift+Enter", "insert newline"),
-        help_key("Tab @path", "complete a workspace file mention"),
+        help_key(
+            "Tab",
+            "toggle sidebar (complete @path when typing a mention)",
+        ),
         help_key("Ctrl+B", "toggle sidebar"),
         help_key("F1", "close help"),
         heading("WHEN IDLE"),

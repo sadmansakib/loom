@@ -110,10 +110,10 @@ pub(crate) fn handle_key(key: KeyEvent, context: &mut KeyContext<'_>) {
         (KeyCode::F(2), _) if control.is_none() => {
             **picker = true;
         }
-        (KeyCode::Char('b'), KeyModifiers::CONTROL) => **sidebar = !**sidebar,
+        (KeyCode::Tab, _) if input.has_file_mention() => input.complete_file(workspace),
+        (KeyCode::Char('b'), KeyModifiers::CONTROL) | (KeyCode::Tab, _) => **sidebar = !**sidebar,
         (KeyCode::Char('r'), KeyModifiers::CONTROL) => reducer.toggle_reasoning(),
         (KeyCode::Char('o'), KeyModifiers::CONTROL) => reducer.toggle_details(),
-        (KeyCode::Tab, _) if input.has_file_mention() => input.complete_file(workspace),
         (KeyCode::Enter, modifiers)
             if modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
         {
@@ -201,4 +201,56 @@ pub(crate) struct KeyContext<'a> {
     pub(crate) pending_display_prompt: &'a mut Option<String>,
     pub(crate) control: Option<&'a TaskControl>,
     pub(crate) reducer: &'a mut Reducer,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input::PromptEditor;
+    use crate::reducer::Reducer;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn press_tab(input: &mut PromptEditor, sidebar: &mut bool) {
+        let mut help = false;
+        let mut picker = false;
+        let mut quit = false;
+        let mut pending_task = None;
+        let mut pending_display_prompt = None;
+        let mut reducer = Reducer::default();
+        let mut context = KeyContext {
+            input,
+            workspace: Path::new("."),
+            help: &mut help,
+            picker: &mut picker,
+            sidebar,
+            quit: &mut quit,
+            pending_task: &mut pending_task,
+            pending_display_prompt: &mut pending_display_prompt,
+            control: None,
+            reducer: &mut reducer,
+        };
+        handle_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut context,
+        );
+    }
+
+    #[test]
+    fn tab_toggles_sidebar_when_no_mention_is_typed() {
+        let mut input = PromptEditor::default();
+        let mut sidebar = false;
+        press_tab(&mut input, &mut sidebar);
+        assert!(sidebar);
+        press_tab(&mut input, &mut sidebar);
+        assert!(!sidebar);
+    }
+
+    #[test]
+    fn tab_completes_mention_instead_of_toggling_sidebar() {
+        let mut input = PromptEditor::default();
+        input.insert('@');
+        let mut sidebar = false;
+        press_tab(&mut input, &mut sidebar);
+        assert!(!sidebar);
+    }
 }
