@@ -1034,6 +1034,152 @@ async fn paused_model_turn_is_continued_before_task_completion() {
             .any(|kind| matches!(kind, EventKind::TaskCompleted))
     );
 }
+/// Names each event kind by its variant identifier (the `Debug` head). Used
+/// instead of an exhaustive match because `EventKind` is `#[non_exhaustive]`.
+fn pinned_kind_names(kinds: &[EventKind]) -> Vec<String> {
+    kinds
+        .iter()
+        .map(|kind| {
+            let debug = format!("{kind:?}");
+            debug
+                .split([' ', '{', '('])
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Continuation: `MaxTokens` commits a partial and injects a reminder, then the
+/// second turn ends normally. Pins the event order for the continuation path.
+#[tokio::test]
+async fn continuation_event_order_is_pinned() {
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            completed(
+                assistant("part", StopReason::MaxTokens, Vec::new()),
+                usage(15, 4, None),
+            ),
+            completed(
+                assistant("done", StopReason::EndTurn, Vec::new()),
+                usage(20, 2, None),
+            ),
+        ],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let control = TaskControl::new();
+    agent(provider, ToolRegistry::new(), 10)
+        .run_task(&mut session, "go", &sink, &control)
+        .await
+        .unwrap();
+    assert_eq!(
+        pinned_kind_names(&drain(&mut receiver)),
+        [
+            "TaskStarted",
+            "TurnStarted",
+            "ContextProgress",
+            "ModelRequestStarted",
+            "ModelCompleted",
+            "LoopNudge",
+            "TurnStarted",
+            "ContextProgress",
+            "ModelRequestStarted",
+            "ModelCompleted",
+            "TaskCompleted",
+        ],
+        "continuation event order",
+    );
+}
+
+/// Pause-turn: `PauseTurn` is continued the same way as `MaxTokens`. Pins its order.
+#[tokio::test]
+async fn pause_turn_event_order_is_pinned() {
+    let control = TaskControl::new();
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            completed(
+                assistant("working", StopReason::PauseTurn, Vec::new()),
+                usage(8, 3, None),
+            ),
+            completed(
+                assistant("ready", StopReason::EndTurn, Vec::new()),
+                usage(9, 5, None),
+            ),
+        ],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    agent(provider, ToolRegistry::new(), 4)
+        .run_task(&mut session, "finish", &sink, &control)
+        .await
+        .unwrap();
+    assert_eq!(
+        pinned_kind_names(&drain(&mut receiver)),
+        [
+            "TaskStarted",
+            "TurnStarted",
+            "ContextProgress",
+            "ModelRequestStarted",
+            "ModelCompleted",
+            "LoopNudge",
+            "TurnStarted",
+            "ContextProgress",
+            "ModelRequestStarted",
+            "ModelCompleted",
+            "TaskCompleted",
+        ],
+        "pause-turn event order",
+    );
+}
+
+/// Budget exhausted before the next request: no further turn events. Pins order.
+#[tokio::test]
+async fn budget_exhaustion_event_order_is_pinned() {
+    let control = TaskControl::new();
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![completed(
+            assistant(
+                "",
+                StopReason::ToolCalls,
+                vec![tool_call("call_1", "echo", json!({}))],
+            ),
+            usage(700, 100, None),
+        )],
+    )
+    .repeat_last();
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let _ = agent(provider, registry_with("echo"), 10)
+        .with_budget(TaskBudget::new().with_max_total_tokens(1_000))
+        .run_task(&mut session, "loop", &sink, &control)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        pinned_kind_names(&drain(&mut receiver)),
+        [
+            "TaskStarted",
+            "TurnStarted",
+            "ContextProgress",
+            "ModelRequestStarted",
+            "ModelCompleted",
+            "ToolStarted",
+            "ToolCompleted",
+            "TurnStarted",
+            "ContextProgress",
+            "ModelRequestStarted",
+            "ModelCompleted",
+            "ToolStarted",
+            "ToolCompleted",
+            "TaskFailed",
+        ],
+        "budget-exhausted event order",
+    );
+}
+
 #[tokio::test]
 async fn max_tokens_truncation_continues_to_a_real_answer() {
     // The recovery contract: truncate once, get the continue reminder,
