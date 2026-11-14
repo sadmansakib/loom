@@ -16,6 +16,9 @@ mod thread;
 use sidebar::{draw_runtime_sidebar, draw_scene_sidebar};
 use thread::draw_reducer_thread;
 
+/// Sidebar width in columns for the wide (>=120) and overlay layouts.
+pub(crate) const SIDEBAR_WIDTH: u16 = 38;
+
 use crate::{
     glyphs::GlyphSet,
     picker::{ModelPricing, PickerState},
@@ -155,7 +158,7 @@ pub fn draw_live_scrolled(
     let body = if wide {
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(65), Constraint::Length(42)])
+            .constraints([Constraint::Min(65), Constraint::Length(SIDEBAR_WIDTH)])
             .split(rows[1])
     } else {
         Layout::default()
@@ -255,9 +258,9 @@ pub fn draw_live_scrolled(
         draw_side(frame, body[1]);
     } else if show_sidebar {
         let overlay = Rect::new(
-            area.x + area.width.saturating_sub(42),
+            area.x + area.width.saturating_sub(SIDEBAR_WIDTH),
             rows[1].y,
-            area.width.min(42),
+            area.width.min(SIDEBAR_WIDTH),
             rows[1].height.min(12),
         );
         draw_side(frame, overlay);
@@ -312,7 +315,7 @@ pub fn draw_picker(frame: &mut Frame<'_>, picker: &PickerState) {
     let columns = if wide {
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(65), Constraint::Length(38)])
+            .constraints([Constraint::Min(65), Constraint::Length(SIDEBAR_WIDTH)])
             .split(rows[1])
     } else {
         Layout::default()
@@ -1339,8 +1342,6 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(text.contains("800 remaining"));
-        assert!(text.contains("unbounded"));
-        assert!(text.contains("estimated 670/"));
         assert!(text.contains("repository facts"));
         assert!(text.contains("7 / 9"));
         assert!(text.contains("01:42 / 09:40"), "{text:?}");

@@ -22,6 +22,9 @@ pub enum Glyph {
     Vertical,
     Horizontal,
     Warning,
+    Needs,
+    Expand,
+    Collapse,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +34,7 @@ pub struct GlyphPair {
     pub ascii: &'static str,
 }
 
-pub const TABLE: [GlyphPair; 14] = [
+pub const TABLE: [GlyphPair; 17] = [
     GlyphPair {
         glyph: Glyph::Brand,
         unicode: "◆",
@@ -99,8 +102,23 @@ pub const TABLE: [GlyphPair; 14] = [
     },
     GlyphPair {
         glyph: Glyph::Warning,
-        unicode: "△",
+        unicode: "⚠",
         ascii: "!",
+    },
+    GlyphPair {
+        glyph: Glyph::Needs,
+        unicode: "◇",
+        ascii: "?",
+    },
+    GlyphPair {
+        glyph: Glyph::Expand,
+        unicode: "▸",
+        ascii: ">",
+    },
+    GlyphPair {
+        glyph: Glyph::Collapse,
+        unicode: "▾",
+        ascii: "v",
     },
 ];
 
@@ -125,7 +143,7 @@ mod tests {
 
     #[test]
     fn every_glyph_has_both_representations() {
-        assert_eq!(TABLE.len(), 14);
+        assert_eq!(TABLE.len(), 17);
         for pair in TABLE {
             assert_ne!(pair.unicode, "");
             assert_ne!(pair.ascii, "");

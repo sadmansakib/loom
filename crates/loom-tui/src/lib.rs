@@ -321,7 +321,7 @@ async fn run_interactive(
                             let event = event::read()?;
                             route_event(
                                 event,
-                                || terminal.size().map(|size| size.width.saturating_sub(42)),
+                                || terminal.size().map(|size| size.width.saturating_sub(scene_views::SIDEBAR_WIDTH)),
                                 (&mut thread_scroll_back, &mut sidebar_scroll_back),
                                 &mut KeyContext {
                                     input: &mut input,
@@ -390,7 +390,11 @@ async fn run_interactive(
             let key_pressed = matches!(event, Event::Key(_));
             route_event(
                 event,
-                || terminal.size().map(|size| size.width.saturating_sub(42)),
+                || {
+                    terminal
+                        .size()
+                        .map(|size| size.width.saturating_sub(scene_views::SIDEBAR_WIDTH))
+                },
                 (&mut thread_scroll_back, &mut sidebar_scroll_back),
                 &mut KeyContext {
                     input: &mut input,
