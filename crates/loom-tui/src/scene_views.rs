@@ -1775,3 +1775,39 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod approval_render_tests {
+    use crate::approval::Request;
+    use ratatui::{Terminal, backend::TestBackend};
+    use tokio::sync::oneshot;
+
+    #[test]
+    fn approval_box_names_the_path_and_all_four_keys() {
+        let (reply, _rx) = oneshot::channel();
+        let request = Request {
+            path: "notes.md".to_owned(),
+            content: "hello".to_owned(),
+            reply,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                super::draw_approval_box(frame, area, &request);
+            })
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("Allow this write?"), "prompt missing");
+        assert!(text.contains("notes.md"), "path missing");
+        for key in ["y allow once", "a always", "n decline", "e edit"] {
+            assert!(text.contains(key), "key hint `{key}` missing");
+        }
+    }
+}

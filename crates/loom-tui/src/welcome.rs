@@ -144,7 +144,7 @@ pub fn draw_welcome(frame: &mut ratatui::Frame<'_>, flow: &Welcome) {
     lines.push(Line::from(""));
     lines.push(step_line(3, "TRUST THIS FOLDER", flow.step == Step::Trust));
     lines.push(Line::from(Span::styled(
-        format!("  {}", flow.provider),
+        "  Reads allowed. Writes and shell ask each time.",
         fg(theme::DIM),
     )));
     if let Some(error) = &flow.error {
@@ -223,5 +223,34 @@ mod tests {
         };
         assert_eq!(flow.advance(), Action::Stay);
         assert_eq!(flow.step, Step::Trust);
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn trust_step_renders_the_folder_and_its_rules() {
+        let mut flow = Welcome::new("deepseek");
+        flow.step = Step::Trust;
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| draw_welcome(frame, &flow)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(
+            text.contains("TRUST THIS FOLDER"),
+            "trust step title missing"
+        );
+        assert!(
+            text.contains("Writes and shell ask each time"),
+            "trust rule missing"
+        );
     }
 }
