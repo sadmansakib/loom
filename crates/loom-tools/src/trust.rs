@@ -117,6 +117,16 @@ pub fn pin(workspace: &Path) -> std::io::Result<Vec<String>> {
     TrustGate::open().pin(workspace)
 }
 
+/// Whether `workspace` has any pinned manifest in the operator's trust
+/// store. A workspace with no pins is a first run: nothing is trusted yet.
+#[must_use]
+pub fn is_pinned(workspace: &Path) -> bool {
+    TrustGate::open()
+        .load()
+        .workspace
+        .contains_key(&TrustGate::workspace_key(workspace))
+}
+
 /// One manifest's trust state, for `loom trust --status`.
 #[derive(Debug, Clone)]
 pub struct ManifestStatus {
@@ -347,6 +357,17 @@ mod tests {
         // Re-pinning records the new digest.
         gate.pin(dir.path()).expect("re-pin");
         assert_eq!(gate.decide(dir.path(), ".loom/verify.toml"), Trust::Trusted);
+    }
+
+    #[test]
+    fn workspace_with_no_pins_is_a_first_run() {
+        let (dir, gate) = gate_and_workspace();
+        let key = TrustGate::workspace_key(dir.path());
+        assert!(!gate.load().workspace.contains_key(&key));
+        std::fs::create_dir_all(dir.path().join(".loom")).expect("dir");
+        std::fs::write(dir.path().join(".loom/mcp.toml"), "[mcp]\n").expect("write");
+        gate.pin(dir.path()).expect("pin");
+        assert!(gate.load().workspace.contains_key(&key));
     }
 
     #[test]

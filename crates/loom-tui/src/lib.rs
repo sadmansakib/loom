@@ -12,13 +12,14 @@ mod reducer;
 mod scene_views;
 mod terminal;
 mod theme;
+mod welcome;
 
 use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use loom_core::kernel::agent::TurnBudget;
 use loom_core::kernel::context::PruneConfig;
 use loom_core::kernel::event::ChannelEventSink;
@@ -29,7 +30,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 #[cfg(test)]
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::KeyModifiers;
 #[cfg(test)]
 use crossterm::event::{KeyEvent, MouseEventKind};
 use input::{PromptEditor, mentioned_file_attachments, workspace_files};
@@ -157,6 +158,66 @@ fn default_config(
     })
 }
 
+/// Runs the first-run flow. Returns `false` when the user quits.
+fn run_welcome(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    config: &EngineConfig,
+) -> Result<bool> {
+    let mut flow = welcome::Welcome::new(&config.provider);
+    loop {
+        terminal.draw(|frame| welcome::draw_welcome(frame, &flow))?;
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match key.code {
+            KeyCode::Esc => return Ok(false),
+            KeyCode::Enter => match flow.advance() {
+                welcome::Action::Stay => {}
+                welcome::Action::Finish => {
+                    if flow.env_var.is_none() && !flow.key.trim().is_empty() {
+                        welcome::save_pasted_key(&config.db_path, &config.provider, &flow.key)
+                            .map_err(|error| anyhow::anyhow!(error))?;
+                    }
+                    loom_core::tools::trust::pin(&config.workspace)?;
+                    return Ok(true);
+                }
+            },
+            KeyCode::Backspace if flow.step == welcome::Step::Key => {
+                flow.key.pop();
+            }
+            KeyCode::Char(ch) if flow.step == welcome::Step::Key => flow.key.push(ch),
+            KeyCode::Backspace
+            | KeyCode::Char(_)
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Delete
+            | KeyCode::Insert
+            | KeyCode::F(_)
+            | KeyCode::Null
+            | KeyCode::CapsLock
+            | KeyCode::ScrollLock
+            | KeyCode::NumLock
+            | KeyCode::PrintScreen
+            | KeyCode::Pause
+            | KeyCode::Menu
+            | KeyCode::KeypadBegin
+            | KeyCode::Media(_)
+            | KeyCode::Modifier(_) => {}
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)] // terminal lifecycle and task event loop are intentionally serialized
 async fn run_interactive(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -164,6 +225,9 @@ async fn run_interactive(
     mut overrides: Option<loom_core::EngineOverrides>,
     mut pending_task: Option<String>,
 ) -> Result<()> {
+    if !loom_core::tools::trust::is_pinned(&config.workspace) && !run_welcome(terminal, &config)? {
+        return Ok(());
+    }
     let mut reducer = Reducer::default();
     let mut input = PromptEditor::default();
     let file_index = workspace_files(&config.workspace);
