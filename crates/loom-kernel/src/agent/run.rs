@@ -4,7 +4,7 @@
 
 use super::Agent;
 use super::budget::turn_extension_reason;
-use super::continuation::{MAX_TOKENS_CONTINUATION_PROMPT, MAX_TOKENS_CONTINUATIONS};
+use super::continuation::MAX_TOKENS_CONTINUATIONS;
 use super::control::{LEASE_TTL_MILLIS, LeaseGuard, lease_holder_for};
 use super::error::persistence;
 use super::feedback::{
@@ -874,32 +874,7 @@ impl Agent {
                     // partial response, then explicitly ask the model to
                     // continue; bounded by the same continuation budget.
                     continuations += 1;
-                    self.commit(session, assistant, Vec::new())?;
-                    let reminder = Item::User {
-                        text: MAX_TOKENS_CONTINUATION_PROMPT.to_owned(),
-                    };
-                    if let Some(store) = &self.store {
-                        store
-                            .append_item(&session.id, session.next_index(), &reminder)
-                            .map_err(persistence)?;
-                    }
-                    session
-                        .push_item(reminder)
-                        .map_err(|error| TaskError::Internal(error.to_string()))?;
-                    sink.emit(
-                        task_id,
-                        EventKind::LoopNudge {
-                            text: MAX_TOKENS_CONTINUATION_PROMPT.to_owned(),
-                        },
-                    );
-                    accounting.turns = turn;
-                    accounting.sync(session, task_id);
-                    if turn == self.max_turns {
-                        return Err(TaskError::MaxTurns {
-                            max_turns: self.max_turns,
-                        });
-                    }
-                    self.reconcile_surface();
+                    self.continue_truncated(session, assistant, sink, task_id, turn, accounting)?;
                 }
                 StopReason::MaxTokens if !has_calls && continuations < MAX_TOKENS_CONTINUATIONS => {
                     // Standard continue pattern: commit the truncated
@@ -907,32 +882,7 @@ impl Agent {
                     // it stopped. Bounded — a model that can never finish
                     // within the cap still surfaces the failure.
                     continuations += 1;
-                    self.commit(session, assistant, Vec::new())?;
-                    let reminder = Item::User {
-                        text: MAX_TOKENS_CONTINUATION_PROMPT.to_owned(),
-                    };
-                    if let Some(store) = &self.store {
-                        store
-                            .append_item(&session.id, session.next_index(), &reminder)
-                            .map_err(persistence)?;
-                    }
-                    session
-                        .push_item(reminder)
-                        .map_err(|error| TaskError::Internal(error.to_string()))?;
-                    sink.emit(
-                        task_id,
-                        EventKind::LoopNudge {
-                            text: MAX_TOKENS_CONTINUATION_PROMPT.to_owned(),
-                        },
-                    );
-                    accounting.turns = turn;
-                    accounting.sync(session, task_id);
-                    if turn == self.max_turns {
-                        return Err(TaskError::MaxTurns {
-                            max_turns: self.max_turns,
-                        });
-                    }
-                    self.reconcile_surface();
+                    self.continue_truncated(session, assistant, sink, task_id, turn, accounting)?;
                 }
                 // `context_limit` / `content_filter` (and any future
                 // reason), or `max_tokens` past the continuation cap.

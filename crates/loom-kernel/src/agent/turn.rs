@@ -3,9 +3,12 @@
 //! writers for items, task records, and todo blocks (§6.1, ADR-012).
 
 use super::Agent;
+use super::continuation::MAX_TOKENS_CONTINUATION_PROMPT;
 use super::error::persistence;
+use super::summary::Accounting;
 use super::{TaskError, derive_reserved_output_tokens};
 use crate::context::{CompiledContext, ContextBudget, ContextInput, PruneCheckpoint};
+use crate::event::{EventKind, EventSink};
 use crate::id::TaskId;
 use crate::model::ModelCapabilities;
 use crate::session::{PlannedTurn, Session, TaskRecord};
@@ -138,6 +141,61 @@ impl Agent {
         session
             .push_item(block)
             .map_err(|error| TaskError::Internal(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Persist-then-push a harness-authored user notice. The caller emits its
+    /// `LoopNudge` itself, so the event-order pins stay with the call site.
+    pub(super) fn inject_notice(
+        &self,
+        session: &mut Session,
+        notice: Item,
+    ) -> Result<(), TaskError> {
+        if let Some(store) = &self.store {
+            store
+                .append_item(&session.id, session.next_index(), &notice)
+                .map_err(persistence)?;
+        }
+        session
+            .push_item(notice)
+            .map_err(|error| TaskError::Internal(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Continuation for a truncated or paused reply: commit the partial,
+    /// inject the continue reminder, emit its `LoopNudge`, then sync
+    /// accounting and check the turn cap. Order is pinned by the
+    /// `*_event_order_is_pinned` tests.
+    pub(super) fn continue_truncated(
+        &self,
+        session: &mut Session,
+        assistant: AssistantMessage,
+        sink: &dyn EventSink,
+        task_id: TaskId,
+        turn: u32,
+        accounting: &mut Accounting,
+    ) -> Result<(), TaskError> {
+        self.commit(session, assistant, Vec::new())?;
+        self.inject_notice(
+            session,
+            Item::User {
+                text: MAX_TOKENS_CONTINUATION_PROMPT.to_owned(),
+            },
+        )?;
+        sink.emit(
+            task_id,
+            EventKind::LoopNudge {
+                text: MAX_TOKENS_CONTINUATION_PROMPT.to_owned(),
+            },
+        );
+        accounting.turns = turn;
+        accounting.sync(session, task_id);
+        if turn == self.max_turns {
+            return Err(TaskError::MaxTurns {
+                max_turns: self.max_turns,
+            });
+        }
+        self.reconcile_surface();
         Ok(())
     }
 }
