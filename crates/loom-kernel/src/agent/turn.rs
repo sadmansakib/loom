@@ -162,6 +162,19 @@ impl Agent {
         Ok(())
     }
 
+    /// Emit a `LoopNudge` for a harness notice, then persist and push it.
+    /// Emit comes first to keep the pinned event order.
+    pub(super) fn nudge(
+        &self,
+        session: &mut Session,
+        sink: &dyn EventSink,
+        task_id: TaskId,
+        text: String,
+    ) -> Result<(), TaskError> {
+        sink.emit(task_id, EventKind::LoopNudge { text: text.clone() });
+        self.inject_notice(session, Item::User { text })
+    }
+
     /// Continuation for a truncated or paused reply: commit the partial,
     /// inject the continue reminder, emit its `LoopNudge`, then sync
     /// accounting and check the turn cap. Order is pinned by the

@@ -496,26 +496,12 @@ impl Agent {
             let stalled = zero_progress_due(turns_since_mutation, nudged);
             if stalled {
                 nudged = true;
-                let notice = Item::User {
-                    text: format!(
-                        "No file has changed in the last {turns_since_mutation} turns. Stop \
-                         exploring and land the best patch you can now: change the workspace \
-                         with write_file or edit_file, then verify it with cargo."
-                    ),
-                };
-                let nudge_text = match &notice {
-                    Item::User { text } => text.clone(),
-                    Item::Assistant(_) | Item::ToolResult(_) => String::new(),
-                };
-                sink.emit(task_id, EventKind::LoopNudge { text: nudge_text });
-                if let Some(store) = &self.store {
-                    store
-                        .append_item(&session.id, session.next_index(), &notice)
-                        .map_err(persistence)?;
-                }
-                session
-                    .push_item(notice)
-                    .map_err(|error| TaskError::Internal(error.to_string()))?;
+                let text = format!(
+                    "No file has changed in the last {turns_since_mutation} turns. Stop \
+                     exploring and land the best patch you can now: change the workspace \
+                     with write_file or edit_file, then verify it with cargo."
+                );
+                self.nudge(session, sink, task_id, text)?;
             }
             // The turn-budget nudge: the zero-progress nudge above can never
             // fire while the model keeps editing, because every successful
@@ -524,26 +510,12 @@ impl Agent {
             // at most once, while a change of approach is still affordable.
             if !stalled && late_budget_due(turn, effective_turns, late_nudged) {
                 late_nudged = true;
-                let notice = Item::User {
-                    text: format!(
-                        "You have used {turn} of {effective_turns} turns. If the same check is \
-                         still failing, stop repeating the same edit: re-read the whole failure \
-                         output, say what it proves, and change approach.",
-                    ),
-                };
-                let nudge_text = match &notice {
-                    Item::User { text } => text.clone(),
-                    Item::Assistant(_) | Item::ToolResult(_) => String::new(),
-                };
-                sink.emit(task_id, EventKind::LoopNudge { text: nudge_text });
-                if let Some(store) = &self.store {
-                    store
-                        .append_item(&session.id, session.next_index(), &notice)
-                        .map_err(persistence)?;
-                }
-                session
-                    .push_item(notice)
-                    .map_err(|error| TaskError::Internal(error.to_string()))?;
+                let text = format!(
+                    "You have used {turn} of {effective_turns} turns. If the same check is \
+                     still failing, stop repeating the same edit: re-read the whole failure \
+                     output, say what it proves, and change approach.",
+                );
+                self.nudge(session, sink, task_id, text)?;
             }
             // Item 30 stall-breaker: two consecutive failed edit-family
             // calls on one file mean the model is fighting the file's
@@ -557,25 +529,11 @@ impl Agent {
                 && let Some(outline) = self.symbol_outline(&turn_tools, &path, &hard).await
             {
                 edit_stalls.resolved(&path);
-                let notice = Item::User {
-                    text: format!(
-                        "{count} consecutive edits failed on {path}. Here is the file's \
-                         symbol outline:\n{outline}"
-                    ),
-                };
-                let nudge_text = match &notice {
-                    Item::User { text } => text.clone(),
-                    Item::Assistant(_) | Item::ToolResult(_) => String::new(),
-                };
-                sink.emit(task_id, EventKind::LoopNudge { text: nudge_text });
-                if let Some(store) = &self.store {
-                    store
-                        .append_item(&session.id, session.next_index(), &notice)
-                        .map_err(persistence)?;
-                }
-                session
-                    .push_item(notice)
-                    .map_err(|error| TaskError::Internal(error.to_string()))?;
+                let text = format!(
+                    "{count} consecutive edits failed on {path}. Here is the file's \
+                     symbol outline:\n{outline}"
+                );
+                self.nudge(session, sink, task_id, text)?;
             }
             // a. Compile the model request from durable state (§8). The
             //    compiler owns every context decision; the loop only passes
@@ -812,16 +770,7 @@ impl Agent {
                     // commit: transcript order stays assistant-then-
                     // nudge, and the next model request sees it.
                     if let Some(text) = failed_call_nudge.take() {
-                        let notice = Item::User { text: text.clone() };
-                        sink.emit(task_id, EventKind::LoopNudge { text });
-                        if let Some(store) = &self.store {
-                            store
-                                .append_item(&session.id, session.next_index(), &notice)
-                                .map_err(persistence)?;
-                        }
-                        session
-                            .push_item(notice)
-                            .map_err(|error| TaskError::Internal(error.to_string()))?;
+                        self.nudge(session, sink, task_id, text)?;
                     }
                     if mutated {
                         turns_since_mutation = 0;
