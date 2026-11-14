@@ -50,6 +50,18 @@ fn verify_mock_runner() {
     std::process::exit(101);
 }
 
+/// The trust store is process-wide (`trust::use_store`), so tests that
+/// repoint it and then pin or read it must not interleave.
+static TRUST_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Holds the trust-store lock for the whole test, since the gate reads the
+/// store during the tool call, not only during `workspace()`.
+fn lock_trust_store() -> std::sync::MutexGuard<'static, ()> {
+    TRUST_STORE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// A cargo workspace with a runner manifest pointing at the mock.
 fn workspace() -> PathBuf {
     // The trust gate must honor this runner manifest (review F-02: a
@@ -102,6 +114,7 @@ fn runtime() -> tokio::runtime::Runtime {
 /// notice and the full expanded argv as the command effect.
 #[test]
 fn standalone_verify_runs_through_the_declared_runner() {
+    let _guard = lock_trust_store();
     let root = workspace();
     let tool = VerifyTool::new();
     let rt = runtime();
@@ -154,6 +167,7 @@ fn standalone_verify_runs_through_the_declared_runner() {
 /// quietly running unisolated local commands.
 #[test]
 fn broken_manifest_fails_closed() {
+    let _guard = lock_trust_store();
     let root = workspace();
     std::fs::write(root.join(".loom/verify.toml"), "garbage\n").unwrap();
     let tool = VerifyTool::new();
@@ -175,6 +189,7 @@ fn broken_manifest_fails_closed() {
 /// structured evidence rides the same tool output.
 #[test]
 fn fused_verify_runs_through_the_declared_runner() {
+    let _guard = lock_trust_store();
     let root = workspace();
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
