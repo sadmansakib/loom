@@ -26,7 +26,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use loom_eval::cli::{csv, env_csv};
+use loom_eval::cli::{csv, env_csv, image_exists};
 use loom_eval::swebench::{
     self, AgentKind, ContainerSpec, EXPECTED_ROWS, RunUsage, SweInstance, api_key_envs,
     build_prompt, dataset_cache_path, docker_run_argv, fetch_dataset_verified, load_dataset_cached,
@@ -317,15 +317,6 @@ fn build_loom_linux(base: &Path) -> PathBuf {
     std::fs::copy(&built, &dest).unwrap();
     println!("linux loom binary: {}", dest.display());
     dest
-}
-
-fn image_exists(image: &str) -> bool {
-    Command::new("docker")
-        .args(["image", "inspect", image])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
 }
 
 /// Makes sure the local testbed tag exists. Missing images are pulled

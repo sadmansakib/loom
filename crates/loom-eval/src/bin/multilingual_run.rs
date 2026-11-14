@@ -33,7 +33,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use loom_eval::cli::{csv, env_csv};
+use loom_eval::cli::{csv, env_csv, image_exists};
 use loom_eval::multilingual::{self, MultilingualInstance, RUST_CONTAINER_SCRIPT, SELECTION_RULE};
 use loom_eval::swebench::{
     self, AgentKind, ContainerSpec, RunUsage, api_key_envs, docker_run_argv, run_outcome, run_usage,
@@ -229,15 +229,6 @@ fn build_loom_linux(base: &Path) -> PathBuf {
     std::fs::copy(&built, &dest).unwrap();
     println!("linux loom binary: {}", dest.display());
     dest
-}
-
-fn image_exists(image: &str) -> bool {
-    Command::new("docker")
-        .args(["image", "inspect", image])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
 }
 
 /// Makes sure the row's testbed image is present. Unlike the Verified
