@@ -151,7 +151,7 @@ pub(super) fn draw_reducer_thread(
                                     Some(ToolStatus::Cancelled { .. }) => {
                                         (Glyph::Warning, theme::AMBER, "cancelled")
                                     }
-                                    Some(_) => (Glyph::Warning, theme::DIM, "finished"),
+                                    Some(_) => (Glyph::Check, theme::DIM, "finished"),
                                     None => (Glyph::Spinner, theme::AMBER, "running"),
                                 }
                             });
@@ -208,7 +208,7 @@ pub(super) fn draw_reducer_thread(
                 Some(ToolStatus::Success) => (Glyph::Check, theme::SAGE, "done"),
                 Some(ToolStatus::Error(_)) => (Glyph::Cross, theme::CORAL, "failed"),
                 Some(ToolStatus::Cancelled { .. }) => (Glyph::Warning, theme::AMBER, "cancelled"),
-                Some(_) => (Glyph::Warning, theme::DIM, "finished"),
+                Some(_) => (Glyph::Check, theme::DIM, "finished"),
                 None => (Glyph::Spinner, theme::AMBER, "running"),
             };
             let timing = tool
@@ -599,7 +599,7 @@ pub(super) fn tool_result_lines(result: &ToolResult, expanded: bool) -> Vec<Line
             format!("error · {}", failure_category(failure)),
         ),
         ToolStatus::Cancelled { .. } => (theme::AMBER, Glyph::Warning, "cancelled".to_owned()),
-        _ => (theme::DIM, Glyph::Warning, "finished".to_owned()),
+        _ => (theme::DIM, Glyph::Check, "finished".to_owned()),
     };
     let truncated = if result.truncated {
         " · truncated"
