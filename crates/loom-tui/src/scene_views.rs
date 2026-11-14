@@ -22,6 +22,7 @@ pub(crate) const SIDEBAR_WIDTH: u16 = 38;
 use crate::{
     glyphs::GlyphSet,
     picker::{ModelPricing, PickerState},
+    recent::RecentSession,
     reducer::Reducer,
     theme,
 };
@@ -77,6 +78,7 @@ pub struct LiveViewOptions<'a> {
     pub thread_scroll_back: usize,
     pub sidebar_scroll_back: usize,
     pub file_suggestions: &'a [String],
+    pub recent: &'a [RecentSession],
     pub pricing: Option<ModelPricing>,
     pub scene: Option<Scene>,
 }
@@ -107,6 +109,7 @@ pub fn draw_live_scrolled(
         file_suggestions,
         pricing,
         scene,
+        recent,
         ..
     } = options;
     let area = frame.area();
@@ -166,7 +169,15 @@ pub fn draw_live_scrolled(
             .constraints([Constraint::Percentage(100)])
             .split(rows[1])
     };
-    draw_reducer_thread(frame, body[0], reducer, compact, thread_scroll_back, scene);
+    if reducer.execution_turns.is_empty()
+        && reducer.original_instruction.is_none()
+        && reducer.task.display_prompts.is_empty()
+        && scene.is_none()
+    {
+        draw_idle_home(frame, body[0], recent);
+    } else {
+        draw_reducer_thread(frame, body[0], reducer, compact, thread_scroll_back, scene);
+    }
     let (cursor_x, cursor_y, prompt_scroll) = prompt_cursor(input, cursor, footer[0]);
     frame.set_cursor_position((cursor_x.saturating_add(2), cursor_y));
     let prompt_spans = vec![
@@ -512,6 +523,32 @@ fn draw_help(frame: &mut Frame<'_>) {
         "Session.transcript is authoritative; events are observations.",
     ));
     render_panel(frame, columns[1], "event stream", right);
+}
+
+fn draw_idle_home(frame: &mut Frame<'_>, area: Rect, recent: &[RecentSession]) {
+    let mut lines = vec![Line::from(Span::styled("RECENT", fg(theme::DIM)))];
+    if recent.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no past sessions yet",
+            fg(theme::DOTTED),
+        )));
+    }
+    for session in recent {
+        let status = session.status.map_or("○", |_| "✓");
+        let short: String = session.id.chars().take(8).collect();
+        lines.push(Line::from(vec![
+            Span::styled(format!("{status} "), fg(theme::TEAL)),
+            Span::styled(short, fg(theme::IVORY)),
+            Span::styled(format!("  {} items", session.items), fg(theme::DIM)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("TRY", fg(theme::DIM))));
+    lines.push(Line::from(Span::styled(
+        "  summarize the failing test in crates/loom-tui",
+        fg(theme::IVORY),
+    )));
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_live_header(

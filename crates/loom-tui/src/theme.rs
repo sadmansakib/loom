@@ -13,6 +13,8 @@ pub const SAGE: Color = Color::Rgb(134, 193, 159);
 pub const CORAL: Color = Color::Rgb(238, 130, 114);
 pub const VIOLET: Color = Color::Rgb(169, 155, 214);
 pub const BLUE: Color = Color::Rgb(141, 180, 232);
+pub const TEAL: Color = Color::Rgb(111, 196, 196);
+pub const DOTTED: Color = Color::Rgb(90, 74, 44);
 
 pub const SELECTED: ratatui::style::Style = ratatui::style::Style::new()
     .fg(IVORY)

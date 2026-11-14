@@ -14,6 +14,7 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::input::{PromptEditor, matching_file_suggestions};
 use crate::picker::{ModelPricing, PickerState};
+use crate::recent::RecentSession;
 use crate::reducer::Reducer;
 use crate::{Scene, scene_views};
 
@@ -33,6 +34,7 @@ pub(crate) struct LiveFrame<'a> {
     pub(crate) pricing: Option<ModelPricing>,
     pub(crate) input_editor: &'a PromptEditor,
     pub(crate) file_index: &'a [String],
+    pub(crate) recent: &'a [RecentSession],
     pub(crate) config: &'a EngineConfig,
     pub(crate) session_id: Option<&'a str>,
     pub(crate) capabilities: Option<ModelCapabilities>,
@@ -55,6 +57,7 @@ pub(crate) fn draw_live(frame: &mut ratatui::Frame<'_>, view: &LiveFrame<'_>) {
         pricing,
         input_editor,
         file_index,
+        recent,
         config,
         session_id,
         capabilities,
@@ -81,6 +84,7 @@ pub(crate) fn draw_live(frame: &mut ratatui::Frame<'_>, view: &LiveFrame<'_>) {
                 thread_scroll_back,
                 sidebar_scroll_back,
                 file_suggestions: &suggestions,
+                recent,
                 pricing,
                 workspace: Some(workspace),
                 session_id,

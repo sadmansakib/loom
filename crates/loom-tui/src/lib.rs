@@ -7,6 +7,7 @@ mod glyphs;
 mod input;
 mod keys;
 mod picker;
+mod recent;
 mod reducer;
 mod scene_views;
 mod terminal;
@@ -166,6 +167,7 @@ async fn run_interactive(
     let mut reducer = Reducer::default();
     let mut input = PromptEditor::default();
     let file_index = workspace_files(&config.workspace);
+    let recent = recent::load(&config.db_path);
     let mut thread_scroll_back = 0_usize;
     let mut sidebar_scroll_back = 0_usize;
     let mut pending_display_prompt = None;
@@ -299,6 +301,7 @@ async fn run_interactive(
                             pricing: picker_state.selected().pricing,
                             input_editor: &input,
                             file_index: &file_index,
+                            recent: &recent,
                             config: &config,
                             session_id: Some(session_id.as_str()),
                             capabilities: picker_state.selected().capabilities,
@@ -374,6 +377,7 @@ async fn run_interactive(
                     pricing: picker_state.selected().pricing,
                     input_editor: &input,
                     file_index: &file_index,
+                    recent: &recent,
                     config: &config,
                     session_id: session_label.as_deref(),
                     capabilities: picker_state.selected().capabilities,
