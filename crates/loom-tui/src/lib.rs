@@ -49,7 +49,7 @@ pub use reducer::Reducer;
 pub use scene_views::Scene;
 #[cfg(test)]
 use std::path::Path;
-use terminal::{draw_live, terminal_session, workspace_label};
+use terminal::{LiveFrame, draw_live, terminal_session, workspace_label};
 
 const FRAME_TICK: Duration = Duration::from_millis(35);
 
@@ -285,24 +285,26 @@ async fn run_interactive(
                 terminal.draw(|frame| {
                     draw_live(
                         frame,
-                        &reducer,
-                        &input.text,
-                        input.cursor,
-                        help,
-                        picker,
-                        sidebar,
-                        Some(started_at.elapsed()),
-                        Some(sink.dropped()),
-                        thread_scroll_back,
-                        sidebar_scroll_back,
-                        picker_state.selected().pricing,
-                        &input,
-                        &file_index,
-                        &config,
-                        Some(session_id.as_str()),
-                        picker_state.selected().capabilities,
-                        &workspace,
-                        &effort,
+                        &LiveFrame {
+                            reducer: &reducer,
+                            input: &input.text,
+                            cursor: input.cursor,
+                            help,
+                            picker,
+                            sidebar,
+                            elapsed: Some(started_at.elapsed()),
+                            dropped: Some(sink.dropped()),
+                            thread_scroll_back,
+                            sidebar_scroll_back,
+                            pricing: picker_state.selected().pricing,
+                            input_editor: &input,
+                            file_index: &file_index,
+                            config: &config,
+                            session_id: Some(session_id.as_str()),
+                            capabilities: picker_state.selected().capabilities,
+                            workspace: &workspace,
+                            effort: &effort,
+                        },
                     );
                 })?;
                 tokio::select! {
@@ -358,24 +360,26 @@ async fn run_interactive(
             let session_label = active.as_ref().map(|(_, session)| session.id.to_string());
             draw_live(
                 frame,
-                &reducer,
-                &input.text,
-                input.cursor,
-                help,
-                picker,
-                sidebar,
-                last_elapsed,
-                last_dropped,
-                thread_scroll_back,
-                sidebar_scroll_back,
-                picker_state.selected().pricing,
-                &input,
-                &file_index,
-                &config,
-                session_label.as_deref(),
-                picker_state.selected().capabilities,
-                &workspace_label(&config.workspace),
-                &format!("{:?}", config.reasoning_effort).to_lowercase(),
+                &LiveFrame {
+                    reducer: &reducer,
+                    input: &input.text,
+                    cursor: input.cursor,
+                    help,
+                    picker,
+                    sidebar,
+                    elapsed: last_elapsed,
+                    dropped: last_dropped,
+                    thread_scroll_back,
+                    sidebar_scroll_back,
+                    pricing: picker_state.selected().pricing,
+                    input_editor: &input,
+                    file_index: &file_index,
+                    config: &config,
+                    session_id: session_label.as_deref(),
+                    capabilities: picker_state.selected().capabilities,
+                    workspace: &workspace_label(&config.workspace),
+                    effort: &format!("{:?}", config.reasoning_effort).to_lowercase(),
+                },
             );
         })?;
         if should_quit {

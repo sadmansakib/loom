@@ -17,28 +17,50 @@ use crate::picker::{ModelPricing, PickerState};
 use crate::reducer::Reducer;
 use crate::{Scene, scene_views};
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn draw_live(
-    frame: &mut ratatui::Frame<'_>,
-    reducer: &Reducer,
-    input: &str,
-    cursor: usize,
-    help: bool,
-    picker: bool,
-    sidebar: bool,
-    elapsed: Option<Duration>,
-    dropped: Option<u64>,
-    thread_scroll_back: usize,
-    sidebar_scroll_back: usize,
-    pricing: Option<ModelPricing>,
-    input_editor: &PromptEditor,
-    file_index: &[String],
-    config: &EngineConfig,
-    session_id: Option<&str>,
-    capabilities: Option<ModelCapabilities>,
-    workspace: &str,
-    effort: &str,
-) {
+/// Everything the live frame needs, grouped so `draw_live` takes one argument
+/// instead of a long positional list.
+pub(crate) struct LiveFrame<'a> {
+    pub(crate) reducer: &'a Reducer,
+    pub(crate) input: &'a str,
+    pub(crate) cursor: usize,
+    pub(crate) help: bool,
+    pub(crate) picker: bool,
+    pub(crate) sidebar: bool,
+    pub(crate) elapsed: Option<Duration>,
+    pub(crate) dropped: Option<u64>,
+    pub(crate) thread_scroll_back: usize,
+    pub(crate) sidebar_scroll_back: usize,
+    pub(crate) pricing: Option<ModelPricing>,
+    pub(crate) input_editor: &'a PromptEditor,
+    pub(crate) file_index: &'a [String],
+    pub(crate) config: &'a EngineConfig,
+    pub(crate) session_id: Option<&'a str>,
+    pub(crate) capabilities: Option<ModelCapabilities>,
+    pub(crate) workspace: &'a str,
+    pub(crate) effort: &'a str,
+}
+
+pub(crate) fn draw_live(frame: &mut ratatui::Frame<'_>, view: &LiveFrame<'_>) {
+    let LiveFrame {
+        reducer,
+        input,
+        cursor,
+        help,
+        picker,
+        sidebar,
+        elapsed,
+        dropped,
+        thread_scroll_back,
+        sidebar_scroll_back,
+        pricing,
+        input_editor,
+        file_index,
+        config,
+        session_id,
+        capabilities,
+        workspace,
+        effort,
+    } = *view;
     if help {
         scene_views::draw(frame, Scene::Help);
     } else if picker {
