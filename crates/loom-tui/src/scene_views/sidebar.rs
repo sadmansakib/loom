@@ -388,10 +388,25 @@ pub(super) fn draw_runtime_sidebar(
         ("NEXT REQUEST · CONTEXT", context_lines),
         ("COST", cost_lines),
     ];
+    if let Some(request) = options.approval {
+        sections_data.push((
+            "PENDING",
+            vec![
+                Line::from(Span::styled(
+                    format!("◇ {}", request.path),
+                    fg(theme::AMBER).add_modifier(Modifier::BOLD),
+                )),
+                muted("y allow once   a always   n decline"),
+            ],
+        ));
+    }
     // Each bordered section consumes a bottom-rule row in addition to its
     // text. Account for that row so natural section heights do not overrun the
     // sidebar and push EVENTS below the viewport.
-    let minimums = [4_u16, 6, 5, 3, 3];
+    let mut minimums = vec![4_u16, 6, 5, 3, 3];
+    if options.approval.is_some() {
+        minimums.insert(4, 3);
+    }
     let mut heights = sections_data
         .iter()
         .map(|(_, lines)| {
@@ -401,7 +416,7 @@ pub(super) fn draw_runtime_sidebar(
         })
         .collect::<Vec<_>>();
     let available = content.height;
-    while heights.iter().copied().sum::<u16>() + minimums[4] > available {
+    while heights.iter().copied().sum::<u16>() + minimums[minimums.len() - 1] > available {
         let Some((index, _)) = heights
             .iter()
             .enumerate()

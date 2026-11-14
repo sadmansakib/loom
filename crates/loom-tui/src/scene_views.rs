@@ -1811,3 +1811,46 @@ mod approval_render_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod pending_sidebar_tests {
+    use crate::approval::Request;
+    use crate::scene_views::{LiveViewOptions, draw_live};
+    use ratatui::{Terminal, backend::TestBackend};
+    use tokio::sync::oneshot;
+
+    #[test]
+    fn pending_section_lists_the_open_write_request() {
+        let (reply, _rx) = oneshot::channel();
+        let request = Request {
+            path: "notes.md".to_owned(),
+            content: "hello".to_owned(),
+            reply,
+        };
+        let reducer = crate::reducer::Reducer::default();
+        let options = LiveViewOptions {
+            approval: Some(&request),
+            sidebar_visible: true,
+            ..LiveViewOptions::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(154, 80)).unwrap();
+        terminal
+            .draw(|frame| draw_live(frame, &reducer, "", 0, options))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(
+            text.contains("◇ notes.md"),
+            "pending path missing from sidebar"
+        );
+        assert!(
+            text.contains("y allow once   a always   n decline"),
+            "pending keys missing"
+        );
+    }
+}
