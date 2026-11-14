@@ -67,8 +67,19 @@ fn unknown_manifest_fields_are_rejected() {
     assert!(error.to_string().contains("unknown field"), "{error}");
 }
 
+/// The trust store is process-wide (`trust::use_store`), so tests that
+/// repoint or read it must not interleave with each other.
+static TRUST_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_trust_store() -> std::sync::MutexGuard<'static, ()> {
+    TRUST_STORE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[test]
 fn a_missing_manifest_is_the_default_policy() {
+    let _guard = lock_trust_store();
     let dir = tempfile::tempdir().expect("tempdir");
     let policy = CommandPolicy::from_manifest(dir.path()).expect("default");
     assert_eq!(policy, CommandPolicy::cargo_only());
@@ -76,6 +87,7 @@ fn a_missing_manifest_is_the_default_policy() {
 
 #[test]
 fn an_unpinned_manifest_loads_without_escalation() {
+    let _guard = lock_trust_store();
     // Review F-12: a repo-shipped `.loom/commands.toml` declaring
     // `sandbox = false`/`network = true` must not load those grants
     // until the operator pins it. `use_store` keeps the test off
@@ -112,6 +124,7 @@ fn an_unpinned_manifest_loads_without_escalation() {
 
 #[test]
 fn a_present_manifest_loads_from_the_workspace() {
+    let _guard = lock_trust_store();
     let dir = tempfile::tempdir().expect("tempdir");
     let manifest_dir = dir.path().join(".loom");
     std::fs::create_dir_all(&manifest_dir).expect("mkdir");
@@ -126,6 +139,7 @@ fn a_present_manifest_loads_from_the_workspace() {
 
 #[test]
 fn an_invalid_manifest_fails_loudly() {
+    let _guard = lock_trust_store();
     let dir = tempfile::tempdir().expect("tempdir");
     let manifest_dir = dir.path().join(".loom");
     std::fs::create_dir_all(&manifest_dir).expect("mkdir");

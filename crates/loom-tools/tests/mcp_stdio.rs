@@ -299,6 +299,17 @@ fn call_result(tool: &str) -> &'static str {
 
 // -------------------------------------------------------------- helpers ----
 
+/// The trust store is process-wide (`trust::use_store`), and `workspace()`
+/// repoints it per test. Tests run in parallel threads, so each test holds
+/// this lock for its whole body.
+static TRUST_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_trust_store() -> std::sync::MutexGuard<'static, ()> {
+    TRUST_STORE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn workspace(name: &str) -> PathBuf {
     // The trust gate must honor these test manifests (review F-02:
     // repo-shipped manifests load restrictively until pinned). Point
@@ -400,6 +411,7 @@ fn tool_names_use_a_safe_charset() {
 
 #[test]
 fn missing_manifest_attaches_nothing() {
+    let _guard = lock_trust_store();
     let dir = workspace("missing");
     let attachment = attach_full(&dir);
     assert!(attachment.tools.is_empty());
@@ -409,6 +421,7 @@ fn missing_manifest_attaches_nothing() {
 
 #[test]
 fn bad_command_degrades_to_zero_tools() {
+    let _guard = lock_trust_store();
     let dir = workspace("bad-command");
     std::fs::write(
         dir.join(".loom/mcp.toml"),
@@ -421,6 +434,7 @@ fn bad_command_degrades_to_zero_tools() {
 
 #[test]
 fn spawned_servers_receive_workspace_env() {
+    let _guard = lock_trust_store();
     let dir = workspace("workspace-env");
     manifest(&dir, "env", "always_load = [\"env_probe\"]\n");
 
@@ -442,6 +456,7 @@ fn spawned_servers_receive_workspace_env() {
 
 #[test]
 fn clean_server_pins_loads_eager_and_defers() {
+    let _guard = lock_trust_store();
     let dir = workspace("clean");
     manifest(&dir, "clean", "always_load = [\"greet\"]\n");
 
@@ -479,6 +494,7 @@ fn clean_server_pins_loads_eager_and_defers() {
 
 #[test]
 fn forwarded_servers_attach_eagerly_without_a_manifest_or_lockfile() {
+    let _guard = lock_trust_store();
     let dir = workspace("forwarded");
     // No `.loom/mcp.toml` is written: the decls come from the caller
     // (loom-acp's `--allow-client-mcp` path), not the workspace.
@@ -530,6 +546,7 @@ fn forwarded_servers_attach_eagerly_without_a_manifest_or_lockfile() {
 
 #[test]
 fn forwarded_attach_leaves_no_state_between_runs() {
+    let _guard = lock_trust_store();
     let dir = workspace("forwarded-twice");
     let exe = std::env::current_exe().unwrap();
     let decl = mcp::McpServerDecl {
@@ -562,6 +579,7 @@ fn forwarded_attach_leaves_no_state_between_runs() {
 
 #[test]
 fn always_loading_everything_disables_the_meta_tools() {
+    let _guard = lock_trust_store();
     let dir = workspace("eager-all");
     manifest(&dir, "clean", "always_load = [\"greet\", \"add\"]\n");
     let attachment = attach_full(&dir);
@@ -581,6 +599,7 @@ fn always_loading_everything_disables_the_meta_tools() {
 
 #[test]
 fn deferred_tools_load_through_the_meta_tools() {
+    let _guard = lock_trust_store();
     let dir = workspace("deferred");
     manifest(&dir, "clean", "");
 
@@ -655,6 +674,7 @@ fn deferred_tools_load_through_the_meta_tools() {
 
 #[test]
 fn poisoned_tools_are_skipped_or_listed_cleanly() {
+    let _guard = lock_trust_store();
     let dir = workspace("poisoned");
     manifest(&dir, "poisoned", "");
     let menu = menu_of(&dir);
@@ -692,6 +712,7 @@ fn poisoned_tools_are_skipped_or_listed_cleanly() {
 
 #[test]
 fn unknown_deny_verdict_excludes_imperative_tools() {
+    let _guard = lock_trust_store();
     let dir = workspace("deny-imperative");
     manifest(
         &dir,
@@ -705,6 +726,7 @@ fn unknown_deny_verdict_excludes_imperative_tools() {
 
 #[test]
 fn cross_server_references_are_rejected() {
+    let _guard = lock_trust_store();
     let dir = workspace("crossref");
     let body = format!(
         "[servers.mock]\ncommand = {}\nenv = {{ LOOM_MCP_MOCK_MODE = \"clean\" }}\n\n\
@@ -724,6 +746,7 @@ fn cross_server_references_are_rejected() {
 
 #[test]
 fn changed_tool_definitions_are_quarantined_by_the_lock() {
+    let _guard = lock_trust_store();
     let dir = workspace("pinning");
     manifest(&dir, "gen1", "");
     let first = menu_of(&dir);
@@ -750,6 +773,7 @@ fn changed_tool_definitions_are_quarantined_by_the_lock() {
 
 #[test]
 fn changed_server_args_are_quarantined_by_the_lock() {
+    let _guard = lock_trust_store();
     let dir = workspace("pinning-argv");
     manifest(&dir, "clean", "always_load = [\"greet\"]\n");
     let first = attach(&dir);
@@ -777,6 +801,7 @@ fn changed_server_args_are_quarantined_by_the_lock() {
 
 #[test]
 fn per_server_tool_cap_keeps_sixty_four() {
+    let _guard = lock_trust_store();
     let dir = workspace("cap");
     manifest(&dir, "many", "");
     let menu = menu_of(&dir);
@@ -789,6 +814,7 @@ fn per_server_tool_cap_keeps_sixty_four() {
 
 #[test]
 fn deny_globs_remove_tools_before_the_cap() {
+    let _guard = lock_trust_store();
     let dir = workspace("deny-globs");
     manifest(&dir, "many", "[servers.mock.policy]\ndeny = [\"t0*\"]\n");
     let menu = menu_of(&dir);
@@ -800,6 +826,7 @@ fn deny_globs_remove_tools_before_the_cap() {
 
 #[test]
 fn server_errors_surface_as_execution_errors() {
+    let _guard = lock_trust_store();
     let dir = workspace("evil");
     manifest(&dir, "evil_result", "");
     let rt = build_runtime();
@@ -861,6 +888,7 @@ fn proxy_manifest(dir: &Path, port: u16, network: bool) {
 
 #[test]
 fn proxy_command_reaches_remote_server_with_network_grant() {
+    let _guard = lock_trust_store();
     let (mut remote, port) = spawn_remote_mock();
     let dir = workspace("proxy-net");
     proxy_manifest(&dir, port, true);
@@ -882,6 +910,7 @@ fn proxy_command_reaches_remote_server_with_network_grant() {
 
 #[test]
 fn proxy_command_without_network_grant_fails_closed() {
+    let _guard = lock_trust_store();
     let (mut remote, port) = spawn_remote_mock();
     let dir = workspace("proxy-nonet");
     proxy_manifest(&dir, port, false);
