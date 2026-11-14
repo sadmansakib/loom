@@ -9,10 +9,11 @@ mod keys;
 mod picker;
 mod reducer;
 mod scene_views;
+mod terminal;
 mod theme;
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -20,7 +21,6 @@ use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use loom_core::kernel::agent::TurnBudget;
 use loom_core::kernel::context::PruneConfig;
 use loom_core::kernel::event::ChannelEventSink;
-use loom_core::kernel::model::ModelCapabilities;
 use loom_core::kernel::session::Session;
 use loom_core::tools::ToolBudgets;
 use loom_core::{Engine, EngineConfig, EventSink, ReasoningEffort, TaskControl};
@@ -29,22 +29,25 @@ use ratatui::backend::CrosstermBackend;
 
 #[cfg(test)]
 use crossterm::event::{KeyEvent, MouseEventKind};
+use input::{PromptEditor, mentioned_file_attachments, workspace_files};
 #[cfg(test)]
-use input::expand_file_mentions;
-use input::{PromptEditor, matching_file_suggestions, mentioned_file_attachments, workspace_files};
+use input::{expand_file_mentions, matching_file_suggestions};
 #[cfg(test)]
 use keys::scroll_from_mouse;
 use keys::{
     KeyContext, handle_key, update_sidebar_mouse, update_sidebar_scroll, update_thread_mouse,
     update_thread_scroll,
 };
-use picker::{ModelPricing, PickerState, navigate_picker};
+use picker::{PickerState, navigate_picker};
 #[cfg(test)]
 use picker::{
     catalog_credential_provider, catalog_models_url, environment_credential, model_choice,
 };
 pub use reducer::Reducer;
 pub use scene_views::Scene;
+#[cfg(test)]
+use std::path::Path;
+use terminal::{draw_live, terminal_session, workspace_label};
 
 const FRAME_TICK: Duration = Duration::from_millis(35);
 
@@ -482,150 +485,6 @@ async fn open_engine(
         .context("open Loom engine")?;
     let session = engine.new_session();
     Ok((engine, session))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_live(
-    frame: &mut ratatui::Frame<'_>,
-    reducer: &Reducer,
-    input: &str,
-    cursor: usize,
-    help: bool,
-    picker: bool,
-    sidebar: bool,
-    elapsed: Option<Duration>,
-    dropped: Option<u64>,
-    thread_scroll_back: usize,
-    sidebar_scroll_back: usize,
-    pricing: Option<ModelPricing>,
-    input_editor: &PromptEditor,
-    file_index: &[String],
-    config: &EngineConfig,
-    session_id: Option<&str>,
-    capabilities: Option<ModelCapabilities>,
-    workspace: &str,
-    effort: &str,
-) {
-    if help {
-        scene_views::draw(frame, Scene::Help);
-    } else if picker {
-        scene_views::draw_picker(frame, &PickerState::empty());
-    } else {
-        let suggestions = input_editor
-            .mention_query()
-            .map_or_default(|query| matching_file_suggestions(file_index, query));
-        scene_views::draw_live_scrolled(
-            frame,
-            reducer,
-            input,
-            cursor,
-            scene_views::LiveViewOptions {
-                sidebar_visible: sidebar,
-                elapsed,
-                dropped,
-                thread_scroll_back,
-                sidebar_scroll_back,
-                file_suggestions: &suggestions,
-                pricing,
-                workspace: Some(workspace),
-                session_id,
-                model: Some(&config.model),
-                effort: Some(effort),
-                thinking: capabilities.map(
-                    |capabilities| {
-                        if capabilities.reasoning { "on" } else { "off" }
-                    },
-                ),
-                turn_limit: Some(config.max_turns),
-                scene: None,
-            },
-        );
-    }
-}
-
-fn workspace_label(workspace: &Path) -> String {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    home.as_deref()
-        .and_then(|home| workspace.strip_prefix(home).ok())
-        .map_or_else(
-            || workspace.display().to_string(),
-            |relative| format!("~/{}", relative.display()),
-        )
-}
-
-fn terminal_session<T>(
-    f: impl FnOnce(&mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<T>,
-) -> Result<T> {
-    let mut guard = TerminalGuard::default();
-    crossterm::terminal::enable_raw_mode().context("enable terminal raw mode")?;
-    guard.raw_mode = true;
-    crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen)
-        .context("enter alternate screen")?;
-    guard.alternate_screen = true;
-    crossterm::execute!(io::stdout(), event::EnableMouseCapture).context("enable mouse capture")?;
-    guard.mouse_capture = true;
-    crossterm::execute!(io::stdout(), event::EnableBracketedPaste)
-        .context("enable bracketed paste")?;
-    guard.bracketed_paste = true;
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend).context("initialize terminal")?;
-    let result = f(&mut terminal);
-    let restore = guard.restore(terminal.backend_mut());
-    match (result, restore) {
-        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
-        (Ok(value), Ok(())) => Ok(value),
-    }
-}
-
-#[derive(Default)]
-#[allow(clippy::struct_excessive_bools)] // independent terminal modes must be restored after partial setup
-struct TerminalGuard {
-    raw_mode: bool,
-    alternate_screen: bool,
-    mouse_capture: bool,
-    bracketed_paste: bool,
-}
-
-impl TerminalGuard {
-    fn restore(&mut self, output: &mut impl io::Write) -> Result<()> {
-        if self.alternate_screen {
-            crossterm::execute!(output, crossterm::terminal::LeaveAlternateScreen)
-                .context("restore terminal screen")?;
-            self.alternate_screen = false;
-        }
-        if self.mouse_capture {
-            crossterm::execute!(output, event::DisableMouseCapture)
-                .context("disable mouse capture")?;
-            self.mouse_capture = false;
-        }
-        if self.bracketed_paste {
-            crossterm::execute!(output, event::DisableBracketedPaste)
-                .context("disable bracketed paste")?;
-            self.bracketed_paste = false;
-        }
-        if self.raw_mode {
-            crossterm::terminal::disable_raw_mode().context("disable terminal raw mode")?;
-            self.raw_mode = false;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        if self.alternate_screen {
-            let _ = crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen);
-        }
-        if self.mouse_capture {
-            let _ = crossterm::execute!(io::stdout(), event::DisableMouseCapture);
-        }
-        if self.bracketed_paste {
-            let _ = crossterm::execute!(io::stdout(), event::DisableBracketedPaste);
-        }
-        if self.raw_mode {
-            let _ = crossterm::terminal::disable_raw_mode();
-        }
-    }
 }
 
 fn epoch_millis() -> u64 {
