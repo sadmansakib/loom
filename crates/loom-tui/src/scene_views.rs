@@ -229,7 +229,13 @@ pub fn draw_live_scrolled(
     } else {
         "[Enter] send   [Tab] @file   [F2] models   [F1] help"
     };
-    let footer_hint = if scene.is_some() {
+    let footer_hint = if compact && scene.is_none() {
+        Line::from(vec![
+            Span::styled("Esc", fg(theme::IVORY).add_modifier(Modifier::BOLD)),
+            Span::styled(" cancel  ", fg(theme::DIM)),
+            Span::styled("? help", fg(theme::IVORY).add_modifier(Modifier::BOLD)),
+        ])
+    } else if scene.is_some() {
         Line::from(keys)
     } else {
         Line::from(vec![
@@ -899,6 +905,28 @@ mod tests {
                 Scene::Main | Scene::Picker | Scene::Help => {}
             }
         }
+    }
+
+    #[test]
+    fn narrow_view_uses_one_status_line_for_key_hints() {
+        let reducer = Reducer::default();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| draw_live(frame, &reducer, "", 0, LiveViewOptions::default()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            rows.iter().any(|row| row.contains("Esc cancel")),
+            "no status line in {rows:#?}"
+        );
+        assert!(!rows.iter().any(|row| row.contains("[F2] models")));
     }
 
     #[test]
