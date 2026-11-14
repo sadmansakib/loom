@@ -2,12 +2,13 @@ use std::env;
 use std::time::Duration;
 
 use loom_core::kernel::{
+    context::ContextCensus,
     session::TaskStatus,
-    transcript::{Item, ToolStatus},
+    transcript::{Item, ToolFailure, ToolResult, ToolStatus},
 };
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
@@ -62,7 +63,14 @@ pub struct LiveViewOptions<'a> {
     pub sidebar_visible: bool,
     pub elapsed: Option<Duration>,
     pub dropped: Option<u64>,
+    pub workspace: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+    pub thinking: Option<&'a str>,
+    pub turn_limit: Option<u32>,
     pub thread_scroll_back: usize,
+    pub sidebar_scroll_back: usize,
     pub file_suggestions: &'a [String],
     pub pricing: Option<ModelPricing>,
     pub scene: Option<Scene>,
@@ -94,38 +102,58 @@ pub fn draw_live_scrolled(
         file_suggestions,
         pricing,
         scene,
+        ..
     } = options;
-    let area = design_area(frame.area());
+    let area = frame.area();
     let compact = area.width < 90;
     let wide = area.width >= 120;
-    let input_rows = u16::try_from(input.lines().count().clamp(2, 4)).unwrap_or(4);
+    let prompt_label = if reducer.task.status == Some(TaskStatus::Running) {
+        "Task running. Type to queue a follow-up."
+    } else {
+        "Describe a task. Use @path to include a workspace file."
+    };
+    let prompt_display = if input.is_empty() {
+        prompt_label
+    } else {
+        input
+    };
+    let queue_count = if reducer.task.status == Some(TaskStatus::Running) {
+        reducer.task.display_prompts.len().saturating_sub(1)
+    } else {
+        0
+    };
+    let input_rows = u16::try_from(input.lines().count().clamp(1, 3)).unwrap_or(3);
     let suggestion_height = if file_suggestions.is_empty() {
         0
     } else {
         u16::try_from(file_suggestions.len().min(5)).unwrap_or(5) + 2
     };
+    let header_height = 2;
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(header_height),
             Constraint::Min(5),
             Constraint::Length(input_rows + suggestion_height + 4),
         ])
         .split(area);
-    draw_live_header(frame, rows[0], reducer, scene);
+    draw_live_header(frame, rows[0], reducer, scene, &options);
     let footer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(input_rows + 2),
-            Constraint::Length(suggestion_height),
+            Constraint::Length(
+                suggestion_height.min(rows[2].height.saturating_sub(input_rows + 4)),
+            ),
             Constraint::Length(2),
+            Constraint::Min(0),
         ])
         .split(rows[2]);
     let show_sidebar = wide || (area.width >= 90 && sidebar_visible);
     let body = if wide {
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(65), Constraint::Length(38)])
+            .constraints([Constraint::Min(65), Constraint::Length(42)])
             .split(rows[1])
     } else {
         Layout::default()
@@ -135,29 +163,28 @@ pub fn draw_live_scrolled(
     };
     draw_reducer_thread(frame, body[0], reducer, compact, thread_scroll_back, scene);
     let (cursor_x, cursor_y, prompt_scroll) = prompt_cursor(input, cursor, footer[0]);
-    frame.set_cursor_position((cursor_x, cursor_y));
-    let placeholder = match reducer.task.status {
-        Some(TaskStatus::Running) => "Task running. Type to queue a follow-up.",
-        _ => "Describe a task. Use @path to include a workspace file.",
-    };
-    let prompt_text = if input.is_empty() { placeholder } else { input };
+    frame.set_cursor_position((cursor_x.saturating_add(2), cursor_y));
+    let prompt_spans = vec![
+        Span::styled("› ", fg(theme::AMBER).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            prompt_display,
+            fg(if input.is_empty() {
+                theme::DIM
+            } else {
+                theme::IVORY
+            }),
+        ),
+        Span::raw(" "),
+        Span::styled(format!("queued {queue_count}"), fg(theme::DIM)),
+    ];
     frame.render_widget(
-        Paragraph::new(prompt_text)
+        Paragraph::new(Line::from(prompt_spans))
             .block(
                 Block::default()
-                    .title(" MESSAGE · @path to mention a file ")
                     .borders(Borders::ALL)
-                    .border_style(fg(theme::AMBER)),
+                    .border_style(fg(theme::BORDER)),
             )
-            .style(
-                Style::default()
-                    .fg(if input.is_empty() {
-                        theme::DIM
-                    } else {
-                        theme::IVORY
-                    })
-                    .bg(theme::BG),
-            )
+            .style(Style::default().bg(theme::BG))
             .scroll((prompt_scroll, 0))
             .wrap(Wrap { trim: false }),
         footer[0],
@@ -179,19 +206,51 @@ pub fn draw_live_scrolled(
             footer[1],
         );
     }
-    let keys = if reducer.task.status == Some(TaskStatus::Running) {
-        "Enter send / queue  ·  Shift+Enter newline  ·  Tab @file  ·  PgUp/PgDn thread  ·  Ctrl+End latest  ·  Esc cancel"
+    let keys = if scene.is_some() {
+        "[Enter] start task   [Tab] @file   [F2] models   [F1] help"
+    } else if reducer.task.status == Some(TaskStatus::Running) {
+        "[Esc] cancel   [^O] details   [^R] reasoning   [^B] sidebar   [F1] help"
     } else {
-        "Enter send  ·  Shift+Enter newline  ·  Tab @file  ·  PgUp/PgDn thread  ·  Ctrl+End latest  ·  F2 models  ·  F1 help"
+        "[Enter] send   [Tab] @file   [F2] models   [F1] help"
     };
-    frame.render_widget(
-        Paragraph::new(keys)
-            .style(fg(theme::DIM))
-            .wrap(Wrap { trim: true }),
-        footer[2],
-    );
+    let footer_hint = if scene.is_some() {
+        Line::from(keys)
+    } else {
+        Line::from(vec![
+            Span::styled("[Esc]", fg(theme::IVORY).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " cancel   [^O] details   [^R] reasoning   [^B] sidebar   [F1] help",
+                fg(theme::DIM),
+            ),
+        ])
+    };
+    frame.render_widget(Paragraph::new(footer_hint).style(fg(theme::DIM)), footer[2]);
+    if scene.is_none() {
+        let counters = match dropped {
+            Some(dropped) => format!("events {} · dropped {dropped}", reducer.event_count),
+            None => "events unavailable".to_owned(),
+        };
+        frame.render_widget(
+            Paragraph::new(counters)
+                .style(fg(theme::DIM))
+                .alignment(Alignment::Right),
+            Rect {
+                x: footer[2].x + footer[2].width.saturating_sub(28),
+                width: 28,
+                ..footer[2]
+            },
+        );
+    }
+    let draw_side = |frame: &mut Frame<'_>, sidebar: Rect| match scene {
+        None => {
+            draw_runtime_sidebar(frame, sidebar, reducer, elapsed, dropped, pricing, &options);
+        }
+        Some(scene) => {
+            draw_scene_sidebar(frame, sidebar, reducer, elapsed, scene, options.turn_limit);
+        }
+    };
     if wide {
-        draw_live_sidebar(frame, body[1], reducer, elapsed, dropped, pricing, scene);
+        draw_side(frame, body[1]);
     } else if show_sidebar {
         let overlay = Rect::new(
             area.x + area.width.saturating_sub(42),
@@ -199,7 +258,7 @@ pub fn draw_live_scrolled(
             area.width.min(42),
             rows[1].height.min(12),
         );
-        draw_live_sidebar(frame, overlay, reducer, elapsed, dropped, pricing, scene);
+        draw_side(frame, overlay);
     }
 }
 
@@ -450,40 +509,82 @@ fn draw_help(frame: &mut Frame<'_>) {
     render_panel(frame, columns[1], "event stream", right);
 }
 
-fn draw_live_header(frame: &mut Frame<'_>, area: Rect, reducer: &Reducer, scene: Option<Scene>) {
+fn draw_live_header(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    reducer: &Reducer,
+    scene: Option<Scene>,
+    options: &LiveViewOptions<'_>,
+) {
     let model = if scene.is_some() {
         "model not available in static preview"
     } else {
         reducer
             .observed_model
             .as_deref()
+            .or(options.model)
             .unwrap_or("model not reported")
     };
-    let task_id = reducer.task.task_id.map_or_else(
-        || "task id unavailable".to_owned(),
-        |id| format!("task {id}"),
-    );
     let state = if scene.is_some() {
         "preview · no live data"
     } else {
         status_label(reducer)
     };
+    let workspace = options.workspace.unwrap_or("workspace unavailable");
+    let session = options.session_id.unwrap_or("session unavailable");
+    let effort = options.effort.unwrap_or("not reported");
+    let thinking = options.thinking.unwrap_or("not reported");
+    let (left, right) = if scene.is_some() {
+        (
+            Line::from(vec![
+                Span::styled("◆ loom", fg(theme::AMBER).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("  · {state}"), fg(theme::DIM)),
+            ]),
+            Line::from(Span::styled(model, fg(theme::BLUE))),
+        )
+    } else {
+        (
+            Line::from(vec![
+                Span::styled("◆ ", fg(theme::AMBER).add_modifier(Modifier::BOLD)),
+                Span::styled("loom", fg(theme::AMBER).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("   {workspace}  ·  session {session}"),
+                    fg(theme::DIM),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(model, fg(theme::BLUE)),
+                Span::styled("   effort ", fg(theme::DIM)),
+                Span::styled(effort, fg(theme::IVORY).add_modifier(Modifier::BOLD)),
+                Span::styled("   thinking ", fg(theme::DIM)),
+                Span::styled(thinking, fg(theme::IVORY).add_modifier(Modifier::BOLD)),
+            ]),
+        )
+    };
+    let content = Rect {
+        height: area.height.saturating_sub(1),
+        ..area
+    };
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+        .split(content);
+    frame.render_widget(Paragraph::new(left), columns[0]);
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("◆ loom", fg(theme::AMBER).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("  {task_id} · {state}"), fg(theme::DIM)),
-            Span::styled(format!("    {model}"), fg(theme::BLUE)),
-        ]))
-        .block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(fg(theme::BORDER)),
-        ),
-        area,
+        Paragraph::new(right).alignment(Alignment::Right),
+        columns[1],
+    );
+    frame.render_widget(
+        Paragraph::new("─".repeat(usize::from(area.width))).style(fg(theme::BORDER)),
+        Rect {
+            y: area.y + area.height.saturating_sub(1),
+            height: 1,
+            ..area
+        },
     );
 }
 
-#[allow(clippy::too_many_lines)] // transcript rendering preserves event and tool ordering
+#[allow(clippy::too_many_lines, clippy::wildcard_enum_match_arm)] // transcript rendering preserves event and tool ordering; Item is non_exhaustive
 fn draw_reducer_thread(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -493,107 +594,147 @@ fn draw_reducer_thread(
     scene: Option<Scene>,
 ) {
     let mut lines = Vec::new();
-    let latest_assistant = reducer
-        .committed_transcript
-        .iter()
-        .rposition(|item| matches!(item, Item::Assistant(_)));
+    if let Some(prompt) = reducer
+        .original_instruction
+        .as_deref()
+        .or_else(|| reducer.task.display_prompts.first().map(String::as_str))
+    {
+        lines.push(Line::from(Span::styled(
+            "TASK · original instruction",
+            fg(theme::DIM),
+        )));
+        lines.push(Line::from(vec![
+            Span::styled("› ", fg(theme::AMBER)),
+            Span::styled(prompt, fg(theme::IVORY).add_modifier(Modifier::BOLD)),
+        ]));
+    }
     if let Some(reason) = &reducer.task.failure_reason {
         lines.push(tinted(&format!("Task failed · {reason}"), theme::CORAL));
     }
-    let mut turn = 0_u32;
-    for (index, item) in reducer.committed_transcript.iter().enumerate() {
-        match item {
-            Item::User { text } => {
-                turn = turn.saturating_add(1);
-                lines.push(Line::from(vec![
-                    Span::styled("› ", fg(theme::AMBER)),
-                    Span::styled(text.as_str(), fg(theme::IVORY).add_modifier(Modifier::BOLD)),
-                ]));
-                for attachment in &reducer.task.attachments {
-                    lines.push(Line::from(vec![
-                        Span::styled("  ↳ attached ", fg(theme::DIM)),
-                        Span::styled(attachment.path.as_str(), fg(theme::BLUE)),
-                        Span::styled(
-                            format!(" · {} · included directly", format_bytes(attachment.bytes)),
-                            fg(theme::DIM),
-                        ),
-                    ]));
-                }
-                lines.push(turn_heading(turn, area.width, false));
+    let mut rendered_retries = std::collections::BTreeSet::new();
+    let transcript_tool_ids = reducer
+        .committed_transcript
+        .iter()
+        .filter_map(|item| {
+            if let Item::ToolResult(result) = item {
+                Some(result.call_id.to_string())
+            } else {
+                None
             }
-            Item::Assistant(message) => {
-                if turn == 0 {
-                    turn = 1;
-                    lines.push(turn_heading(turn, area.width, false));
-                }
-                let is_final = Some(index) == latest_assistant
-                    && reducer.task.status == Some(TaskStatus::Completed)
-                    && message.tool_calls.is_empty();
-                if is_final {
-                    continue;
-                }
-                if let Some(reasoning) = message
-                    .reasoning
-                    .as_ref()
-                    .filter(|trace| !trace.text.is_empty())
-                {
-                    lines.push(Line::from(Span::styled(
-                        if looks_like_structured_json(&reasoning.text) {
-                            "  ▸ reasoning · structured trace".to_owned()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for (turn_number, turn) in &reducer.execution_turns {
+        let streaming = reducer.turn == Some(*turn_number) && reducer.has_provisional_output();
+        lines.push(turn_heading(*turn_number, area.width, streaming, reducer));
+        for input in &turn.user_inputs {
+            lines.push(Line::from(vec![
+                Span::styled("│  › ", fg(theme::AMBER)),
+                Span::styled(
+                    input.as_str(),
+                    fg(theme::IVORY).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+        lines.push(Line::from(Span::styled("│", fg(theme::THREAD))));
+
+        for (retry_index, retry) in reducer
+            .retries
+            .iter()
+            .enumerate()
+            .filter(|(_, retry)| retry.turn == Some(*turn_number))
+        {
+            rendered_retries.insert(retry_index);
+            lines.push(Line::from(vec![
+                Span::styled("│  ", fg(theme::THREAD)),
+                Span::styled(
+                    format!(
+                        "{} attempt {}",
+                        glyphs::glyph(Glyph::Retry, glyph_set()),
+                        retry.attempt
+                    ),
+                    fg(theme::CORAL),
+                ),
+                Span::styled(
+                    format!(
+                        " · {} · {} ms · {} · discarded",
+                        retry.kind,
+                        retry.delay_ms,
+                        if retry.response_started {
+                            "response started"
                         } else {
-                            format!("  ▸ reasoning · {} tok", reasoning.text.chars().count())
-                        },
-                        fg(theme::VIOLET).add_modifier(Modifier::ITALIC),
-                    )));
-                    if !looks_like_structured_json(&reasoning.text) {
+                            "no response"
+                        }
+                    ),
+                    fg(theme::DIM),
+                ),
+            ]));
+        }
+
+        // Assistant content is deferred until after tool results so the
+        // turn reads chronologically: reasoning → tool executions → tool
+        // results → the model's prose (reference ordering).
+        let mut assistant_content: Vec<String> = Vec::new();
+        for item in &turn.transcript {
+            match item {
+                Item::Assistant(message) => {
+                    if let Some(reasoning) = message
+                        .reasoning
+                        .as_ref()
+                        .filter(|trace| !trace.text.is_empty())
+                    {
+                        let indicator = if reducer.expanded.reasoning {
+                            "▾"
+                        } else {
+                            "▸"
+                        };
+                        let size = reasoning_size(&reasoning.text, reducer, *turn_number);
                         lines.push(Line::from(Span::styled(
-                            format!("  {}", reasoning.text),
+                            format!("│  {indicator} reasoning · {size}"),
                             fg(theme::VIOLET).add_modifier(Modifier::ITALIC),
                         )));
-                    }
-                }
-                if !message.content.trim().is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(human_readable_content(&message.content), fg(theme::IVORY)),
-                    ]));
-                }
-                if !message.tool_calls.is_empty() {
-                    lines.push(muted(&format!(
-                        "  {} tool call{}",
-                        message.tool_calls.len(),
-                        if message.tool_calls.len() == 1 {
-                            ""
-                        } else {
-                            "s"
+                        if reducer.expanded.reasoning
+                            && !looks_like_structured_json(&reasoning.text)
+                        {
+                            lines.push(Line::from(Span::styled(
+                                format!("│      {}", reasoning.text),
+                                fg(theme::VIOLET).add_modifier(Modifier::ITALIC),
+                            )));
                         }
-                    )));
+                    }
+                    if !message.content.trim().is_empty() {
+                        assistant_content.push(human_readable_content(&message.content));
+                    }
                     for (call_index, call) in message.tool_calls.iter().enumerate() {
-                        let state = reducer.tools.get(&call.id.to_string());
+                        let call_id = call.id.to_string();
+                        let state = reducer.tools.get(&call_id);
                         let (marker, color, label) =
                             state.map_or((Glyph::Spinner, theme::AMBER, "running"), |tool| {
                                 match tool.status {
-                                    Some(loom_core::kernel::transcript::ToolStatus::Success) => {
+                                    Some(ToolStatus::Success) => {
                                         (Glyph::Check, theme::SAGE, "done")
                                     }
-                                    Some(loom_core::kernel::transcript::ToolStatus::Error(_)) => {
+                                    Some(ToolStatus::Error(_)) => {
                                         (Glyph::Cross, theme::CORAL, "failed")
                                     }
-                                    Some(
-                                        loom_core::kernel::transcript::ToolStatus::Cancelled {
-                                            ..
-                                        },
-                                    ) => (Glyph::Warning, theme::AMBER, "cancelled"),
+                                    Some(ToolStatus::Cancelled { .. }) => {
+                                        (Glyph::Warning, theme::AMBER, "cancelled")
+                                    }
                                     Some(_) => (Glyph::Warning, theme::DIM, "finished"),
                                     None => (Glyph::Spinner, theme::AMBER, "running"),
                                 }
                             });
+                        let duration = state.and_then(|tool| {
+                            tool.started_at_millis
+                                .zip(tool.completed_at_millis)
+                                .map(|(start, end)| end.saturating_sub(start))
+                        });
+                        let timing = duration.map_or_else(String::new, |ms| format!(" · {ms}ms"));
                         let branch = if call_index + 1 == message.tool_calls.len() {
-                            "  └─ "
+                            "│    └─ "
                         } else {
-                            "  ├─ "
+                            "│    ├─ "
                         };
-                        let arguments = concise_arguments(&call.arguments.to_string());
                         lines.push(Line::from(vec![
                             Span::styled(branch, fg(theme::DIM)),
                             Span::styled(
@@ -604,124 +745,48 @@ fn draw_reducer_thread(
                                 call.name.as_str(),
                                 fg(theme::BLUE).add_modifier(Modifier::BOLD),
                             ),
-                            Span::styled(format!("  {arguments}  · {label}"), fg(theme::DIM)),
+                            Span::styled(
+                                format!(
+                                    "  {}  · {label}{timing}",
+                                    concise_arguments(&call.arguments.to_string())
+                                ),
+                                fg(theme::DIM),
+                            ),
                         ]));
+                        if reducer.expanded.tools {
+                            lines.push(Line::from(Span::styled(
+                                format!(
+                                    "│       args: {}",
+                                    truncate_chars(&call.arguments.to_string(), 160)
+                                ),
+                                fg(theme::DIM),
+                            )));
+                        }
                     }
                 }
+                Item::ToolResult(result) => {
+                    lines.extend(tool_result_lines(result, reducer.expanded.tools));
+                }
+                _ => {}
             }
-            Item::ToolResult(result) => {
-                let color = match result.status {
-                    ToolStatus::Error(_) => theme::CORAL,
-                    ToolStatus::Cancelled { .. } => theme::AMBER,
-                    ToolStatus::Success | _ => theme::DIM,
-                };
-                lines.push(Line::from(vec![
-                    Span::styled("      ↳ ", fg(theme::DIM)),
-                    Span::styled(tool_result_summary(&result.content), fg(color)),
-                ]));
-            }
-            _ => {}
         }
-    }
-    for retry in &reducer.retries {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(
-                    "{} attempt {}",
-                    glyphs::glyph(Glyph::Retry, glyph_set()),
-                    retry.attempt
-                ),
-                fg(theme::CORAL),
-            ),
-            Span::styled(
-                format!(" · {} · {} ms · discarded", retry.kind, retry.delay_ms),
-                fg(theme::DIM),
-            ),
-        ]));
-    }
-    if reducer.turn.is_some() && turn == 0 {
-        turn = reducer.turn.unwrap_or_default().saturating_sub(1);
-    }
-    if reducer.has_provisional_output() {
-        lines.push(turn_heading(
-            reducer.turn.unwrap_or(turn.saturating_add(1)),
-            area.width,
-            true,
-        ));
-    }
-    if !reducer.provisional.reasoning.is_empty() {
-        lines.push(Line::from(Span::styled(
-            if looks_like_structured_json(&reducer.provisional.reasoning) {
-                "  ▸ reasoning · structured trace".to_owned()
-            } else {
-                format!(
-                    "  ▸ reasoning · {} tok",
-                    reducer.provisional.reasoning.chars().count()
-                )
-            },
-            fg(theme::VIOLET).add_modifier(Modifier::ITALIC),
-        )));
-        if !looks_like_structured_json(&reducer.provisional.reasoning) {
-            lines.push(Line::from(Span::styled(
-                format!("  {}", reducer.provisional.reasoning),
-                fg(theme::VIOLET).add_modifier(Modifier::ITALIC),
-            )));
-        }
-    }
-    if !reducer.provisional.text.is_empty() {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                human_readable_content(&reducer.provisional.text),
-                fg(theme::IVORY),
-            ),
-        ]));
-    }
-    let mut transcript_tool_ids = std::collections::BTreeSet::new();
-    for item in &reducer.committed_transcript {
-        if let Item::ToolResult(result) = item {
-            transcript_tool_ids.insert(result.call_id.to_string());
-        }
-    }
-    let live_tools = reducer
-        .tools
-        .iter()
-        .filter(|(id, _)| !transcript_tool_ids.contains(*id))
-        .collect::<Vec<_>>();
-    if !live_tools.is_empty() {
-        lines.push(muted(&format!(
-            "  {} read-only call{} · concurrent",
-            live_tools.len(),
-            if live_tools.len() == 1 { "" } else { "s" }
-        )));
-        for (index, (_, tool)) in live_tools.iter().enumerate() {
-            let (marker, color, state) = match tool.status {
-                Some(loom_core::kernel::transcript::ToolStatus::Success) => {
-                    (Glyph::Check, theme::SAGE, "done")
-                }
-                Some(loom_core::kernel::transcript::ToolStatus::Error(_)) => {
-                    (Glyph::Cross, theme::CORAL, "failed")
-                }
-                Some(loom_core::kernel::transcript::ToolStatus::Cancelled { .. }) => {
-                    (Glyph::Warning, theme::AMBER, "cancelled")
-                }
+        for (_id, tool) in reducer.tools.iter().filter(|(id, _)| {
+            reducer.tool_call_turn(id) == Some(*turn_number) && !transcript_tool_ids.contains(*id)
+        }) {
+            let (marker, color, status) = match tool.status {
+                Some(ToolStatus::Success) => (Glyph::Check, theme::SAGE, "done"),
+                Some(ToolStatus::Error(_)) => (Glyph::Cross, theme::CORAL, "failed"),
+                Some(ToolStatus::Cancelled { .. }) => (Glyph::Warning, theme::AMBER, "cancelled"),
                 Some(_) => (Glyph::Warning, theme::DIM, "finished"),
                 None => (Glyph::Spinner, theme::AMBER, "running"),
             };
-            let branch = if index + 1 == live_tools.len() {
-                "  └─ "
-            } else {
-                "  ├─ "
-            };
-            let arguments = concise_arguments(tool.arguments.as_deref().unwrap_or(""));
-            let summary = tool
-                .content_head
-                .as_deref()
-                .map_or_else(String::new, |head| {
-                    format!("  {}", tool_result_summary(head))
-                });
+            let timing = tool
+                .started_at_millis
+                .zip(tool.completed_at_millis)
+                .map(|(start, end)| end.saturating_sub(start))
+                .map_or_else(String::new, |ms| format!(" · {ms}ms"));
             lines.push(Line::from(vec![
-                Span::styled(branch, fg(theme::DIM)),
+                Span::styled("│    └─ ", fg(theme::DIM)),
                 Span::styled(
                     format!("{} ", glyphs::glyph(marker, glyph_set())),
                     fg(color),
@@ -730,23 +795,112 @@ fn draw_reducer_thread(
                     tool.name.as_str(),
                     fg(theme::BLUE).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!("  {arguments}  · {state}{summary}"), fg(theme::DIM)),
+                Span::styled(
+                    format!(
+                        "  {}  · {status}{timing}",
+                        concise_arguments(tool.arguments.as_deref().unwrap_or(""))
+                    ),
+                    fg(theme::DIM),
+                ),
+            ]));
+            if reducer.expanded.tools
+                && let Some(output) = &tool.content_head
+            {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "│       output preview: {}",
+                        truncate_chars(&output.replace('\n', " ↵ "), 160)
+                    ),
+                    fg(color),
+                )));
+            }
+        }
+        // The model's prose lands after every execution in the turn.
+        for content in assistant_content {
+            lines.push(Line::from(vec![
+                Span::styled("│  ", fg(theme::THREAD)),
+                Span::styled(content, fg(theme::IVORY)),
             ]));
         }
+        if reducer.turn == Some(*turn_number)
+            && (reducer.has_provisional_output()
+                || (!matches!(
+                    reducer.task.status,
+                    Some(TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled)
+                ) && reducer.task.status.is_some()))
+        {
+            if !reducer.provisional.reasoning.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "│  {} reasoning · provisional · streaming {}",
+                        if reducer.expanded.reasoning {
+                            "▾"
+                        } else {
+                            "▸"
+                        },
+                        glyphs::glyph(Glyph::Spinner, glyph_set()),
+                    ),
+                    fg(theme::VIOLET).add_modifier(Modifier::ITALIC),
+                )));
+                if reducer.expanded.reasoning {
+                    lines.push(Line::from(vec![
+                        Span::styled("│      ", fg(theme::THREAD)),
+                        Span::styled(
+                            truncate_chars(&reducer.provisional.reasoning, 200),
+                            fg(theme::VIOLET).add_modifier(Modifier::ITALIC),
+                        ),
+                        Span::styled(
+                            streaming_cursor(),
+                            fg(theme::VIOLET).add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                }
+            }
+            if !reducer.provisional.text.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("│  ", fg(theme::THREAD)),
+                    Span::styled(
+                        human_readable_content(&reducer.provisional.text),
+                        fg(theme::IVORY),
+                    ),
+                    Span::styled(
+                        streaming_cursor(),
+                        fg(theme::AMBER).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
+        }
+        lines.push(Line::from(Span::styled("│", fg(theme::THREAD))));
     }
-    if let Some(Item::Assistant(message)) =
-        latest_assistant.and_then(|index| reducer.committed_transcript.get(index))
-        && reducer.task.status == Some(TaskStatus::Completed)
-        && message.tool_calls.is_empty()
-    {
-        lines.push(Line::from(Span::styled(
-            "▸ final answer",
-            fg(theme::SAGE).add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(message.content.as_str(), fg(theme::IVORY)),
-        ]));
+
+    // A committed transcript may contain a fast-path result without model turns.
+    if reducer.execution_turns.is_empty() {
+        for item in &reducer.committed_transcript {
+            if let Item::Assistant(message) = item {
+                lines.push(Line::from(Span::styled(
+                    human_readable_content(&message.content),
+                    fg(theme::IVORY),
+                )));
+            }
+        }
+    }
+    for (retry_index, retry) in reducer.retries.iter().enumerate() {
+        if !rendered_retries.contains(&retry_index) {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{} attempt {}",
+                        glyphs::glyph(Glyph::Retry, glyph_set()),
+                        retry.attempt
+                    ),
+                    fg(theme::CORAL),
+                ),
+                Span::styled(
+                    format!(" · {} · {} ms · discarded", retry.kind, retry.delay_ms),
+                    fg(theme::DIM),
+                ),
+            ]));
+        }
     }
     if lines.is_empty() {
         let message = match scene {
@@ -758,34 +912,62 @@ fn draw_reducer_thread(
         };
         lines.push(muted(message));
     }
-    if !compact && reducer.follow_up_queued {
+    if reducer.task.status == Some(TaskStatus::Running) {
+        for prompt in reducer.task.display_prompts.iter().skip(1) {
+            lines.push(Line::from(vec![
+                Span::styled("  ↳ queued · ", fg(theme::AMBER)),
+                Span::styled(prompt.as_str(), fg(theme::IVORY)),
+            ]));
+        }
+    }
+    if !compact && reducer.follow_up_queued && reducer.task.display_prompts.len() <= 1 {
         lines.push(tinted("follow-up queued for next turn", theme::AMBER));
     }
-    render_thread_scrolled(frame, area, lines, thread_scroll_back);
+    if scene.is_some() {
+        render_preview_thread(frame, area, "task thread", lines);
+    } else {
+        render_thread_scrolled(frame, area, lines, thread_scroll_back);
+    }
 }
 
-fn turn_heading(turn: u32, width: u16, streaming: bool) -> Line<'static> {
-    let occupied = if streaming { 19 } else { 10 };
+fn turn_heading(turn: u32, width: u16, streaming: bool, reducer: &Reducer) -> Line<'static> {
+    let metrics = reducer.turn_metrics.get(&turn);
+    let usage = metrics
+        .filter(|metrics| metrics.usage_reported)
+        .map_or(String::new(), |metrics| {
+            format!(
+                " · {} in / {} out",
+                metrics.usage.input_tokens, metrics.usage.output_tokens
+            )
+        });
+    let cached = metrics
+        .filter(|metrics| metrics.usage_reported)
+        .and_then(|metrics| metrics.usage.cached_input_tokens)
+        .filter(|tokens| *tokens > 0)
+        .map_or(String::new(), |tokens| {
+            format!(" · {} cached", format_compact_tokens(tokens))
+        });
+    let duration = metrics
+        .and_then(|metrics| {
+            Some(
+                metrics
+                    .completed_at_millis?
+                    .saturating_sub(metrics.started_at_millis?),
+            )
+        })
+        .map_or(String::new(), |millis| format!(" · {millis}ms"));
+    let state = if streaming { "  ⋮ streaming" } else { "" };
+    let metadata = format!("turn {turn}{usage}{cached}{duration}{state}");
+    let occupied = metadata.chars().count() + 5;
     let fill = usize::from(width).saturating_sub(occupied);
     Line::from(vec![
-        Span::styled("● ", fg(theme::AMBER)),
-        Span::styled(format!("turn {turn}"), fg(theme::DIM)),
-        if streaming {
-            Span::styled("  ⋮ streaming", fg(theme::AMBER))
-        } else {
-            Span::raw("")
-        },
-        Span::styled(format!(" {}", "─".repeat(fill)), fg(theme::BORDER)),
+        Span::styled("╭─ ", fg(theme::THREAD)),
+        Span::styled(
+            format!("{metadata} "),
+            fg(theme::AMBER).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" {}", "─".repeat(fill)), fg(theme::THREAD)),
     ])
-}
-
-fn format_bytes(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else {
-        let tenths = u128::from(bytes) * 10 / 1024;
-        format!("{}.{:01} KB", tenths / 10, tenths % 10)
-    }
 }
 
 fn concise_arguments(raw: &str) -> String {
@@ -840,6 +1022,187 @@ fn human_readable_content(raw: &str) -> String {
     raw.to_owned()
 }
 
+/// Truncates to a character budget with an ellipsis marker.
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+    let mut truncated: String = text.chars().take(limit.saturating_sub(1)).collect();
+    truncated.push('…');
+    truncated
+}
+
+/// Block cursor shown while the model streams provisional output.
+fn streaming_cursor() -> &'static str {
+    if matches!(glyph_set(), GlyphSet::Unicode) {
+        "▌"
+    } else {
+        "|"
+    }
+}
+
+/// Reasoning size prefers the provider-reported thinking tokens for the turn
+/// and falls back to the character count of the streamed trace.
+fn reasoning_size(text: &str, reducer: &Reducer, turn: u32) -> String {
+    reducer
+        .turn_metrics
+        .get(&turn)
+        .filter(|metrics| metrics.usage_reported)
+        .and_then(|metrics| metrics.usage.thinking_tokens)
+        .map_or_else(
+            || format!("{} chars", text.chars().count()),
+            |tokens| format!("{} tok", format_compact_tokens(tokens)),
+        )
+}
+
+fn failure_category(failure: ToolFailure) -> &'static str {
+    match failure {
+        ToolFailure::UnknownTool => "unknown tool",
+        ToolFailure::NotExposed => "not exposed",
+        ToolFailure::InvalidInput => "invalid input",
+        ToolFailure::Execution => "execution",
+        ToolFailure::Timeout => "timeout",
+        ToolFailure::RepeatedCall => "repeated call",
+        _ => "error",
+    }
+}
+
+/// A numbered file window produced by `read_file`: a `path: N lines` header,
+/// `line-number<TAB>text` body rows, and an optional `... [` trailer.
+struct NumberedRead<'a> {
+    header: &'a str,
+    body: Vec<(usize, &'a str)>,
+    trailer: Option<&'a str>,
+}
+
+fn parse_numbered_read(raw: &str) -> Option<NumberedRead<'_>> {
+    let mut lines = raw.lines();
+    let header = lines.next()?.trim_end();
+    let stem = header.strip_suffix(" lines")?;
+    stem.rsplit_once(' ')?.1.parse::<usize>().ok()?;
+    let mut body = Vec::new();
+    let mut trailer = None;
+    for line in lines {
+        if let Some((number, text)) = line.split_once('\t')
+            && let Ok(number) = number.trim().parse::<usize>()
+        {
+            body.push((number, text));
+        } else if line.trim_start().starts_with("... [") {
+            trailer = Some(line.trim());
+        }
+    }
+    if body.is_empty() {
+        return None;
+    }
+    Some(NumberedRead {
+        header,
+        body,
+        trailer,
+    })
+}
+
+fn comment_line(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("//") || trimmed.starts_with('#')
+}
+
+/// Renders one committed tool result: a status line with the honest category,
+/// then a bounded, tool-aware preview (numbered file windows keep their
+/// gutter; everything else summarizes to its first meaningful line).
+fn tool_result_lines(result: &ToolResult, expanded: bool) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(read) = parse_numbered_read(&result.content) {
+        let truncated = if result.truncated {
+            " · truncated"
+        } else {
+            ""
+        };
+        lines.push(Line::from(vec![
+            Span::styled("│       ↳ ", fg(theme::DIM)),
+            Span::styled(
+                format!(
+                    "{} ok{truncated} · ",
+                    glyphs::glyph(Glyph::Check, glyph_set())
+                ),
+                fg(theme::SAGE),
+            ),
+            Span::styled(read.header.to_owned(), fg(theme::SAGE)),
+        ]));
+        let cap = if expanded { 12 } else { 3 };
+        for (number, text) in read.body.iter().take(cap) {
+            let style = if comment_line(text) {
+                theme::DIM
+            } else {
+                theme::IVORY
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("│         {number:>3} │ "), fg(theme::DIM)),
+                Span::styled(truncate_chars(text, 80), fg(style)),
+            ]));
+        }
+        if read.body.len() > cap {
+            lines.push(Line::from(Span::styled(
+                format!("│         … +{} more lines", read.body.len() - cap),
+                fg(theme::DIM),
+            )));
+        }
+        if let Some(trailer) = read.trailer {
+            lines.push(Line::from(Span::styled(
+                format!("│         {trailer}"),
+                fg(theme::DIM),
+            )));
+        }
+        return lines;
+    }
+    let (color, marker, status) = match result.status {
+        ToolStatus::Success => (theme::SAGE, Glyph::Check, "ok".to_owned()),
+        ToolStatus::Error(failure) => (
+            theme::CORAL,
+            Glyph::Cross,
+            format!("error · {}", failure_category(failure)),
+        ),
+        ToolStatus::Cancelled { .. } => (theme::AMBER, Glyph::Warning, "cancelled".to_owned()),
+        _ => (theme::DIM, Glyph::Warning, "finished".to_owned()),
+    };
+    let truncated = if result.truncated {
+        " · truncated"
+    } else {
+        ""
+    };
+    lines.push(Line::from(vec![
+        Span::styled("│       ↳ ", fg(theme::DIM)),
+        Span::styled(
+            format!(
+                "{} {status}{truncated} · ",
+                glyphs::glyph(marker, glyph_set())
+            ),
+            fg(color),
+        ),
+        Span::styled(tool_result_summary(&result.content), fg(color)),
+    ]));
+    if expanded {
+        let content_lines: Vec<&str> = result
+            .content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        let cap = 12;
+        for line in content_lines.iter().take(cap) {
+            lines.push(Line::from(vec![
+                Span::styled("│         ", fg(theme::THREAD)),
+                Span::styled(truncate_chars(line, 96), fg(theme::DIM)),
+            ]));
+        }
+        if content_lines.len() > cap {
+            lines.push(Line::from(Span::styled(
+                format!("│         … +{} more lines", content_lines.len() - cap),
+                fg(theme::DIM),
+            )));
+        }
+    }
+    lines
+}
+
 fn render_thread_scrolled(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -866,22 +1229,30 @@ fn render_thread_scrolled(
             .min(usize::from(u16::MAX)),
     )
     .unwrap_or(u16::MAX);
-    let is_lagging = thread_scroll_back > 0;
-    let title = if is_lagging {
-        format!(" THREAD  ↑ {thread_scroll_back} lines · PgDn resume follow ")
-    } else {
-        " THREAD  ↓ following latest ".to_owned()
-    };
     frame.render_widget(
         Paragraph::new(lines)
             .block(
                 Block::default()
                     .borders(Borders::LEFT)
-                    .title(title)
                     .border_style(fg(theme::THREAD)),
             )
             .style(Style::default().bg(theme::BG))
             .scroll((scroll, 0))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_preview_thread(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_>>) {
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(format!(" {title} "))
+                    .borders(Borders::ALL)
+                    .border_style(fg(theme::BORDER)),
+            )
+            .style(Style::default().bg(theme::BG))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -901,15 +1272,15 @@ fn draw_test_live(frame: &mut Frame<'_>, reducer: &Reducer, input: &str) {
     );
 }
 
-#[allow(clippy::too_many_lines)] // ordered dashboard sections share the same panel state
-fn draw_live_sidebar(
+/// Sidebar for the static preview scenes: every live counter is explicitly
+/// marked unavailable so a preview can never imply a running task.
+fn draw_scene_sidebar(
     frame: &mut Frame<'_>,
     area: Rect,
     reducer: &Reducer,
     elapsed: Option<Duration>,
-    dropped: Option<u64>,
-    pricing: Option<ModelPricing>,
-    scene: Option<Scene>,
+    scene: Scene,
+    turn_limit: Option<u32>,
 ) {
     let reported = |value: Option<u64>| {
         if reducer.usage_reported {
@@ -918,93 +1289,26 @@ fn draw_live_sidebar(
             "not reported".to_owned()
         }
     };
-    let cost = if scene.is_some() {
-        Some("not reported".to_owned())
-    } else {
-        format_run_cost(reducer, pricing)
-    };
+    let cost = "not reported".to_owned();
     let elapsed = elapsed.map_or_else(
         || "not available".to_owned(),
         |value| format!("{:02}:{:02}", value.as_secs() / 60, value.as_secs() % 60),
     );
-    let mut lines = if scene.is_some() {
-        vec![
-            heading("TASK"),
-            muted("no task status in static preview"),
-            muted("model not available in static preview"),
-            heading("LIVE USAGE · UNAVAILABLE"),
-            muted("not available in static preview"),
-            muted("not available in static preview"),
-            muted("not available in static preview"),
-            muted("not available in static preview"),
-            muted("elapsed not available in static preview"),
-            muted("tools not available in static preview"),
-            muted(""),
-        ]
-    } else {
-        vec![
-            heading("TASK"),
-            body(&format!(
-                "{} · turn {} · attempt {}",
-                status_label(reducer),
-                reducer
-                    .turn
-                    .map_or_else(|| "not reported".to_owned(), |n| n.to_string()),
-                reducer
-                    .attempt
-                    .map_or_else(|| "not reported".to_owned(), |n| n.to_string())
-            )),
-            muted(&format!(
-                "model  {}",
-                reducer.observed_model.as_deref().unwrap_or("not reported")
-            )),
-            muted(""),
-        ]
-    };
-    if let Some(summary) = scene
-        .is_none()
-        .then_some(reducer.summary.as_ref())
-        .flatten()
-    {
-        lines.extend([
-            heading("COMPLETED RUN RECORD"),
-            muted(&format!(
-                "turns {} · model requests {}",
-                summary.turns, summary.model_requests
-            )),
-            muted(&format!(
-                "tools {} succeeded · {} failed",
-                summary.successful_tool_calls, summary.failed_tool_calls
-            )),
-            muted(&format!(
-                "wall time {}s · dropped events {}",
-                summary.wall_time.as_secs(),
-                summary.events_dropped
-            )),
-            if summary.model_requests > 0 {
-                muted(&format!(
-                    "final request census {} tokens",
-                    summary.last_context_census.total
-                ))
-            } else {
-                muted("final request census not available; no request compiled")
-            },
-            muted(&format!(
-                "input budget {} · output {}",
-                optional_budget(summary.remaining_budget.input_tokens),
-                optional_budget(summary.remaining_budget.output_tokens)
-            )),
-            muted(&format!(
-                "total budget {} · tools {}",
-                optional_budget(summary.remaining_budget.total_tokens),
-                summary
-                    .remaining_budget
-                    .tool_calls
-                    .map_or_else(|| "unbounded".to_owned(), |value| value.to_string())
-            )),
-            muted(""),
-        ]);
-    }
+    let mut lines = vec![
+        heading("TASK"),
+        muted("no task status in static preview"),
+        muted("model not available in static preview"),
+        muted("task state not available in static preview"),
+        heading("LIVE USAGE · UNAVAILABLE"),
+        muted("not available in static preview"),
+        muted("not available in static preview"),
+        muted("not available in static preview"),
+        muted("not available in static preview"),
+        muted("elapsed not available in static preview"),
+        muted("tools   not available"),
+        muted(""),
+    ];
+    let tools_usage = muted(&format!("tools   {} calls observed", reducer.tools.len()));
     lines.extend([
         heading("USAGE"),
         muted(&format!(
@@ -1020,99 +1324,259 @@ fn draw_live_sidebar(
             reported(Some(reducer.usage.output_tokens))
         )),
         muted(&format!("elapsed {elapsed}")),
-        muted(&format!(
-            "tools   {}",
-            if scene.is_some() {
-                "not available".to_owned()
-            } else {
-                format!("{} calls observed", reducer.tools.len())
-            }
-        )),
+        tools_usage,
         muted(""),
     ]);
-    if let Some(cost) = cost {
-        lines.insert(
-            lines.len().saturating_sub(3),
-            muted(&format!("cost    {cost}")),
-        );
-    }
+    lines.insert(
+        lines.len().saturating_sub(3),
+        muted(&format!("cost    {cost}")),
+    );
     match scene {
-        Some(Scene::Cancel) => {
+        Scene::Cancel => {
             lines.push(heading("CANCELLATION LEDGER"));
             lines.push(muted("No cancellation event in this preview."));
             lines.push(muted("Call outcomes are not available."));
         }
-        Some(Scene::Retry) => {
+        Scene::Retry => {
             lines.push(heading("RETRIES"));
             lines.push(muted("No retry events in this preview."));
             lines.push(muted("Retry policy is not exposed by the event stream."));
         }
-        Some(Scene::Complete) => {
+        Scene::Complete => {
             lines.push(heading("RUN RECORD"));
             lines.push(muted("No completed task in this preview."));
         }
-        _ => {}
+        Scene::Main | Scene::Picker | Scene::Help => {}
+    }
+    lines.extend([
+        heading("PREVIEW NOTES"),
+        muted("No cancellation event in this preview."),
+        muted("No retry events in this preview."),
+        muted("No completed task in this preview."),
+    ]);
+    if let Some(limit) = turn_limit {
+        lines.push(heading("TASK LIMIT"));
+        lines.push(muted(&format!("{limit} turns configured")));
     }
     lines.push(muted(""));
     lines.push(heading("TASK BUDGET · REMAINING"));
-    if let Some(progress) = scene
-        .is_none()
-        .then_some(reducer.context_progress)
-        .flatten()
-    {
-        let budget = progress.remaining_budget;
-        lines.extend([
-            budget_line("input tokens", budget.input_tokens),
-            budget_line("output tokens", budget.output_tokens),
-            budget_line("total tokens", budget.total_tokens),
-            budget_line("tool calls", budget.tool_calls.map(u64::from)),
-            muted(&format!(
-                "wall time  {}",
-                budget.wall_time.map_or_else(
-                    || "unbounded".to_owned(),
-                    |remaining| format!("{}s remaining", remaining.as_secs())
-                )
-            )),
-        ]);
-    } else if scene.is_some() {
-        lines.push(muted("not available in static preview"));
-    } else {
-        lines.push(muted("not reported before request compilation"));
-    }
+    lines.push(muted("not available in static preview"));
     lines.push(heading("REQUEST CONTEXT · LATEST COMPILE"));
-    if let Some(progress) = scene
-        .is_none()
-        .then_some(reducer.context_progress)
-        .flatten()
-    {
-        let census = progress.census;
-        lines.extend([
-            muted(&format!(
-                "turn {} · estimated {}/{} input tokens",
-                progress.turn, census.total, progress.context_budget.max_input_tokens
-            )),
-            muted(&format!(
-                "output reserve {} tokens",
-                progress.context_budget.reserved_output_tokens
-            )),
-            census_line("system", census.system_prompt),
-            census_line("repository facts", census.repo_facts),
-            census_line("user items", census.user_items),
-            census_line("assistant history", census.assistant_history),
-            census_line("reasoning replay", census.reasoning_replay),
-            census_line("tool results", census.tool_results),
-            census_line("tool specs", census.tool_specs),
-        ]);
-    } else if scene.is_some() {
-        lines.push(muted("not available in static preview"));
-    } else {
-        lines.push(muted("not reported before request compilation"));
-    }
+    lines.push(muted("not available in static preview"));
     lines.push(heading("EVENTS"));
     lines.extend(reducer.recent_events.iter().map(|event| muted(event)));
-    lines.push(match (scene, dropped) {
-        (Some(_), _) => muted("events unavailable in preview"),
-        (None, Some(dropped)) => tinted(
+    lines.push(muted("events unavailable in preview"));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(theme::BG))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+#[allow(clippy::too_many_lines)] // ordered dashboard sections share the same panel state
+fn draw_runtime_sidebar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    reducer: &Reducer,
+    elapsed: Option<Duration>,
+    dropped: Option<u64>,
+    pricing: Option<ModelPricing>,
+    options: &LiveViewOptions<'_>,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::LEFT)
+            .border_style(fg(theme::BORDER))
+            .style(Style::default().bg(theme::BG)),
+        area,
+    );
+    let content = Rect {
+        x: area.x.saturating_add(1),
+        width: area.width.saturating_sub(1),
+        ..area
+    };
+    if content.width == 0 {
+        return;
+    }
+
+    let elapsed_label = elapsed.map_or_else(
+        || "not available".to_owned(),
+        |value| format!("{:02}:{:02}", value.as_secs() / 60, value.as_secs() % 60),
+    );
+    let task_id = reducer.task.task_id.map_or_else(
+        || "task id unavailable".to_owned(),
+        |id| format!("t_{}", &id.to_string()[..8]),
+    );
+    let status_color = if reducer.task.status == Some(TaskStatus::Running) {
+        theme::AMBER
+    } else if reducer.task.status == Some(TaskStatus::Completed) {
+        theme::SAGE
+    } else if reducer.task.status == Some(TaskStatus::Failed) {
+        theme::CORAL
+    } else {
+        theme::DIM
+    };
+    let task_lines = vec![
+        heading("TASK"),
+        Line::from(vec![
+            Span::styled("◈ ", fg(status_color)),
+            Span::styled(
+                status_label(reducer),
+                fg(status_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {elapsed_label}"), fg(theme::DIM)),
+        ]),
+        muted(&task_id),
+    ];
+
+    let turns = reducer.turn.map(u64::from);
+    let turn_limit = options.turn_limit.map(u64::from);
+    let mut budget_lines = vec![
+        heading("BUDGET"),
+        sidebar_budget_width("turns", turns, turn_limit, content.width),
+    ];
+    if let (Some(used), Some(limit)) = (turns, turn_limit) {
+        budget_lines.push(sidebar_limit_bar(used, limit, content.width));
+    } else {
+        budget_lines.push(sidebar_unbounded_bar(content.width));
+    }
+    if let Some(progress) = reducer.context_progress {
+        let budget = progress.remaining_budget;
+        if let Some(remaining) = budget.tool_calls {
+            let limit = progress
+                .tool_calls_used
+                .saturating_add(u64::from(remaining));
+            let used = reducer.tool_calls_started;
+            budget_lines.push(sidebar_budget_width(
+                "tool calls",
+                Some(used),
+                Some(limit),
+                content.width,
+            ));
+            budget_lines.push(sidebar_limit_bar(used, limit, content.width));
+        } else {
+            budget_lines.push(sidebar_budget_width(
+                "tool calls",
+                Some(reducer.tool_calls_started),
+                None,
+                content.width,
+            ));
+            budget_lines.push(sidebar_unbounded_bar(content.width));
+        }
+        if let Some(remaining) = budget.wall_time {
+            let used = elapsed.or(progress.elapsed_at_compile);
+            if let (Some(used), Some(elapsed_at_compile)) = (used, progress.elapsed_at_compile) {
+                let limit = elapsed_at_compile.saturating_add(remaining);
+                budget_lines.push(sidebar_budget_text(
+                    "wall",
+                    &format!("{} / {}", format_duration(used), format_duration(limit)),
+                    content.width,
+                ));
+                budget_lines.push(sidebar_limit_bar(
+                    used.as_secs(),
+                    limit.as_secs(),
+                    content.width,
+                ));
+            } else {
+                budget_lines.push(sidebar_budget_text(
+                    "wall",
+                    &format!(
+                        "{} elapsed · limit available",
+                        elapsed.map_or_else(|| "time unavailable".to_owned(), format_duration)
+                    ),
+                    content.width,
+                ));
+                budget_lines.push(sidebar_unbounded_bar(content.width));
+            }
+        } else {
+            budget_lines.push(sidebar_budget_text(
+                "wall",
+                &format!("{elapsed_label} · unbounded"),
+                content.width,
+            ));
+            budget_lines.push(sidebar_unbounded_bar(content.width));
+        }
+        budget_lines.push(muted(&format!(
+            "tokens  in {} · out {} · total {}",
+            optional_budget(budget.input_tokens),
+            optional_budget(budget.output_tokens),
+            optional_budget(budget.total_tokens)
+        )));
+    } else {
+        budget_lines.push(sidebar_budget_text(
+            "tool calls",
+            &format!(
+                "{} observed · limit unavailable",
+                reducer.tool_calls_started
+            ),
+            content.width,
+        ));
+        budget_lines.push(sidebar_unbounded_bar(content.width));
+        budget_lines.push(sidebar_budget_text(
+            "wall",
+            &format!("{elapsed_label} · limit unavailable"),
+            content.width,
+        ));
+        budget_lines.push(sidebar_unbounded_bar(content.width));
+    }
+
+    let mut context_lines = vec![heading("NEXT REQUEST · CONTEXT")];
+    if let Some(progress) = reducer.context_progress {
+        let census = progress.census;
+        context_lines.push(context_bar(census, content.width));
+        context_lines.extend(context_segments(census, content.width));
+        let capacity = progress.context_budget.max_input_tokens;
+        let utilization = if capacity > 0 {
+            format!(
+                "{:.1}% of {}",
+                f64::from(census.total) * 100.0 / f64::from(capacity),
+                format_compact_tokens(u64::from(capacity))
+            )
+        } else {
+            "capacity unavailable".to_owned()
+        };
+        context_lines.push(muted(&format!(
+            "total (est.) {} · estimated {}/{} · {utilization}",
+            format_compact_tokens(u64::from(census.total)),
+            census.total,
+            capacity,
+        )));
+    } else {
+        context_lines.push(muted("not reported before request compilation"));
+    }
+
+    let cost = format_run_cost(reducer, pricing).unwrap_or_else(|| "not reported".to_owned());
+    let usage_value = |value: Option<u64>| {
+        if reducer.usage_reported {
+            value.map_or_else(|| "not reported".to_owned(), format_compact_tokens)
+        } else {
+            "not reported".to_owned()
+        }
+    };
+    let cost_lines = vec![
+        heading("COST"),
+        Line::from(vec![Span::styled(
+            cost,
+            fg(theme::AMBER).add_modifier(Modifier::BOLD),
+        )]),
+        muted(&format!(
+            "in {} · {} cached",
+            usage_value(Some(reducer.usage.input_tokens)),
+            usage_value(reducer.usage.cached_input_tokens)
+        )),
+        muted(&format!(
+            "out {}",
+            usage_value(Some(reducer.usage.output_tokens))
+        )),
+    ];
+
+    let event_count = match dropped {
+        Some(dropped) => tinted(
             &format!("events {} · dropped {dropped}", reducer.event_count),
             if dropped == 0 {
                 theme::DIM
@@ -1120,9 +1584,204 @@ fn draw_live_sidebar(
                 theme::CORAL
             },
         ),
-        (None, None) => muted("event counters not available"),
-    });
-    render_panel(frame, area, "run state", lines);
+        None => muted("event counters not available"),
+    };
+
+    if let Some(summary) = &reducer.summary {
+        let census = if summary.model_requests > 0 {
+            format!(
+                "final request census {} tokens",
+                summary.last_context_census.total
+            )
+        } else {
+            "final request census not available; no request compiled".to_owned()
+        };
+        budget_lines.extend([
+            heading("COMPLETED RUN RECORD"),
+            muted(&format!(
+                "turns {} · model requests {}",
+                summary.turns, summary.model_requests
+            )),
+            muted(&format!(
+                "tools {} succeeded · {} failed",
+                summary.successful_tool_calls, summary.failed_tool_calls
+            )),
+            muted(&format!(
+                "wall time {}s · dropped events {}",
+                summary.wall_time.as_secs(),
+                summary.events_dropped
+            )),
+            muted(&census),
+            muted(&format!(
+                "input budget {} · output {}",
+                optional_budget(summary.remaining_budget.input_tokens),
+                optional_budget(summary.remaining_budget.output_tokens)
+            )),
+            muted(&format!(
+                "total budget {} · tools {}",
+                optional_budget(summary.remaining_budget.total_tokens),
+                summary
+                    .remaining_budget
+                    .tool_calls
+                    .map_or_else(|| "unbounded".to_owned(), |value| value.to_string())
+            )),
+            muted(&format!(
+                "output budget {} · wall {}",
+                optional_budget(summary.remaining_budget.output_tokens),
+                summary
+                    .remaining_budget
+                    .wall_time
+                    .map_or_else(|| "unbounded".to_owned(), format_duration)
+            )),
+        ]);
+    }
+
+    // Reserve space for every sidebar section first. Compress informational
+    // rows before sacrificing the event panel at shorter terminal heights.
+    let mut sections_data = vec![
+        ("TASK", task_lines),
+        ("BUDGET", budget_lines),
+        ("NEXT REQUEST · CONTEXT", context_lines),
+        ("COST", cost_lines),
+    ];
+    // Each bordered section consumes a bottom-rule row in addition to its
+    // text. Account for that row so natural section heights do not overrun the
+    // sidebar and push EVENTS below the viewport.
+    let minimums = [4_u16, 6, 5, 3, 3];
+    let mut heights = sections_data
+        .iter()
+        .map(|(_, lines)| {
+            u16::try_from(lines.len())
+                .unwrap_or(u16::MAX)
+                .saturating_add(1)
+        })
+        .collect::<Vec<_>>();
+    let available = content.height;
+    while heights.iter().copied().sum::<u16>() + minimums[4] > available {
+        let Some((index, _)) = heights
+            .iter()
+            .enumerate()
+            .filter(|(index, height)| **height > minimums[*index])
+            .max_by_key(|(_, height)| *height)
+        else {
+            break;
+        };
+        heights[index] -= 1;
+    }
+    if heights.iter().copied().sum::<u16>() >= available {
+        // Tiny terminal fallback: keep the event heading visible rather than
+        // allowing the last section to disappear entirely.
+        heights.fill(0);
+    }
+    let event_height = available.saturating_sub(heights.iter().copied().sum::<u16>());
+    let mut constraints = heights
+        .iter()
+        .map(|height| Constraint::Length(*height))
+        .collect::<Vec<_>>();
+    constraints.push(Constraint::Length(event_height));
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(content);
+    for (index, ((_, mut lines), area)) in sections_data
+        .drain(..)
+        .zip(areas.iter().copied())
+        .enumerate()
+    {
+        let line_capacity = usize::from(heights[index].saturating_sub(1));
+        if lines.len() > line_capacity {
+            lines.truncate(line_capacity);
+            if let Some(last) = lines.last_mut() {
+                *last = muted("…");
+            }
+        }
+        render_sidebar_section(frame, area, lines, true);
+    }
+
+    let Some(&event_area) = areas.last() else {
+        return;
+    };
+    let event_rows = usize::from(event_area.height);
+    let mut event_lines = if event_rows == 0 {
+        Vec::new()
+    } else {
+        vec![heading("EVENTS")]
+    };
+    let event_count_rows = usize::from(event_rows >= 2);
+    event_lines.extend(
+        reducer
+            .recent_events
+            .iter()
+            .skip(options.sidebar_scroll_back)
+            .take(event_rows.saturating_sub(1 + event_count_rows))
+            .map(|event| event_line(event)),
+    );
+    if event_count_rows == 1 && event_lines.len() < event_rows {
+        event_lines.push(event_count);
+    }
+    frame.render_widget(
+        Paragraph::new(event_lines).style(Style::default().bg(theme::BG)),
+        event_area,
+    );
+}
+
+fn render_sidebar_section(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    separated: bool,
+) {
+    let border = if separated {
+        Borders::BOTTOM
+    } else {
+        Borders::empty()
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(border)
+                    .border_style(fg(theme::BORDER)),
+            )
+            .style(Style::default().bg(theme::BG))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn sidebar_limit_bar(used: u64, limit: u64, width: u16) -> Line<'static> {
+    let inner = usize::from(width);
+    let filled = match limit {
+        // A zero limit means unbounded: a full bar once anything ran.
+        0 => usize::from(used > 0) * inner,
+        limit => {
+            let cap = u64::try_from(inner).unwrap_or(u64::MAX);
+            usize::try_from((used.saturating_mul(cap) / limit).min(cap)).unwrap_or(inner)
+        }
+    };
+    Line::from(vec![
+        Span::styled("━".repeat(filled), fg(theme::AMBER)),
+        Span::styled("━".repeat(inner.saturating_sub(filled)), fg(theme::BORDER)),
+    ])
+}
+
+fn sidebar_unbounded_bar(width: u16) -> Line<'static> {
+    Line::from(Span::styled(
+        "━".repeat(usize::from(width)),
+        fg(theme::BORDER),
+    ))
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let hours = seconds / 3_600;
+    let minutes = (seconds / 60) % 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
 }
 
 fn format_run_cost(reducer: &Reducer, pricing: Option<ModelPricing>) -> Option<String> {
@@ -1145,9 +1804,20 @@ fn format_run_cost(reducer: &Reducer, pricing: Option<ModelPricing>) -> Option<S
 }
 
 fn render_panel(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_>>) {
-    render_panel_scrolled(frame, area, title, lines, false);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(format!(" {title} "))
+                    .borders(Borders::ALL),
+            )
+            .style(Style::default().bg(theme::BG))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
+#[allow(dead_code)]
 fn render_panel_scrolled(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1182,8 +1852,8 @@ fn render_panel_scrolled(
         Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title(format!(" {title} "))
-                    .borders(Borders::ALL)
+                    .title(title)
+                    .borders(Borders::LEFT)
                     .border_style(fg(if title == "task thread" {
                         theme::THREAD
                     } else {
@@ -1224,14 +1894,7 @@ fn help_key(key: &'static str, description: &'static str) -> Line<'static> {
 }
 
 fn design_area(area: Rect) -> Rect {
-    let width = area.width.min(154);
-    let height = area.height.min(40);
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
+    area
 }
 
 fn heading(text: &str) -> Line<'static> {
@@ -1249,11 +1912,141 @@ fn muted(text: &str) -> Line<'static> {
 fn tinted(text: &str, color: Color) -> Line<'static> {
     Line::from(Span::styled(text.to_owned(), fg(color)))
 }
-fn budget_line(label: &str, value: Option<u64>) -> Line<'static> {
-    muted(&format!("{label}  {}", optional_budget(value)))
+
+fn sidebar_budget_width(
+    label: &str,
+    used: Option<u64>,
+    limit: Option<u64>,
+    width: u16,
+) -> Line<'static> {
+    let (used, limit) = match (used, limit) {
+        (Some(used), Some(limit)) => (used.to_string(), limit.to_string()),
+        (Some(used), None) => (used.to_string(), "unbounded".to_owned()),
+        _ => ("not reported".to_owned(), "not reported".to_owned()),
+    };
+    sidebar_budget_text(label, &format!("{used} / {limit}"), width)
 }
-fn census_line(label: &str, value: u32) -> Line<'static> {
-    muted(&format!("{label}  {value} tokens · compiler estimate"))
+
+fn sidebar_budget_text(label: &str, value: &str, width: u16) -> Line<'static> {
+    let label_len = label.chars().count();
+    let value_len = value.chars().count();
+    let gap = usize::from(width)
+        .saturating_sub(label_len.saturating_add(value_len))
+        .max(2);
+    Line::from(vec![
+        Span::styled(label.to_owned(), fg(theme::DIM)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(value.to_owned(), fg(theme::IVORY)),
+    ])
+}
+fn context_bar(census: ContextCensus, width: u16) -> Line<'static> {
+    let segments = context_categories(census);
+    let total = segments
+        .iter()
+        .map(|(_, value, _)| u64::from(*value))
+        .sum::<u64>();
+    let cells = usize::from(width.saturating_sub(1));
+    if total == 0 || cells == 0 {
+        return Line::from(Span::styled("░".repeat(cells), fg(theme::BORDER)));
+    }
+    let mut widths = segments
+        .iter()
+        .map(|(_, value, _)| {
+            let cells = u64::try_from(cells).unwrap_or(u64::MAX);
+            usize::try_from(u64::from(*value) * cells / total).unwrap_or(0)
+        })
+        .collect::<Vec<_>>();
+    // Largest-remainder allocation ensures the stack always spans its full width.
+    let mut remainders = segments
+        .iter()
+        .enumerate()
+        .map(|(index, (_, value, _))| (index, u64::from(*value) * cells as u64 % total))
+        .collect::<Vec<_>>();
+    remainders.sort_by_key(|(_, remainder)| std::cmp::Reverse(*remainder));
+    for (index, _) in remainders
+        .into_iter()
+        .take(cells.saturating_sub(widths.iter().sum()))
+    {
+        widths[index] += 1;
+    }
+    Line::from(
+        segments
+            .iter()
+            .zip(widths)
+            .filter(|(_, count)| *count > 0)
+            .map(|((_, _, color), count)| Span::styled("█".repeat(count), fg(*color)))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn context_categories(census: ContextCensus) -> Vec<(&'static str, u32, Color)> {
+    [
+        ("system prompt", census.system_prompt, theme::DIM),
+        ("repository facts", census.repo_facts, theme::THREAD),
+        ("user", census.user_items, theme::BLUE),
+        ("reasoning", census.reasoning_replay, theme::VIOLET),
+        ("assistant", census.assistant_history, theme::IVORY),
+        ("tool results", census.tool_results, theme::SAGE),
+        ("tool specs", census.tool_specs, theme::AMBER),
+    ]
+    .into_iter()
+    .filter(|(_, tokens, _)| *tokens > 0)
+    .collect()
+}
+
+fn context_segments(census: ContextCensus, width: u16) -> Vec<Line<'static>> {
+    let categories = context_categories(census);
+    if categories.is_empty() {
+        return vec![muted("no categorized tokens reported")];
+    }
+    let inner_width = usize::from(width.saturating_sub(2));
+    let max_label = categories
+        .iter()
+        .map(|(label, _, _)| label.len())
+        .max()
+        .unwrap_or_default();
+    let count_width = categories
+        .iter()
+        .map(|(_, value, _)| format_compact_tokens(u64::from(*value)).len())
+        .max()
+        .unwrap_or_default();
+    let label_width = max_label.min(inner_width.saturating_sub(count_width + 4));
+    categories
+        .into_iter()
+        .map(|(label, tokens, color)| {
+            Line::from(vec![
+                Span::styled("■ ", fg(color)),
+                Span::styled(format!("{label:<label_width$}"), fg(theme::IVORY)),
+                Span::styled(
+                    format!("{:>count_width$}", format_compact_tokens(u64::from(tokens))),
+                    fg(theme::DIM),
+                ),
+            ])
+        })
+        .collect()
+}
+
+fn event_line(event: &str) -> Line<'static> {
+    let color = if event.contains("ToolCompleted") || event.contains("TaskCompleted") {
+        theme::SAGE
+    } else if event.contains("Failed") || event.contains("Retry") || event.contains("Cancelled") {
+        theme::CORAL
+    } else if event.contains("Reasoning") {
+        theme::VIOLET
+    } else if event.contains("Model") {
+        theme::BLUE
+    } else {
+        theme::DIM
+    };
+    Line::from(Span::styled(event.to_owned(), fg(color)))
+}
+#[allow(clippy::cast_precision_loss)] // compact display rounds to one decimal anyway
+fn format_compact_tokens(tokens: u64) -> String {
+    if tokens >= 1_000 {
+        format!("{:.1}K", tokens as f64 / 1000.0)
+    } else {
+        tokens.to_string()
+    }
 }
 fn optional_budget(value: Option<u64>) -> String {
     value.map_or_else(
@@ -1267,7 +2060,7 @@ fn status_label(reducer: &Reducer) -> &'static str {
         Some(TaskStatus::Completed) => "Completed",
         Some(TaskStatus::Cancelled) => "Cancelled",
         Some(TaskStatus::Failed) => "Failed",
-        Some(TaskStatus::Paused) => "Paused",
+        Some(TaskStatus::Paused) => "Awaiting input",
         _ => "Idle",
     }
 }
@@ -1297,6 +2090,9 @@ mod tests {
     use loom_core::kernel::{
         agent::RemainingBudget,
         context::{ContextBudget, ContextCensus},
+        event::EVENT_SCHEMA_VERSION,
+        model::{ModelResponse, StopReason, Usage},
+        transcript::{AssistantMessage, ToolArguments, ToolCall, ToolCallId},
     };
     use ratatui::{Terminal, backend::TestBackend};
 
@@ -1425,20 +2221,99 @@ mod tests {
     }
 
     #[test]
-    fn live_read_file_result_shows_only_a_one_line_summary() {
+    fn live_header_falls_back_to_configured_model_before_reporting_unknown() {
+        let reducer = Reducer::default();
+        let mut terminal = Terminal::new(TestBackend::new(154, 40)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_live(
+                    frame,
+                    &reducer,
+                    "",
+                    0,
+                    LiveViewOptions {
+                        model: Some("configured-model"),
+                        ..LiveViewOptions::default()
+                    },
+                );
+            })
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("configured-model"));
+        assert!(!rendered.contains("model not reported"));
+    }
+
+    #[test]
+    fn live_read_file_result_shows_a_bounded_numbered_preview() {
         let mut reducer = Reducer::default();
         reducer.begin_task("inspect the file");
-        reducer.tools.insert(
-            "read-1".to_owned(),
-            crate::reducer::ToolState {
-                name: "read_file".to_owned(),
-                arguments: Some(r#"{"path":"src/lib.rs"}"#.to_owned()),
-                status: Some(loom_core::kernel::transcript::ToolStatus::Success),
-                content_head: Some(
-                    "src/lib.rs: 42 lines\n1\tfn main() {\n2\t    secret_file_content()".to_owned(),
-                ),
+        reducer.reduce(
+            &loom_core::EventEnvelope {
+                schema_version: loom_core::kernel::event::EVENT_SCHEMA_VERSION,
+                sequence: 0,
+                task_id: loom_core::TaskId::new(),
+                kind: loom_core::EventKind::TurnStarted { turn: 1 },
             },
+            1,
         );
+        reducer.reduce(
+            &loom_core::EventEnvelope {
+                schema_version: loom_core::kernel::event::EVENT_SCHEMA_VERSION,
+                sequence: 1,
+                task_id: loom_core::TaskId::new(),
+                kind: loom_core::EventKind::ToolStarted {
+                    name: "read_file".into(),
+                    call_id: loom_core::kernel::transcript::ToolCallId::try_from(
+                        "read-1".to_owned(),
+                    )
+                    .unwrap(),
+                    arguments: r#"{"path":"src/lib.rs"}"#.to_owned(),
+                },
+            },
+            1,
+        );
+        let read_window = concat!(
+            "src/lib.rs: 6 lines\n",
+            "1\tfn main() {\n",
+            "2\t    // comment explaining the next line\n",
+            "3\t    first_visible_call()\n",
+            "4\t    fourth_line_hidden_when_collapsed()\n",
+            "5\t    fifth_line_hidden_when_collapsed()\n",
+            "6\t    sixth_line_hidden_when_collapsed()",
+        );
+        let call_id =
+            loom_core::kernel::transcript::ToolCallId::try_from("read-1".to_owned()).unwrap();
+        reducer.reduce(
+            &loom_core::EventEnvelope {
+                schema_version: loom_core::kernel::event::EVENT_SCHEMA_VERSION,
+                sequence: 2,
+                task_id: loom_core::TaskId::new(),
+                kind: loom_core::EventKind::ToolCompleted {
+                    name: "read_file".into(),
+                    call_id,
+                    status: loom_core::kernel::transcript::ToolStatus::Success,
+                    content_head: read_window.to_owned(),
+                },
+            },
+            2,
+        );
+        reducer.committed_transcript.push(Item::ToolResult(
+            loom_core::kernel::transcript::ToolResult::new(
+                loom_core::kernel::transcript::ToolCallId::try_from("read-1".to_owned()).unwrap(),
+                loom_core::kernel::transcript::ToolStatus::Success,
+                read_window,
+                false,
+            ),
+        ));
+        let mut session = loom_core::Session::new(loom_core::SessionId::new());
+        session.transcript.clone_from(&reducer.committed_transcript);
+        reducer.reconcile_session(&session);
         let mut terminal = Terminal::new(TestBackend::new(154, 40)).unwrap();
         terminal
             .draw(|frame| draw_test_live(frame, &reducer, "inspect the file"))
@@ -1451,9 +2326,173 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
 
-        assert!(rendered.contains("src/lib.rs: 42 lines"));
-        assert!(!rendered.contains("fn main()"));
-        assert!(!rendered.contains("secret_file_content"));
+        // The window header summarizes the read and the preview keeps the
+        // numbered gutter for the first lines.
+        assert!(rendered.contains("src/lib.rs: 6 lines"));
+        assert!(rendered.contains("1 │ fn main() {"));
+        assert!(rendered.contains("2 │     // comment explaining the next line"));
+        assert!(rendered.contains("3 │     first_visible_call()"));
+        // Lines past the collapsed cap are elided with an honest count.
+        assert!(!rendered.contains("fourth_line_hidden_when_collapsed"));
+        assert!(rendered.contains("… +3 more lines"));
+    }
+
+    #[test]
+    fn tool_errors_keep_their_category_and_message() {
+        let mut reducer = Reducer::default();
+        reducer.begin_task("run the tool");
+        reducer.reduce(
+            &loom_core::EventEnvelope {
+                schema_version: loom_core::kernel::event::EVENT_SCHEMA_VERSION,
+                sequence: 0,
+                task_id: loom_core::TaskId::new(),
+                kind: loom_core::EventKind::TurnStarted { turn: 1 },
+            },
+            1,
+        );
+        // The model requested the tool before it executed: a real
+        // ModelCompleted registers the assistant message (and its tool call)
+        // in the turn transcript so the branch line renders.
+        reducer.reduce(
+            &loom_core::EventEnvelope {
+                schema_version: EVENT_SCHEMA_VERSION,
+                sequence: 1,
+                task_id: loom_core::TaskId::new(),
+                kind: loom_core::EventKind::ModelCompleted {
+                    response: ModelResponse {
+                        message: AssistantMessage {
+                            content: String::new(),
+                            reasoning: None,
+                            tool_calls: vec![ToolCall {
+                                id: ToolCallId::try_from("cmd-1".to_owned()).unwrap(),
+                                name: "run_command".to_owned(),
+                                arguments: ToolArguments::try_from(serde_json::json!({
+                                    "program": "cargo"
+                                }))
+                                .unwrap(),
+                            }],
+                            stop_reason: StopReason::ToolCalls,
+                        },
+                        usage: Usage::default(),
+                    },
+                },
+            },
+            900,
+        );
+        reducer.reduce(
+            &loom_core::EventEnvelope {
+                schema_version: EVENT_SCHEMA_VERSION,
+                sequence: 2,
+                task_id: loom_core::TaskId::new(),
+                kind: loom_core::EventKind::ToolStarted {
+                    name: "run_command".into(),
+                    call_id: ToolCallId::try_from("cmd-1".to_owned()).unwrap(),
+                    arguments: r#"{"program":"cargo"}"#.to_owned(),
+                },
+            },
+            1000,
+        );
+        let call_id =
+            loom_core::kernel::transcript::ToolCallId::try_from("cmd-1".to_owned()).unwrap();
+        reducer.reduce(
+            &loom_core::EventEnvelope {
+                schema_version: loom_core::kernel::event::EVENT_SCHEMA_VERSION,
+                sequence: 3,
+                task_id: loom_core::TaskId::new(),
+                kind: loom_core::EventKind::ToolCompleted {
+                    name: "run_command".into(),
+                    call_id,
+                    status: loom_core::kernel::transcript::ToolStatus::Error(
+                        loom_core::kernel::transcript::ToolFailure::Timeout,
+                    ),
+                    content_head: "timed out after 30s waiting for cargo test".to_owned(),
+                },
+            },
+            1250,
+        );
+        reducer.committed_transcript.push(Item::ToolResult(
+            loom_core::kernel::transcript::ToolResult::new(
+                loom_core::kernel::transcript::ToolCallId::try_from("cmd-1".to_owned()).unwrap(),
+                loom_core::kernel::transcript::ToolStatus::Error(
+                    loom_core::kernel::transcript::ToolFailure::Timeout,
+                ),
+                "timed out after 30s waiting for cargo test",
+                false,
+            ),
+        ));
+        let mut session = loom_core::Session::new(loom_core::SessionId::new());
+        session.transcript.clone_from(&reducer.committed_transcript);
+        reducer.reconcile_session(&session);
+        let mut terminal = Terminal::new(TestBackend::new(154, 40)).unwrap();
+        terminal
+            .draw(|frame| draw_test_live(frame, &reducer, "run the tool"))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(rendered.contains("error · timeout"));
+        assert!(rendered.contains("timed out after 30s waiting for cargo test"));
+        // Duration stays visible even though the call failed.
+        assert!(rendered.contains("250ms"));
+        assert!(!rendered.contains("· done"));
+    }
+
+    #[test]
+    fn streaming_turn_shows_cursor_and_provisional_reasoning() {
+        let mut reducer = Reducer::default();
+        reducer.begin_task("streaming task");
+        reducer.reduce(
+            &loom_core::EventEnvelope {
+                schema_version: loom_core::kernel::event::EVENT_SCHEMA_VERSION,
+                sequence: 0,
+                task_id: loom_core::TaskId::new(),
+                kind: loom_core::EventKind::TurnStarted { turn: 1 },
+            },
+            1,
+        );
+        reducer.provisional.reasoning = "weighing two approaches".to_owned();
+        reducer.provisional.text = "partial answer so far".to_owned();
+        let mut terminal = Terminal::new(TestBackend::new(154, 40)).unwrap();
+        terminal
+            .draw(|frame| draw_test_live(frame, &reducer, "streaming task"))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(rendered.contains("reasoning · provisional · streaming"));
+        assert!(rendered.contains("partial answer so far"));
+        assert!(rendered.contains("▌"));
+    }
+
+    #[test]
+    fn paused_task_awaits_input() {
+        let mut reducer = Reducer::default();
+        reducer.begin_task("paused task");
+        reducer.task.status = Some(TaskStatus::Paused);
+        let mut terminal = Terminal::new(TestBackend::new(154, 40)).unwrap();
+        terminal
+            .draw(|frame| draw_test_live(frame, &reducer, "paused task"))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(rendered.contains("Awaiting input"));
+        assert!(!rendered.contains("Paused"));
     }
 
     #[test]
@@ -1510,7 +2549,7 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(rendered.contains("MESSAGE · @path to mention a file"));
+        assert!(rendered.contains("› ask @src/lib.rs"));
         assert!(rendered.contains("final answer"));
         assert!(rendered.contains("The final answer is visible."));
         assert!(rendered.contains("ask @src/lib.rs"));
@@ -1595,10 +2634,10 @@ mod tests {
         .unwrap();
         let remaining_budget: RemainingBudget = serde_json::from_value(serde_json::json!({
             "input_tokens": 800,
-            "output_tokens": 500,
+            "output_tokens": null,
             "total_tokens": 1300,
             "tool_calls": 2,
-            "wall_time": null
+            "wall_time": {"secs": 478, "nanos": 0}
         }))
         .unwrap();
         reducer.context_progress = Some(crate::reducer::ContextProgress {
@@ -1606,7 +2645,10 @@ mod tests {
             context_budget,
             census,
             remaining_budget,
+            elapsed_at_compile: Some(Duration::from_secs(102)),
+            tool_calls_used: 7,
         });
+        reducer.tool_calls_started = 7;
         let mut terminal = Terminal::new(TestBackend::new(154, 60)).unwrap();
         terminal
             .draw(|frame| {
@@ -1616,7 +2658,7 @@ mod tests {
                     "",
                     0,
                     LiveViewOptions {
-                        elapsed: Some(Duration::ZERO),
+                        elapsed: Some(Duration::from_secs(102)),
                         ..LiveViewOptions::default()
                     },
                 );
@@ -1633,6 +2675,157 @@ mod tests {
         assert!(text.contains("unbounded"));
         assert!(text.contains("estimated 670/"));
         assert!(text.contains("repository facts"));
+        assert!(text.contains("7 / 9"));
+        assert!(text.contains("01:42 / 09:40"), "{text:?}");
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .filter(|cell| cell.symbol() == "━")
+                .count()
+                >= 40,
+            "expected tool-call and wall-time budget bars"
+        );
+    }
+
+    #[test]
+    fn runtime_sidebar_keeps_every_section_and_events_visible() {
+        let mut reducer = Reducer::default();
+        reducer.task.task_id = Some(loom_core::TaskId::new());
+        reducer.task.status = Some(loom_core::kernel::session::TaskStatus::Running);
+        reducer.event_count = 1284;
+        reducer.recent_events = vec![
+            "#1284 ReasoningDelta".into(),
+            "#1283 ModelRequestStarted".into(),
+            "#1282 TurnStarted".into(),
+        ];
+        // At screenshot-scale terminal heights the sidebar must still retain
+        // its EVENTS heading, at least one event, and the counter.
+        let mut terminal = Terminal::new(TestBackend::new(154, 40)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_live(
+                    frame,
+                    &reducer,
+                    "",
+                    0,
+                    LiveViewOptions {
+                        elapsed: Some(Duration::from_secs(102)),
+                        dropped: Some(0),
+                        ..LiveViewOptions::default()
+                    },
+                );
+            })
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        for section in ["TASK", "BUDGET", "NEXT REQUEST · CONTEXT", "COST", "EVENTS"] {
+            assert!(
+                rendered.contains(section),
+                "missing {section} section: {rendered}"
+            );
+        }
+        assert!(rendered.contains("#1284 ReasoningDelta"));
+        assert!(rendered.contains("events 1284 · dropped 0"));
+    }
+
+    #[test]
+    fn context_bar_uses_proportional_census_categories_and_legend_colors() {
+        let census: ContextCensus = serde_json::from_value(serde_json::json!({
+            "system_prompt": 50,
+            "repo_facts": 0,
+            "user_items": 25,
+            "assistant_history": 0,
+            "reasoning_replay": 0,
+            "tool_results": 25,
+            "tool_specs": 0,
+            "total": 120
+        }))
+        .unwrap();
+
+        let bar = context_bar(census, 21);
+        let symbols = bar
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let system_style = bar.spans[0].style;
+        let user_style = bar.spans[1].style;
+        let tools_style = bar.spans[2].style;
+        let segments = context_segments(census, 30);
+
+        assert_eq!(symbols.chars().count(), 20);
+        assert_eq!(symbols.chars().filter(|symbol| *symbol == '█').count(), 20);
+        assert_eq!(
+            bar.spans
+                .iter()
+                .map(|span| span.content.chars().count())
+                .collect::<Vec<_>>(),
+            [10, 5, 5]
+        );
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].spans[0].style, system_style);
+        assert_eq!(segments[1].spans[0].style, user_style);
+        assert_eq!(segments[2].spans[0].style, tools_style);
+        assert!(segments[0].to_string().contains("system prompt"));
+        assert!(segments[1].to_string().contains("user"));
+        assert!(segments[2].to_string().contains("tool results"));
+    }
+
+    #[test]
+    fn empty_context_census_reports_unavailable_categories_without_fake_segments() {
+        let census = ContextCensus::default();
+        assert!(
+            context_bar(census, 12)
+                .spans
+                .iter()
+                .all(|span| !span.content.contains('█'))
+        );
+        assert_eq!(
+            context_segments(census, 30)[0].to_string(),
+            "no categorized tokens reported"
+        );
+    }
+
+    #[test]
+    fn sidebar_event_offset_reveals_older_events() {
+        let mut reducer = Reducer::default();
+        reducer.recent_events = (0..8)
+            .rev()
+            .map(|sequence| format!("#{sequence} TurnStarted"))
+            .collect();
+        let mut terminal = Terminal::new(TestBackend::new(154, 40)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_live(
+                    frame,
+                    &reducer,
+                    "",
+                    0,
+                    LiveViewOptions {
+                        sidebar_scroll_back: 5,
+                        ..LiveViewOptions::default()
+                    },
+                );
+            })
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("#2 TurnStarted"));
+        assert!(!rendered.contains("#7 TurnStarted"));
     }
 
     #[test]
@@ -1646,6 +2839,8 @@ mod tests {
             },
             census: ContextCensus::default(),
             remaining_budget: RemainingBudget::default(),
+            elapsed_at_compile: None,
+            tool_calls_used: 0,
         });
         let mut terminal = Terminal::new(TestBackend::new(154, 60)).unwrap();
         terminal
@@ -1669,9 +2864,20 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(rendered.contains("unbounded"));
+        assert!(rendered.contains("unbounded"), "{rendered}");
         assert!(rendered.contains("estimated 0/20000"));
         assert!(!rendered.contains("0 remaining"));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .filter(|cell| cell.symbol() == "━")
+                .count()
+                >= 40,
+            "unbounded tool-call and wall-time limits should still show neutral tracks"
+        );
     }
 
     #[test]

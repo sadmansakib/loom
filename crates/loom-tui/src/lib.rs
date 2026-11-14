@@ -143,6 +143,7 @@ async fn run_interactive(
     let mut input = PromptEditor::default();
     let file_index = workspace_files(&config.workspace);
     let mut thread_scroll_back = 0_usize;
+    let mut sidebar_scroll_back = 0_usize;
     let mut pending_display_prompt = None;
     let mut help = false;
     let mut picker = pending_task.is_none();
@@ -296,6 +297,9 @@ async fn run_interactive(
             reducer.set_attachments(mentioned);
             reducer.restore_display_prompt();
             let started_at = std::time::Instant::now();
+            let workspace = workspace_label(&config.workspace);
+            let session_id = session.id.to_string();
+            let effort = format!("{:?}", config.reasoning_effort).to_lowercase();
             let mut run = Box::pin(engine.run_task(session, task, &sink, &task_control));
             let result = loop {
                 terminal.draw(|frame| {
@@ -310,9 +314,15 @@ async fn run_interactive(
                         Some(started_at.elapsed()),
                         Some(sink.dropped()),
                         thread_scroll_back,
+                        sidebar_scroll_back,
                         picker_state.selected().pricing,
                         &input,
                         &file_index,
+                        &config,
+                        Some(session_id.as_str()),
+                        picker_state.selected().capabilities,
+                        &workspace,
+                        &effort,
                     );
                 })?;
                 tokio::select! {
@@ -328,7 +338,7 @@ async fn run_interactive(
                         if event::poll(Duration::ZERO)? {
                             match event::read()? {
                                 Event::Key(key) => {
-                                    if !update_thread_scroll(key, &mut thread_scroll_back) {
+                                    if !update_sidebar_scroll(key, &mut sidebar_scroll_back) && !update_thread_scroll(key, &mut thread_scroll_back) {
                                         handle_key(key, &mut KeyContext {
                                             input: &mut input,
                                             workspace: &config.workspace,
@@ -343,7 +353,13 @@ async fn run_interactive(
                                         });
                                     }
                                 }
-                                Event::Mouse(mouse) => update_thread_mouse(mouse, &mut thread_scroll_back),
+                                Event::Mouse(mouse) => {
+                                    if mouse.column >= terminal.size()?.width.saturating_sub(42) {
+                                        update_sidebar_mouse(mouse, &mut sidebar_scroll_back);
+                                    } else {
+                                        update_thread_mouse(mouse, &mut thread_scroll_back);
+                                    }
+                                }
                                 Event::Paste(text) => input.insert_paste(&text),
                                 Event::FocusGained | Event::FocusLost | Event::Resize(..) => {}
                             }
@@ -368,6 +384,7 @@ async fn run_interactive(
         }
 
         terminal.draw(|frame| {
+            let session_label = active.as_ref().map(|(_, session)| session.id.to_string());
             draw_live(
                 frame,
                 &reducer,
@@ -379,9 +396,15 @@ async fn run_interactive(
                 last_elapsed,
                 last_dropped,
                 thread_scroll_back,
+                sidebar_scroll_back,
                 picker_state.selected().pricing,
                 &input,
                 &file_index,
+                &config,
+                session_label.as_deref(),
+                picker_state.selected().capabilities,
+                &workspace_label(&config.workspace),
+                &format!("{:?}", config.reasoning_effort).to_lowercase(),
             );
         })?;
         if should_quit {
@@ -390,7 +413,9 @@ async fn run_interactive(
         if event::poll(FRAME_TICK)? {
             match event::read()? {
                 Event::Key(key) => {
-                    if !update_thread_scroll(key, &mut thread_scroll_back) {
+                    if !update_sidebar_scroll(key, &mut sidebar_scroll_back)
+                        && !update_thread_scroll(key, &mut thread_scroll_back)
+                    {
                         handle_key(
                             key,
                             &mut KeyContext {
@@ -411,7 +436,13 @@ async fn run_interactive(
                         picker_loaded = false;
                     }
                 }
-                Event::Mouse(mouse) => update_thread_mouse(mouse, &mut thread_scroll_back),
+                Event::Mouse(mouse) => {
+                    if mouse.column >= terminal.size()?.width.saturating_sub(42) {
+                        update_sidebar_mouse(mouse, &mut sidebar_scroll_back);
+                    } else {
+                        update_thread_mouse(mouse, &mut thread_scroll_back);
+                    }
+                }
                 Event::Paste(text) => input.insert_paste(&text),
                 Event::FocusGained | Event::FocusLost | Event::Resize(..) => {}
             }
@@ -961,6 +992,37 @@ fn update_thread_scroll(key: KeyEvent, scroll_back: &mut usize) -> bool {
     }
 }
 
+fn update_sidebar_scroll(key: KeyEvent, scroll_back: &mut usize) -> bool {
+    match (key.code, key.modifiers) {
+        (KeyCode::PageUp, KeyModifiers::SHIFT) => {
+            *scroll_back = scroll_back.saturating_add(3);
+            true
+        }
+        (KeyCode::PageDown, KeyModifiers::SHIFT) => {
+            *scroll_back = scroll_back.saturating_sub(3);
+            true
+        }
+        (KeyCode::Home, KeyModifiers::SHIFT) => {
+            *scroll_back = 0;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn update_sidebar_mouse(mouse: MouseEvent, scroll_back: &mut usize) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => *scroll_back = scroll_back.saturating_add(3),
+        MouseEventKind::ScrollDown => *scroll_back = scroll_back.saturating_sub(3),
+        MouseEventKind::Down(_)
+        | MouseEventKind::Up(_)
+        | MouseEventKind::Drag(_)
+        | MouseEventKind::Moved
+        | MouseEventKind::ScrollLeft
+        | MouseEventKind::ScrollRight => {}
+    }
+}
+
 fn update_thread_mouse(mouse: MouseEvent, scroll_back: &mut usize) {
     match mouse.kind {
         MouseEventKind::ScrollUp => *scroll_back = scroll_back.saturating_add(3),
@@ -1046,6 +1108,8 @@ fn handle_key(key: KeyEvent, context: &mut KeyContext<'_>) {
             **picker = true;
         }
         (KeyCode::Char('b'), KeyModifiers::CONTROL) => **sidebar = !**sidebar,
+        (KeyCode::Char('r'), KeyModifiers::CONTROL) => reducer.toggle_reasoning(),
+        (KeyCode::Char('o'), KeyModifiers::CONTROL) => reducer.toggle_details(),
         (KeyCode::Tab, _) if input.has_file_mention() => input.complete_file(workspace),
         (KeyCode::Enter, modifiers)
             if modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
@@ -1320,9 +1384,15 @@ fn draw_live(
     elapsed: Option<Duration>,
     dropped: Option<u64>,
     thread_scroll_back: usize,
+    sidebar_scroll_back: usize,
     pricing: Option<ModelPricing>,
     input_editor: &PromptEditor,
     file_index: &[String],
+    config: &EngineConfig,
+    session_id: Option<&str>,
+    capabilities: Option<ModelCapabilities>,
+    workspace: &str,
+    effort: &str,
 ) {
     if help {
         scene_views::draw(frame, Scene::Help);
@@ -1342,12 +1412,33 @@ fn draw_live(
                 elapsed,
                 dropped,
                 thread_scroll_back,
+                sidebar_scroll_back,
                 file_suggestions: &suggestions,
                 pricing,
+                workspace: Some(workspace),
+                session_id,
+                model: Some(&config.model),
+                effort: Some(effort),
+                thinking: capabilities.map(
+                    |capabilities| {
+                        if capabilities.reasoning { "on" } else { "off" }
+                    },
+                ),
+                turn_limit: Some(config.max_turns),
                 scene: None,
             },
         );
     }
+}
+
+fn workspace_label(workspace: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    home.as_deref()
+        .and_then(|home| workspace.strip_prefix(home).ok())
+        .map_or_else(
+            || workspace.display().to_string(),
+            |relative| format!("~/{}", relative.display()),
+        )
 }
 
 fn matching_file_suggestions(file_index: &[String], query: &str) -> Vec<String> {
@@ -1736,6 +1827,29 @@ mod tests {
         assert!(update_thread_scroll(
             KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL),
             &mut scroll_back
+        ));
+    }
+
+    #[test]
+    fn shift_page_navigation_scrolls_sidebar_independently() {
+        let mut sidebar_scroll = 0;
+        assert!(update_sidebar_scroll(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT),
+            &mut sidebar_scroll
+        ));
+        assert_eq!(sidebar_scroll, 3);
+        assert!(update_sidebar_scroll(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT),
+            &mut sidebar_scroll
+        ));
+        assert_eq!(sidebar_scroll, 0);
+        assert!(update_sidebar_scroll(
+            KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT),
+            &mut sidebar_scroll
+        ));
+        assert!(!update_sidebar_scroll(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            &mut sidebar_scroll
         ));
     }
 
