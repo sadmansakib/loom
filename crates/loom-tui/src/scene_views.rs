@@ -136,7 +136,7 @@ pub fn draw_live_scrolled(
     } else {
         u16::try_from(file_suggestions.len().min(5)).unwrap_or(5) + 2
     };
-    let header_height = 2;
+    let header_height = if compact { 1 } else { 2 };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -195,11 +195,13 @@ pub fn draw_live_scrolled(
     ];
     frame.render_widget(
         Paragraph::new(Line::from(prompt_spans))
-            .block(
+            .block(if compact {
+                Block::default()
+            } else {
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(fg(theme::BORDER)),
-            )
+                    .border_style(fg(theme::BORDER))
+            })
             .style(Style::default().bg(theme::BG))
             .scroll((prompt_scroll, 0))
             .wrap(Wrap { trim: false }),
@@ -619,7 +621,7 @@ fn draw_live_header(
         )
     };
     let content = Rect {
-        height: area.height.saturating_sub(1),
+        height: area.height.saturating_sub(u16::from(area.height > 1)),
         ..area
     };
     let columns = Layout::default()
@@ -631,14 +633,16 @@ fn draw_live_header(
         Paragraph::new(right).alignment(Alignment::Right),
         columns[1],
     );
-    frame.render_widget(
-        Paragraph::new("─".repeat(usize::from(area.width))).style(fg(theme::BORDER)),
-        Rect {
-            y: area.y + area.height.saturating_sub(1),
-            height: 1,
-            ..area
-        },
-    );
+    if area.height > 1 {
+        frame.render_widget(
+            Paragraph::new("─".repeat(usize::from(area.width))).style(fg(theme::BORDER)),
+            Rect {
+                y: area.y + area.height.saturating_sub(1),
+                height: 1,
+                ..area
+            },
+        );
+    }
 }
 
 #[cfg(test)]
@@ -927,6 +931,10 @@ mod tests {
             "no status line in {rows:#?}"
         );
         assert!(!rows.iter().any(|row| row.contains("[F2] models")));
+        assert!(
+            !rows.iter().any(|row| row.contains("┌")),
+            "prompt still boxed"
+        );
     }
 
     #[test]
