@@ -388,6 +388,33 @@ pub(super) fn draw_runtime_sidebar(
         ("NEXT REQUEST · CONTEXT", context_lines),
         ("COST", cost_lines),
     ];
+    if reducer.task.status.is_none() {
+        sections_data.push((
+            "SESSION",
+            vec![
+                muted(&format!(
+                    "model {}",
+                    options.model.unwrap_or("not reported")
+                )),
+                muted(&format!(
+                    "effort {}",
+                    options.effort.unwrap_or("not reported")
+                )),
+                muted(&format!(
+                    "thinking {}",
+                    options.thinking.unwrap_or("not reported")
+                )),
+            ],
+        ));
+        sections_data.push((
+            "TOOLS",
+            vec![
+                muted("read   allowed"),
+                muted("write  asks each time"),
+                muted("shell  asks each time"),
+            ],
+        ));
+    }
     if let Some(request) = options.approval {
         sections_data.push((
             "PENDING",
@@ -406,6 +433,10 @@ pub(super) fn draw_runtime_sidebar(
     let mut minimums = vec![4_u16, 6, 5, 3, 3];
     if options.approval.is_some() {
         minimums.insert(4, 3);
+    }
+    if reducer.task.status.is_none() {
+        minimums.insert(4, 3);
+        minimums.insert(5, 3);
     }
     let mut heights = sections_data
         .iter()

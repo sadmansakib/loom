@@ -1854,3 +1854,41 @@ mod pending_sidebar_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod idle_sidebar_tests {
+    use crate::scene_views::{LiveViewOptions, draw_live};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn idle_sidebar_shows_session_and_tool_permissions() {
+        let reducer = crate::reducer::Reducer::default();
+        let options = LiveViewOptions {
+            sidebar_visible: true,
+            model: Some("deepseek-chat"),
+            effort: Some("medium"),
+            thinking: Some("on"),
+            ..LiveViewOptions::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(154, 80)).unwrap();
+        terminal
+            .draw(|frame| draw_live(frame, &reducer, "", 0, options))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(
+            text.contains("model deepseek-chat"),
+            "session model missing"
+        );
+        assert!(text.contains("effort medium"), "session effort missing");
+        assert!(
+            text.contains("write  asks each time"),
+            "tool permission missing"
+        );
+    }
+}
