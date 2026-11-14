@@ -209,6 +209,13 @@ pub struct ExpandedDetails {
 }
 
 impl Reducer {
+    /// Records a locally observed event label (approval decisions) in the
+    /// same newest-first list the event stream feeds.
+    pub fn note_event(&mut self, label: impl Into<String>) {
+        self.recent_events.insert(0, label.into());
+        self.recent_events.truncate(RECENT_EVENT_LIMIT);
+    }
+
     /// Adds the user-authored task to the live projection before engine events
     /// arrive. Session reconciliation later replaces this with committed data.
     pub fn begin_task(&mut self, task: impl Into<String>) {

@@ -35,11 +35,23 @@ pub struct WriteFileTool {
     approval: Option<WriteApproval>,
 }
 
-/// Asks the operator to approve one write: `true` allows it. The
-/// frontend returns `false` (decline) or `true` (allow, possibly after
-/// recording "never ask again" in the trust store).
-pub type WriteApproval =
-    std::sync::Arc<dyn Fn(String) -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
+/// The operator's answer to one write approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteDecision {
+    /// Write the proposed content as-is.
+    Allow,
+    /// Refuse the write.
+    Decline,
+    /// Write this edited content instead of the proposed one.
+    Edit(String),
+}
+
+/// Asks the operator to approve one write. The frontend returns a
+/// [`WriteDecision`]; "never ask again" is recorded in the trust store
+/// by the frontend before it returns `Allow`.
+pub type WriteApproval = std::sync::Arc<
+    dyn Fn(String, String) -> futures::future::BoxFuture<'static, WriteDecision> + Send + Sync,
+>;
 
 impl std::fmt::Debug for WriteFileTool {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -128,16 +140,19 @@ impl Tool for WriteFileTool {
             // escalation wearing the operator's signature.
             crate::confinement::ensure_mutable(&ctx.workspace_root, &path)?;
             let relative = workspace_relative(&ctx.workspace_root, &path);
+            let mut content = input.content;
             if let Some(approval) = &self.approval {
-                let allowed = approval(relative.clone()).await;
-                if !allowed {
-                    return Err(ToolError::Execution(format!(
-                        "write to \"{relative}\" was declined by the operator"
-                    )));
+                match approval(relative.clone(), content.clone()).await {
+                    WriteDecision::Allow => {}
+                    WriteDecision::Edit(edited) => content = edited,
+                    WriteDecision::Decline => {
+                        return Err(ToolError::Execution(format!(
+                            "write to \"{relative}\" was declined by the operator"
+                        )));
+                    }
                 }
             }
             let scope = input.verify;
-            let content = input.content;
             let written = content.len();
             let moved_path = path.clone();
             let moved_display = display.clone();
@@ -264,6 +279,55 @@ mod tests {
 
     async fn write(root: &Path, args: Value) -> Result<ToolOutput, ToolError> {
         WriteFileTool::default().call(args, &ctx(root)).await
+    }
+
+    /// A tool whose approval hook always answers `decision`.
+    fn gated(decision: WriteDecision) -> WriteFileTool {
+        let approval: WriteApproval = std::sync::Arc::new(move |_path, _content| {
+            let decision = decision.clone();
+            Box::pin(async move { decision })
+        });
+        WriteFileTool::default().with_approval(approval)
+    }
+
+    #[tokio::test]
+    async fn approved_write_lands_as_proposed() {
+        let (_guard, root) = temp_root();
+        let args = json!({"path": "a.txt", "content": "as proposed"});
+        gated(WriteDecision::Allow)
+            .call(args, &ctx(&root))
+            .await
+            .expect("allowed");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).expect("read"),
+            "as proposed"
+        );
+    }
+
+    #[tokio::test]
+    async fn declined_write_touches_nothing() {
+        let (_guard, root) = temp_root();
+        let args = json!({"path": "a.txt", "content": "nope"});
+        let err = gated(WriteDecision::Decline)
+            .call(args, &ctx(&root))
+            .await
+            .expect_err("declined");
+        assert!(err.to_string().contains("declined by the operator"));
+        assert!(!root.join("a.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn edited_write_lands_the_operator_text() {
+        let (_guard, root) = temp_root();
+        let args = json!({"path": "a.txt", "content": "model draft"});
+        gated(WriteDecision::Edit("operator edit".to_string()))
+            .call(args, &ctx(&root))
+            .await
+            .expect("edited");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).expect("read"),
+            "operator edit"
+        );
     }
 
     #[tokio::test]

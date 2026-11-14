@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
 mod sidebar;
@@ -79,6 +79,8 @@ pub struct LiveViewOptions<'a> {
     pub sidebar_scroll_back: usize,
     pub file_suggestions: &'a [String],
     pub recent: &'a [RecentSession],
+    /// Write awaiting the operator; drawn as an amber box over the thread.
+    pub approval: Option<&'a crate::approval::Request>,
     pub pricing: Option<ModelPricing>,
     pub scene: Option<Scene>,
 }
@@ -179,6 +181,9 @@ pub fn draw_live_scrolled(
         draw_reducer_thread(frame, body[0], reducer, compact, thread_scroll_back, scene);
     }
     let (cursor_x, cursor_y, prompt_scroll) = prompt_cursor(input, cursor, footer[0]);
+    if let Some(request) = options.approval {
+        draw_approval_box(frame, body[0], request);
+    }
     frame.set_cursor_position((cursor_x.saturating_add(2), cursor_y));
     let prompt_spans = vec![
         Span::styled("› ", fg(theme::AMBER).add_modifier(Modifier::BOLD)),
@@ -566,6 +571,42 @@ fn draw_idle_home(frame: &mut Frame<'_>, area: Rect, recent: &[RecentSession]) {
         fg(theme::DIM),
     )));
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Amber box for a write waiting on the operator: path, a preview line, and
+/// the answer keys. Meaning is carried by text as well as color.
+fn draw_approval_box(frame: &mut Frame<'_>, area: Rect, request: &crate::approval::Request) {
+    let height = 5.min(area.height);
+    let box_area = Rect {
+        x: area.x,
+        y: area.y + area.height.saturating_sub(height),
+        width: area.width,
+        height,
+    };
+    let preview = request.content.lines().next().unwrap_or("");
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "◇ Allow this write? ",
+                fg(theme::AMBER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(request.path.clone(), fg(theme::IVORY)),
+        ]),
+        Line::from(Span::styled(preview.to_string(), fg(theme::DIM))),
+        Line::from(Span::styled(
+            "y allow once   a always (don't ask again)   n decline   e edit",
+            fg(theme::DIM),
+        )),
+    ];
+    frame.render_widget(Clear, box_area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(fg(theme::AMBER)),
+        ),
+        box_area,
+    );
 }
 
 fn draw_live_header(

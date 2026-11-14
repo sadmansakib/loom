@@ -3,6 +3,7 @@
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+mod approval;
 mod glyphs;
 mod input;
 mod keys;
@@ -243,6 +244,9 @@ async fn run_interactive(
     let mut picker_state = PickerState::configured(&config);
     let mut picker_loaded = false;
     let mut last_dropped = None;
+    let (approval_tx, mut approval_rx) =
+        tokio::sync::mpsc::unbounded_channel::<approval::Request>();
+    let mut pending_approval: Option<approval::Request> = None;
     if picker {
         picker_state = PickerState::discover(&config).await?;
         picker_state.apply(&mut config);
@@ -251,7 +255,8 @@ async fn run_interactive(
     let mut active: Option<(Engine, Session)> = None;
 
     if !picker {
-        active = Some(open_engine(&config, overrides.take().unwrap_or_default()).await?);
+        active =
+            Some(open_engine(&config, overrides.take().unwrap_or_default(), &approval_tx).await?);
     }
 
     loop {
@@ -305,7 +310,8 @@ async fn run_interactive(
                                 engine_overrides =
                                     engine_overrides.with_credential(credential.clone());
                             }
-                            let (engine, session) = open_engine(&config, engine_overrides).await?;
+                            let (engine, session) =
+                                open_engine(&config, engine_overrides, &approval_tx).await?;
                             active = Some((engine, previous_session.unwrap_or(session)));
                             picker = false;
                         }
@@ -322,7 +328,10 @@ async fn run_interactive(
 
         if let Some(task) = pending_task.take() {
             let Some((engine, session)) = active.as_mut() else {
-                active = Some(open_engine(&config, overrides.take().unwrap_or_default()).await?);
+                active = Some(
+                    open_engine(&config, overrides.take().unwrap_or_default(), &approval_tx)
+                        .await?,
+                );
                 continue;
             };
             let (sink, mut events) = ChannelEventSink::new();
@@ -366,6 +375,7 @@ async fn run_interactive(
                             input_editor: &input,
                             file_index: &file_index,
                             recent: &recent,
+                            approval: pending_approval.as_ref(),
                             config: &config,
                             session_id: Some(session_id.as_str()),
                             capabilities: picker_state.selected().capabilities,
@@ -380,12 +390,33 @@ async fn run_interactive(
                             reducer.reduce(&event, epoch_millis());
                         }
                     }
+                    request = approval_rx.recv(), if pending_approval.is_none() => {
+                        if let Some(request) = request {
+                            reducer.note_event(format!("ApprovalRequested {}", request.path));
+                            pending_approval = Some(request);
+                        }
+                    }
                     result = &mut run => {
                         break result;
                     }
                     () = tokio::time::sleep(FRAME_TICK) => {
                         if event::poll(Duration::ZERO)? {
                             let event = event::read()?;
+                            if let Event::Key(crossterm::event::KeyEvent { code: KeyCode::Char(answer), .. }) = &event
+                                && let Some(decision) = approval::decision_for_key(*answer)
+                                && let Some(request) = pending_approval.take()
+                            {
+                                if *answer == 'a' {
+                                    loom_core::tools::trust::allow_writes(&config.workspace)?;
+                                }
+                                reducer.note_event(format!(
+                                    "ApprovalDecided {} {}",
+                                    request.path,
+                                    if decision == loom_core::tools::WriteDecision::Decline { "declined" } else { "allowed" }
+                                ));
+                                let _ = request.reply.send(decision);
+                                continue;
+                            }
                             route_event(
                                 event,
                                 || terminal.size().map(|size| size.width.saturating_sub(scene_views::SIDEBAR_WIDTH)),
@@ -442,6 +473,7 @@ async fn run_interactive(
                     input_editor: &input,
                     file_index: &file_index,
                     recent: &recent,
+                    approval: pending_approval.as_ref(),
                     config: &config,
                     session_id: session_label.as_deref(),
                     capabilities: picker_state.selected().capabilities,
@@ -491,7 +523,10 @@ async fn run_interactive(
 async fn open_engine(
     config: &EngineConfig,
     overrides: loom_core::EngineOverrides,
+    requests: &tokio::sync::mpsc::UnboundedSender<approval::Request>,
 ) -> Result<(Engine, Session)> {
+    let overrides =
+        overrides.with_write_approval(approval::hook(config.workspace.clone(), requests.clone()));
     let engine = Engine::open_async_with(config.clone(), overrides)
         .await
         .context("open Loom engine")?;

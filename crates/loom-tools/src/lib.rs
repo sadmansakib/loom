@@ -58,4 +58,4 @@ pub use search::SearchTool;
 pub use skills::LoadSkillTool;
 pub use symbols::{ReplaceSymbolTool, SymbolsOverviewTool, enclosing_symbol_cues};
 pub use verify::VerifyTool;
-pub use write_file::{WriteApproval, WriteFileTool};
+pub use write_file::{WriteApproval, WriteDecision, WriteFileTool};
