@@ -534,19 +534,28 @@ fn draw_idle_home(frame: &mut Frame<'_>, area: Rect, recent: &[RecentSession]) {
         )));
     }
     for session in recent {
-        let status = session.status.map_or("○", |_| "✓");
-        let short: String = session.id.chars().take(8).collect();
+        let status = match session.status {
+            Some(TaskStatus::Completed) => "✓",
+            Some(TaskStatus::Failed | TaskStatus::Cancelled) => "⊘",
+            _ => "○",
+        };
+        let status_color = match session.status {
+            Some(TaskStatus::Completed) => theme::TEAL,
+            _ => theme::DIM,
+        };
         lines.push(Line::from(vec![
-            Span::styled(format!("{status} "), fg(theme::TEAL)),
-            Span::styled(short, fg(theme::IVORY)),
-            Span::styled(format!("  {} items", session.items), fg(theme::DIM)),
+            Span::styled(format!("❯ {} ", session.title), fg(theme::IVORY)),
+            Span::styled(
+                format!("{status} {} turns", session.turns),
+                fg(status_color),
+            ),
         ]));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled("TRY", fg(theme::DIM))));
     lines.push(Line::from(Span::styled(
-        "  summarize the failing test in crates/loom-tui",
-        fg(theme::IVORY),
+        "Explain this crate · Find where X is defined · Add a test for Y",
+        fg(theme::DIM),
     )));
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -890,6 +899,45 @@ mod tests {
                 Scene::Main | Scene::Picker | Scene::Help => {}
             }
         }
+    }
+
+    #[test]
+    fn idle_home_lists_recent_sessions_and_try_hints() {
+        let reducer = Reducer::default();
+        let recent = [crate::recent::RecentSession {
+            title: "Inspect the retry path".into(),
+            turns: 5,
+            status: Some(TaskStatus::Completed),
+        }];
+        let mut terminal = Terminal::new(TestBackend::new(154, 40)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_live(
+                    frame,
+                    &reducer,
+                    "",
+                    0,
+                    LiveViewOptions {
+                        recent: &recent,
+                        ..LiveViewOptions::default()
+                    },
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("RECENT"));
+        assert!(rendered.contains("Inspect the retry path"));
+        assert!(rendered.contains("✓ 5 turns"));
+        assert!(rendered.contains("TRY"));
+        assert!(rendered.contains("Explain this crate"));
     }
 
     #[test]
