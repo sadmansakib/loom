@@ -20,6 +20,12 @@ use crate::{Scene, scene_views};
 
 /// Everything the live frame needs, grouped so `draw_live` takes one argument
 /// instead of a long positional list.
+/// Full-screen modal scenes drawn instead of the live view.
+#[derive(Clone, Copy)]
+pub(crate) enum Overlay {
+    Context,
+}
+
 pub(crate) struct LiveFrame<'a> {
     pub(crate) reducer: &'a Reducer,
     pub(crate) input: &'a str,
@@ -43,6 +49,7 @@ pub(crate) struct LiveFrame<'a> {
     pub(crate) palette_selected: usize,
     /// The `/sessions` screen, drawn over the live view while open.
     pub(crate) sessions: Option<&'a crate::sessions_screen::SessionsScreen>,
+    pub(crate) overlay: Option<Overlay>,
     pub(crate) config: &'a EngineConfig,
     pub(crate) session_id: Option<&'a str>,
     pub(crate) capabilities: Option<ModelCapabilities>,
@@ -70,6 +77,7 @@ pub(crate) fn draw_live(frame: &mut ratatui::Frame<'_>, view: &LiveFrame<'_>) {
         notice,
         palette_selected,
         sessions,
+        overlay,
         config,
         session_id,
         capabilities,
@@ -80,6 +88,8 @@ pub(crate) fn draw_live(frame: &mut ratatui::Frame<'_>, view: &LiveFrame<'_>) {
         scene_views::draw(frame, Scene::Help);
     } else if let Some(screen) = sessions {
         crate::sessions_screen::draw(frame, frame.area(), screen);
+    } else if let Some(Overlay::Context) = overlay {
+        crate::context_screen::draw(frame, frame.area(), reducer);
     } else if picker {
         scene_views::draw_picker(frame, &PickerState::empty());
     } else {

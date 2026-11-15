@@ -4,6 +4,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 mod approval;
+mod context_screen;
 mod glyphs;
 mod input;
 mod keys;
@@ -259,6 +260,7 @@ async fn run_interactive(
     let mut palette_selected = 0_usize;
     let mut notice: Option<String> = None;
     let mut sessions: Option<sessions_screen::SessionsScreen> = None;
+    let mut context_open = false;
     let mut event_log: Vec<loom_core::EventEnvelope> = Vec::new();
     if picker {
         picker_state = PickerState::discover(&config).await?;
@@ -393,6 +395,7 @@ async fn run_interactive(
                             notice: None,
                             palette_selected: 0,
                             sessions: None,
+                            overlay: None,
                             config: &config,
                             session_id: Some(session_id.as_str()),
                             capabilities: picker_state.selected().capabilities,
@@ -511,6 +514,7 @@ async fn run_interactive(
                     notice: notice.as_deref(),
                     palette_selected,
                     sessions: sessions.as_ref(),
+                    overlay: context_open.then_some(crate::terminal::Overlay::Context),
                     config: &config,
                     session_id: session_label.as_deref(),
                     capabilities: picker_state.selected().capabilities,
@@ -583,6 +587,19 @@ async fn run_interactive(
             } else {
                 false
             };
+            // The context inspector owns every key while it is open.
+            let handled_by_context = if context_open && let Event::Key(key) = &event {
+                if key.code == crossterm::event::KeyCode::Esc {
+                    context_open = false;
+                } else if key.code == crossterm::event::KeyCode::Char('c')
+                    && key.modifiers.is_empty()
+                {
+                    notice = Some("compaction runs automatically when the context fills".into());
+                }
+                true
+            } else {
+                false
+            };
             // The palette owns ↑/↓/Enter/Esc while the composer holds a
             // `/` command; every other key falls through and keeps typing.
             let handled_by_palette =
@@ -602,6 +619,7 @@ async fn run_interactive(
                                             screen.refresh_preview(&config.db_path);
                                         }
                                     }
+                                    "/context" => context_open = true,
                                     "/compact" => {
                                         notice = Some(
                                             "compaction runs automatically when the context fills"
@@ -637,7 +655,7 @@ async fn run_interactive(
                 } else {
                     false
                 };
-            if !handled_by_palette && !handled_by_sessions {
+            if !handled_by_palette && !handled_by_sessions && !handled_by_context {
                 // A plain key press dismisses the footer notice; keys the
                 // palette or sessions screen consumed (like Esc closing a
                 // modal) leave it visible so the user can read the result.
