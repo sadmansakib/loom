@@ -17,6 +17,7 @@ mod scene_views;
 mod sessions_screen;
 mod terminal;
 mod theme;
+mod tools_screen;
 mod welcome;
 
 use std::io;
@@ -261,6 +262,7 @@ async fn run_interactive(
     let mut notice: Option<String> = None;
     let mut sessions: Option<sessions_screen::SessionsScreen> = None;
     let mut context_open = false;
+    let mut tools: Option<tools_screen::ToolsScreen> = None;
     let mut event_log: Vec<loom_core::EventEnvelope> = Vec::new();
     if picker {
         picker_state = PickerState::discover(&config).await?;
@@ -396,6 +398,7 @@ async fn run_interactive(
                             palette_selected: 0,
                             sessions: None,
                             overlay: None,
+                            tools: None,
                             config: &config,
                             session_id: Some(session_id.as_str()),
                             capabilities: picker_state.selected().capabilities,
@@ -515,6 +518,7 @@ async fn run_interactive(
                     palette_selected,
                     sessions: sessions.as_ref(),
                     overlay: context_open.then_some(crate::terminal::Overlay::Context),
+                    tools: tools.as_ref(),
                     config: &config,
                     session_id: session_label.as_deref(),
                     capabilities: picker_state.selected().capabilities,
@@ -600,62 +604,111 @@ async fn run_interactive(
             } else {
                 false
             };
+            // The tools screen owns its keys while it is open.
+            let tools_action = tools.as_mut().and_then(|screen| {
+                let Event::Key(key) = &event else {
+                    return None;
+                };
+                screen.key(*key)
+            });
+            let handled_by_tools = match tools_action {
+                Some(tools_screen::ToolsAction::Consumed) => true,
+                Some(tools_screen::ToolsAction::Close) => {
+                    tools = None;
+                    true
+                }
+                Some(tools_screen::ToolsAction::ToggleWrites) => {
+                    match tools.as_mut() {
+                        Some(screen) if screen.writes_allowed => {
+                            notice =
+                                Some("writes are already always allowed for this folder".into());
+                        }
+                        Some(screen) => {
+                            if let Err(error) =
+                                loom_core::tools::trust::allow_writes(&config.workspace)
+                            {
+                                notice = Some(format!("could not save the writes choice: {error}"));
+                            } else {
+                                screen.writes_allowed = true;
+                                notice =
+                                    Some("writes are now always allowed for this folder".into());
+                            }
+                        }
+                        None => {}
+                    }
+                    true
+                }
+                Some(tools_screen::ToolsAction::Retry) => {
+                    notice = Some("MCP servers attach when a session opens".into());
+                    true
+                }
+                None => false,
+            };
             // The palette owns ↑/↓/Enter/Esc while the composer holds a
             // `/` command; every other key falls through and keeps typing.
-            let handled_by_palette =
-                if let (Event::Key(key), true) = (&event, palette::is_open(&input.text)) {
-                    let matches = palette::matching(&input.text);
-                    match palette::key(*key, &mut palette_selected, matches.len()) {
-                        Some(palette::PaletteAction::Run) => {
-                            if let Some(command) = matches.get(palette_selected) {
-                                match command.name {
-                                    "/model" | "/effort" => picker = true,
-                                    "/help" => help = true,
-                                    "/sessions" => {
-                                        sessions = Some(sessions_screen::SessionsScreen::load(
-                                            &config.db_path,
-                                        ));
-                                        if let Some(screen) = sessions.as_mut() {
-                                            screen.refresh_preview(&config.db_path);
-                                        }
+            let handled_by_palette = if let (Event::Key(key), true) =
+                (&event, palette::is_open(&input.text))
+            {
+                let matches = palette::matching(&input.text);
+                match palette::key(*key, &mut palette_selected, matches.len()) {
+                    Some(palette::PaletteAction::Run) => {
+                        if let Some(command) = matches.get(palette_selected) {
+                            match command.name {
+                                "/model" | "/effort" => picker = true,
+                                "/help" => help = true,
+                                "/sessions" => {
+                                    sessions = Some(sessions_screen::SessionsScreen::load(
+                                        &config.db_path,
+                                    ));
+                                    if let Some(screen) = sessions.as_mut() {
+                                        screen.refresh_preview(&config.db_path);
                                     }
-                                    "/context" => context_open = true,
-                                    "/compact" => {
-                                        notice = Some(
-                                            "compaction runs automatically when the context fills"
-                                                .into(),
-                                        );
-                                    }
-                                    "/export" => {
-                                        notice = Some(export_task(
-                                            &config.workspace.join(".loom").join("exports"),
-                                            &event_log,
-                                            active.as_ref().map(|(_, s)| s),
-                                            &config,
-                                            reducer.summary.as_ref(),
-                                        ));
-                                    }
-                                    other => notice = Some(format!("{other} is not wired yet")),
                                 }
+                                "/context" => context_open = true,
+                                "/tools" => {
+                                    tools =
+                                        Some(tools_screen::ToolsScreen::load(&config.workspace));
+                                }
+                                "/compact" => {
+                                    notice = Some(
+                                        "compaction runs automatically when the context fills"
+                                            .into(),
+                                    );
+                                }
+                                "/export" => {
+                                    notice = Some(export_task(
+                                        &config.workspace.join(".loom").join("exports"),
+                                        &event_log,
+                                        active.as_ref().map(|(_, s)| s),
+                                        &config,
+                                        reducer.summary.as_ref(),
+                                    ));
+                                }
+                                other => notice = Some(format!("{other} is not wired yet")),
                             }
-                            input.text.clear();
-                            input.cursor = 0;
-                            palette_selected = 0;
-                            true
                         }
-                        Some(palette::PaletteAction::Close) => {
-                            input.text.clear();
-                            input.cursor = 0;
-                            palette_selected = 0;
-                            true
-                        }
-                        Some(palette::PaletteAction::Consumed) => true,
-                        None => false,
+                        input.text.clear();
+                        input.cursor = 0;
+                        palette_selected = 0;
+                        true
                     }
-                } else {
-                    false
-                };
-            if !handled_by_palette && !handled_by_sessions && !handled_by_context {
+                    Some(palette::PaletteAction::Close) => {
+                        input.text.clear();
+                        input.cursor = 0;
+                        palette_selected = 0;
+                        true
+                    }
+                    Some(palette::PaletteAction::Consumed) => true,
+                    None => false,
+                }
+            } else {
+                false
+            };
+            if !handled_by_palette
+                && !handled_by_sessions
+                && !handled_by_context
+                && !handled_by_tools
+            {
                 // A plain key press dismisses the footer notice; keys the
                 // palette or sessions screen consumed (like Esc closing a
                 // modal) leave it visible so the user can read the result.

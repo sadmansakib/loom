@@ -22,6 +22,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "inspect what the next request will contain",
     },
     Command {
+        name: "/tools",
+        blurb: "built-in tools and MCP servers",
+    },
+    Command {
         name: "/sessions",
         blurb: "browse, resume, export, or delete past sessions",
     },
