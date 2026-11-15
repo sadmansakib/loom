@@ -26,6 +26,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "built-in tools and MCP servers",
     },
     Command {
+        name: "/account",
+        blurb: "providers, keys, and the active account",
+    },
+    Command {
         name: "/compare",
         blurb: "recent runs side by side",
     },

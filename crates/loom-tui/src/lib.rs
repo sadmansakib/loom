@@ -3,6 +3,7 @@
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+mod account_screen;
 mod approval;
 mod compare_screen;
 mod context_screen;
@@ -265,6 +266,7 @@ async fn run_interactive(
     let mut context_open = false;
     let mut tools: Option<tools_screen::ToolsScreen> = None;
     let mut compare: Option<compare_screen::CompareScreen> = None;
+    let mut accounts: Option<account_screen::AccountScreen> = None;
     let mut event_log: Vec<loom_core::EventEnvelope> = Vec::new();
     if picker {
         picker_state = PickerState::discover(&config).await?;
@@ -402,6 +404,7 @@ async fn run_interactive(
                             overlay: None,
                             tools: None,
                             compare: None,
+                            accounts: None,
                             config: &config,
                             session_id: Some(session_id.as_str()),
                             capabilities: picker_state.selected().capabilities,
@@ -523,6 +526,7 @@ async fn run_interactive(
                     overlay: context_open.then_some(crate::terminal::Overlay::Context),
                     tools: tools.as_ref(),
                     compare: compare.as_ref(),
+                    accounts: accounts.as_ref(),
                     config: &config,
                     session_id: session_label.as_deref(),
                     capabilities: picker_state.selected().capabilities,
@@ -648,6 +652,114 @@ async fn run_interactive(
                 }
                 None => false,
             };
+            // The account screen owns its keys while it is open.
+            let account_action = accounts.as_mut().and_then(|screen| {
+                let Event::Key(key) = &event else {
+                    return None;
+                };
+                screen.key(*key)
+            });
+            let handled_by_accounts = match account_action {
+                Some(account_screen::AccountAction::Consumed) => true,
+                Some(account_screen::AccountAction::Close) => {
+                    accounts = None;
+                    true
+                }
+                Some(account_screen::AccountAction::Activate { provider, label }) => {
+                    match loom_core::engine::auth::Auth::open(&config.db_path) {
+                        Ok(auth) => match auth.activate(&provider, &label) {
+                            Ok(_) => {
+                                notice = Some(format!(
+                                    "switched {provider} to {label} (next task uses it)"
+                                ));
+                            }
+                            Err(error) => notice = Some(format!("switch failed: {error}")),
+                        },
+                        Err(error) => notice = Some(format!("switch failed: {error}")),
+                    }
+                    if let Ok(auth) = loom_core::engine::auth::Auth::open(&config.db_path)
+                        && let Some(screen) = accounts.as_mut()
+                    {
+                        screen.accounts = auth.list(None).unwrap_or_default();
+                    }
+                    true
+                }
+                Some(account_screen::AccountAction::Remove { provider, label }) => {
+                    match loom_core::engine::auth::Auth::open(&config.db_path) {
+                        Ok(auth) => match auth.remove(&provider, &label) {
+                            Ok(_) => notice = Some(format!("removed {label} from {provider}")),
+                            Err(error) => notice = Some(format!("remove failed: {error}")),
+                        },
+                        Err(error) => notice = Some(format!("remove failed: {error}")),
+                    }
+                    if let Ok(auth) = loom_core::engine::auth::Auth::open(&config.db_path)
+                        && let Some(screen) = accounts.as_mut()
+                    {
+                        screen.accounts = auth.list(None).unwrap_or_default();
+                        screen.selected = 0;
+                    }
+                    true
+                }
+                Some(account_screen::AccountAction::Test { provider }) => {
+                    accounts = None;
+                    config.provider = provider;
+                    picker = true;
+                    true
+                }
+                Some(account_screen::AccountAction::Add {
+                    provider,
+                    label,
+                    base_url,
+                    key,
+                }) => {
+                    let spec = loom_core::engine::auth::LoginSpec {
+                        provider: provider.clone(),
+                        label: Some(label.clone()),
+                        method: loom_core::engine::auth::Method::Key,
+                        command: None,
+                        secret: Some(key),
+                    };
+                    match loom_core::engine::auth::Auth::open(&config.db_path) {
+                        Ok(auth) => match auth.login(spec) {
+                            Ok(_) => {
+                                let registry_error = if base_url.is_empty() {
+                                    None
+                                } else {
+                                    let mut registry =
+                                        loom_core::engine::registry::ProviderRegistry::load(
+                                            &config.db_path,
+                                        );
+                                    registry.upsert(
+                                        &provider,
+                                        loom_core::engine::registry::RegistryEntry {
+                                            base_url,
+                                            models_url: None,
+                                            headers: std::collections::BTreeMap::new(),
+                                        },
+                                    );
+                                    registry.save(&config.db_path).err()
+                                };
+                                accounts = None;
+                                config.provider.clone_from(&provider);
+                                config.model.clear();
+                                picker = true;
+                                notice = Some(match registry_error {
+                                    Some(error) => format!(
+                                        "saved {provider} · {label}, but the registry write failed: {error}"
+                                    ),
+                                    None => {
+                                        format!("saved {provider} · {label}; picking a model")
+                                    }
+                                });
+                            }
+                            Err(error) => notice = Some(format!("save failed: {error}")),
+                        },
+                        Err(error) => notice = Some(format!("save failed: {error}")),
+                    }
+                    true
+                }
+                None => false,
+            };
             // The compare screen owns its keys while it is open.
             let compare_action = compare.as_mut().and_then(|screen| {
                 let Event::Key(key) = &event else {
@@ -715,6 +827,12 @@ async fn run_interactive(
                                     tools =
                                         Some(tools_screen::ToolsScreen::load(&config.workspace));
                                 }
+                                "/account" => {
+                                    let list = loom_core::engine::auth::Auth::open(&config.db_path)
+                                        .and_then(|auth| auth.list(None))
+                                        .unwrap_or_default();
+                                    accounts = Some(account_screen::AccountScreen::new(list));
+                                }
                                 "/compare" => {
                                     compare =
                                         Some(compare_screen::CompareScreen::load(&config.db_path));
@@ -759,6 +877,7 @@ async fn run_interactive(
                 && !handled_by_context
                 && !handled_by_tools
                 && !handled_by_compare
+                && !handled_by_accounts
             {
                 // A plain key press dismisses the footer notice; keys the
                 // palette or sessions screen consumed (like Esc closing a
