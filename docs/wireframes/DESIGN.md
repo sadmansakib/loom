@@ -37,3 +37,10 @@ Meaning is never color alone: glyph + word + color.
 
 ## Regenerate
 `python3 loom_wireframes.py` writes project/*.dc.html and canvas.json, then publish.
+
+## Commands
+Slash-first. Idle: the composer owns the keyboard, so actions are commands (/model /effort /account /sessions /new /context /tools /copy /export /reasoning /sidebar /help /quit). Inline list above the composer, filters as you type, Tab completes.
+Live keys kept while a task runs: Esc, ^C, r, up/down, ^O, up (edit last task).
+
+## Compact notice
+Posted to the status bar; a modal (/context) may cover it. One slot, latest wins; timer starts when the status bar is uncovered; stays until next keypress or 8 s.
