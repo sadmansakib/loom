@@ -81,6 +81,10 @@ pub struct LiveViewOptions<'a> {
     pub recent: &'a [RecentSession],
     /// Write awaiting the operator; drawn as an amber box over the thread.
     pub approval: Option<&'a crate::approval::Request>,
+    /// One-line status message (`/export` result, `/compact` note).
+    pub notice: Option<&'a str>,
+    /// Highlighted row while the `/` command palette is open.
+    pub palette_selected: usize,
     pub pricing: Option<ModelPricing>,
     pub scene: Option<Scene>,
 }
@@ -133,7 +137,11 @@ pub fn draw_live_scrolled(
         0
     };
     let input_rows = u16::try_from(input.lines().count().clamp(1, 3)).unwrap_or(3);
-    let suggestion_height = if file_suggestions.is_empty() {
+    // The `/` palette replaces the @file suggestion slot while open.
+    let palette_open = crate::palette::is_open(input);
+    let suggestion_height = if palette_open {
+        u16::try_from(crate::palette::matching(input).len().min(5) + 3).unwrap_or(8)
+    } else if file_suggestions.is_empty() {
         0
     } else {
         u16::try_from(file_suggestions.len().min(5)).unwrap_or(5) + 2
@@ -144,7 +152,9 @@ pub fn draw_live_scrolled(
         .constraints([
             Constraint::Length(header_height),
             Constraint::Min(5),
-            Constraint::Length(input_rows + suggestion_height + 4),
+            Constraint::Length(
+                input_rows + suggestion_height + 4 + u16::from(options.notice.is_some()),
+            ),
         ])
         .split(area);
     draw_live_header(frame, rows[0], reducer, scene, &options);
@@ -156,6 +166,7 @@ pub fn draw_live_scrolled(
                 suggestion_height.min(rows[2].height.saturating_sub(input_rows + 4)),
             ),
             Constraint::Length(2),
+            Constraint::Length(u16::from(options.notice.is_some())),
             Constraint::Min(0),
         ])
         .split(rows[2]);
@@ -212,7 +223,9 @@ pub fn draw_live_scrolled(
             .wrap(Wrap { trim: false }),
         footer[0],
     );
-    if !file_suggestions.is_empty() && footer[1].height > 0 {
+    if palette_open && footer[1].height > 0 {
+        draw_palette(frame, footer[1], input, options.palette_selected);
+    } else if !file_suggestions.is_empty() && footer[1].height > 0 {
         let suggestions = file_suggestions
             .iter()
             .map(|path| Line::from(Span::styled(format!("  @{path}"), fg(theme::BLUE))))
@@ -254,6 +267,15 @@ pub fn draw_live_scrolled(
         ])
     };
     frame.render_widget(Paragraph::new(footer_hint).style(fg(theme::DIM)), footer[2]);
+    if let Some(notice) = options.notice {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("· ", fg(theme::AMBER)),
+                Span::styled(notice, fg(theme::IVORY)),
+            ])),
+            footer[3],
+        );
+    }
     if scene.is_none() {
         let counters = match dropped {
             Some(dropped) => format!("events {} · dropped {dropped}", reducer.event_count),
@@ -604,6 +626,56 @@ fn draw_approval_box(frame: &mut Frame<'_>, area: Rect, request: &crate::approva
                 .border_style(fg(theme::AMBER)),
         ),
         box_area,
+    );
+}
+
+/// Filtered `/` command list anchored over the composer. Selection is
+/// highlighted in amber; meaning is carried by the `❯` marker as well.
+fn draw_palette(frame: &mut Frame<'_>, area: Rect, input: &str, selected: usize) {
+    let matches = crate::palette::matching(input);
+    let mut lines: Vec<Line<'_>> = matches
+        .iter()
+        .enumerate()
+        .map(|(index, command)| {
+            let selected_row = index == selected;
+            let marker = if selected_row { "❯ " } else { "  " };
+            Line::from(vec![
+                Span::styled(
+                    format!("{marker}{}", command.name),
+                    fg(if selected_row {
+                        theme::AMBER
+                    } else {
+                        theme::IVORY
+                    })
+                    .add_modifier(if selected_row {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+                ),
+                Span::styled(format!("   {}", command.blurb), fg(theme::DIM)),
+            ])
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no matching command",
+            fg(theme::DIM),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        " ↑↓ move · Enter run · Esc close",
+        fg(theme::DIM),
+    )));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(" commands ")
+                .borders(Borders::ALL)
+                .border_style(fg(theme::AMBER)),
+        ),
+        area,
     );
 }
 
@@ -985,6 +1057,67 @@ mod tests {
             !rows.iter().any(|row| row.contains("┌")),
             "prompt still boxed"
         );
+    }
+
+    #[test]
+    fn slash_input_opens_the_command_palette_over_the_composer() {
+        let reducer = Reducer::default();
+        let mut terminal = Terminal::new(TestBackend::new(130, 30)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_live(
+                    frame,
+                    &reducer,
+                    "/mod",
+                    4,
+                    LiveViewOptions {
+                        palette_selected: 0,
+                        ..LiveViewOptions::default()
+                    },
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(rows.iter().any(|row| row.contains("commands")));
+        assert!(rows.iter().any(|row| row.contains("/model")));
+        assert!(
+            !rows.iter().any(|row| row.contains("/export")),
+            "filter should hide non-matching commands"
+        );
+        assert!(rows.iter().any(|row| row.contains("Enter run")));
+
+        // A notice renders above the footer.
+        terminal
+            .draw(|frame| {
+                draw_live(
+                    frame,
+                    &reducer,
+                    "",
+                    0,
+                    LiveViewOptions {
+                        notice: Some("exported to /tmp/x"),
+                        ..LiveViewOptions::default()
+                    },
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("exported to /tmp/x"));
     }
 
     #[test]

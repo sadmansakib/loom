@@ -8,6 +8,7 @@ mod glyphs;
 mod input;
 mod keys;
 mod modal;
+mod palette;
 mod picker;
 mod recent;
 mod reducer;
@@ -253,6 +254,9 @@ async fn run_interactive(
     let (approval_tx, mut approval_rx) =
         tokio::sync::mpsc::unbounded_channel::<approval::Request>();
     let mut pending_approval: Option<approval::Request> = None;
+    let mut palette_selected = 0_usize;
+    let mut notice: Option<String> = None;
+    let mut event_log: Vec<loom_core::EventEnvelope> = Vec::new();
     if picker {
         picker_state = PickerState::discover(&config).await?;
         picker_state.apply(&mut config);
@@ -343,6 +347,7 @@ async fn run_interactive(
             let (sink, mut events) = ChannelEventSink::new();
             let task_control = TaskControl::new();
             reducer = Reducer::default();
+            event_log.clear();
             let prompt = pending_display_prompt
                 .take()
                 .unwrap_or_else(|| task.clone());
@@ -382,6 +387,8 @@ async fn run_interactive(
                             file_index: &file_index,
                             recent: &recent,
                             approval: pending_approval.as_ref(),
+                            notice: None,
+                            palette_selected: 0,
                             config: &config,
                             session_id: Some(session_id.as_str()),
                             capabilities: picker_state.selected().capabilities,
@@ -393,6 +400,7 @@ async fn run_interactive(
                 tokio::select! {
                     event = events.recv() => {
                         if let Some(event) = event {
+                            event_log.push(event.clone());
                             reducer.reduce(&event, epoch_millis());
                         }
                     }
@@ -496,6 +504,8 @@ async fn run_interactive(
                     file_index: &file_index,
                     recent: &recent,
                     approval: pending_approval.as_ref(),
+                    notice: notice.as_deref(),
+                    palette_selected,
                     config: &config,
                     session_id: session_label.as_deref(),
                     capabilities: picker_state.selected().capabilities,
@@ -510,27 +520,76 @@ async fn run_interactive(
         if event::poll(FRAME_TICK)? {
             let event = event::read()?;
             let key_pressed = matches!(event, Event::Key(_));
-            route_event(
-                event,
-                || {
-                    terminal
-                        .size()
-                        .map(|size| size.width.saturating_sub(scene_views::SIDEBAR_WIDTH))
-                },
-                (&mut thread_scroll_back, &mut sidebar_scroll_back),
-                &mut KeyContext {
-                    input: &mut input,
-                    workspace: &config.workspace,
-                    help: &mut help,
-                    picker: &mut picker,
-                    sidebar: &mut sidebar,
-                    quit: &mut should_quit,
-                    pending_task: &mut pending_task,
-                    pending_display_prompt: &mut pending_display_prompt,
-                    control: None,
-                    reducer: &mut reducer,
-                },
-            )?;
+            notice = None;
+            // The palette owns ↑/↓/Enter/Esc while the composer holds a
+            // `/` command; every other key falls through and keeps typing.
+            let handled_by_palette =
+                if let (Event::Key(key), true) = (&event, palette::is_open(&input.text)) {
+                    let matches = palette::matching(&input.text);
+                    match palette::key(*key, &mut palette_selected, matches.len()) {
+                        Some(palette::PaletteAction::Run) => {
+                            if let Some(command) = matches.get(palette_selected) {
+                                match command.name {
+                                    "/model" | "/effort" => picker = true,
+                                    "/help" => help = true,
+                                    "/compact" => {
+                                        notice = Some(
+                                            "compaction runs automatically when the context fills"
+                                                .into(),
+                                        );
+                                    }
+                                    "/export" => {
+                                        notice = Some(export_task(
+                                            &config.workspace.join(".loom").join("exports"),
+                                            &event_log,
+                                            active.as_ref().map(|(_, s)| s),
+                                            &config,
+                                            reducer.summary.as_ref(),
+                                        ));
+                                    }
+                                    other => notice = Some(format!("{other} is not wired yet")),
+                                }
+                            }
+                            input.text.clear();
+                            input.cursor = 0;
+                            palette_selected = 0;
+                            true
+                        }
+                        Some(palette::PaletteAction::Close) => {
+                            input.text.clear();
+                            input.cursor = 0;
+                            palette_selected = 0;
+                            true
+                        }
+                        Some(palette::PaletteAction::Consumed) => true,
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+            if !handled_by_palette {
+                route_event(
+                    event,
+                    || {
+                        terminal
+                            .size()
+                            .map(|size| size.width.saturating_sub(scene_views::SIDEBAR_WIDTH))
+                    },
+                    (&mut thread_scroll_back, &mut sidebar_scroll_back),
+                    &mut KeyContext {
+                        input: &mut input,
+                        workspace: &config.workspace,
+                        help: &mut help,
+                        picker: &mut picker,
+                        sidebar: &mut sidebar,
+                        quit: &mut should_quit,
+                        pending_task: &mut pending_task,
+                        pending_display_prompt: &mut pending_display_prompt,
+                        control: None,
+                        reducer: &mut reducer,
+                    },
+                )?;
+            }
             if key_pressed && picker {
                 picker_loaded = false;
             }
@@ -539,6 +598,47 @@ async fn run_interactive(
             pending_task = Some(task);
             picker = false;
         }
+    }
+}
+
+/// Replays the buffered run events through a [`TraceWriter`] so `/export`
+/// produces the same NDJSON + manifest layout as `loom run --trace`.
+fn export_task(
+    base: &std::path::Path,
+    log: &[loom_core::EventEnvelope],
+    session: Option<&Session>,
+    config: &EngineConfig,
+    summary: Option<&loom_core::TaskSummary>,
+) -> String {
+    let Some(session) = session else {
+        return "nothing to export: no active session".into();
+    };
+    if log.is_empty() {
+        return "nothing to export: no events recorded yet, run a task first".into();
+    }
+    let mut writer = loom_core::engine::trace::TraceWriter::new(base.to_path_buf());
+    for envelope in log {
+        writer.record(envelope);
+    }
+    let meta = loom_core::engine::trace::TraceMeta {
+        provider: &config.provider,
+        model: &config.model,
+        reasoning_effort: config.reasoning_effort,
+        max_turns: config.max_turns,
+        persisted: true,
+    };
+    let outcome = if summary.is_some() {
+        loom_core::engine::trace::Outcome::Completed
+    } else {
+        loom_core::engine::trace::Outcome::Ended {
+            status: "failed",
+            end_reason: "task ended without a summary".into(),
+        }
+    };
+    match writer.finish(session, meta, outcome, summary) {
+        Ok(Some(dir)) => format!("exported to {}", dir.display()),
+        Ok(None) => "nothing to export: no events were recorded".into(),
+        Err(error) => format!("export failed: {error}"),
     }
 }
 

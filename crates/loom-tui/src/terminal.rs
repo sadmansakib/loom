@@ -37,6 +37,10 @@ pub(crate) struct LiveFrame<'a> {
     pub(crate) recent: &'a [RecentSession],
     /// Write awaiting the operator, shown as the amber approval prompt.
     pub(crate) approval: Option<&'a crate::approval::Request>,
+    /// One-line status message (`/export` result, `/compact` note).
+    pub(crate) notice: Option<&'a str>,
+    /// Highlighted row while the `/` command palette is open.
+    pub(crate) palette_selected: usize,
     pub(crate) config: &'a EngineConfig,
     pub(crate) session_id: Option<&'a str>,
     pub(crate) capabilities: Option<ModelCapabilities>,
@@ -61,6 +65,8 @@ pub(crate) fn draw_live(frame: &mut ratatui::Frame<'_>, view: &LiveFrame<'_>) {
         file_index,
         recent,
         approval,
+        notice,
+        palette_selected,
         config,
         session_id,
         capabilities,
@@ -89,6 +95,8 @@ pub(crate) fn draw_live(frame: &mut ratatui::Frame<'_>, view: &LiveFrame<'_>) {
                 file_suggestions: &suggestions,
                 recent,
                 approval,
+                notice,
+                palette_selected,
                 pricing,
                 workspace: Some(workspace),
                 session_id,
