@@ -5,7 +5,10 @@
 use super::TaskError;
 use crate::id::SessionId;
 use crate::store::{Lease, SessionStore};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio_util::sync::CancellationToken;
 
 /// Cooperative stop control for one task run: the operator's two
@@ -36,6 +39,11 @@ pub struct TaskControl {
     /// the next turn boundary. `Arc` so clones share one queue,
     /// matching token semantics.
     pub(super) steering: Arc<Mutex<Vec<String>>>,
+    /// Operator-armed compaction (`/compact`): consumed by the turn
+    /// loop before the first compile, which runs the handoff eagerly
+    /// instead of waiting for a budget overrun. `Arc` so clones share
+    /// one latch, matching token semantics.
+    pub(super) compaction: Arc<AtomicBool>,
 }
 
 impl TaskControl {
@@ -87,6 +95,21 @@ impl TaskControl {
     pub fn hard_token(&self) -> CancellationToken {
         self.hard.clone()
     }
+
+    /// Arm an eager compaction (`/compact`): the turn loop runs the
+    /// handoff summary before its next compile instead of waiting for
+    /// a context budget overrun. One-shot — `Agent::run_task` consumes
+    /// the request even when the handoff reply is unusable, mirroring
+    /// the overrun path's once-per-task limit.
+    pub fn request_compaction(&self) {
+        self.compaction.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a compaction was armed, clearing the request. Kernel
+    /// internal: the turn loop calls this at its compile boundary.
+    pub(super) fn take_compaction_request(&self) -> bool {
+        self.compaction.swap(false, Ordering::Relaxed)
+    }
 }
 
 impl From<CancellationToken> for TaskControl {
@@ -96,6 +119,7 @@ impl From<CancellationToken> for TaskControl {
             hard,
             soft: CancellationToken::new(),
             steering: Arc::new(Mutex::new(Vec::new())),
+            compaction: Arc::new(AtomicBool::new(false)),
         }
     }
 }

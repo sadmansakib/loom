@@ -102,6 +102,8 @@ fn fake_engine(provider: FakeProvider) -> Engine {
         resolution: None,
         notices_flushed: std::sync::OnceLock::new(),
         events: None,
+        mcp_servers: Vec::new(),
+        prune_ops: None,
     }
 }
 

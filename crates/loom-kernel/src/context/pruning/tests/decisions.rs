@@ -60,7 +60,14 @@ fn gate_reclaim_matches_the_report_walk_on_existing_sessions() {
             ..PruneConfig::default()
         },
     ] {
-        let decisions = decide(&session, &registry, config, &estimator, true);
+        let decisions = decide(
+            &session,
+            &registry,
+            config,
+            &estimator,
+            true,
+            &PruneOps::default(),
+        );
         let gated = projected_reclaim(&session, &decisions, &estimator);
         let reported = prune_report(PruneTrigger::Window, &session, &decisions, &estimator);
         assert_eq!(gated, reported.reclaimed_tokens);

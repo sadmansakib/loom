@@ -72,6 +72,7 @@ mod compiler;
 mod config;
 mod elision;
 mod facts;
+mod ops;
 mod projection;
 mod reclaim;
 mod strategies;
@@ -79,6 +80,7 @@ mod types;
 
 pub use compiler::PruningContextCompiler;
 pub use config::PruneConfig;
+pub use ops::{PruneOps, PruneOpsHandle};
 pub use types::{ArgElision, PruneReport, PruneTrigger, PrunedCall, StubDecision, StubReason};
 
 #[cfg(test)]

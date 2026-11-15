@@ -48,6 +48,11 @@ pub struct McpAttachment {
     /// Session tool surface that promotes loaded tools between turns
     /// and evicts them after idle, when non-empty.
     pub surface: Option<Arc<ToolSurface>>,
+    /// Per-server attach outcome in manifest order: `true` when the
+    /// server spawned, handshook, and answered `tools/list` (individual
+    /// tools may still have been filtered or deferred). Frontends show
+    /// this as connection status; failures stay tracing-only here.
+    pub servers: Vec<(String, bool)>,
 }
 
 /// Attaches every manifest server: spawn, handshake, `tools/list`,
@@ -178,6 +183,11 @@ async fn attach_declared(
     }))
     .await;
 
+    // Collected before the ingestion loop moves each fetched triple.
+    let servers = fetched
+        .iter()
+        .map(|(name, _, pair)| ((*name).clone(), pair.is_some()))
+        .collect();
     for (name, decl, pair) in fetched {
         let Some((process, raw_tools)) = pair else {
             continue;
@@ -227,6 +237,7 @@ async fn attach_declared(
         tools,
         menu,
         surface,
+        servers,
     }
 }
 

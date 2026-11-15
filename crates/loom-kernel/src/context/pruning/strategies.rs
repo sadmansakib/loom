@@ -10,6 +10,7 @@ use super::elision::{
     elide_aged_assistant_text, elide_aged_calls, elide_aged_reasoning, elide_aged_users,
 };
 use super::facts::{ResultFacts, TranscriptFacts};
+use super::ops::PruneOps;
 use super::reclaim::stub_tokens;
 use super::types::{ArgElision, StubDecision, StubReason};
 
@@ -230,13 +231,15 @@ const WRITING_PHASE_DETECT_TURNS: usize = 3;
 
 /// Computes the decision set from the transcript under ADR-011's fixed
 /// strategy order, plus the reclaim estimate (in tokens) against the
-/// *unpruned* projection.
+/// *unpruned* projection. Operator pin/drop actions are applied last so
+/// they win over every heuristic.
 pub(super) fn decide(
     session: &Session,
     registry: &ToolRegistry,
     config: PruneConfig,
     estimator: &dyn TokenEstimator,
     window_triggered: bool,
+    ops: &PruneOps,
 ) -> DecisionSet {
     let facts = TranscriptFacts::collect(session, registry, estimator);
     let protected_from = facts.protected_from(&session.transcript, config, estimator);
@@ -296,5 +299,32 @@ pub(super) fn decide(
         &mut pass,
     );
 
+    apply_operator_actions(&facts, ops, estimator, &mut pass);
     pass
+}
+
+/// Overlays the operator's `/context` actions on the heuristic decision
+/// set: a pinned call is never stubbed this pass, and a dropped call is
+/// stubbed even when no heuristic selected it. Call ids with no result
+/// in the transcript are inert (nothing to rewrite).
+fn apply_operator_actions(
+    facts: &TranscriptFacts<'_>,
+    ops: &PruneOps,
+    estimator: &dyn TokenEstimator,
+    pass: &mut DecisionSet,
+) {
+    if ops.is_empty() {
+        return;
+    }
+    if !ops.pinned.is_empty() {
+        pass.stubbed
+            .retain(|stub| !ops.pinned.contains(&stub.call_id));
+        pass.stubbed_ids.retain(|id| !ops.pinned.contains(id));
+    }
+    for result in &facts.results {
+        let id = result.call_id.as_str();
+        if ops.dropped.contains(id) && !pass.stubbed_ids.contains(id) {
+            pass.add(result, StubReason::OperatorDropped, estimator);
+        }
+    }
 }

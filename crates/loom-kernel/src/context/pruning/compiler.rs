@@ -4,6 +4,7 @@ use crate::model::Message;
 use crate::session::Session;
 
 use super::config::PruneConfig;
+use super::ops::{PruneOps, PruneOpsHandle};
 use super::projection::{apply_elisions, apply_stubs, handoff_session, stubbed_session};
 use super::reclaim::{frozen_reclaim, projected_reclaim, prune_report};
 use super::strategies::decide;
@@ -22,6 +23,8 @@ pub struct PruningContextCompiler {
     inner: Box<dyn ContextCompiler>,
     config: PruneConfig,
     estimator: Arc<dyn TokenEstimator>,
+    /// Operator `/context` pin/drop sets, shared with the engine.
+    ops: PruneOpsHandle,
     /// Reclaim total for the currently frozen checkpoint. Frozen call
     /// ids and transcript ordinals do not change as the session grows.
     frozen_reclaim_cache: std::sync::Mutex<Option<(PruneCheckpoint, u64)>>,
@@ -38,8 +41,25 @@ impl PruningContextCompiler {
             inner,
             config,
             estimator: Arc::new(HeuristicEstimator),
+            ops: PruneOpsHandle::default(),
             frozen_reclaim_cache: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The engine's handle to this compiler's operator pin/drop sets.
+    /// Clones share one policy; actions take effect at the next decision
+    /// pass (a new task's first compile).
+    #[must_use]
+    pub fn operator_handle(&self) -> PruneOpsHandle {
+        self.ops.clone()
+    }
+
+    /// Uses `ops` instead of a fresh handle — the caller keeps the
+    /// handle it passed here.
+    #[must_use]
+    pub fn with_operator_handle(mut self, ops: PruneOpsHandle) -> Self {
+        self.ops = ops;
+        self
     }
 
     /// Uses `estimator` for the reclaim and protected-tail math, so the
@@ -98,6 +118,9 @@ impl ContextCompiler for PruningContextCompiler {
         } = input;
         let facts_text = facts.render();
         let mut checkpoint = prune_checkpoint.cloned();
+        // Operator policy for this compile: pin/drop actions armed
+        // between tasks. Snapshot once so one compile sees one policy.
+        let ops = self.ops.snapshot();
         // Attribution for a checkpoint frozen by *this* compile, when one
         // was; re-applications of an earlier freeze report nothing.
         let mut report: Option<PruneReport> = None;
@@ -148,7 +171,8 @@ impl ContextCompiler for PruningContextCompiler {
             // worth taking. Fails closed when nothing is prunable or the
             // pruned view still does not fit.
             Err(overrun @ ContextError::BudgetExceeded { .. }) => {
-                let mut decisions = decide(session, tools, self.config, &*self.estimator, true);
+                let mut decisions =
+                    decide(session, tools, self.config, &*self.estimator, true, &ops);
                 // Under a handoff the view renumbers user/assistant
                 // ordinals, so ordinal-keyed elisions cannot apply there;
                 // drop them so the freeze and the report agree on what
@@ -268,13 +292,20 @@ impl ContextCompiler for PruningContextCompiler {
         let elision_enabled = self.config.elide_turns.is_some()
             || self.config.elide_reasoning.is_some()
             || self.config.elide_assistant_text.is_some();
-        if window_triggered || age_masking || phase_masking || elision_enabled {
+        // Operator drops are an extra below-trigger arm: a result the
+        // operator dropped must be stubbed on the next decision pass,
+        // gate or no gate, so a session parked below the trigger still
+        // honors the action. Once a frozen checkpoint carries every
+        // pending drop, the arm stays quiet and the projection is stable.
+        let drops_pending = pending_drops(session, checkpoint.as_ref(), &ops);
+        if window_triggered || age_masking || phase_masking || elision_enabled || drops_pending {
             let mut decisions = decide(
                 session,
                 tools,
                 self.config,
                 &*self.estimator,
                 window_triggered,
+                &ops,
             );
             // Same handoff rule as the rescue arm: ordinal-keyed elisions
             // cannot land on the renumbered view, so they are dropped
@@ -293,12 +324,15 @@ impl ContextCompiler for PruningContextCompiler {
             let candidate_reclaim = projected_reclaim(session, &decisions, &*self.estimator);
             let already =
                 self.cached_frozen_reclaim(session, checkpoint.as_ref(), &*self.estimator);
-            if candidate_reclaim
-                >= already.saturating_add(u64::from(self.config.min_reclaim_tokens))
+            if drops_pending
+                || candidate_reclaim
+                    >= already.saturating_add(u64::from(self.config.min_reclaim_tokens))
             {
                 let candidate_report = prune_report(
                     if window_triggered {
                         PruneTrigger::Window
+                    } else if drops_pending {
+                        PruneTrigger::Operator
                     } else {
                         PruneTrigger::AgeMask
                     },
@@ -355,6 +389,24 @@ impl ContextCompiler for PruningContextCompiler {
         compiled.stubbed_calls = stubbed_calls;
         Ok(compiled)
     }
+}
+
+/// Whether the operator dropped a result the frozen checkpoint does not
+/// stub yet. A dropped id whose result has not been committed is inert,
+/// so a stale drop cannot force a re-freeze on every turn.
+fn pending_drops(session: &Session, frozen: Option<&PruneCheckpoint>, ops: &PruneOps) -> bool {
+    if ops.dropped.is_empty() {
+        return false;
+    }
+    ops.dropped.iter().any(|id| {
+        let committed = session.transcript.iter().any(|item| {
+            matches!(item, crate::transcript::Item::ToolResult(result)
+                if result.call_id.as_str() == id)
+        });
+        committed
+            && frozen
+                .is_none_or(|checkpoint| !checkpoint.stubs.iter().any(|stub| &stub.call_id == id))
+    })
 }
 
 // `ContextCensus` is reconstructed via `census` in `compile`.

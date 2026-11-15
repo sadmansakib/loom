@@ -41,6 +41,8 @@ async fn routing_picks_the_tier_agent_and_surfaces_the_choice() {
         resolution: None,
         notices_flushed: std::sync::OnceLock::new(),
         events: None,
+        mcp_servers: Vec::new(),
+        prune_ops: None,
     };
 
     let (sink, mut receiver) = loom_kernel::event::ChannelEventSink::new();

@@ -53,6 +53,10 @@ pub(crate) struct LiveFrame<'a> {
     pub(crate) tools: Option<&'a crate::tools_screen::ToolsScreen>,
     pub(crate) compare: Option<&'a crate::compare_screen::CompareScreen>,
     pub(crate) accounts: Option<&'a crate::account_screen::AccountScreen>,
+    /// Largest tool results for the `/context` items list, and the
+    /// highlighted row.
+    pub(crate) context_items: &'a [crate::context_screen::ContextItem],
+    pub(crate) context_selected: usize,
     pub(crate) config: &'a EngineConfig,
     pub(crate) session_id: Option<&'a str>,
     pub(crate) capabilities: Option<ModelCapabilities>,
@@ -84,6 +88,8 @@ pub(crate) fn draw_live(frame: &mut ratatui::Frame<'_>, view: &LiveFrame<'_>) {
         tools,
         compare,
         accounts,
+        context_items,
+        context_selected,
         config,
         session_id,
         capabilities,
@@ -95,7 +101,13 @@ pub(crate) fn draw_live(frame: &mut ratatui::Frame<'_>, view: &LiveFrame<'_>) {
     } else if let Some(screen) = sessions {
         crate::sessions_screen::draw(frame, frame.area(), screen);
     } else if let Some(Overlay::Context) = overlay {
-        crate::context_screen::draw(frame, frame.area(), reducer);
+        crate::context_screen::draw(
+            frame,
+            frame.area(),
+            reducer,
+            context_items,
+            context_selected,
+        );
     } else if let Some(screen) = tools {
         crate::tools_screen::draw(frame, frame.area(), screen);
     } else if let Some(screen) = compare {

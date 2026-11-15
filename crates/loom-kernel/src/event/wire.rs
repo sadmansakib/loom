@@ -70,7 +70,9 @@ use serde::{Deserialize, Serialize};
 /// file writes, so a pending write and the answer to it are on the record.
 /// v19 makes `ApprovalDecided.allowed` exact: a refused write reports
 /// `false` from the operator's decision, not inferred from the tool status.
-pub const EVENT_SCHEMA_VERSION: u16 = 19;
+/// v20 adds `PruneTrigger::Operator`: an operator drop (`/context` `x`)
+/// stubbed a result below the window trigger.
+pub const EVENT_SCHEMA_VERSION: u16 = 20;
 
 /// The evidence that justified a [`EventKind::TurnBudgetExtended`] grant
 /// (item 26): state the loop already tracks, never a model call.

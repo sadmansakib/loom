@@ -2768,6 +2768,60 @@ async fn budget_overrun_with_unprunable_history_falls_through_to_handoff() {
     );
 }
 
+/// An operator-armed compaction (`/compact` → `TaskControl::
+/// request_compaction`) spends the handoff before the first turn's
+/// compile instead of waiting for a budget overrun.
+#[tokio::test]
+async fn operator_armed_compaction_runs_the_handoff_first() {
+    let provider = FakeProvider::new(
+        small_capabilities(),
+        vec![
+            completed(
+                assistant("SUMMARY: keep going", StopReason::EndTurn, Vec::new()),
+                usage(50, 20, None),
+            ),
+            completed(
+                assistant("done", StopReason::EndTurn, Vec::new()),
+                usage(30, 5, None),
+            ),
+        ],
+    );
+    let requests = provider.requests_handle();
+    let agent = handoff_agent(provider, true);
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let control = TaskControl::new();
+    control.request_compaction();
+    agent
+        .run_task(&mut session, "explore the tree", &sink, &control)
+        .await
+        .unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "handoff, then the first turn");
+    assert!(
+        requests[0].tools.is_empty(),
+        "the eager handoff is a plain completion"
+    );
+    let turn = serde_json::to_string(&requests[1].messages).unwrap();
+    assert!(turn.contains("explore the tree"), "brief leads");
+    assert!(turn.contains("SUMMARY: keep going"), "handoff view");
+
+    let events = drain(&mut receiver);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EventKind::ContextHandoff { turn: 1, .. })),
+        "the handoff is reported on the first turn"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EventKind::TaskCompleted)),
+        "task still completes"
+    );
+}
+
 /// `handoff_compaction: false` (the engine's bare arm) keeps the
 /// deterministic-only contract: the budget error propagates.
 #[tokio::test]

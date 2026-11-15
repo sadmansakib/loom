@@ -543,6 +543,23 @@ impl Agent {
                 );
                 self.nudge(session, sink, task_id, text)?;
             }
+            // Operator-armed compaction (`/compact` via
+            // [`TaskControl::request_compaction`]): run the handoff
+            // eagerly before this turn's compile instead of waiting
+            // for a budget overrun. The latch is one-shot and gated by
+            // the same once-per-task limit as the overrun path, so a
+            // task still gets at most one handoff.
+            if self.config.handoff_compaction
+                && prune_checkpoint
+                    .as_ref()
+                    .is_none_or(|frozen| frozen.handoff.is_none())
+                && control.take_compaction_request()
+                && let Some(checkpoint) = self
+                    .attempt_handoff(session, task_id, sink, &hard, accounting, turn)
+                    .await?
+            {
+                prune_checkpoint = Some(checkpoint);
+            }
             // a. Compile the model request from durable state (§8). The
             //    compiler owns every context decision; the loop only passes
             //    it the inputs. When even the compiler's rescue arm cannot

@@ -39,10 +39,13 @@ const BUILT_IN: [(&str, Class); 9] = [
     ("verify", Class::Shell),
 ];
 
-/// One declared MCP server from `.loom/mcp.toml`.
+/// One declared MCP server from `.loom/mcp.toml`, plus its live attach
+/// outcome from the open engine (`None` when the screen has no engine
+/// yet — the server has not been attempted).
 pub(crate) struct McpRow {
     name: String,
     command: String,
+    connected: Option<bool>,
 }
 
 pub(crate) struct ToolsScreen {
@@ -67,8 +70,10 @@ pub(crate) enum ToolsAction {
 
 impl ToolsScreen {
     /// Loads declared MCP servers; a missing or invalid manifest means
-    /// none, which is the truth the engine itself attaches with.
-    pub(crate) fn load(workspace: &Path) -> Self {
+    /// none, which is the truth the engine itself attaches with. `live`
+    /// is the open engine's per-server outcome (manifest order, same
+    /// source), matched by name.
+    pub(crate) fn load(workspace: &Path, live: &[(String, bool)]) -> Self {
         let mcp =
             std::fs::read_to_string(workspace.join(loom_core::tools::mcp::MANIFEST_RELATIVE_PATH))
                 .ok()
@@ -78,8 +83,12 @@ impl ToolsScreen {
                         .servers
                         .into_iter()
                         .map(|(name, decl)| McpRow {
-                            name,
+                            connected: live
+                                .iter()
+                                .find(|(server, _)| *server == name)
+                                .map(|(_, ok)| *ok),
                             command: decl.command.join(" "),
+                            name,
                         })
                         .collect()
                 });
@@ -198,13 +207,16 @@ pub(crate) fn draw(frame: &mut Frame<'_>, area: Rect, screen: &ToolsScreen) {
     if !screen.mcp.is_empty() {
         lines.push(Line::from(Span::styled("MCP SERVERS", amber)));
         for server in &screen.mcp {
+            let (glyph, tone, status) = match server.connected {
+                Some(true) => ("●", theme::SAGE, "connected"),
+                Some(false) => ("○", theme::CORAL, "failed to attach"),
+                None => ("·", theme::DIM, "attaches when a session opens"),
+            };
             lines.push(Line::from(vec![
-                Span::styled("○ ", Style::default().fg(theme::DIM)),
-                Span::styled(format!("{} ", server.name), ivory),
-                Span::styled(
-                    format!("· {} · attaches at session open", server.command),
-                    dim,
-                ),
+                Span::styled(format!("{glyph} "), Style::default().fg(tone)),
+                Span::styled(format!("{:<14}", server.name), ivory),
+                Span::styled(format!("{status:<26}"), Style::default().fg(tone)),
+                Span::styled(server.command.clone(), dim),
             ]));
         }
     }
@@ -232,6 +244,7 @@ mod tests {
             mcp: vec![McpRow {
                 name: "github".into(),
                 command: "npx -y @modelcontextprotocol/server-github".into(),
+                connected: Some(true),
             }],
             selected: 5,
             writes_allowed: false,
@@ -240,7 +253,7 @@ mod tests {
 
     #[test]
     fn keys_move_toggle_retry_and_close() {
-        let mut tools = ToolsScreen::load(Path::new("/nonexistent"));
+        let mut tools = ToolsScreen::load(Path::new("/nonexistent"), &[]);
         assert!(tools.mcp.is_empty());
         assert_eq!(tools.key(KeyCode::Up.into()), Some(ToolsAction::Consumed)); // clamps at top
         tools.selected = 5;
@@ -280,11 +293,75 @@ mod tests {
             "manifest policy",
             "MCP SERVERS",
             "github",
-            "attaches at session open",
+            "connected",
             "9 built-in · 1 MCP",
             "Space permission",
         ] {
             assert!(text.contains(needle), "missing {needle}");
         }
+    }
+
+    #[test]
+    fn failed_server_shows_the_failure_and_unattempted_the_open_hint() {
+        let mut tools = screen();
+        tools.mcp[0].connected = Some(false);
+        let backend = TestBackend::new(130, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, Rect::new(0, 0, 130, 30), &tools))
+            .expect("draw");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("failed to attach"));
+        tools.mcp[0].connected = None;
+        let backend = TestBackend::new(130, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, Rect::new(0, 0, 130, 30), &tools))
+            .expect("draw");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("attaches when a session opens"));
+    }
+
+    #[test]
+    fn narrow_terminal_keeps_the_attach_status_visible() {
+        // At 80 columns the command can be clipped; the status may not,
+        // because it is the only thing that says whether the server's
+        // tools exist in this session.
+        let mut tools = screen();
+        tools.mcp[0].connected = Some(true);
+        tools.mcp.push(crate::tools_screen::McpRow {
+            name: "broken".to_owned(),
+            command: "some-very-long-command-name-that-will-not-fit-anywhere".to_owned(),
+            connected: Some(false),
+        });
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, Rect::new(0, 0, 80, 30), &tools))
+            .expect("draw");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("connected"), "missing connected at 80 cols");
+        assert!(
+            text.contains("failed to attach"),
+            "missing failed to attach at 80 cols"
+        );
     }
 }

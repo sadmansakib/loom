@@ -37,6 +37,9 @@ pub enum StubReason {
     /// the first 200 characters plus a `[pruned N chars]` marker
     /// (last-resort history elision, window/rescue passes only).
     ElidedAssistantText,
+    /// The operator dropped this result from `/context`: it is stubbed
+    /// even below the window trigger and outside the reclaim gate.
+    OperatorDropped,
 }
 
 impl StubReason {
@@ -71,6 +74,9 @@ impl StubReason {
             Self::ElidedReasoning => "[pruned] earlier reasoning elided by context pruning",
             Self::ElidedAssistantText => {
                 "[pruned] earlier assistant text reduced to its signature by context pruning"
+            }
+            Self::OperatorDropped => {
+                "[pruned] result omitted by the operator; re-run the call to recover the content"
             }
         }
     }
@@ -115,6 +121,9 @@ pub enum PruneTrigger {
     /// The budget-exceeded rescue: the unpruned projection could not
     /// fit, so the wrapper decided stubs ahead of any trigger.
     Rescue,
+    /// Operator drops (`/context` `x`): the result was stubbed because
+    /// the operator asked, even below the window trigger.
+    Operator,
 }
 
 /// One stub decision paired with its estimated reclaim — the unit of

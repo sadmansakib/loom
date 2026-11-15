@@ -299,6 +299,7 @@ impl Engine {
                 .with_mcp_menu(mcp.menu.clone())
                 .with_lsp_menu(lsp.menu.clone())
         });
+        let mut operator_ops: Option<loom_kernel::context::PruneOpsHandle> = None;
         let compiler: Box<dyn ContextCompiler> = if let Some(compiler) = overrides.compiler {
             compiler
         } else {
@@ -311,19 +312,20 @@ impl Engine {
                 crate::estimate::estimator_for(&config.provider);
             // The bare-loop arm compiles plain append-only context —
             // no pruning, no checkpoints — so a bare run measures the
-            // levers the full chain adds.
+            // levers the full chain adds. It also has no operator
+            // pin/drop sets: there is nothing to prune.
             if overrides.bare_loop {
                 Box::new(DefaultContextCompiler::with_estimator(estimator))
             } else {
-                Box::new(
-                    PruningContextCompiler::new(
-                        Box::new(DefaultContextCompiler::with_estimator(estimator.clone())),
-                        config
-                            .prune
-                            .unwrap_or_else(|| prune_config_for(&config.provider)),
-                    )
-                    .with_estimator(estimator),
+                let pruning = PruningContextCompiler::new(
+                    Box::new(DefaultContextCompiler::with_estimator(estimator.clone())),
+                    config
+                        .prune
+                        .unwrap_or_else(|| prune_config_for(&config.provider)),
                 )
+                .with_estimator(estimator);
+                operator_ops = Some(pruning.operator_handle());
+                Box::new(pruning)
             }
         };
         // The bare-loop arm also disarms the LLM handoff: the plain
@@ -466,7 +468,46 @@ impl Engine {
             resolution: Some(resolution),
             notices_flushed: std::sync::OnceLock::new(),
             events,
+            mcp_servers: mcp.servers,
+            prune_ops: operator_ops,
         })
+    }
+
+    /// Per-server MCP attach outcome from open time (manifest order):
+    /// `(server name, connected)`. A `false` row means that server
+    /// failed spawn, handshake, or `tools/list` and contributed no
+    /// tools; other servers proceeded. Empty when MCP is off or no
+    /// manifest declares servers.
+    #[must_use]
+    pub fn mcp_servers(&self) -> &[(String, bool)] {
+        &self.mcp_servers
+    }
+
+    /// Pins a tool result (`/context` `p`): no later prune pass stubs
+    /// it. Takes effect at the next task's first decision pass. A no-op
+    /// when the loop has no pruning compiler.
+    pub fn pin_context_call(&self, call_id: impl Into<String>) {
+        if let Some(ops) = &self.prune_ops {
+            ops.pin(call_id);
+        }
+    }
+
+    /// Drops a tool result (`/context` `x`): the next decision pass
+    /// stubs it even below the window trigger. A no-op when the loop has
+    /// no pruning compiler.
+    pub fn drop_context_call(&self, call_id: impl Into<String>) {
+        if let Some(ops) = &self.prune_ops {
+            ops.drop(call_id);
+        }
+    }
+
+    /// Snapshot of the operator's pin/drop sets, for the `/context`
+    /// inspector. `None` when the loop has no pruning compiler.
+    #[must_use]
+    pub fn context_ops(&self) -> Option<loom_kernel::context::PruneOps> {
+        self.prune_ops
+            .as_ref()
+            .map(loom_kernel::context::PruneOpsHandle::snapshot)
     }
 
     /// Resolves the config's model catalog exactly the way

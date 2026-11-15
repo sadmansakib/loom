@@ -91,6 +91,14 @@ pub struct Engine {
     /// savings per mechanism from a stored session. `None` when
     /// `persist` was off — the stream stays in-memory only.
     events: Option<SharedEventStore>,
+    /// Per-server MCP attach outcome from open time (manifest order):
+    /// name and whether spawn/handshake/`tools/list` succeeded. Empty
+    /// when MCP is off or no manifest declares servers.
+    mcp_servers: Vec<(String, bool)>,
+    /// Operator `/context` pin/drop sets shared with the pruning
+    /// compiler. `None` for a bare loop or a caller-supplied compiler —
+    /// both have no pruning decisions to steer.
+    prune_ops: Option<loom_kernel::context::PruneOpsHandle>,
 }
 
 /// A tier agent plus the model label it runs on, for the routing

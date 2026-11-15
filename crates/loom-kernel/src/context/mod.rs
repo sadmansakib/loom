@@ -30,8 +30,8 @@ pub use facts::{
     StaticFacts,
 };
 pub use pruning::{
-    ArgElision, PruneConfig, PruneReport, PruneTrigger, PrunedCall, PruningContextCompiler,
-    StubDecision, StubReason,
+    ArgElision, PruneConfig, PruneOps, PruneOpsHandle, PruneReport, PruneTrigger, PrunedCall,
+    PruningContextCompiler, StubDecision, StubReason,
 };
 
 use crate::model::{ModelCapabilities, ModelRequest};

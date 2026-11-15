@@ -1,10 +1,13 @@
 //! The `/context` inspector: what the next request will contain.
 //!
-//! Reads the live reducer only — the census from the last
-//! `ContextProgress` event plus the cache split from the task summary —
-//! so every number shown is one the engine itself produced.
+//! Reads the live reducer for the census and cache split, and the
+//! session transcript for the largest tool results — every number shown
+//! is derived from engine state, never re-estimated by the provider.
+//! Pin/drop actions go through the engine's pruning policy.
 
-use loom_core::kernel::context::ContextCensus;
+use loom_core::Session;
+use loom_core::kernel::context::{ContextCensus, PruneOps};
+use loom_core::kernel::transcript::Item;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -13,6 +16,67 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::reducer::Reducer;
 use crate::theme;
+
+/// One tool result the operator can pin or drop, in transcript order.
+pub(crate) struct ContextItem {
+    pub(crate) call_id: String,
+    /// Tool name plus its primary argument, e.g. `read_file agent/mod.rs`.
+    pub(crate) label: String,
+    /// Estimated tokens (the kernel's bytes ÷ 3 heuristic).
+    pub(crate) tokens: u64,
+    pub(crate) pinned: bool,
+    pub(crate) dropped: bool,
+}
+
+/// The largest tool results in `session`, biggest first — the wireframe's
+/// LARGEST ITEMS list. `limit` caps the rows the modal can show.
+pub(crate) fn items(session: &Session, ops: &PruneOps, limit: usize) -> Vec<ContextItem> {
+    let mut labels: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    for item in &session.transcript {
+        let Item::Assistant(message) = item else {
+            continue;
+        };
+        for call in &message.tool_calls {
+            let arguments: serde_json::Value = call.arguments.clone().into();
+            let primary = arguments
+                .get("path")
+                .or_else(|| arguments.get("command"))
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(String::new, |text| {
+                    format!(" {}", crate::recent::first_line(text, 32))
+                });
+            labels.insert(call.id.as_str(), format!("{}{primary}", call.name));
+        }
+    }
+    let mut rows: Vec<ContextItem> = session
+        .transcript
+        .iter()
+        .filter_map(|item| {
+            let Item::ToolResult(result) = item else {
+                return None;
+            };
+            let call_id = result.call_id.as_str().to_owned();
+            Some(ContextItem {
+                pinned: ops.pinned.contains(&call_id),
+                dropped: ops.dropped.contains(&call_id),
+                label: labels
+                    .get(result.call_id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| "tool result".into()),
+                tokens: u64::try_from(result.content.len() / 3).unwrap_or(u64::MAX),
+                call_id,
+            })
+        })
+        .collect();
+    rows.sort_by(|left, right| {
+        right
+            .tokens
+            .cmp(&left.tokens)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    rows.truncate(limit);
+    rows
+}
 
 type CensusField = fn(&ContextCensus) -> u32;
 
@@ -30,8 +94,14 @@ const BREAKDOWN: [(&str, CensusField, ratatui::style::Color); 5] = [
 ];
 
 /// Render the inspector modal over the dimmed live view.
-pub(crate) fn draw(frame: &mut Frame<'_>, area: Rect, reducer: &Reducer) {
-    let height = area.height.clamp(12, 24);
+pub(crate) fn draw(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    reducer: &Reducer,
+    items: &[ContextItem],
+    selected: usize,
+) {
+    let height = area.height.clamp(12, 26);
     let modal = crate::modal::centered(area, height);
     crate::modal::dim_scene(frame, area, modal);
     frame.render_widget(Clear, modal);
@@ -52,10 +122,32 @@ pub(crate) fn draw(frame: &mut Frame<'_>, area: Rect, reducer: &Reducer) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(6), Constraint::Length(2)])
         .split(inner);
+    let dim = Style::default().fg(theme::DIM);
+    let body = body_lines(reducer, items, selected);
+    frame.render_widget(Paragraph::new(body), rows[0]);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "RULES dropping keeps the call line; the model sees [pruned] and can re-run it",
+                dim,
+            )),
+            Line::from(Span::styled(
+                "↑↓ move   p pin   x drop   c compact next task   Esc back",
+                dim,
+            )),
+        ]),
+        rows[1],
+    );
+}
+
+/// The modal body: the census breakdown, then the operator's largest
+/// tool results with pin/drop state. Split from `draw` so each half
+/// stays one screenful of logic.
+fn body_lines(reducer: &Reducer, items: &[ContextItem], selected: usize) -> Vec<Line<'static>> {
     let amber = Style::default().fg(theme::AMBER);
     let dim = Style::default().fg(theme::DIM);
     let ivory = Style::default().fg(theme::IVORY);
-    let body = match reducer.context_progress.as_ref() {
+    let mut body = match reducer.context_progress.as_ref() {
         Some(progress) => {
             let census = &progress.census;
             let budget = progress.context_budget.max_input_tokens;
@@ -95,20 +187,38 @@ pub(crate) fn draw(frame: &mut Frame<'_>, area: Rect, reducer: &Reducer) {
             )),
         ],
     };
-    frame.render_widget(Paragraph::new(body), rows[0]);
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(
-                "RULES elision keeps the first 200 chars of old assistant text; aged tool args become [pruned N chars]",
-                dim,
-            )),
-            Line::from(Span::styled(
-                "c compact (runs automatically)   Esc back",
-                dim,
-            )),
-        ]),
-        rows[1],
-    );
+    body.push(Line::from(""));
+    body.push(Line::from(Span::styled("LARGEST ITEMS", amber)));
+    if items.is_empty() {
+        body.push(Line::from(Span::styled(
+            "no tool results in this session yet",
+            dim,
+        )));
+    }
+    for (position, item) in items.iter().enumerate() {
+        let (status, tone) = if item.dropped {
+            ("dropped", theme::CORAL)
+        } else if item.pinned {
+            ("pinned", theme::SAGE)
+        } else {
+            ("—", theme::DIM)
+        };
+        let style = if position == selected {
+            Style::default().fg(theme::IVORY).bg(theme::PANEL)
+        } else {
+            ivory
+        };
+        body.push(Line::from(vec![
+            Span::styled(if position == selected { "▸ " } else { "  " }, amber),
+            Span::styled(format!("{:<28}", item.label), style),
+            Span::styled(
+                format!("{:>7}  ", tokens_label(item.tokens)),
+                Style::default().fg(theme::BLUE),
+            ),
+            Span::styled(status, Style::default().fg(tone)),
+        ]));
+    }
+    body
 }
 
 /// Cached input tokens and their whole-number share of the last request,
@@ -197,7 +307,7 @@ mod tests {
         let backend = TestBackend::new(130, 30);
         let mut frame = ratatui::Terminal::new(backend).expect("test terminal");
         let reducer = reducer_with_progress();
-        frame.draw(|frame| draw(frame, Rect::new(0, 0, 130, 30), &reducer));
+        frame.draw(|frame| draw(frame, Rect::new(0, 0, 130, 30), &reducer, &[], 0));
         let buffer = frame.backend().buffer().clone();
         let text: String = buffer
             .content
@@ -218,5 +328,55 @@ mod tests {
         ] {
             assert!(text.contains(needle), "missing {needle}");
         }
+    }
+
+    #[test]
+    fn items_list_the_largest_results_and_mark_pin_and_drop() {
+        use loom_core::kernel::transcript::{
+            AssistantMessage, Item, ToolArguments, ToolCall, ToolCallId, ToolResult, ToolStatus,
+        };
+
+        let mut session = loom_core::Session::new(loom_core::SessionId::new());
+        session.transcript.push(Item::Assistant(AssistantMessage {
+            content: String::new(),
+            reasoning: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: ToolCallId::try_from("call_1".to_owned()).expect("id"),
+                    name: "read_file".to_owned(),
+                    arguments: ToolArguments::try_from(serde_json::json!({"path": "src/a.rs"}))
+                        .expect("args"),
+                },
+                ToolCall {
+                    id: ToolCallId::try_from("call_2".to_owned()).expect("id"),
+                    name: "search".to_owned(),
+                    arguments: ToolArguments::try_from(
+                        serde_json::json!({"command": "RetryPolicy"}),
+                    )
+                    .expect("args"),
+                },
+            ],
+            stop_reason: loom_core::kernel::model::StopReason::ToolCalls,
+        }));
+        session.transcript.push(Item::ToolResult(ToolResult::new(
+            ToolCallId::try_from("call_1".to_owned()).expect("id"),
+            ToolStatus::Success,
+            "x".repeat(3_000),
+            false,
+        )));
+        session.transcript.push(Item::ToolResult(ToolResult::new(
+            ToolCallId::try_from("call_2".to_owned()).expect("id"),
+            ToolStatus::Success,
+            "y".repeat(300),
+            false,
+        )));
+        let mut ops = loom_core::kernel::context::PruneOps::default();
+        ops.dropped.insert("call_2".to_owned());
+        let items = items(&session, &ops, 6);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].label, "read_file src/a.rs", "biggest first");
+        assert_eq!(items[0].tokens, 1_000);
+        assert!(!items[0].dropped);
+        assert!(items[1].dropped);
     }
 }

@@ -159,7 +159,11 @@ fn default_config(
         git: false,
         skills: false,
         lessons: false,
-        mcp: false,
+        // The `/tools` screen shows live per-server attach status and the
+        // wireframe's MCP section, so the TUI turns MCP on. Attach is
+        // trust-gated (`loom trust` pins `.loom/mcp.toml`) and fails
+        // closed: an unpinned or broken server contributes no tools.
+        mcp: true,
         lsp: false,
         budgets: ToolBudgets::default(),
         prune: Some(PruneConfig::default()),
@@ -262,8 +266,13 @@ async fn run_interactive(
     let mut pending_approval: Option<approval::Request> = None;
     let mut palette_selected = 0_usize;
     let mut notice: Option<String> = None;
+    // Armed by `/compact`: the next task runs an eager handoff summary
+    // before its first compile (the kernel's compaction latch).
+    let mut compact_next = false;
     let mut sessions: Option<sessions_screen::SessionsScreen> = None;
     let mut context_open = false;
+    let mut context_items: Vec<context_screen::ContextItem> = Vec::new();
+    let mut context_selected = 0_usize;
     let mut tools: Option<tools_screen::ToolsScreen> = None;
     let mut compare: Option<compare_screen::CompareScreen> = None;
     let mut accounts: Option<account_screen::AccountScreen> = None;
@@ -357,6 +366,9 @@ async fn run_interactive(
             };
             let (sink, mut events) = ChannelEventSink::new();
             let task_control = TaskControl::new();
+            if std::mem::take(&mut compact_next) {
+                task_control.request_compaction();
+            }
             reducer = Reducer::default();
             event_log.clear();
             let prompt = pending_display_prompt
@@ -405,6 +417,8 @@ async fn run_interactive(
                             tools: None,
                             compare: None,
                             accounts: None,
+                            context_items: &[],
+                            context_selected: 0,
                             config: &config,
                             session_id: Some(session_id.as_str()),
                             capabilities: picker_state.selected().capabilities,
@@ -527,6 +541,8 @@ async fn run_interactive(
                     tools: tools.as_ref(),
                     compare: compare.as_ref(),
                     accounts: accounts.as_ref(),
+                    context_items: &context_items,
+                    context_selected,
                     config: &config,
                     session_id: session_label.as_deref(),
                     capabilities: picker_state.selected().capabilities,
@@ -601,12 +617,41 @@ async fn run_interactive(
             };
             // The context inspector owns every key while it is open.
             let handled_by_context = if context_open && let Event::Key(key) = &event {
-                if key.code == crossterm::event::KeyCode::Esc {
-                    context_open = false;
-                } else if key.code == crossterm::event::KeyCode::Char('c')
-                    && key.modifiers.is_empty()
-                {
-                    notice = Some("compaction runs automatically when the context fills".into());
+                use crossterm::event::KeyCode;
+                match (key.code, key.modifiers) {
+                    (KeyCode::Esc, _) => context_open = false,
+                    (KeyCode::Up, _) => {
+                        context_selected = context_selected.saturating_sub(1);
+                    }
+                    (KeyCode::Down, _) => {
+                        context_selected =
+                            (context_selected + 1).min(context_items.len().saturating_sub(1));
+                    }
+                    (KeyCode::Char('c'), modifiers) if modifiers.is_empty() => {
+                        compact_next = true;
+                        notice = Some("context will be compacted before the next task".into());
+                    }
+                    (KeyCode::Char(status @ ('p' | 'x')), modifiers) if modifiers.is_empty() => {
+                        if let Some(item) = context_items.get(context_selected) {
+                            let call_id = item.call_id.clone();
+                            if let Some((engine, _)) = active.as_ref() {
+                                if status == 'p' {
+                                    engine.pin_context_call(&call_id);
+                                    notice = Some(format!("pinned {call_id} to the prefix"));
+                                } else {
+                                    engine.drop_context_call(&call_id);
+                                    notice =
+                                        Some(format!("dropped {call_id} from the next request"));
+                                }
+                                let ops = engine.context_ops().unwrap_or_default();
+                                for item in &mut context_items {
+                                    item.pinned = ops.pinned.contains(&item.call_id);
+                                    item.dropped = ops.dropped.contains(&item.call_id);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 true
             } else {
@@ -647,6 +692,10 @@ async fn run_interactive(
                     true
                 }
                 Some(tools_screen::ToolsAction::Retry) => {
+                    let live = active
+                        .as_ref()
+                        .map_or(&[][..], |(engine, _)| engine.mcp_servers());
+                    tools = Some(tools_screen::ToolsScreen::load(&config.workspace, live));
                     notice = Some("MCP servers attach when a session opens".into());
                     true
                 }
@@ -822,10 +871,25 @@ async fn run_interactive(
                                         screen.refresh_preview(&config.db_path);
                                     }
                                 }
-                                "/context" => context_open = true,
+                                "/context" => {
+                                    context_open = true;
+                                    context_selected = 0;
+                                    context_items = active.as_ref().map_or_else(
+                                        Vec::new,
+                                        |(engine, session)| {
+                                            let ops = engine.context_ops().unwrap_or_default();
+                                            context_screen::items(session, &ops, 6)
+                                        },
+                                    );
+                                }
                                 "/tools" => {
-                                    tools =
-                                        Some(tools_screen::ToolsScreen::load(&config.workspace));
+                                    let live = active
+                                        .as_ref()
+                                        .map_or(&[][..], |(engine, _)| engine.mcp_servers());
+                                    tools = Some(tools_screen::ToolsScreen::load(
+                                        &config.workspace,
+                                        live,
+                                    ));
                                 }
                                 "/account" => {
                                     let list = loom_core::engine::auth::Auth::open(&config.db_path)
@@ -838,9 +902,9 @@ async fn run_interactive(
                                         Some(compare_screen::CompareScreen::load(&config.db_path));
                                 }
                                 "/compact" => {
+                                    compact_next = true;
                                     notice = Some(
-                                        "compaction runs automatically when the context fills"
-                                            .into(),
+                                        "context will be compacted before the next task".into(),
                                     );
                                 }
                                 "/export" => {
@@ -1264,7 +1328,7 @@ mod tests {
         let config = default_config(None, None, None, None, None).unwrap();
         assert_eq!(config.provider, "");
         assert_eq!(config.model, "");
-        assert!(!config.mcp);
+        assert!(config.mcp, "the /tools screen reports live MCP status");
         assert!(!config.lsp);
         assert!(!config.autofix);
     }
