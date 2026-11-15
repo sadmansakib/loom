@@ -459,6 +459,11 @@ async fn run_interactive(
                 }
             };
             drop(run);
+            // A request left unanswered by an abandoned or retried call must
+            // not outlive the run: decline it so the box cannot linger.
+            if let Some(stale) = pending_approval.take() {
+                let _ = stale.reply.send(loom_core::tools::WriteDecision::Decline);
+            }
             while let Ok(event) = events.try_recv() {
                 reducer.reduce(&event, epoch_millis());
             }

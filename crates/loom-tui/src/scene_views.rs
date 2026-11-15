@@ -632,6 +632,17 @@ fn draw_live_header(
     let session = options.session_id.unwrap_or("session unavailable");
     let effort = options.effort.unwrap_or("not reported");
     let thinking = options.thinking.unwrap_or("not reported");
+    // Below wide width the left header half must stop short of the model
+    // label: cap the workspace path and drop the session suffix.
+    let left_column = usize::from(area.width) * 62 / 100;
+    let (workspace_label, session_suffix) = if area.width >= 120 {
+        (workspace.to_owned(), format!("  ·  session {session}"))
+    } else {
+        (
+            thread::truncate_chars(workspace, left_column.saturating_sub(12)),
+            String::new(),
+        )
+    };
     let (left, right) = if scene.is_some() {
         (
             Line::from(vec![
@@ -646,7 +657,7 @@ fn draw_live_header(
                 Span::styled("◆ ", fg(theme::AMBER).add_modifier(Modifier::BOLD)),
                 Span::styled("loom", fg(theme::AMBER).add_modifier(Modifier::BOLD)),
                 Span::styled(
-                    format!("   {workspace}  ·  session {session}"),
+                    format!("   {workspace_label}{session_suffix}"),
                     fg(theme::DIM),
                 ),
             ]),
@@ -974,6 +985,38 @@ mod tests {
             !rows.iter().any(|row| row.contains("┌")),
             "prompt still boxed"
         );
+    }
+
+    #[test]
+    fn medium_header_truncates_workspace_instead_of_gluing_onto_the_model() {
+        let reducer = Reducer::default();
+        let long_path = "/var/folders/sf/kblwt_lj3c1gbsvjy52tt2fr0000gn/T/tmp.oTHmCBHiSr/ws";
+        let mut terminal = Terminal::new(TestBackend::new(105, 40)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_live(
+                    frame,
+                    &reducer,
+                    "",
+                    0,
+                    LiveViewOptions {
+                        workspace: Some(long_path),
+                        model: Some("deepseek-flash"),
+                        ..LiveViewOptions::default()
+                    },
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let header: String = (0..buffer.area.width)
+            .map(|x| buffer.cell((x, 0)).unwrap().symbol())
+            .collect::<String>();
+        assert!(header.contains('…'), "workspace not truncated: {header}");
+        assert!(
+            !header.contains("wsdeepseek-flash"),
+            "workspace glued onto model: {header}"
+        );
+        assert!(header.contains("deepseek-flash"));
     }
 
     #[test]
