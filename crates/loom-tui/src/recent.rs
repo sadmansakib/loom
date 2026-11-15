@@ -62,11 +62,16 @@ pub(crate) fn load(db_path: &Path) -> Vec<RecentSession> {
 
 /// First line of a prompt, cut to [`TITLE_LIMIT`] characters.
 fn title_of(text: &str) -> String {
+    first_line(text, TITLE_LIMIT)
+}
+
+/// First line of a text, cut to `limit` characters with `…`.
+pub(crate) fn first_line(text: &str, limit: usize) -> String {
     let line = text.lines().next().unwrap_or_default().trim();
-    if line.chars().count() <= TITLE_LIMIT {
+    if line.chars().count() <= limit {
         return line.to_owned();
     }
-    let cut: String = line.chars().take(TITLE_LIMIT - 1).collect();
+    let cut: String = line.chars().take(limit - 1).collect();
     format!("{cut}…")
 }
 

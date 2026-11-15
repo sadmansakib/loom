@@ -360,6 +360,47 @@ impl SessionStore for SqliteStore {
     }
 }
 
+impl SqliteStore {
+    /// Removes a session and every row that belongs to it (items, tasks,
+    /// events, forks, checkpoints, leases). Inherent, not on the
+    /// [`SessionStore`](loom_kernel::store::SessionStore) trait: only the
+    /// SQLite store supports deletion, and in-memory test stores must not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when a delete fails; tables already
+    /// cleared stay cleared.
+    pub fn delete_session(&self, session: &SessionId) -> Result<(), StoreError> {
+        let connection = self.lock()?;
+        let id = session.to_string();
+        // Children first: foreign-key cascades are not guaranteed to be
+        // enabled on every connection, so each table is cleared by hand.
+        for table in [
+            "items",
+            "tasks",
+            "events",
+            "forks",
+            "start_checkpoints",
+            "sessions",
+        ] {
+            connection
+                .execute(
+                    &format!("DELETE FROM {table} WHERE session_id = ?1"),
+                    params![&id],
+                )
+                .or_else(|error| {
+                    if table == "sessions" {
+                        connection.execute("DELETE FROM sessions WHERE id = ?1", params![&id])
+                    } else {
+                        Err(error)
+                    }
+                })
+                .map_err(backend)?;
+        }
+        Ok(())
+    }
+}
+
 /// Unix milliseconds, saturating at the epoch (never panics on a bad clock).
 pub(super) fn now_millis() -> u64 {
     SystemTime::now()

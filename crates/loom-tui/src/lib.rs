@@ -13,6 +13,7 @@ mod picker;
 mod recent;
 mod reducer;
 mod scene_views;
+mod sessions_screen;
 mod terminal;
 mod theme;
 mod welcome;
@@ -27,6 +28,7 @@ use loom_core::kernel::agent::TurnBudget;
 use loom_core::kernel::context::PruneConfig;
 use loom_core::kernel::event::ChannelEventSink;
 use loom_core::kernel::session::Session;
+use loom_core::kernel::store::EventStore;
 use loom_core::tools::ToolBudgets;
 use loom_core::{Engine, EngineConfig, EventSink, ReasoningEffort, TaskControl};
 use ratatui::Terminal;
@@ -256,6 +258,7 @@ async fn run_interactive(
     let mut pending_approval: Option<approval::Request> = None;
     let mut palette_selected = 0_usize;
     let mut notice: Option<String> = None;
+    let mut sessions: Option<sessions_screen::SessionsScreen> = None;
     let mut event_log: Vec<loom_core::EventEnvelope> = Vec::new();
     if picker {
         picker_state = PickerState::discover(&config).await?;
@@ -389,6 +392,7 @@ async fn run_interactive(
                             approval: pending_approval.as_ref(),
                             notice: None,
                             palette_selected: 0,
+                            sessions: None,
                             config: &config,
                             session_id: Some(session_id.as_str()),
                             capabilities: picker_state.selected().capabilities,
@@ -506,6 +510,7 @@ async fn run_interactive(
                     approval: pending_approval.as_ref(),
                     notice: notice.as_deref(),
                     palette_selected,
+                    sessions: sessions.as_ref(),
                     config: &config,
                     session_id: session_label.as_deref(),
                     capabilities: picker_state.selected().capabilities,
@@ -520,7 +525,64 @@ async fn run_interactive(
         if event::poll(FRAME_TICK)? {
             let event = event::read()?;
             let key_pressed = matches!(event, Event::Key(_));
-            notice = None;
+            // The sessions screen owns every key while it is open.
+            let sessions_action = match (&event, sessions.as_mut()) {
+                (Event::Key(key), Some(screen)) => screen.key(*key),
+                _ => None,
+            };
+            let handled_by_sessions = if let Some(action) = sessions_action {
+                use sessions_screen::SessionsAction;
+                match action {
+                    SessionsAction::Consumed => {
+                        if let Some(screen) = sessions.as_mut() {
+                            screen.refresh_preview(&config.db_path);
+                        }
+                        true
+                    }
+                    SessionsAction::Close => {
+                        sessions = None;
+                        true
+                    }
+                    SessionsAction::Resume(raw) => {
+                        sessions = None;
+                        notice = Some(
+                            resume_session(
+                                &config,
+                                overrides.take().unwrap_or_default(),
+                                &approval_tx,
+                                &mut active,
+                                &mut reducer,
+                                &raw,
+                            )
+                            .await,
+                        );
+                        true
+                    }
+                    SessionsAction::Export(raw) => {
+                        notice = Some(export_session_events(&config, &raw));
+                        if let Some(screen) = sessions.as_mut() {
+                            screen.refresh_preview(&config.db_path);
+                        }
+                        true
+                    }
+                    SessionsAction::Delete(raw) => {
+                        notice = Some(delete_session(&config.db_path, &raw));
+                        sessions = Some(sessions_screen::SessionsScreen::load(&config.db_path));
+                        if let Some(screen) = sessions.as_mut() {
+                            screen.refresh_preview(&config.db_path);
+                        }
+                        true
+                    }
+                    SessionsAction::NewSession => {
+                        active = None;
+                        sessions = None;
+                        notice = Some("started a new session".into());
+                        true
+                    }
+                }
+            } else {
+                false
+            };
             // The palette owns ↑/↓/Enter/Esc while the composer holds a
             // `/` command; every other key falls through and keeps typing.
             let handled_by_palette =
@@ -532,6 +594,14 @@ async fn run_interactive(
                                 match command.name {
                                     "/model" | "/effort" => picker = true,
                                     "/help" => help = true,
+                                    "/sessions" => {
+                                        sessions = Some(sessions_screen::SessionsScreen::load(
+                                            &config.db_path,
+                                        ));
+                                        if let Some(screen) = sessions.as_mut() {
+                                            screen.refresh_preview(&config.db_path);
+                                        }
+                                    }
                                     "/compact" => {
                                         notice = Some(
                                             "compaction runs automatically when the context fills"
@@ -567,7 +637,11 @@ async fn run_interactive(
                 } else {
                     false
                 };
-            if !handled_by_palette {
+            if !handled_by_palette && !handled_by_sessions {
+                // A plain key press dismisses the footer notice; keys the
+                // palette or sessions screen consumed (like Esc closing a
+                // modal) leave it visible so the user can read the result.
+                notice = None;
                 route_event(
                     event,
                     || {
@@ -639,6 +713,90 @@ fn export_task(
         Ok(Some(dir)) => format!("exported to {}", dir.display()),
         Ok(None) => "nothing to export: no events were recorded".into(),
         Err(error) => format!("export failed: {error}"),
+    }
+}
+
+/// Writes one session's recorded events as NDJSON, the same layout
+/// `TraceWriter` produces, for the sessions screen's `e` key.
+fn export_session_events(config: &EngineConfig, raw: &str) -> String {
+    let Ok(id) = raw.parse::<loom_core::SessionId>() else {
+        return "export failed: bad session id".into();
+    };
+    if !config.db_path.exists() {
+        return "export failed: no store found".into();
+    }
+    let Ok(store) = loom_core::store::SqliteStore::open(&config.db_path) else {
+        return "export failed: cannot open the store".into();
+    };
+    let events = store.load_events(&id).unwrap_or_default();
+    if events.is_empty() {
+        return "nothing to export: no events for that session".into();
+    }
+    let dir = config.workspace.join(".loom").join("exports");
+    let path = dir.join(format!("{raw}.ndjson"));
+    let mut body = String::new();
+    for envelope in &events {
+        match serde_json::to_string(envelope) {
+            Ok(line) => {
+                body.push_str(&line);
+                body.push('\n');
+            }
+            Err(error) => return format!("export failed: {error}"),
+        }
+    }
+    match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, body)) {
+        Ok(()) => format!("exported to {}", path.display()),
+        Err(error) => format!("export failed: {error}"),
+    }
+}
+
+/// Deletes a session and its children from the store, then reloads.
+fn delete_session(db_path: &std::path::Path, raw: &str) -> String {
+    let Ok(id) = raw.parse::<loom_core::SessionId>() else {
+        return "delete failed: bad session id".into();
+    };
+    if !db_path.exists() {
+        return "delete failed: no store found".into();
+    }
+    let Ok(store) = loom_core::store::SqliteStore::open(db_path) else {
+        return "delete failed: cannot open the store".into();
+    };
+    match store.delete_session(&id) {
+        Ok(()) => format!("deleted {raw}"),
+        Err(error) => format!("delete failed: {error}"),
+    }
+}
+
+/// Swaps the live session for a recorded one so the next task continues it.
+async fn resume_session(
+    config: &EngineConfig,
+    overrides: loom_core::EngineOverrides,
+    requests: &tokio::sync::mpsc::UnboundedSender<approval::Request>,
+    active: &mut Option<(Engine, Session)>,
+    reducer: &mut reducer::Reducer,
+    raw: &str,
+) -> String {
+    let Ok(id) = raw.parse::<loom_core::SessionId>() else {
+        return "resume failed: bad session id".into();
+    };
+    if active.is_none() {
+        match open_engine(config, overrides, requests).await {
+            Ok(pair) => *active = Some(pair),
+            Err(error) => return format!("resume failed: {error}"),
+        }
+    }
+    let Some((engine, session_slot)) = active.as_mut() else {
+        return "resume failed: no engine open".into();
+    };
+    match engine.load_session(&id) {
+        Ok(Some(session)) => {
+            *reducer = crate::reducer::Reducer::default();
+            reducer.reconcile_session(&session);
+            *session_slot = session;
+            format!("resumed session {id}")
+        }
+        Ok(None) => format!("resume failed: unknown session {id}"),
+        Err(error) => format!("resume failed: {error}"),
     }
 }
 

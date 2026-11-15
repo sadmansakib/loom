@@ -18,6 +18,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "set reasoning effort",
     },
     Command {
+        name: "/sessions",
+        blurb: "browse, resume, export, or delete past sessions",
+    },
+    Command {
         name: "/compact",
         blurb: "compact the context",
     },

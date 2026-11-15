@@ -41,6 +41,8 @@ pub(crate) struct LiveFrame<'a> {
     pub(crate) notice: Option<&'a str>,
     /// Highlighted row while the `/` command palette is open.
     pub(crate) palette_selected: usize,
+    /// The `/sessions` screen, drawn over the live view while open.
+    pub(crate) sessions: Option<&'a crate::sessions_screen::SessionsScreen>,
     pub(crate) config: &'a EngineConfig,
     pub(crate) session_id: Option<&'a str>,
     pub(crate) capabilities: Option<ModelCapabilities>,
@@ -67,6 +69,7 @@ pub(crate) fn draw_live(frame: &mut ratatui::Frame<'_>, view: &LiveFrame<'_>) {
         approval,
         notice,
         palette_selected,
+        sessions,
         config,
         session_id,
         capabilities,
@@ -75,6 +78,8 @@ pub(crate) fn draw_live(frame: &mut ratatui::Frame<'_>, view: &LiveFrame<'_>) {
     } = *view;
     if help {
         scene_views::draw(frame, Scene::Help);
+    } else if let Some(screen) = sessions {
+        crate::sessions_screen::draw(frame, frame.area(), screen);
     } else if picker {
         scene_views::draw_picker(frame, &PickerState::empty());
     } else {

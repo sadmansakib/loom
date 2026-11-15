@@ -113,6 +113,27 @@ fn session_round_trips_through_sqlite() {
 }
 
 #[test]
+fn delete_session_removes_the_session_and_its_children() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let id = SessionId::new();
+    store.ensure_session(&id).unwrap();
+    let user = Item::User {
+        text: "hello".to_owned(),
+    };
+    store.append_item(&id, ItemIndex::from(0), &user).unwrap();
+    store
+        .upsert_task(&id, &TaskRecord::new(TaskId::new(), 1_000))
+        .unwrap();
+    let other = SessionId::new();
+    store.ensure_session(&other).unwrap();
+
+    store.delete_session(&id).unwrap();
+
+    assert!(store.load(&id).unwrap().is_none());
+    assert_eq!(store.session_ids().unwrap(), vec![other]);
+}
+
+#[test]
 fn a_session_survives_reopening_the_database_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("nested").join("loom.db");

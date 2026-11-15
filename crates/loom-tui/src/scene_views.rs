@@ -914,7 +914,7 @@ fn fg(color: Color) -> Style {
         .fg(adapt_color(color))
         .bg(adapt_color(theme::BG))
 }
-fn glyph_set() -> GlyphSet {
+pub(crate) fn glyph_set() -> GlyphSet {
     if env::var_os("LOOM_ASCII").is_some_and(|value| value == "1") {
         GlyphSet::Ascii
     } else {
