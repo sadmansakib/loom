@@ -80,7 +80,11 @@ impl Agent {
 
         // 2. The task record, persisted then mirrored before its start event.
         let task_id = TaskId::new();
-        let record = TaskRecord::new(task_id, now_millis());
+        let mut record = TaskRecord::new(task_id, now_millis());
+        record.effort = self
+            .config
+            .reasoning_effort
+            .map(|effort| effort.as_str().to_owned());
         self.persist_task(session, &record)?;
         session.push_task(record);
         sink.emit(task_id, EventKind::TaskStarted);
@@ -153,7 +157,11 @@ impl Agent {
         // 2. The task record and its start events; the marker names the
         //    deterministic classification for attribution.
         let task_id = TaskId::new();
-        let record = TaskRecord::new(task_id, now_millis());
+        let mut record = TaskRecord::new(task_id, now_millis());
+        record.effort = self
+            .config
+            .reasoning_effort
+            .map(|effort| effort.as_str().to_owned());
         self.persist_task(session, &record)?;
         session.push_task(record);
         sink.emit(task_id, EventKind::TaskStarted);

@@ -46,6 +46,14 @@ pub struct TaskRecord {
     pub started_at_millis: u64,
     /// When the task reached a terminal state, if it has.
     pub completed_at_millis: Option<u64>,
+    /// Reasoning-effort level the engine armed for this task, as the
+    /// request wire string (`"low"`, `"high"`, …); `None` when the
+    /// engine sends no effort hint or the record predates the field.
+    /// Recorded per task because a session can mix efforts across
+    /// follow-up tasks; not part of the event wire format, so old
+    /// persisted rows deserialize with `None`.
+    #[serde(default)]
+    pub effort: Option<String>,
     /// Short machine-readable token naming the cause of the ending, in
     /// `snake_case` (e.g. `"end_turn"`, `"max_turns"`, `"model_error"`,
     /// `"user_cancelled"`, `"shutdown"`). Convention: **always set on
@@ -251,6 +259,7 @@ impl TaskRecord {
             usage: Usage::default(),
             started_at_millis,
             completed_at_millis: None,
+            effort: None,
             end_reason: None,
         }
     }

@@ -400,6 +400,7 @@ mod tests {
             usage: Usage::default(),
             started_at_millis: 0,
             completed_at_millis: None,
+            effort: None,
             end_reason: None,
         });
         session

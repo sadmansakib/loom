@@ -1,10 +1,10 @@
 //! The `/compare` screen: recent runs side by side.
 //!
 //! Rows come from the store's task records; calls and model are
-//! recovered from each session's event log. Cost is an estimate at the
-//! current model's pricing — runs on other models show `≈` to say so.
-//! Effort is not recorded per run, so the wireframe's effort column is
-//! omitted.
+//! recovered from each session's event log. Cost is the provider-reported
+//! charge when the run's usage carries one, else an estimate at the
+//! current model's pricing — `≈` marks estimates. Effort is the level the
+//! engine armed for the task (`—` for records that predate it).
 
 use std::path::Path;
 
@@ -20,6 +20,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+use crate::glyphs::GlyphSet;
 use crate::picker::ModelPricing;
 use crate::recent::first_line;
 use crate::theme;
@@ -29,6 +30,8 @@ pub(crate) struct RunRow {
     task: String,
     status: Option<TaskStatus>,
     model: String,
+    effort: Option<String>,
+    cost_usd: Option<f64>,
     turns: u32,
     calls: u64,
     wall_millis: Option<u64>,
@@ -97,6 +100,8 @@ impl CompareScreen {
                         task: short_id(&task.id.to_string()),
                         status: Some(task.status),
                         model: model.clone(),
+                        effort: task.effort.clone(),
+                        cost_usd: task.usage.cost_usd,
                         turns: task.turns,
                         calls: u64::try_from(calls).unwrap_or(u64::MAX),
                         wall_millis: task
@@ -218,9 +223,12 @@ fn wall_label(millis: Option<u64>) -> String {
 }
 
 fn cost_label(row: &RunRow, pricing: Option<ModelPricing>) -> String {
-    pricing
-        .and_then(|p| p.estimate(row.input, row.output))
-        .map_or_else(|| "—".into(), |cost| format!("≈${cost:.3}"))
+    match row.cost_usd {
+        Some(cost) => format!("${cost:.4}"),
+        None => pricing
+            .and_then(|p| p.estimate(row.input, row.output))
+            .map_or_else(|| "—".into(), |cost| format!("≈${cost:.3}")),
+    }
 }
 
 fn cache_label(row: &RunRow) -> String {
@@ -274,6 +282,15 @@ fn row_line(
     ));
     spans.push(Span::styled(
         format!(
+            "{:<6} ",
+            row.effort
+                .as_deref()
+                .map_or_else(|| "—".into(), str::to_owned)
+        ),
+        dim,
+    ));
+    spans.push(Span::styled(
+        format!(
             "{:<5} {:<5} {:<8} ",
             row.turns,
             row.calls,
@@ -287,6 +304,112 @@ fn row_line(
     ));
     spans.push(Span::styled(format!("  {}", row.prompt), dim));
     Line::from(spans)
+}
+
+/// Cost-vs-wall chart under the table (wireframe `COST VS WALL TIME`):
+/// one line per visible run with an amber cost bar and a teal wall bar,
+/// each scaled against the max across the visible runs. Skipped when no
+/// run has a cost basis or none has a wall time.
+fn chart_lines(
+    screen: &CompareScreen,
+    visible: &[usize],
+    pricing: Option<ModelPricing>,
+    amber: Style,
+    dim: Style,
+) -> Vec<Line<'static>> {
+    let cost_of = |row: &RunRow| {
+        row.cost_usd
+            .or_else(|| pricing.and_then(|p| p.estimate(row.input, row.output)))
+    };
+    let rows: Vec<&RunRow> = visible.iter().filter_map(|i| screen.rows.get(*i)).collect();
+    let max_cost = rows
+        .iter()
+        .filter_map(|row| cost_of(row))
+        .fold(0.0_f64, f64::max);
+    let max_wall = rows
+        .iter()
+        .filter_map(|row| row.wall_millis)
+        .fold(0_u64, u64::max);
+    if max_cost <= 0.0 || max_wall == 0 {
+        return Vec::new();
+    }
+    let (filled, empty) = if let GlyphSet::Ascii = crate::scene_views::glyph_set() {
+        ('#', '.')
+    } else {
+        ('\u{2588}', '\u{2591}')
+    };
+    let mut lines = vec![
+        Line::from(Span::styled("", dim)),
+        Line::from(Span::styled("COST VS WALL", amber)),
+    ];
+    for row in rows.iter().take(8) {
+        let cost = cost_of(row);
+        let wall = row.wall_millis;
+        let mut spans = vec![
+            Span::styled(format!("  {:<6} ", row.task), dim),
+            Span::styled(
+                format!(
+                    "{:<8} ",
+                    cost.map_or_else(|| "—".into(), |c| format!("${c:.4}"))
+                ),
+                amber,
+            ),
+            Span::styled(
+                cost_bar(cost.unwrap_or(0.0), max_cost, filled, empty),
+                amber,
+            ),
+            Span::styled("  ", dim),
+            Span::styled(
+                format!("{:<6} ", wall_label(wall)),
+                Style::default().fg(theme::TEAL),
+            ),
+            Span::styled(
+                ratio_bar(wall.unwrap_or(0), max_wall, filled, empty),
+                Style::default().fg(theme::TEAL),
+            ),
+        ];
+        spans.push(Span::styled(
+            format!("  {}", first_line(&row.prompt, 24)),
+            dim,
+        ));
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+/// `CELLS` blocks with `ratio` (0.0–1.0) of them filled, clamped.
+const CELLS: u16 = 8;
+
+fn cost_bar(value: f64, max: f64, filled: char, empty: char) -> String {
+    if max <= 0.0 {
+        return blocks(0, filled, empty);
+    }
+    // Pure f64 comparisons avoid an f64→int cast; a cell fills when the ratio
+    // reaches its midpoint, which matches round(ratio * CELLS).
+    let ratio = (value / max).clamp(0.0, 1.0);
+    (1..=CELLS)
+        .map(|cell| {
+            let filled_here = ratio >= (f64::from(cell) - 0.5) / f64::from(CELLS);
+            if filled_here { filled } else { empty }
+        })
+        .collect()
+}
+
+fn ratio_bar(part: u64, total: u64, filled: char, empty: char) -> String {
+    if total == 0 {
+        return blocks(0, filled, empty);
+    }
+    let fill = (part * u64::from(CELLS) + total / 2) / total;
+    blocks(u16::try_from(fill).unwrap_or(CELLS), filled, empty)
+}
+
+fn blocks(fill: u16, filled: char, empty: char) -> String {
+    std::iter::repeat_n(filled, usize::from(fill.min(CELLS)))
+        .chain(std::iter::repeat_n(
+            empty,
+            usize::from(CELLS - fill.min(CELLS)),
+        ))
+        .collect()
 }
 
 pub(crate) fn draw(
@@ -341,7 +464,7 @@ pub(crate) fn draw(
     );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "task        st        model            turns calls wall     cost    cache",
+            "task        st        model            effort turns calls wall     cost    cache",
             dim,
         ))),
         rows[1],
@@ -374,6 +497,7 @@ pub(crate) fn draw(
     if lines.is_empty() {
         lines.push(Line::from(Span::styled("no runs match the filter", dim)));
     }
+    lines.extend(chart_lines(screen, &visible, pricing, amber, dim));
     frame.render_widget(Paragraph::new(lines), rows[2]);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -462,6 +586,65 @@ pub(crate) fn csv(screen: &CompareScreen) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(task: &str, cost: Option<f64>, wall: Option<u64>) -> RunRow {
+        RunRow {
+            session: "s".into(),
+            task: task.into(),
+            status: Some(TaskStatus::Completed),
+            model: "m".into(),
+            effort: Some("high".into()),
+            cost_usd: cost,
+            turns: 1,
+            calls: 1,
+            wall_millis: wall,
+            input: 100,
+            output: 10,
+            cached: None,
+            prompt: "p".into(),
+        }
+    }
+
+    #[test]
+    fn cost_bars_scale_against_the_most_expensive_run() {
+        assert_eq!(cost_bar(0.5, 2.0, '#', '.'), "##......"); // 0.25 → 2 of 8
+        assert_eq!(cost_bar(2.0, 2.0, '#', '.'), "########");
+        assert_eq!(cost_bar(0.0, 0.0, '#', '.'), "........");
+    }
+
+    #[test]
+    fn ratio_bar_rounds_and_clamps() {
+        assert_eq!(ratio_bar(50, 100, '#', '.'), "####....");
+        assert_eq!(ratio_bar(200, 100, '#', '.'), "########");
+        assert_eq!(ratio_bar(0, 0, '#', '.'), "........");
+    }
+
+    #[test]
+    fn chart_lists_cost_vs_wall_for_visible_runs() {
+        let screen = CompareScreen {
+            rows: vec![
+                row("a1b2c3", Some(0.01), Some(60_000)),
+                row("d4e5f6", None, Some(30_000)),
+            ],
+            filter: String::new(),
+            selected: 0,
+            baseline: None,
+        };
+        let amber = Style::default();
+        let dim = Style::default();
+        let lines = chart_lines(&screen, &[0, 1], None, amber, dim);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(Span::to_string).collect::<String>())
+            .collect();
+        assert!(text.iter().any(|l| l.contains("COST VS WALL")));
+        assert!(
+            text.iter()
+                .any(|l| l.contains("a1b2c3") && l.contains("$0.0100"))
+        );
+        // the costless run still gets a wall bar
+        assert!(text.iter().any(|l| l.contains("d4e5f6") && l.contains("—")));
+    }
 
     #[test]
     fn empty_store_loads_no_rows_and_keys_close() {

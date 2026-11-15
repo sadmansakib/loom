@@ -528,6 +528,7 @@ mod tests {
                         usage: Usage::default(),
                         started_at_millis: 1_000,
                         completed_at_millis: Some(61_000),
+                        effort: None,
                         end_reason: None,
                     },
                 )
