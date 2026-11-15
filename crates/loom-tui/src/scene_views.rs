@@ -20,7 +20,7 @@ use thread::draw_reducer_thread;
 pub(crate) const SIDEBAR_WIDTH: u16 = 38;
 
 use crate::{
-    glyphs::GlyphSet,
+    glyphs::{self, Glyph, GlyphSet},
     picker::{ModelPricing, PickerState},
     recent::RecentSession,
     reducer::Reducer,
@@ -122,9 +122,9 @@ pub fn draw_live_scrolled(
     let compact = area.width < 90;
     let wide = area.width >= 120;
     let prompt_label = if reducer.task.status == Some(TaskStatus::Running) {
-        "Task running. Type to queue a follow-up."
+        "Task running… type to queue a follow-up."
     } else {
-        "Describe a task. Use @path to include a workspace file."
+        "Describe a task…"
     };
     let prompt_display = if input.is_empty() {
         prompt_label
@@ -182,22 +182,38 @@ pub fn draw_live_scrolled(
             .constraints([Constraint::Percentage(100)])
             .split(rows[1])
     };
+    // The wireframes inset the thread, composer and footer by one text
+    // margin; full-bleed chrome is the one thing that reads as unfinished.
+    let gutter = |area: Rect| Rect {
+        x: area.x.saturating_add(2),
+        width: area.width.saturating_sub(4),
+        ..area
+    };
+    let thread_area = gutter(body[0]);
     if reducer.execution_turns.is_empty()
         && reducer.original_instruction.is_none()
         && reducer.task.display_prompts.is_empty()
         && scene.is_none()
     {
-        draw_idle_home(frame, body[0], recent);
+        draw_idle_home(frame, thread_area, recent);
     } else {
-        draw_reducer_thread(frame, body[0], reducer, compact, thread_scroll_back, scene);
+        draw_reducer_thread(
+            frame,
+            thread_area,
+            reducer,
+            compact,
+            thread_scroll_back,
+            scene,
+        );
     }
-    let (cursor_x, cursor_y, prompt_scroll) = prompt_cursor(input, cursor, footer[0]);
+    let composer = gutter(footer[0]);
+    let (cursor_x, cursor_y, prompt_scroll) = prompt_cursor(input, cursor, composer);
     if let Some(request) = options.approval {
-        draw_approval_box(frame, body[0], request);
+        draw_approval_box(frame, thread_area, request);
     }
-    frame.set_cursor_position((cursor_x.saturating_add(2), cursor_y));
-    let prompt_spans = vec![
-        Span::styled("› ", fg(theme::AMBER).add_modifier(Modifier::BOLD)),
+    frame.set_cursor_position((cursor_x, cursor_y));
+    let mut prompt_spans = vec![
+        Span::styled("❯ ", fg(theme::AMBER).add_modifier(Modifier::BOLD)),
         Span::styled(
             prompt_display,
             fg(if input.is_empty() {
@@ -206,22 +222,24 @@ pub fn draw_live_scrolled(
                 theme::IVORY
             }),
         ),
-        Span::raw(" "),
-        Span::styled(format!("queued {queue_count}"), fg(theme::DIM)),
     ];
+    if queue_count > 0 {
+        prompt_spans.push(Span::styled(
+            format!("   queued {queue_count}"),
+            fg(theme::AMBER),
+        ));
+    }
     frame.render_widget(
         Paragraph::new(Line::from(prompt_spans))
-            .block(if compact {
-                Block::default()
-            } else {
+            .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(fg(theme::BORDER))
-            })
+                    .border_style(fg(theme::AMBER)),
+            )
             .style(Style::default().bg(theme::BG))
             .scroll((prompt_scroll, 0))
             .wrap(Wrap { trim: false }),
-        footer[0],
+        composer,
     );
     if palette_open && footer[1].height > 0 {
         draw_palette(frame, footer[1], input, options.palette_selected);
@@ -242,53 +260,59 @@ pub fn draw_live_scrolled(
             footer[1],
         );
     }
-    let keys = if scene.is_some() {
-        "[Enter] start task   [Tab] @file   [F2] models   [F1] help"
+    let footer_hint = if scene.is_some() {
+        key_hint_line(&[
+            ("Enter", "start task"),
+            ("Tab", "@file"),
+            ("F2", "models"),
+            ("F1", "help"),
+        ])
+    } else if compact {
+        key_hint_line(&[("Esc", "cancel"), ("?", "help")])
     } else if reducer.task.status == Some(TaskStatus::Running) {
-        "[Esc] cancel   [^O] details   [^R] reasoning   [^B] sidebar   [F1] help"
-    } else {
-        "[Enter] send   [Tab] @file · sidebar   [F2] models   [F1] help"
-    };
-    let footer_hint = if compact && scene.is_none() {
-        Line::from(vec![
-            Span::styled("Esc", fg(theme::IVORY).add_modifier(Modifier::BOLD)),
-            Span::styled(" cancel  ", fg(theme::DIM)),
-            Span::styled("? help", fg(theme::IVORY).add_modifier(Modifier::BOLD)),
+        key_hint_line(&[
+            ("Esc", "cancel"),
+            ("^O", "details"),
+            ("^R", "reasoning"),
+            ("↑↓", "scroll"),
+            ("?", "help"),
         ])
-    } else if scene.is_some() {
-        Line::from(keys)
     } else {
-        Line::from(vec![
-            Span::styled("[Esc]", fg(theme::IVORY).add_modifier(Modifier::BOLD)),
-            Span::styled(
-                " cancel   [^O] details   [^R] reasoning   [^B] sidebar   [F1] help",
-                fg(theme::DIM),
-            ),
+        key_hint_line(&[
+            ("Enter", "send"),
+            ("/", "commands"),
+            ("Tab", "sidebar"),
+            ("?", "help"),
         ])
     };
-    frame.render_widget(Paragraph::new(footer_hint).style(fg(theme::DIM)), footer[2]);
+    frame.render_widget(Paragraph::new(footer_hint), gutter(footer[2]));
     if let Some(notice) = options.notice {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("· ", fg(theme::AMBER)),
                 Span::styled(notice, fg(theme::IVORY)),
             ])),
-            footer[3],
+            gutter(footer[3]),
         );
     }
     if scene.is_none() {
         let counters = match dropped {
             Some(dropped) => format!("events {} · dropped {dropped}", reducer.event_count),
+            // Idle has no sink yet; zero events is a fact, not missing data.
+            None if reducer.task.status.is_none() => {
+                format!("events {} · dropped 0", reducer.event_count)
+            }
             None => "events unavailable".to_owned(),
         };
+        let footer = gutter(footer[2]);
         frame.render_widget(
             Paragraph::new(counters)
                 .style(fg(theme::DIM))
                 .alignment(Alignment::Right),
             Rect {
-                x: footer[2].x + footer[2].width.saturating_sub(28),
+                x: footer.x + footer.width.saturating_sub(28),
                 width: 28,
-                ..footer[2]
+                ..footer
             },
         );
     }
@@ -308,6 +332,13 @@ pub fn draw_live_scrolled(
             rows[1].y,
             area.width.min(SIDEBAR_WIDTH),
             rows[1].height.min(12),
+        );
+        // The medium-width sidebar floats over the thread: clear the
+        // cells first or the text underneath shows through the gaps.
+        frame.render_widget(ratatui::widgets::Clear, overlay);
+        frame.render_widget(
+            ratatui::widgets::Block::default().style(Style::default().bg(theme::BG)),
+            overlay,
         );
         draw_side(frame, overlay);
     }
@@ -564,6 +595,41 @@ fn draw_help(frame: &mut Frame<'_>) {
 }
 
 fn draw_idle_home(frame: &mut Frame<'_>, area: Rect, recent: &[RecentSession]) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let brand_rows = area.height.min(8);
+    let brand_area = Rect {
+        height: brand_rows,
+        ..area
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::from(""),
+            Line::from(Span::styled(
+                "◆ loom",
+                fg(theme::AMBER).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Describe a task. It runs as one thread.",
+                fg(theme::DIM),
+            )),
+        ])
+        .alignment(Alignment::Center),
+        brand_area,
+    );
+    let list_y = area.y.saturating_add(6);
+    if list_y >= area.y.saturating_add(area.height) {
+        return;
+    }
+    let list_area = Rect {
+        y: list_y,
+        height: area.height.saturating_sub(6),
+        ..area
+    };
+    let width = usize::from(list_area.width);
     let mut lines = vec![Line::from(Span::styled("RECENT", fg(theme::DIM)))];
     if recent.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -572,21 +638,23 @@ fn draw_idle_home(frame: &mut Frame<'_>, area: Rect, recent: &[RecentSession]) {
         )));
     }
     for session in recent {
-        let status = match session.status {
-            Some(TaskStatus::Completed) => "✓",
-            Some(TaskStatus::Failed | TaskStatus::Cancelled) => "⊘",
-            _ => "○",
+        let (status, status_color) = match session.status {
+            Some(TaskStatus::Completed) => ("✓", theme::SAGE),
+            Some(TaskStatus::Failed) => ("✗", theme::CORAL),
+            Some(TaskStatus::Cancelled) => ("⊘", theme::DIM),
+            _ => ("○", theme::DIM),
         };
-        let status_color = match session.status {
-            Some(TaskStatus::Completed) => theme::TEAL,
-            _ => theme::DIM,
-        };
+        let tail = format!("{status} {} turns", session.turns);
+        let room = width.saturating_sub(tail.chars().count() + 4).max(8);
+        let title = thread::truncate_chars(&session.title, room);
+        let gap = width
+            .saturating_sub(2 + title.chars().count() + tail.chars().count())
+            .max(1);
         lines.push(Line::from(vec![
-            Span::styled(format!("❯ {} ", session.title), fg(theme::IVORY)),
-            Span::styled(
-                format!("{status} {} turns", session.turns),
-                fg(status_color),
-            ),
+            Span::styled("❯ ", fg(theme::AMBER)),
+            Span::styled(title, fg(theme::IVORY)),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(tail, fg(status_color)),
         ]));
     }
     lines.push(Line::from(""));
@@ -595,36 +663,49 @@ fn draw_idle_home(frame: &mut Frame<'_>, area: Rect, recent: &[RecentSession]) {
         "Explain this crate · Find where X is defined · Add a test for Y",
         fg(theme::DIM),
     )));
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(Paragraph::new(lines), list_area);
 }
 
 /// Amber box for a write waiting on the operator: path, a preview line, and
 /// the answer keys. Meaning is carried by text as well as color.
 fn draw_approval_box(frame: &mut Frame<'_>, area: Rect, request: &crate::approval::Request) {
-    let box_area = crate::modal::centered(area, 5);
-    crate::modal::dim_scene(frame, area, box_area);
+    // Inline at the bottom of the thread, like the wireframe: the paused
+    // task, its prose and the pending tool row stay readable above it.
+    let height = area.height.min(6);
+    let box_area = Rect {
+        y: area.y + area.height.saturating_sub(height),
+        height,
+        ..area
+    };
     let preview = request.content.lines().next().unwrap_or("");
     let lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "◇ Allow this write? ",
-                fg(theme::AMBER).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(request.path.clone(), fg(theme::IVORY)),
-        ]),
-        Line::from(Span::styled(preview.to_string(), fg(theme::DIM))),
         Line::from(Span::styled(
-            "y allow once   a always (don't ask again)   n decline   e edit",
+            "◇ Allow this write? The task is paused, not failed.",
+            fg(theme::AMBER).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled("  ", fg(theme::DIM)),
+            Span::styled(request.path.clone(), fg(theme::BLUE)),
+            Span::styled(format!("   {preview}"), fg(theme::DIM)),
+        ]),
+        Line::from(Span::styled(
+            "  Writes touch your working tree. Reads never ask.",
             fg(theme::DIM),
+        )),
+        Line::from(Span::styled(
+            "  [y] allow once   [a] allow for session   [n] deny, tell the model   [e] edit first",
+            fg(theme::IVORY),
         )),
     ];
     frame.render_widget(Clear, box_area);
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(fg(theme::AMBER)),
-        ),
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(fg(theme::AMBER)),
+            )
+            .style(Style::default().bg(theme::BG)),
         box_area,
     );
 }
@@ -695,61 +776,80 @@ fn draw_live_header(
             .or(options.model)
             .unwrap_or("model not reported")
     };
-    let state = if scene.is_some() {
-        "preview · no live data"
-    } else {
-        status_label(reducer)
-    };
     let workspace = options.workspace.unwrap_or("workspace unavailable");
     let session = options.session_id.unwrap_or("session unavailable");
     let effort = options.effort.unwrap_or("not reported");
-    let thinking = options.thinking.unwrap_or("not reported");
-    // Below wide width the left header half must stop short of the model
-    // label: cap the workspace path and drop the session suffix.
-    let left_column = usize::from(area.width) * 62 / 100;
-    let (workspace_label, session_suffix) = if area.width >= 120 {
-        (workspace.to_owned(), format!("  ·  session {session}"))
-    } else {
-        (
-            thread::truncate_chars(workspace, left_column.saturating_sub(12)),
-            String::new(),
-        )
-    };
-    let (left, right) = if scene.is_some() {
-        (
-            Line::from(vec![
-                Span::styled("◆ loom", fg(theme::AMBER).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("  · {state}"), fg(theme::DIM)),
-            ]),
-            Line::from(Span::styled(model, fg(theme::BLUE))),
-        )
-    } else {
-        (
-            Line::from(vec![
-                Span::styled("◆ ", fg(theme::AMBER).add_modifier(Modifier::BOLD)),
-                Span::styled("loom", fg(theme::AMBER).add_modifier(Modifier::BOLD)),
-                Span::styled(
-                    format!("   {workspace_label}{session_suffix}"),
-                    fg(theme::DIM),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(model, fg(theme::BLUE)),
-                Span::styled("   effort ", fg(theme::DIM)),
-                Span::styled(effort, fg(theme::IVORY).add_modifier(Modifier::BOLD)),
-                Span::styled("   thinking ", fg(theme::DIM)),
-                Span::styled(thinking, fg(theme::IVORY).add_modifier(Modifier::BOLD)),
-            ]),
-        )
-    };
     let content = Rect {
         height: area.height.saturating_sub(u16::from(area.height > 1)),
         ..area
     };
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(content);
+    let left_width = usize::from(columns[0].width);
+    let right_width = usize::from(columns[1].width);
+
+    let left = if scene.is_some() {
+        Line::from(vec![
+            Span::styled("◆ loom", fg(theme::AMBER).add_modifier(Modifier::BOLD)),
+            Span::styled("  · preview · no live data", fg(theme::DIM)),
+        ])
+    } else {
+        let suffix = if area.width >= 100 && options.session_id.is_some() {
+            format!(
+                "  ·  session {}",
+                session.chars().take(8).collect::<String>()
+            )
+        } else {
+            String::new()
+        };
+        let room = left_width.saturating_sub(9 + suffix.chars().count());
+        let workspace = thread::truncate_chars(workspace, room.max(8));
+        Line::from(vec![
+            Span::styled("◆ ", fg(theme::AMBER).add_modifier(Modifier::BOLD)),
+            Span::styled("loom", fg(theme::AMBER).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("   {workspace}"), fg(theme::DIM)),
+            Span::styled(suffix, fg(theme::DIM)),
+        ])
+    };
+
+    let right = if scene.is_some() {
+        Line::from(Span::styled(model, fg(theme::BLUE)))
+    } else {
+        let state = header_state(reducer, options.approval.is_some());
+        let effort_visible = area.width >= 110 && options.effort.is_some();
+        let state_room = state.map_or(0, |(glyph, label, _)| {
+            glyph.chars().count() + label.chars().count() + 3
+        });
+        let effort_room = if effort_visible {
+            effort.chars().count() + 12
+        } else {
+            0
+        };
+        let model = thread::truncate_chars(
+            model,
+            right_width.saturating_sub(state_room + effort_room).max(10),
+        );
+        let mut spans = Vec::new();
+        if let Some((glyph, label, color)) = state {
+            spans.push(Span::styled(
+                format!("{glyph} {label}"),
+                fg(color).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::styled(model, fg(theme::BLUE)));
+        if effort_visible {
+            spans.push(Span::styled("   effort ", fg(theme::DIM)));
+            spans.push(Span::styled(
+                effort,
+                fg(theme::IVORY).add_modifier(Modifier::BOLD),
+            ));
+        }
+        Line::from(spans)
+    };
+
     frame.render_widget(Paragraph::new(left), columns[0]);
     frame.render_widget(
         Paragraph::new(right).alignment(Alignment::Right),
@@ -764,6 +864,43 @@ fn draw_live_header(
                 ..area
             },
         );
+    }
+}
+
+/// Glyph + word + color: the design rule that state is never color alone.
+fn header_state(
+    reducer: &Reducer,
+    approval_pending: bool,
+) -> Option<(&'static str, &'static str, Color)> {
+    if approval_pending || reducer.task.status == Some(TaskStatus::Paused) {
+        return Some((
+            glyphs::glyph(Glyph::Needs, glyph_set()),
+            "needs you",
+            theme::AMBER,
+        ));
+    }
+    match reducer.task.status {
+        Some(TaskStatus::Running) => Some((
+            glyphs::glyph(Glyph::Spinner, glyph_set()),
+            "running",
+            theme::AMBER,
+        )),
+        Some(TaskStatus::Completed) => Some((
+            glyphs::glyph(Glyph::Check, glyph_set()),
+            "done",
+            theme::SAGE,
+        )),
+        Some(TaskStatus::Failed) => Some((
+            glyphs::glyph(Glyph::Cross, glyph_set()),
+            "failed",
+            theme::CORAL,
+        )),
+        Some(TaskStatus::Cancelled) => Some((
+            glyphs::glyph(Glyph::Cancel, glyph_set()),
+            "cancelled",
+            theme::DIM,
+        )),
+        _ => None,
     }
 }
 
@@ -875,11 +1012,25 @@ fn design_area(area: Rect) -> Rect {
     area
 }
 
+/// `[key] label` pairs in the wireframes' footer style: key ivory, label dim.
+fn key_hint_line(pairs: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, (key, label)) in pairs.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::styled(
+            format!("[{key}]"),
+            fg(theme::IVORY).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(format!(" {label}"), fg(theme::DIM)));
+    }
+    Line::from(spans)
+}
+
 fn heading(text: &str) -> Line<'static> {
-    Line::from(Span::styled(
-        text.to_owned(),
-        fg(theme::AMBER).add_modifier(Modifier::BOLD),
-    ))
+    // Section labels are quiet chrome; amber is reserved for live state.
+    Line::from(Span::styled(text.to_owned(), fg(theme::DIM)))
 }
 fn body(text: &str) -> Line<'static> {
     Line::from(Span::styled(text.to_owned(), fg(theme::IVORY)))
@@ -1049,14 +1200,11 @@ mod tests {
             })
             .collect();
         assert!(
-            rows.iter().any(|row| row.contains("Esc cancel")),
+            rows.iter()
+                .any(|row| row.contains("[Esc]") && row.contains("cancel")),
             "no status line in {rows:#?}"
         );
-        assert!(!rows.iter().any(|row| row.contains("[F2] models")));
-        assert!(
-            !rows.iter().any(|row| row.contains("┌")),
-            "prompt still boxed"
-        );
+        assert!(!rows.iter().any(|row| row.contains("models")));
     }
 
     #[test]
@@ -1555,7 +1703,7 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(rendered.contains("› ask @src/lib.rs"));
+        assert!(rendered.contains("❯ ask @src/lib.rs"));
         assert!(rendered.contains("final answer"));
         assert!(rendered.contains("The final answer is visible."));
         assert!(rendered.contains("ask @src/lib.rs"));
@@ -1980,7 +2128,12 @@ mod approval_render_tests {
             .collect::<String>();
         assert!(text.contains("Allow this write?"), "prompt missing");
         assert!(text.contains("notes.md"), "path missing");
-        for key in ["y allow once", "a always", "n decline", "e edit"] {
+        for key in [
+            "[y] allow once",
+            "[a] allow for session",
+            "[n] deny",
+            "[e] edit first",
+        ] {
             assert!(text.contains(key), "key hint `{key}` missing");
         }
     }
@@ -2055,14 +2208,9 @@ mod idle_sidebar_tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(
-            text.contains("model deepseek-chat"),
-            "session model missing"
-        );
-        assert!(text.contains("effort medium"), "session effort missing");
-        assert!(
-            text.contains("write  asks each time"),
-            "tool permission missing"
-        );
+        assert!(text.contains("deepseek-chat"), "session model missing");
+        assert!(text.contains("effort / thinking"), "session effort missing");
+        assert!(text.contains("TOOLS"), "tool permissions missing");
+        assert!(text.contains("ask"), "tool permission missing");
     }
 }

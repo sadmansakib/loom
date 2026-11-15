@@ -1,7 +1,6 @@
-//! The `/account` screen (wireframes J1–J3): list accounts, switch the
-//! active one, remove it, or add a provider. Verify and model choice
-//! (J4–J5) are the existing model picker: adding or testing an account
-//! opens discovery, which is the connection test.
+//! The `/account` screen (wireframes J1–J4): list accounts, switch the
+//! active one, remove it, or add a provider. Model choice (J5) is the
+//! existing model picker: discovery lists what the key can reach.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use loom_core::engine::auth::Account;
@@ -24,6 +23,7 @@ pub(crate) enum Stage {
     List,
     Type,
     Credentials,
+    Verify,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -51,6 +51,10 @@ pub(crate) enum AccountAction {
         base_url: String,
         key: String,
     },
+    /// Verify passed: close the wizard and pick a model for this provider.
+    Continue {
+        provider: String,
+    },
 }
 
 pub(crate) struct AccountScreen {
@@ -64,6 +68,9 @@ pub(crate) struct AccountScreen {
     pub(crate) key: String,
     /// Which credentials field Tab is on: 0 label, 1 base URL, 2 key.
     pub(crate) field: usize,
+    /// J4 verify result: `None` while the save is in flight, then
+    /// `(passed, detail)`.
+    pub(crate) verify: Option<(bool, String)>,
 }
 
 impl AccountScreen {
@@ -77,6 +84,7 @@ impl AccountScreen {
             base_url: String::new(),
             key: String::new(),
             field: 0,
+            verify: None,
         }
     }
 
@@ -101,6 +109,7 @@ impl AccountScreen {
             Stage::List => self.list_key(key),
             Stage::Type => self.type_key(key),
             Stage::Credentials => self.credentials_key(key),
+            Stage::Verify => Some(self.verify_key(key)),
         }
     }
 
@@ -179,14 +188,23 @@ impl AccountScreen {
             self.stage = Stage::List;
             return Some(AccountAction::Consumed);
         }
-        if key.code == KeyCode::Tab {
-            let fields = if self.type_selected == 0 { 2 } else { 3 };
-            self.field = (self.field + 1) % fields;
-            return Some(AccountAction::Consumed);
-        }
-        if key.code == KeyCode::BackTab {
-            let fields = if self.type_selected == 0 { 2 } else { 3 };
-            self.field = (self.field + fields - 1) % fields;
+        if key.code == KeyCode::Tab || key.code == KeyCode::BackTab {
+            // Hosted providers have no base URL field: label ↔ key only.
+            let cycle: &[usize] = if self.type_selected == 0 {
+                &[0, 2]
+            } else {
+                &[0, 1, 2]
+            };
+            let position = cycle
+                .iter()
+                .position(|field| *field == self.field)
+                .unwrap_or(0);
+            let next = if key.code == KeyCode::Tab {
+                (position + 1) % cycle.len()
+            } else {
+                (position + cycle.len() - 1) % cycle.len()
+            };
+            self.field = cycle[next];
             return Some(AccountAction::Consumed);
         }
         if key.code == KeyCode::Backspace {
@@ -207,22 +225,75 @@ impl AccountScreen {
             if self.key.is_empty() {
                 return Some(AccountAction::Consumed); // nothing to save yet
             }
-            return Some(AccountAction::Add {
-                provider: self.wizard_provider(),
-                label: if self.label.is_empty() {
-                    self.wizard_provider()
-                } else {
-                    self.label.clone()
-                },
-                base_url: if self.type_selected == 0 {
-                    String::new()
-                } else {
-                    self.base_url.clone()
-                },
-                key: self.key.clone(),
-            });
+            self.stage = Stage::Verify;
+            self.verify = None;
+            return Some(self.add_action());
         }
         None
+    }
+
+    fn add_action(&self) -> AccountAction {
+        AccountAction::Add {
+            provider: self.wizard_provider(),
+            label: if self.label.is_empty() {
+                self.wizard_provider()
+            } else {
+                self.label.clone()
+            },
+            base_url: if self.type_selected == 0 {
+                String::new()
+            } else {
+                self.base_url.clone()
+            },
+            key: self.key.clone(),
+        }
+    }
+
+    /// J4: the save is the connection test. `r` reruns it, Esc returns to
+    /// the key field, Enter moves on to model discovery.
+    fn verify_key(&mut self, key: KeyEvent) -> AccountAction {
+        let passed = self.verify.as_ref().is_some_and(|(passed, _)| *passed);
+        match key.code {
+            KeyCode::Enter if passed => AccountAction::Continue {
+                provider: self.wizard_provider(),
+            },
+            KeyCode::Char('r') => {
+                self.verify = None;
+                self.add_action()
+            }
+            KeyCode::Esc => {
+                self.stage = Stage::Credentials;
+                self.field = 2; // back to the key field
+                AccountAction::Consumed
+            }
+            // everything else (unmatched Enter, editing keys) is swallowed
+            KeyCode::Enter
+            | KeyCode::Char(_)
+            | KeyCode::Backspace
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Delete
+            | KeyCode::Insert
+            | KeyCode::F(_)
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Null
+            | KeyCode::CapsLock
+            | KeyCode::ScrollLock
+            | KeyCode::NumLock
+            | KeyCode::PrintScreen
+            | KeyCode::Pause
+            | KeyCode::Menu
+            | KeyCode::KeypadBegin
+            | KeyCode::Media(_)
+            | KeyCode::Modifier(_) => AccountAction::Consumed,
+        }
     }
 
     fn text_field_mut(&mut self) -> &mut String {
@@ -248,11 +319,85 @@ fn body_lines(screen: &AccountScreen) -> Vec<Line<'static>> {
     let dim = Style::default().fg(theme::DIM);
     let ivory = Style::default().fg(theme::IVORY);
     let sage = Style::default().fg(theme::SAGE);
+    let coral = Style::default().fg(theme::CORAL);
     match screen.stage {
         Stage::List => list_lines(screen, amber, dim, ivory, sage),
         Stage::Type => type_lines(screen, amber, dim, ivory),
         Stage::Credentials => credentials_lines(screen, amber, dim, ivory),
+        Stage::Verify => verify_lines(screen, amber, dim, ivory, sage, coral),
     }
+}
+
+fn step(
+    glyph: &'static str,
+    label: &'static str,
+    detail: &str,
+    glyph_style: Style,
+    detail_style: Style,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{glyph} "), glyph_style),
+        Span::styled(format!("{label:<16}"), Style::default().fg(theme::IVORY)),
+        Span::styled(detail.to_owned(), detail_style),
+    ])
+}
+
+fn verify_lines(
+    screen: &AccountScreen,
+    amber: Style,
+    dim: Style,
+    ivory: Style,
+    sage: Style,
+    coral: Style,
+) -> Vec<Line<'static>> {
+    let label = if screen.label.is_empty() {
+        screen.wizard_provider()
+    } else {
+        screen.label.clone()
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(format!("TESTING · {label}"), amber)),
+        Line::from(Span::styled("", dim)),
+    ];
+    match screen.verify.as_ref() {
+        Some((true, detail)) => {
+            lines.push(step("✓", "reach endpoint", "saved credentials", sage, dim));
+            lines.push(step("✓", "auth accepted", detail, sage, dim));
+            lines.push(step(
+                "○",
+                "list models",
+                "the model picker fetches them next",
+                dim,
+                dim,
+            ));
+            lines.push(step(
+                "○",
+                "probe tools",
+                "declared per model in the picker",
+                dim,
+                dim,
+            ));
+            lines.push(Line::from(Span::styled("", dim)));
+            lines.push(Line::from(Span::styled(
+                "Nothing is written to the registry until the model is chosen.",
+                dim,
+            )));
+        }
+        Some((false, detail)) => {
+            lines.push(Line::from(Span::styled("IF IT FAILS", dim)));
+            lines.push(Line::from(Span::styled("", dim)));
+            lines.push(Line::from(vec![
+                Span::styled("✗ save  ", coral),
+                Span::styled(detail.clone(), ivory),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "The account was not saved. Esc edits the key, r retries.",
+                dim,
+            )));
+        }
+        None => lines.push(step("⠇", "storing the key", "", amber, dim)),
+    }
+    lines
 }
 
 fn list_lines(
@@ -408,7 +553,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, area: Rect, screen: &AccountScreen) {
     let breadcrumb = match screen.stage {
         Stage::List => "providers",
         Stage::Type => "providers · type",
-        Stage::Credentials => "providers · type · credentials · verify · model",
+        Stage::Credentials | Stage::Verify => "providers · type · credentials · verify · model",
     };
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -441,6 +586,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, area: Rect, screen: &AccountScreen) {
                 Stage::List => "↑↓ move · Enter switch · t test · a add · d remove · Esc back",
                 Stage::Type => "↑↓ move · Enter choose · Esc back",
                 Stage::Credentials => "Tab next field · Enter save + verify · Esc back",
+                Stage::Verify => "Enter pick a model · r retry · Esc edit key",
             },
             dim,
         ))),
@@ -517,6 +663,28 @@ mod tests {
                 label: "mykey".into(),
                 base_url: String::new(),
                 key: "sk-test".into(),
+            })
+        );
+        assert_eq!(screen.stage, Stage::Verify);
+        screen.verify = Some((false, "nope".into()));
+        assert_eq!(
+            screen.key(KeyEvent::from(KeyCode::Enter)),
+            Some(AccountAction::Consumed)
+        );
+        assert_eq!(
+            screen.key(KeyEvent::from(KeyCode::Char('r'))),
+            Some(AccountAction::Add {
+                provider: "deepseek".into(),
+                label: "mykey".into(),
+                base_url: String::new(),
+                key: "sk-test".into(),
+            })
+        );
+        screen.verify = Some((true, "deepseek · mykey".into()));
+        assert_eq!(
+            screen.key(KeyEvent::from(KeyCode::Enter)),
+            Some(AccountAction::Continue {
+                provider: "deepseek".into()
             })
         );
     }

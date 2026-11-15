@@ -30,12 +30,8 @@ pub(super) fn draw_reducer_thread(
         .as_deref()
         .or_else(|| reducer.task.display_prompts.first().map(String::as_str))
     {
-        lines.push(Line::from(Span::styled(
-            "TASK · original instruction",
-            fg(theme::DIM),
-        )));
         lines.push(Line::from(vec![
-            Span::styled("› ", fg(theme::AMBER)),
+            Span::styled("❯ ", fg(theme::AMBER)),
             Span::styled(prompt, fg(theme::IVORY).add_modifier(Modifier::BOLD)),
         ]));
     }
@@ -43,6 +39,7 @@ pub(super) fn draw_reducer_thread(
         lines.push(tinted(&format!("Task failed · {reason}"), theme::CORAL));
     }
     let mut rendered_retries = std::collections::BTreeSet::new();
+    let mut rendered_call_ids = std::collections::BTreeSet::new();
     let transcript_tool_ids = reducer
         .committed_transcript
         .iter()
@@ -56,18 +53,39 @@ pub(super) fn draw_reducer_thread(
         .collect::<std::collections::BTreeSet<_>>();
 
     for (turn_number, turn) in &reducer.execution_turns {
+        if let Some((_, chars)) = reducer
+            .compactions
+            .iter()
+            .find(|(turn, _)| turn == turn_number)
+        {
+            // Permanent marker: the model now sees a handoff summary, not
+            // the raw turns above.
+            lines.push(Line::from(vec![
+                Span::styled("── ", fg(theme::THREAD)),
+                Span::styled("compacted", fg(theme::AMBER)),
+                Span::styled(
+                    format!(" · turn {turn_number} · {chars} chars of handoff summary ──"),
+                    fg(theme::DIM),
+                ),
+            ]));
+        }
         let streaming = reducer.turn == Some(*turn_number) && reducer.has_provisional_output();
-        lines.push(turn_heading(*turn_number, area.width, streaming, reducer));
+        lines.push(turn_heading(
+            *turn_number,
+            area.width.saturating_sub(1),
+            streaming,
+            reducer,
+        ));
         for input in &turn.user_inputs {
             lines.push(Line::from(vec![
-                Span::styled("│  › ", fg(theme::AMBER)),
+                Span::styled("❯ ", fg(theme::AMBER)),
                 Span::styled(
                     input.as_str(),
                     fg(theme::IVORY).add_modifier(Modifier::BOLD),
                 ),
             ]));
         }
-        lines.push(Line::from(Span::styled("│", fg(theme::THREAD))));
+        lines.push(Line::from(""));
 
         for (retry_index, retry) in reducer
             .retries
@@ -77,7 +95,7 @@ pub(super) fn draw_reducer_thread(
         {
             rendered_retries.insert(retry_index);
             lines.push(Line::from(vec![
-                Span::styled("│  ", fg(theme::THREAD)),
+                Span::styled("", fg(theme::THREAD)),
                 Span::styled(
                     format!(
                         "{} attempt {}",
@@ -102,10 +120,6 @@ pub(super) fn draw_reducer_thread(
             ]));
         }
 
-        // Assistant content is deferred until after tool results so the
-        // turn reads chronologically: reasoning → tool executions → tool
-        // results → the model's prose (reference ordering).
-        let mut assistant_content: Vec<String> = Vec::new();
         for item in &turn.transcript {
             match item {
                 Item::Assistant(message) => {
@@ -121,23 +135,37 @@ pub(super) fn draw_reducer_thread(
                         };
                         let size = reasoning_size(&reasoning.text, reducer, *turn_number);
                         lines.push(Line::from(Span::styled(
-                            format!("│  {indicator} reasoning · {size}"),
+                            format!("{indicator} reasoning · {size}"),
                             fg(theme::VIOLET).add_modifier(Modifier::ITALIC),
                         )));
                         if reducer.expanded.reasoning
                             && !looks_like_structured_json(&reasoning.text)
                         {
                             lines.push(Line::from(Span::styled(
-                                format!("│      {}", reasoning.text),
+                                format!("   {}", reasoning.text),
                                 fg(theme::VIOLET).add_modifier(Modifier::ITALIC),
                             )));
                         }
                     }
                     if !message.content.trim().is_empty() {
-                        assistant_content.push(human_readable_content(&message.content));
+                        // A Line does not split on newlines: markdown headings
+                        // and paragraphs must become their own rows or the
+                        // whole answer collapses onto one line.
+                        for text in human_readable_content(&message.content).lines() {
+                            let text = text.trim_end();
+                            if text.is_empty() {
+                                lines.push(Line::from(""));
+                            } else {
+                                lines.push(Line::from(Span::styled(
+                                    text.to_owned(),
+                                    fg(theme::IVORY),
+                                )));
+                            }
+                        }
                     }
                     for (call_index, call) in message.tool_calls.iter().enumerate() {
                         let call_id = call.id.to_string();
+                        rendered_call_ids.insert(call_id.clone());
                         let state = reducer.tools.get(&call_id);
                         let (marker, color, label) =
                             state.map_or((Glyph::Spinner, theme::AMBER, "running"), |tool| {
@@ -162,10 +190,22 @@ pub(super) fn draw_reducer_thread(
                         });
                         let timing = duration.map_or_else(String::new, |ms| format!(" · {ms}ms"));
                         let branch = if call_index + 1 == message.tool_calls.len() {
-                            "│    └─ "
+                            "└─ "
                         } else {
-                            "│    ├─ "
+                            "├─ "
                         };
+                        let status = format!("{label}{timing}");
+                        let used = branch.chars().count()
+                            + 2
+                            + call.name.chars().count()
+                            + status.chars().count()
+                            + 7;
+                        let arguments = truncate_chars(
+                            &concise_arguments(&call.arguments.to_string()),
+                            usize::from(area.width.saturating_sub(1))
+                                .saturating_sub(used)
+                                .max(6),
+                        );
                         lines.push(Line::from(vec![
                             Span::styled(branch, fg(theme::DIM)),
                             Span::styled(
@@ -176,18 +216,12 @@ pub(super) fn draw_reducer_thread(
                                 call.name.as_str(),
                                 fg(theme::BLUE).add_modifier(Modifier::BOLD),
                             ),
-                            Span::styled(
-                                format!(
-                                    "  {}  · {label}{timing}",
-                                    concise_arguments(&call.arguments.to_string())
-                                ),
-                                fg(theme::DIM),
-                            ),
+                            Span::styled(format!("  {arguments}  · {status}"), fg(theme::DIM)),
                         ]));
                         if reducer.expanded.tools {
                             lines.push(Line::from(Span::styled(
                                 format!(
-                                    "│       args: {}",
+                                    "       args: {}",
                                     truncate_chars(&call.arguments.to_string(), 160)
                                 ),
                                 fg(theme::DIM),
@@ -201,9 +235,21 @@ pub(super) fn draw_reducer_thread(
                 _ => {}
             }
         }
-        for (_id, tool) in reducer.tools.iter().filter(|(id, _)| {
-            reducer.tool_call_turn(id) == Some(*turn_number) && !transcript_tool_ids.contains(*id)
-        }) {
+        let uncommitted = reducer
+            .tools
+            .iter()
+            .filter(|(id, _)| {
+                reducer.tool_call_turn(id) == Some(*turn_number)
+                    && !transcript_tool_ids.contains(*id)
+                    && !rendered_call_ids.contains(*id)
+            })
+            .collect::<Vec<_>>();
+        for (index, (_id, tool)) in uncommitted.iter().enumerate() {
+            let branch = if index + 1 == uncommitted.len() {
+                "└─ "
+            } else {
+                "├─ "
+            };
             let (marker, color, status) = match tool.status {
                 Some(ToolStatus::Success) => (Glyph::Check, theme::SAGE, "done"),
                 Some(ToolStatus::Error(_)) => (Glyph::Cross, theme::CORAL, "failed"),
@@ -216,8 +262,17 @@ pub(super) fn draw_reducer_thread(
                 .zip(tool.completed_at_millis)
                 .map(|(start, end)| end.saturating_sub(start))
                 .map_or_else(String::new, |ms| format!(" · {ms}ms"));
+            let detail = format!("{status}{timing}");
+            let used =
+                branch.chars().count() + 2 + tool.name.chars().count() + detail.chars().count() + 7;
+            let arguments = truncate_chars(
+                &concise_arguments(tool.arguments.as_deref().unwrap_or("")),
+                usize::from(area.width.saturating_sub(1))
+                    .saturating_sub(used)
+                    .max(6),
+            );
             lines.push(Line::from(vec![
-                Span::styled("│    └─ ", fg(theme::DIM)),
+                Span::styled(branch, fg(theme::DIM)),
                 Span::styled(
                     format!("{} ", glyphs::glyph(marker, glyph_set())),
                     fg(color),
@@ -226,20 +281,14 @@ pub(super) fn draw_reducer_thread(
                     tool.name.as_str(),
                     fg(theme::BLUE).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!(
-                        "  {}  · {status}{timing}",
-                        concise_arguments(tool.arguments.as_deref().unwrap_or(""))
-                    ),
-                    fg(theme::DIM),
-                ),
+                Span::styled(format!("  {arguments}  · {detail}"), fg(theme::DIM)),
             ]));
             if reducer.expanded.tools
                 && let Some(output) = &tool.content_head
             {
                 lines.push(Line::from(Span::styled(
                     format!(
-                        "│       output preview: {}",
+                        "       output preview: {}",
                         truncate_chars(&output.replace('\n', " ↵ "), 160)
                     ),
                     fg(color),
@@ -247,12 +296,6 @@ pub(super) fn draw_reducer_thread(
             }
         }
         // The model's prose lands after every execution in the turn.
-        for content in assistant_content {
-            lines.push(Line::from(vec![
-                Span::styled("│  ", fg(theme::THREAD)),
-                Span::styled(content, fg(theme::IVORY)),
-            ]));
-        }
         if reducer.turn == Some(*turn_number)
             && (reducer.has_provisional_output()
                 || (!matches!(
@@ -263,7 +306,7 @@ pub(super) fn draw_reducer_thread(
             if !reducer.provisional.reasoning.is_empty() {
                 lines.push(Line::from(Span::styled(
                     format!(
-                        "│  {} reasoning · provisional · streaming {}",
+                        "{} reasoning · provisional · streaming {}",
                         if reducer.expanded.reasoning {
                             "▾"
                         } else {
@@ -275,7 +318,7 @@ pub(super) fn draw_reducer_thread(
                 )));
                 if reducer.expanded.reasoning {
                     lines.push(Line::from(vec![
-                        Span::styled("│      ", fg(theme::THREAD)),
+                        Span::styled("   ", fg(theme::THREAD)),
                         Span::styled(
                             truncate_chars(&reducer.provisional.reasoning, 200),
                             fg(theme::VIOLET).add_modifier(Modifier::ITALIC),
@@ -289,7 +332,7 @@ pub(super) fn draw_reducer_thread(
             }
             if !reducer.provisional.text.is_empty() {
                 lines.push(Line::from(vec![
-                    Span::styled("│  ", fg(theme::THREAD)),
+                    Span::styled("", fg(theme::THREAD)),
                     Span::styled(
                         human_readable_content(&reducer.provisional.text),
                         fg(theme::IVORY),
@@ -301,7 +344,7 @@ pub(super) fn draw_reducer_thread(
                 ]));
             }
         }
-        lines.push(Line::from(Span::styled("│", fg(theme::THREAD))));
+        lines.push(Line::from(""));
     }
 
     // A committed transcript may contain a fast-path result without model turns.
@@ -392,17 +435,23 @@ pub(super) fn turn_heading(
             )
         })
         .map_or(String::new(), |millis| format!(" · {millis}ms"));
-    let state = if streaming { "  ⋮ streaming" } else { "" };
+    let state = if streaming {
+        format!("  {} streaming", glyphs::glyph(Glyph::Spinner, glyph_set()))
+    } else if reducer.task.status == Some(TaskStatus::Completed)
+        && metrics.is_some_and(|metrics| metrics.completed_at_millis.is_some())
+    {
+        format!("  {} done", glyphs::glyph(Glyph::Check, glyph_set()))
+    } else {
+        String::new()
+    };
     let metadata = format!("turn {turn}{usage}{cached}{duration}{state}");
-    let occupied = metadata.chars().count() + 5;
-    let fill = usize::from(width).saturating_sub(occupied);
+    let metadata = truncate_chars(&metadata, usize::from(width).saturating_sub(3));
     Line::from(vec![
-        Span::styled("╭─ ", fg(theme::THREAD)),
         Span::styled(
-            format!("{metadata} "),
-            fg(theme::AMBER).add_modifier(Modifier::BOLD),
+            format!("{} ", glyphs::glyph(Glyph::Bullet, glyph_set())),
+            fg(theme::AMBER),
         ),
-        Span::styled(format!(" {}", "─".repeat(fill)), fg(theme::THREAD)),
+        Span::styled(metadata, fg(theme::DIM)),
     ])
 }
 
@@ -555,7 +604,7 @@ pub(super) fn tool_result_lines(result: &ToolResult, expanded: bool) -> Vec<Line
             ""
         };
         lines.push(Line::from(vec![
-            Span::styled("│       ↳ ", fg(theme::DIM)),
+            Span::styled("  ↳ ", fg(theme::DIM)),
             Span::styled(
                 format!(
                     "{} ok{truncated} · ",
@@ -573,19 +622,19 @@ pub(super) fn tool_result_lines(result: &ToolResult, expanded: bool) -> Vec<Line
                 theme::IVORY
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("│         {number:>3} │ "), fg(theme::DIM)),
+                Span::styled(format!("    {number:>3} │ "), fg(theme::DIM)),
                 Span::styled(truncate_chars(text, 80), fg(style)),
             ]));
         }
         if read.body.len() > cap {
             lines.push(Line::from(Span::styled(
-                format!("│         … +{} more lines", read.body.len() - cap),
+                format!("    … +{} more lines", read.body.len() - cap),
                 fg(theme::DIM),
             )));
         }
         if let Some(trailer) = read.trailer {
             lines.push(Line::from(Span::styled(
-                format!("│         {trailer}"),
+                format!("    {trailer}"),
                 fg(theme::DIM),
             )));
         }
@@ -626,13 +675,13 @@ pub(super) fn tool_result_lines(result: &ToolResult, expanded: bool) -> Vec<Line
         let cap = 12;
         for line in content_lines.iter().take(cap) {
             lines.push(Line::from(vec![
-                Span::styled("│         ", fg(theme::THREAD)),
+                Span::styled("    ", fg(theme::THREAD)),
                 Span::styled(truncate_chars(line, 96), fg(theme::DIM)),
             ]));
         }
         if content_lines.len() > cap {
             lines.push(Line::from(Span::styled(
-                format!("│         … +{} more lines", content_lines.len() - cap),
+                format!("    … +{} more lines", content_lines.len() - cap),
                 fg(theme::DIM),
             )));
         }
@@ -646,7 +695,7 @@ pub(super) fn render_thread_scrolled(
     lines: Vec<Line<'_>>,
     thread_scroll_back: usize,
 ) {
-    let width = usize::from(area.width.saturating_sub(1).max(1));
+    let width = usize::from(area.width.max(1));
     let inner_height = usize::from(area.height);
     let visual_lines = lines
         .iter()
@@ -668,11 +717,6 @@ pub(super) fn render_thread_scrolled(
     .unwrap_or(u16::MAX);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::LEFT)
-                    .border_style(fg(theme::THREAD)),
-            )
             .style(Style::default().bg(theme::BG))
             .scroll((scroll, 0))
             .wrap(Wrap { trim: false }),

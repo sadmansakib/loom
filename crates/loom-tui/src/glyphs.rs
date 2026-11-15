@@ -52,7 +52,7 @@ pub const TABLE: [GlyphPair; 17] = [
     },
     GlyphPair {
         glyph: Glyph::Cross,
-        unicode: "×",
+        unicode: "✗",
         ascii: "x",
     },
     GlyphPair {
@@ -67,7 +67,7 @@ pub const TABLE: [GlyphPair; 17] = [
     },
     GlyphPair {
         glyph: Glyph::Spinner,
-        unicode: "◌",
+        unicode: "⠇",
         ascii: "o",
     },
     GlyphPair {

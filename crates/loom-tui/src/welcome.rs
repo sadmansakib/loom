@@ -97,13 +97,15 @@ pub fn save_pasted_key(db_path: &Path, provider: &str, key: &str) -> Result<(), 
     .map_err(|error| error.to_string())
 }
 
-/// Draws the first-run screen: three numbered steps, the active one expanded.
-pub fn draw_welcome(frame: &mut ratatui::Frame<'_>, flow: &Welcome) {
+/// Draws the first-run screen as a centered 620 px flow: brand,
+/// description, then the three steps with the active one expanded.
+#[allow(clippy::too_many_lines)] // three-step flow, one row block per step
+pub fn draw_welcome(frame: &mut ratatui::Frame<'_>, flow: &Welcome, workspace: &str) {
     use crate::theme;
-    use ratatui::layout::{Constraint, Direction, Layout};
+    use ratatui::layout::{Constraint, Direction, Layout, Rect};
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Span};
-    use ratatui::widgets::{Block, Borders, Paragraph};
+    use ratatui::widgets::{Paragraph, Wrap};
 
     let fg = |color| Style::default().fg(color);
     let area = frame.area();
@@ -123,45 +125,176 @@ pub fn draw_welcome(frame: &mut ratatui::Frame<'_>, flow: &Welcome) {
         rows[0],
     );
 
-    let mut lines: Vec<Line<'_>> = Vec::new();
-    lines.push(step_line(1, "PROVIDER", flow.step == Step::Provider));
-    lines.push(Line::from(Span::styled(
-        format!("  ● {}", flow.provider),
-        fg(theme::IVORY),
-    )));
-    lines.push(Line::from(""));
-    lines.push(step_line(2, "KEY", flow.step == Step::Key));
-    match &flow.env_var {
-        Some(name) => lines.push(Line::from(Span::styled(
-            format!("  ✓ {name} found in env"),
-            fg(theme::SAGE),
-        ))),
-        None => lines.push(Line::from(Span::styled(
-            format!("  {}", "•".repeat(flow.key.chars().count())),
-            fg(theme::DIM),
-        ))),
+    // 620 px at the wireframe's 7.8 px per column, capped to the terminal.
+    let column_width = area.width.min(79);
+    let top_margin = if rows[1].height >= 26 { 3 } else { 0 };
+    let column = Rect {
+        x: area.x + area.width.saturating_sub(column_width) / 2,
+        y: rows[1].y.saturating_add(top_margin),
+        width: column_width,
+        height: rows[1].height.saturating_sub(top_margin),
+    };
+    let mut row = column.y;
+    macro_rules! put {
+        ($lines:expr, $height:expr) => {{
+            let top = row;
+            let height = u16::min($height, column.height.saturating_sub(top - column.y));
+            if height > 0 {
+                frame.render_widget(
+                    Paragraph::new($lines)
+                        .style(fg(theme::IVORY))
+                        .wrap(Wrap { trim: false }),
+                    Rect {
+                        x: column.x,
+                        y: top,
+                        width: column.width,
+                        height,
+                    },
+                );
+                row = top.saturating_add($height);
+            }
+        }};
     }
-    lines.push(Line::from(""));
-    lines.push(step_line(3, "TRUST THIS FOLDER", flow.step == Step::Trust));
-    lines.push(Line::from(Span::styled(
-        "  Reads allowed. Writes and shell ask each time.",
-        fg(theme::DIM),
-    )));
+    macro_rules! put_box {
+        ($lines:expr, $height:expr, $color:expr) => {{
+            let top = row;
+            let height = u16::min($height, column.height.saturating_sub(top - column.y));
+            if height > 0 {
+                frame.render_widget(
+                    Paragraph::new($lines)
+                        .block(section_box($color))
+                        .style(fg(theme::IVORY))
+                        .wrap(Wrap { trim: false }),
+                    Rect {
+                        x: column.x,
+                        y: top,
+                        width: column.width,
+                        height,
+                    },
+                );
+                row = top.saturating_add($height);
+            }
+        }};
+    }
+
+    put!(
+        vec![
+            Line::from(Span::styled(
+                "◆ loom",
+                fg(theme::AMBER).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "A coding agent for your terminal. One thread per task.",
+                fg(theme::DIM),
+            )),
+            Line::from(""),
+            step_line(1, "PROVIDER", flow.step == Step::Provider),
+            Line::from(vec![
+                Span::styled("  ● ", fg(theme::AMBER)),
+                Span::styled(flow.provider.clone(), fg(theme::IVORY)),
+            ]),
+            Line::from(""),
+            step_line(2, "KEY", flow.step == Step::Key),
+        ],
+        7
+    );
+    let key_lines = match &flow.env_var {
+        Some(name) => vec![
+            Line::from(vec![
+                Span::styled(" ❯  ✓ ", fg(theme::SAGE)),
+                Span::styled(format!("{name} found in env"), fg(theme::IVORY)),
+            ]),
+            Line::from(Span::styled(
+                " Or paste a key. Stored in the OS keychain, never in the transcript.",
+                fg(theme::DIM),
+            )),
+        ],
+        None => vec![
+            Line::from(vec![
+                Span::styled(" ❯  ", fg(theme::AMBER)),
+                Span::styled("•".repeat(flow.key.chars().count()), fg(theme::IVORY)),
+            ]),
+            Line::from(Span::styled(
+                "  Pasted keys go to the OS keychain, never the transcript.",
+                fg(theme::DIM),
+            )),
+        ],
+    };
+    put_box!(key_lines, 4, theme::DOTTED);
+    put!(vec![Line::from("")], 1);
+    put!(
+        vec![step_line(3, "TRUST THIS FOLDER", flow.step == Step::Trust,)],
+        1
+    );
+    let trust_color = if flow.step == Step::Trust {
+        theme::AMBER
+    } else {
+        theme::DOTTED
+    };
+    put_box!(
+        vec![
+            Line::from(Span::styled(format!(" {workspace}"), fg(theme::IVORY),)),
+            Line::from(Span::styled(
+                " Reads allowed. Writes and shell ask each time. Later in /tools.",
+                fg(theme::DIM),
+            )),
+        ],
+        4,
+        trust_color
+    );
     if let Some(error) = &flow.error {
-        lines.push(Line::from(Span::styled(error.clone(), fg(theme::CORAL))));
+        put!(
+            vec![Line::from(Span::styled(error.clone(), fg(theme::CORAL),))],
+            1
+        );
     }
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(fg(theme::BORDER)),
-        ),
-        rows[1],
+    put!(vec![Line::from("")], 1);
+    put!(
+        key_hints(&[
+            (
+                "Enter",
+                if flow.step == Step::Trust {
+                    "start"
+                } else {
+                    "continue"
+                }
+            ),
+            ("Esc", "quit")
+        ]),
+        1
     );
-    frame.render_widget(
-        Paragraph::new("Enter continue   Esc quit").style(fg(theme::DIM)),
-        rows[2],
-    );
+    let _ = row;
+}
+
+fn section_box(color: ratatui::style::Color) -> ratatui::widgets::Block<'static> {
+    use ratatui::style::Style;
+    use ratatui::widgets::{Block, Borders};
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color))
+}
+
+fn key_hints(pairs: &[(&str, &str)]) -> ratatui::text::Line<'static> {
+    use crate::theme;
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Span};
+    let mut spans = Vec::new();
+    for (index, (key, label)) in pairs.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::styled(
+            format!("[{key}]"),
+            Style::default()
+                .fg(theme::IVORY)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(" {label}"),
+            Style::default().fg(theme::DIM),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn step_line(number: u8, title: &str, active: bool) -> ratatui::text::Line<'static> {
@@ -236,7 +369,9 @@ mod render_tests {
         let mut flow = Welcome::new("deepseek");
         flow.step = Step::Trust;
         let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
-        terminal.draw(|frame| draw_welcome(frame, &flow)).unwrap();
+        terminal
+            .draw(|frame| draw_welcome(frame, &flow, "~/work/loom"))
+            .unwrap();
         let text = terminal
             .backend()
             .buffer()
@@ -252,5 +387,6 @@ mod render_tests {
             text.contains("Writes and shell ask each time"),
             "trust rule missing"
         );
+        assert!(text.contains("~/work/loom"), "trusted folder missing");
     }
 }

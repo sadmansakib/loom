@@ -38,6 +38,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "browse, resume, export, or delete past sessions",
     },
     Command {
+        name: "/new",
+        blurb: "start a fresh session",
+    },
+    Command {
         name: "/compact",
         blurb: "compact the context",
     },
@@ -91,6 +95,11 @@ pub(crate) fn key(
         return Some(PaletteAction::Close);
     }
     if match_count == 0 {
+        // An unmatched `/word` must never fall through to the composer and
+        // be submitted to the model as a task.
+        if key.code == crossterm::event::KeyCode::Enter {
+            return Some(PaletteAction::Consumed);
+        }
         // Nothing to run or move; everything else types.
         return None;
     }

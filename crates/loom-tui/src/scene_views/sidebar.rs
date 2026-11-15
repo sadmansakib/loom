@@ -148,6 +148,61 @@ pub(super) fn draw_runtime_sidebar(
         return;
     }
 
+    // Idle is not a zeroed dashboard: the wireframe keeps three quiet
+    // sections (what this session is, its limits, what tools may do).
+    if reducer.task.status.is_none()
+        && reducer.execution_turns.is_empty()
+        && reducer.original_instruction.is_none()
+        && reducer.task.display_prompts.is_empty()
+        && reducer.context_progress.is_none()
+        && reducer.summary.is_none()
+        && reducer.recent_events.is_empty()
+        && reducer.tools.is_empty()
+        && options.approval.is_none()
+    {
+        let pad = Rect {
+            x: content.x.saturating_add(2),
+            width: content.width.saturating_sub(2),
+            ..content
+        };
+        if pad.width == 0 {
+            return;
+        }
+        let width = pad.width;
+        let turns = options
+            .turn_limit
+            .map_or_else(|| "unbounded".to_owned(), |limit| limit.to_string());
+        let lines = vec![
+            heading("SESSION"),
+            sidebar_budget_text("new", "no turns yet", width),
+            sidebar_budget_text("model", options.model.unwrap_or("not reported"), width),
+            sidebar_budget_text(
+                "effort / thinking",
+                &format!(
+                    "{} · {}",
+                    options.effort.unwrap_or("not reported"),
+                    options.thinking.unwrap_or("not reported")
+                ),
+                width,
+            ),
+            heading("DEFAULT BUDGET"),
+            sidebar_budget_text("turns", &turns, width),
+            sidebar_budget_text("tool calls", "unbounded", width),
+            sidebar_budget_text("wall", "unbounded", width),
+            heading("TOOLS"),
+            sidebar_budget_text("read", "allowed", width),
+            sidebar_budget_text("write", "ask", width),
+            sidebar_budget_text("shell", "ask", width),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines)
+                .style(Style::default().bg(theme::BG))
+                .wrap(Wrap { trim: false }),
+            pad,
+        );
+        return;
+    }
+
     let elapsed_label = elapsed.map_or_else(
         || "not available".to_owned(),
         |value| format!("{:02}:{:02}", value.as_secs() / 60, value.as_secs() % 60),
@@ -245,12 +300,16 @@ pub(super) fn draw_runtime_sidebar(
             ));
             budget_lines.push(sidebar_unbounded_bar(content.width));
         }
-        budget_lines.push(muted(&format!(
-            "tokens  in {} · out {} · total {}",
-            optional_budget(budget.input_tokens),
-            optional_budget(budget.output_tokens),
-            optional_budget(budget.total_tokens)
-        )));
+        budget_lines.push(sidebar_budget_text(
+            "tokens in",
+            &optional_budget(budget.input_tokens),
+            content.width,
+        ));
+        budget_lines.push(sidebar_budget_text(
+            "tokens out",
+            &optional_budget(budget.output_tokens),
+            content.width,
+        ));
     } else {
         budget_lines.push(sidebar_budget_text(
             "tool calls",
@@ -698,13 +757,13 @@ pub(super) fn context_segments(census: ContextCensus, width: u16) -> Vec<Line<'s
         .map(|(_, value, _)| format_compact_tokens(u64::from(*value)).len())
         .max()
         .unwrap_or_default();
-    let label_width = max_label.min(inner_width.saturating_sub(count_width + 4));
+    let label_width = max_label.min(inner_width.saturating_sub(count_width + 3));
     categories
         .into_iter()
         .map(|(label, tokens, color)| {
             Line::from(vec![
                 Span::styled("■ ", fg(color)),
-                Span::styled(format!("{label:<label_width$}"), fg(theme::IVORY)),
+                Span::styled(format!("{label:<label_width$} "), fg(theme::IVORY)),
                 Span::styled(
                     format!("{:>count_width$}", format_compact_tokens(u64::from(tokens))),
                     fg(theme::DIM),

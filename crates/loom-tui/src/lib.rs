@@ -63,6 +63,9 @@ use std::path::Path;
 use terminal::{LiveFrame, draw_live, terminal_session, workspace_label};
 
 const FRAME_TICK: Duration = Duration::from_millis(35);
+/// DESIGN.md "Compact notice": one slot, latest wins, 8 s once the status
+/// bar is uncovered.
+const NOTICE_TTL: Duration = Duration::from_secs(8);
 
 /// Renders one of the six fixed reference scenes and restores the terminal.
 ///
@@ -183,7 +186,9 @@ fn run_welcome(
     };
     let mut flow = welcome::Welcome::new(provider);
     loop {
-        terminal.draw(|frame| welcome::draw_welcome(frame, &flow))?;
+        terminal.draw(|frame| {
+            welcome::draw_welcome(frame, &flow, &workspace_label(&config.workspace));
+        })?;
         let Event::Key(key) = event::read()? else {
             continue;
         };
@@ -266,6 +271,8 @@ async fn run_interactive(
     let mut pending_approval: Option<approval::Request> = None;
     let mut palette_selected = 0_usize;
     let mut notice: Option<String> = None;
+    // (last seen text, when the status bar first showed it uncovered)
+    let mut notice_clock: Option<(String, Option<std::time::Instant>)> = None;
     // Armed by `/compact`: the next task runs an eager handoff summary
     // before its first compile (the kernel's compaction latch).
     let mut compact_next = false;
@@ -391,6 +398,7 @@ async fn run_interactive(
             let effort = format!("{:?}", config.reasoning_effort).to_lowercase();
             let mut run = Box::pin(engine.run_task(session, task, &sink, &task_control));
             let result = loop {
+                tick_notice(&mut notice, &mut notice_clock, false);
                 terminal.draw(|frame| {
                     draw_live(
                         frame,
@@ -410,7 +418,7 @@ async fn run_interactive(
                             file_index: &file_index,
                             recent: &recent,
                             approval: pending_approval.as_ref(),
-                            notice: None,
+                            notice: notice.as_deref(),
                             palette_selected: 0,
                             sessions: None,
                             overlay: None,
@@ -430,6 +438,12 @@ async fn run_interactive(
                 tokio::select! {
                     event = events.recv() => {
                         if let Some(event) = event {
+                            if let loom_core::EventKind::ContextHandoff { turn, chars } = &event.kind
+                            {
+                                notice = Some(format!(
+                                    "✓ compacted turn {turn} into a handoff summary · {chars} chars"
+                                ));
+                            }
                             event_log.push(event.clone());
                             reducer.reduce(&event, epoch_millis());
                         }
@@ -514,6 +528,13 @@ async fn run_interactive(
             reducer.reconcile_session(session);
         }
 
+        let covered = help
+            || sessions.is_some()
+            || context_open
+            || tools.is_some()
+            || compare.is_some()
+            || accounts.is_some();
+        tick_notice(&mut notice, &mut notice_clock, covered);
         terminal.draw(|frame| {
             let session_label = active.as_ref().map(|(_, session)| session.id.to_string());
             draw_live(
@@ -788,23 +809,39 @@ async fn run_interactive(
                                     );
                                     registry.save(&config.db_path).err()
                                 };
-                                accounts = None;
-                                config.provider.clone_from(&provider);
-                                config.model.clear();
-                                picker = true;
-                                notice = Some(match registry_error {
-                                    Some(error) => format!(
-                                        "saved {provider} · {label}, but the registry write failed: {error}"
-                                    ),
-                                    None => {
-                                        format!("saved {provider} · {label}; picking a model")
-                                    }
-                                });
+                                // J4: stay on the verify step until the user
+                                // moves on to the model picker.
+                                if let Some(screen) = accounts.as_mut() {
+                                    screen.verify = Some((
+                                        true,
+                                        registry_error.map_or_else(
+                                            || format!("{provider} · {label}"),
+                                            |error| {
+                                                format!("saved, registry write failed: {error}")
+                                            },
+                                        ),
+                                    ));
+                                }
                             }
-                            Err(error) => notice = Some(format!("save failed: {error}")),
+                            Err(error) => {
+                                if let Some(screen) = accounts.as_mut() {
+                                    screen.verify = Some((false, error.to_string()));
+                                }
+                            }
                         },
-                        Err(error) => notice = Some(format!("save failed: {error}")),
+                        Err(error) => {
+                            if let Some(screen) = accounts.as_mut() {
+                                screen.verify = Some((false, error.to_string()));
+                            }
+                        }
                     }
+                    true
+                }
+                Some(account_screen::AccountAction::Continue { provider }) => {
+                    accounts = None;
+                    config.provider.clone_from(&provider);
+                    config.model.clear();
+                    picker = true;
                     true
                 }
                 None => false,
@@ -900,6 +937,10 @@ async fn run_interactive(
                                 "/compare" => {
                                     compare =
                                         Some(compare_screen::CompareScreen::load(&config.db_path));
+                                }
+                                "/new" => {
+                                    active = None;
+                                    notice = Some("started a new session".into());
                                 }
                                 "/compact" => {
                                     compact_next = true;
@@ -1146,6 +1187,29 @@ async fn open_engine(
         .context("open Loom engine")?;
     let session = engine.new_session();
     Ok((engine, session))
+}
+
+/// Applies the compact-notice rule: latest text wins, the 8 s timer only
+/// runs while the status bar is uncovered.
+fn tick_notice(
+    notice: &mut Option<String>,
+    clock: &mut Option<(String, Option<std::time::Instant>)>,
+    covered: bool,
+) {
+    let Some(text) = notice.as_ref() else {
+        *clock = None;
+        return;
+    };
+    if clock.as_ref().is_none_or(|(seen, _)| seen != text) {
+        *clock = Some((text.clone(), None));
+    }
+    let Some((_, since)) = clock.as_mut() else {
+        return;
+    };
+    if !covered && since.get_or_insert_with(std::time::Instant::now).elapsed() >= NOTICE_TTL {
+        *notice = None;
+        *clock = None;
+    }
 }
 
 fn epoch_millis() -> u64 {

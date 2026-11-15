@@ -189,6 +189,8 @@ pub struct Reducer {
     pub summary: Option<loom_core::TaskSummary>,
     /// Per-turn measurements from the event stream.
     pub turn_metrics: BTreeMap<u32, TurnMetrics>,
+    /// `(turn, summary chars)` for each LLM handoff compaction, in order.
+    pub compactions: Vec<(u32, usize)>,
     /// Turn ownership of authoritative assistant items, in transcript order.
     assistant_turns: Vec<u32>,
     /// Parent turn for each observed call ID.
@@ -476,11 +478,13 @@ impl Reducer {
             EventKind::TaskPaused => {
                 self.finish_task(event, TaskStatus::Paused, timestamp_millis, None);
             }
+            EventKind::ContextHandoff { turn, chars } => {
+                self.compactions.push((*turn, *chars));
+            }
             EventKind::ContextPruned { .. }
             | EventKind::FastPathHit { .. }
             | EventKind::FastPathDeclined { .. }
             | EventKind::HarnessNotice { .. }
-            | EventKind::ContextHandoff { .. }
             | EventKind::AutofixApplied { .. }
             | EventKind::TodoUpdated { .. }
             | EventKind::TurnBudgetExtended { .. }
