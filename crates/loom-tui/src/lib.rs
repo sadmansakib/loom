@@ -4,6 +4,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 mod approval;
+mod compare_screen;
 mod context_screen;
 mod glyphs;
 mod input;
@@ -263,6 +264,7 @@ async fn run_interactive(
     let mut sessions: Option<sessions_screen::SessionsScreen> = None;
     let mut context_open = false;
     let mut tools: Option<tools_screen::ToolsScreen> = None;
+    let mut compare: Option<compare_screen::CompareScreen> = None;
     let mut event_log: Vec<loom_core::EventEnvelope> = Vec::new();
     if picker {
         picker_state = PickerState::discover(&config).await?;
@@ -399,6 +401,7 @@ async fn run_interactive(
                             sessions: None,
                             overlay: None,
                             tools: None,
+                            compare: None,
                             config: &config,
                             session_id: Some(session_id.as_str()),
                             capabilities: picker_state.selected().capabilities,
@@ -519,6 +522,7 @@ async fn run_interactive(
                     sessions: sessions.as_ref(),
                     overlay: context_open.then_some(crate::terminal::Overlay::Context),
                     tools: tools.as_ref(),
+                    compare: compare.as_ref(),
                     config: &config,
                     session_id: session_label.as_deref(),
                     capabilities: picker_state.selected().capabilities,
@@ -644,6 +648,48 @@ async fn run_interactive(
                 }
                 None => false,
             };
+            // The compare screen owns its keys while it is open.
+            let compare_action = compare.as_mut().and_then(|screen| {
+                let Event::Key(key) = &event else {
+                    return None;
+                };
+                screen.key(*key)
+            });
+            let handled_by_compare = match compare_action {
+                Some(compare_screen::CompareAction::Consumed) => true,
+                Some(compare_screen::CompareAction::Close) => {
+                    compare = None;
+                    true
+                }
+                Some(compare_screen::CompareAction::Open(session)) => {
+                    compare = None;
+                    notice = Some(
+                        resume_session(
+                            &config,
+                            overrides.take().unwrap_or_default(),
+                            &approval_tx,
+                            &mut active,
+                            &mut reducer,
+                            &session,
+                        )
+                        .await,
+                    );
+                    true
+                }
+                Some(compare_screen::CompareAction::ExportNdjson) => {
+                    if let Some(screen) = compare.as_ref() {
+                        notice = Some(export_runs_ndjson(&config, screen));
+                    }
+                    true
+                }
+                Some(compare_screen::CompareAction::ExportCsv) => {
+                    if let Some(screen) = compare.as_ref() {
+                        notice = Some(export_runs_csv(&config, screen));
+                    }
+                    true
+                }
+                None => false,
+            };
             // The palette owns ↑/↓/Enter/Esc while the composer holds a
             // `/` command; every other key falls through and keeps typing.
             let handled_by_palette = if let (Event::Key(key), true) =
@@ -668,6 +714,10 @@ async fn run_interactive(
                                 "/tools" => {
                                     tools =
                                         Some(tools_screen::ToolsScreen::load(&config.workspace));
+                                }
+                                "/compare" => {
+                                    compare =
+                                        Some(compare_screen::CompareScreen::load(&config.db_path));
                                 }
                                 "/compact" => {
                                     notice = Some(
@@ -708,6 +758,7 @@ async fn run_interactive(
                 && !handled_by_sessions
                 && !handled_by_context
                 && !handled_by_tools
+                && !handled_by_compare
             {
                 // A plain key press dismisses the footer notice; keys the
                 // palette or sessions screen consumed (like Esc closing a
@@ -815,6 +866,31 @@ fn export_session_events(config: &EngineConfig, raw: &str) -> String {
             Err(error) => return format!("export failed: {error}"),
         }
     }
+    match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, body)) {
+        Ok(()) => format!("exported to {}", path.display()),
+        Err(error) => format!("export failed: {error}"),
+    }
+}
+
+/// Writes the compare screen's visible rows as NDJSON.
+fn export_runs_ndjson(config: &EngineConfig, screen: &compare_screen::CompareScreen) -> String {
+    let body = compare_screen::ndjson(screen);
+    if body.is_empty() {
+        return "nothing to export: no runs match".into();
+    }
+    let dir = config.workspace.join(".loom").join("exports");
+    let path = dir.join("runs.ndjson");
+    match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, body)) {
+        Ok(()) => format!("exported to {}", path.display()),
+        Err(error) => format!("export failed: {error}"),
+    }
+}
+
+/// Writes the compare screen's visible rows as CSV.
+fn export_runs_csv(config: &EngineConfig, screen: &compare_screen::CompareScreen) -> String {
+    let body = compare_screen::csv(screen);
+    let dir = config.workspace.join(".loom").join("exports");
+    let path = dir.join("runs.csv");
     match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, body)) {
         Ok(()) => format!("exported to {}", path.display()),
         Err(error) => format!("export failed: {error}"),

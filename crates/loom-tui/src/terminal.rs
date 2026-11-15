@@ -51,6 +51,7 @@ pub(crate) struct LiveFrame<'a> {
     pub(crate) sessions: Option<&'a crate::sessions_screen::SessionsScreen>,
     pub(crate) overlay: Option<Overlay>,
     pub(crate) tools: Option<&'a crate::tools_screen::ToolsScreen>,
+    pub(crate) compare: Option<&'a crate::compare_screen::CompareScreen>,
     pub(crate) config: &'a EngineConfig,
     pub(crate) session_id: Option<&'a str>,
     pub(crate) capabilities: Option<ModelCapabilities>,
@@ -80,6 +81,7 @@ pub(crate) fn draw_live(frame: &mut ratatui::Frame<'_>, view: &LiveFrame<'_>) {
         sessions,
         overlay,
         tools,
+        compare,
         config,
         session_id,
         capabilities,
@@ -94,6 +96,8 @@ pub(crate) fn draw_live(frame: &mut ratatui::Frame<'_>, view: &LiveFrame<'_>) {
         crate::context_screen::draw(frame, frame.area(), reducer);
     } else if let Some(screen) = tools {
         crate::tools_screen::draw(frame, frame.area(), screen);
+    } else if let Some(screen) = compare {
+        crate::compare_screen::draw(frame, frame.area(), screen, pricing);
     } else if picker {
         scene_views::draw_picker(frame, &PickerState::empty());
     } else {

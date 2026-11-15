@@ -26,6 +26,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "built-in tools and MCP servers",
     },
     Command {
+        name: "/compare",
+        blurb: "recent runs side by side",
+    },
+    Command {
         name: "/sessions",
         blurb: "browse, resume, export, or delete past sessions",
     },
