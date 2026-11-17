@@ -1869,9 +1869,10 @@ mod tests {
 
     #[test]
     fn command_palette_scrolls_to_keep_the_selected_command_visible() {
+        let last = crate::palette::COMMANDS.len() - 1;
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
         terminal
-            .draw(|frame| draw_palette(frame, frame.area(), "/", 15, GlyphSet::Unicode))
+            .draw(|frame| draw_palette(frame, frame.area(), "/", last, GlyphSet::Unicode))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let rows: Vec<String> = (0..buffer.area.height)
@@ -1881,7 +1882,10 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
-        assert!(rows.iter().any(|row| row.contains("/quit")));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains(crate::palette::COMMANDS[last].name))
+        );
     }
 
     #[test]

@@ -25,7 +25,7 @@ mod welcome;
 mod wireframe_scenes;
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -34,7 +34,7 @@ use loom_core::kernel::agent::TurnBudget;
 use loom_core::kernel::context::PruneConfig;
 use loom_core::kernel::event::ChannelEventSink;
 use loom_core::kernel::session::Session;
-use loom_core::kernel::store::EventStore;
+use loom_core::kernel::store::{EventStore, SessionStore};
 use loom_core::tools::ToolBudgets;
 use loom_core::{Engine, EngineConfig, EventSink, ReasoningEffort, TaskControl};
 use ratatui::Terminal;
@@ -60,8 +60,6 @@ use picker::{
 };
 pub use reducer::Reducer;
 pub use scene_views::Scene;
-#[cfg(test)]
-use std::path::Path;
 use terminal::{LiveFrame, draw_live, terminal_session, workspace_label};
 
 const FRAME_TICK: Duration = Duration::from_millis(35);
@@ -354,7 +352,7 @@ async fn run_interactive(
     let mut reducer = Reducer::default();
     let mut input = PromptEditor::default();
     let file_index = workspace_files(&config.workspace);
-    let recent = recent::load(&config.db_path);
+    let mut recent = recent::load(&config.db_path);
     let mut thread_scroll_back = 0_usize;
     let mut sidebar_scroll_back = 0_usize;
     let mut pending_display_prompt = None;
@@ -869,7 +867,10 @@ async fn run_interactive(
                         true
                     }
                     SessionsAction::Delete(raw) => {
-                        notice = Some(delete_session(&config.db_path, &raw));
+                        notice = Some(match delete_session(&config.db_path, &raw) {
+                            Ok(()) => format!("deleted {raw}"),
+                            Err(error) => error,
+                        });
                         let mut screen = sessions_screen::SessionsScreen::load(&config.db_path);
                         screen.workspace = workspace_label(&config.workspace);
                         sessions = Some(screen);
@@ -1281,12 +1282,59 @@ async fn run_interactive(
                                         ));
                                     }
                                     palette::Action::New => {
-                                        active = None;
-                                        reducer = reducer::Reducer::default();
-                                        event_log.clear();
-                                        last_elapsed = None;
-                                        last_dropped = None;
+                                        clear_live_view(
+                                            &mut active,
+                                            &mut reducer,
+                                            &mut event_log,
+                                            &mut last_elapsed,
+                                            &mut last_dropped,
+                                            &mut recent,
+                                            &config.db_path,
+                                        );
                                         notice = Some("started a new session".into());
+                                    }
+                                    palette::Action::Clear => {
+                                        let failure = active.as_ref().and_then(|(_, session)| {
+                                            delete_session(&config.db_path, &session.id.to_string())
+                                                .err()
+                                        });
+                                        if let Some(error) = failure {
+                                            notice = Some(error);
+                                        } else {
+                                            clear_live_view(
+                                                &mut active,
+                                                &mut reducer,
+                                                &mut event_log,
+                                                &mut last_elapsed,
+                                                &mut last_dropped,
+                                                &mut recent,
+                                                &config.db_path,
+                                            );
+                                            notice = Some("cleared the current session".into());
+                                        }
+                                    }
+                                    palette::Action::ClearHistory => {
+                                        match clear_all_sessions(&config.db_path) {
+                                            Ok(count) => {
+                                                clear_live_view(
+                                                    &mut active,
+                                                    &mut reducer,
+                                                    &mut event_log,
+                                                    &mut last_elapsed,
+                                                    &mut last_dropped,
+                                                    &mut recent,
+                                                    &config.db_path,
+                                                );
+                                                notice = Some(match count {
+                                                    0 => "no saved sessions to clear".into(),
+                                                    1 => "cleared 1 saved session".into(),
+                                                    count => {
+                                                        format!("cleared {count} saved sessions")
+                                                    }
+                                                });
+                                            }
+                                            Err(error) => notice = Some(error),
+                                        }
                                     }
                                     palette::Action::Compact => {
                                         compact_next = true;
@@ -1625,21 +1673,56 @@ fn export_runs_csv(config: &EngineConfig, screen: &compare_screen::CompareScreen
     }
 }
 
-/// Deletes a session and its children from the store, then reloads.
-fn delete_session(db_path: &std::path::Path, raw: &str) -> String {
+/// Deletes a session and its children from the store.
+fn delete_session(db_path: &Path, raw: &str) -> std::result::Result<(), String> {
     let Ok(id) = raw.parse::<loom_core::SessionId>() else {
-        return "delete failed: bad session id".into();
+        return Err("delete failed: bad session id".into());
     };
     if !db_path.exists() {
-        return "delete failed: no store found".into();
+        return Err("delete failed: no store found".into());
     }
     let Ok(store) = loom_core::store::SqliteStore::open(db_path) else {
-        return "delete failed: cannot open the store".into();
+        return Err("delete failed: cannot open the store".into());
     };
-    match store.delete_session(&id) {
-        Ok(()) => format!("deleted {raw}"),
-        Err(error) => format!("delete failed: {error}"),
+    store
+        .delete_session(&id)
+        .map_err(|error| format!("delete failed: {error}"))
+}
+
+/// Deletes every saved session, returning how many were removed.
+fn clear_all_sessions(db_path: &Path) -> std::result::Result<usize, String> {
+    if !db_path.exists() {
+        return Ok(0);
     }
+    let store = loom_core::store::SqliteStore::open(db_path)
+        .map_err(|error| format!("clear failed: {error}"))?;
+    let ids = store
+        .session_ids()
+        .map_err(|error| format!("clear failed: {error}"))?;
+    for id in &ids {
+        store
+            .delete_session(id)
+            .map_err(|error| format!("clear failed: {error}"))?;
+    }
+    Ok(ids.len())
+}
+
+/// Drops the live session and its view, then reloads the recent list.
+fn clear_live_view(
+    active: &mut Option<(Engine, Session)>,
+    reducer: &mut Reducer,
+    event_log: &mut Vec<loom_core::EventEnvelope>,
+    last_elapsed: &mut Option<Duration>,
+    last_dropped: &mut Option<u64>,
+    recent: &mut Vec<recent::RecentSession>,
+    db_path: &Path,
+) {
+    *active = None;
+    *reducer = Reducer::default();
+    event_log.clear();
+    *last_elapsed = None;
+    *last_dropped = None;
+    *recent = recent::load(db_path);
 }
 
 /// Swaps the live session for a recorded one so the next task continues it.
@@ -1775,6 +1858,8 @@ mod tests {
             "/account",
             "/sessions",
             "/new",
+            "/clear",
+            "/clear-history",
             "/context",
             "/tools",
             "/retry",
@@ -1787,6 +1872,22 @@ mod tests {
         ] {
             assert!(names.contains(&command), "{command} missing from palette");
         }
+    }
+
+    #[test]
+    fn clear_all_sessions_removes_every_saved_session() {
+        let path = std::env::temp_dir().join(format!("loom-clear-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = loom_core::store::SqliteStore::open(&path).unwrap();
+            for _ in 0..2 {
+                store.ensure_session(&loom_core::SessionId::new()).unwrap();
+            }
+        }
+        assert_eq!(clear_all_sessions(&path), Ok(2));
+        let store = loom_core::store::SqliteStore::open(&path).unwrap();
+        assert_eq!(store.session_ids().unwrap().len(), 0);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

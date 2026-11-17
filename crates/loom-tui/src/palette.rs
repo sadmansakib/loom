@@ -42,6 +42,14 @@ pub const COMMANDS: &[Command] = &[
         blurb: "start a fresh session",
     },
     Command {
+        name: "/clear",
+        blurb: "clear the current session",
+    },
+    Command {
+        name: "/clear-history",
+        blurb: "delete all saved sessions",
+    },
+    Command {
         name: "/compact",
         blurb: "compact the context",
     },
@@ -84,6 +92,8 @@ pub(crate) enum Action {
     Account,
     Sessions,
     New,
+    Clear,
+    ClearHistory,
     Context,
     Tools,
     Copy,
@@ -105,6 +115,8 @@ pub(crate) fn action_for(name: &str) -> Option<Action> {
         "/account" => Action::Account,
         "/sessions" => Action::Sessions,
         "/new" => Action::New,
+        "/clear" => Action::Clear,
+        "/clear-history" => Action::ClearHistory,
         "/context" => Action::Context,
         "/tools" => Action::Tools,
         "/copy" => Action::Copy,
@@ -218,6 +230,12 @@ mod tests {
                 command.name
             );
         }
+    }
+
+    #[test]
+    fn clear_is_selected_before_clear_history() {
+        assert_eq!(matching("/clear")[0].name, "/clear");
+        assert_eq!(matching("/clear-")[0].name, "/clear-history");
     }
 
     #[test]
