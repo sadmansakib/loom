@@ -24,13 +24,20 @@ pub(crate) struct ContextItem {
     pub(crate) label: String,
     /// Estimated tokens (the kernel's bytes ÷ 3 heuristic).
     pub(crate) tokens: u64,
+    /// Turn the call that produced this result ran in, when known.
+    pub(crate) turn: Option<u32>,
     pub(crate) pinned: bool,
     pub(crate) dropped: bool,
 }
 
 /// The largest tool results in `session`, biggest first — the wireframe's
 /// LARGEST ITEMS list. `limit` caps the rows the modal can show.
-pub(crate) fn items(session: &Session, ops: &PruneOps, limit: usize) -> Vec<ContextItem> {
+pub(crate) fn items(
+    session: &Session,
+    ops: &PruneOps,
+    reducer: &Reducer,
+    limit: usize,
+) -> Vec<ContextItem> {
     let mut labels: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
     for item in &session.transcript {
         let Item::Assistant(message) = item else {
@@ -64,6 +71,7 @@ pub(crate) fn items(session: &Session, ops: &PruneOps, limit: usize) -> Vec<Cont
                     .cloned()
                     .unwrap_or_else(|| "tool result".into()),
                 tokens: u64::try_from(result.content.len() / 3).unwrap_or(u64::MAX),
+                turn: reducer.tool_call_turn(result.call_id.as_str()),
                 call_id,
             })
         })
@@ -82,15 +90,16 @@ type CensusField = fn(&ContextCensus) -> u32;
 
 /// The wireframe's category rows: label, census field, swatch color.
 const BREAKDOWN: [(&str, CensusField, ratatui::style::Color); 5] = [
+    // Colours follow the wireframe's segment swatches exactly.
     (
         "system + tools",
         |c| c.system_prompt + c.tool_specs,
-        theme::SAGE,
+        theme::DIM,
     ),
-    ("user", |c| c.user_items, theme::IVORY),
+    ("user", |c| c.user_items, theme::BLUE),
     ("reasoning", |c| c.reasoning_replay, theme::VIOLET),
-    ("assistant", |c| c.assistant_history, theme::BLUE),
-    ("tool results", |c| c.tool_results, theme::TEAL),
+    ("assistant", |c| c.assistant_history, theme::IVORY),
+    ("tool results", |c| c.tool_results, theme::SAGE),
 ];
 
 /// Render the inspector modal over the dimmed live view.
@@ -100,6 +109,7 @@ pub(crate) fn draw(
     reducer: &Reducer,
     items: &[ContextItem],
     selected: usize,
+    command: Option<Line<'static>>,
 ) {
     let height = area.height.clamp(12, 26);
     let modal = crate::modal::centered(area, height);
@@ -109,8 +119,9 @@ pub(crate) fn draw(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::AMBER))
+            .style(Style::default().bg(theme::BG))
             .title(Span::styled(
-                " /context ",
+                " ◆ context  /context ",
                 Style::default()
                     .fg(theme::AMBER)
                     .add_modifier(Modifier::BOLD),
@@ -120,30 +131,73 @@ pub(crate) fn draw(
     let inner = modal.inner(ratatui::layout::Margin::new(1, 1));
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(6), Constraint::Length(2)])
+        .constraints([Constraint::Min(6), Constraint::Length(1)])
         .split(inner);
     let dim = Style::default().fg(theme::DIM);
-    let body = body_lines(reducer, items, selected);
-    frame.render_widget(Paragraph::new(body), rows[0]);
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(
-                "RULES dropping keeps the call line; the model sees [pruned] and can re-run it",
-                dim,
-            )),
-            Line::from(Span::styled(
-                "↑↓ move   p pin   x drop   c compact next task   Esc back",
-                dim,
-            )),
-        ]),
-        rows[1],
-    );
+    let amber = Style::default().fg(theme::AMBER);
+    // The wireframe puts actions on the right; below 100 cells the census
+    // needs the whole width, so the actions collapse into the key line.
+    let wide = inner.width >= 100;
+    let columns = if wide {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(60), Constraint::Length(36)])
+            .split(rows[0])
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(100)])
+            .split(rows[0])
+    };
+    let body = body_lines(reducer, items, selected, columns[0].width);
+    frame.render_widget(Paragraph::new(body), columns[0]);
+    if wide {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled("ACTIONS", amber)),
+                Line::from(vec![
+                    Span::styled("[/compact] ", Style::default().fg(theme::IVORY)),
+                    Span::styled("compact old turns", dim),
+                ]),
+                Line::from(vec![
+                    Span::styled("[/drop] ", Style::default().fg(theme::IVORY)),
+                    Span::styled("drop selected result", dim),
+                ]),
+                Line::from(vec![
+                    Span::styled("[/pin] ", Style::default().fg(theme::IVORY)),
+                    Span::styled("pin to prefix", dim),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled("RULES", amber)),
+                Line::from(Span::styled("Drop keeps the call line.", dim)),
+                Line::from(Span::styled("The model sees “result omitted”.", dim)),
+            ])
+            .block(
+                Block::default()
+                    .borders(Borders::LEFT)
+                    .border_style(Style::default().fg(theme::BORDER)),
+            ),
+            columns[1],
+        );
+    }
+    let footer = command.unwrap_or_else(|| {
+        Line::from(Span::styled(
+            "↑↓ move · [/pin] pin · [/drop] drop · [/compact] compact · Esc back",
+            dim,
+        ))
+    });
+    frame.render_widget(Paragraph::new(footer), rows[1]);
 }
 
 /// The modal body: the census breakdown, then the operator's largest
 /// tool results with pin/drop state. Split from `draw` so each half
 /// stays one screenful of logic.
-fn body_lines(reducer: &Reducer, items: &[ContextItem], selected: usize) -> Vec<Line<'static>> {
+fn body_lines(
+    reducer: &Reducer,
+    items: &[ContextItem],
+    selected: usize,
+    width: u16,
+) -> Vec<Line<'static>> {
     let amber = Style::default().fg(theme::AMBER);
     let dim = Style::default().fg(theme::DIM);
     let ivory = Style::default().fg(theme::IVORY);
@@ -151,7 +205,10 @@ fn body_lines(reducer: &Reducer, items: &[ContextItem], selected: usize) -> Vec<
         Some(progress) => {
             let census = &progress.census;
             let budget = progress.context_budget.max_input_tokens;
-            let mut lines = vec![Line::from(Span::styled("BREAKDOWN", amber))];
+            let mut lines = vec![
+                Line::from(Span::styled("BREAKDOWN", amber)),
+                crate::scene_views::sidebar::context_bar(*census, width.saturating_sub(2)),
+            ];
             for (label, field, color) in BREAKDOWN {
                 let tokens = field(census);
                 lines.push(Line::from(vec![
@@ -210,7 +267,15 @@ fn body_lines(reducer: &Reducer, items: &[ContextItem], selected: usize) -> Vec<
         };
         body.push(Line::from(vec![
             Span::styled(if position == selected { "▸ " } else { "  " }, amber),
-            Span::styled(format!("{:<28}", item.label), style),
+            Span::styled(
+                format!(
+                    "{:<8}",
+                    item.turn
+                        .map_or_else(|| "—".into(), |turn| format!("turn {turn}"))
+                ),
+                dim,
+            ),
+            Span::styled(format!("{:<24}", item.label), style),
             Span::styled(
                 format!("{:>7}  ", tokens_label(item.tokens)),
                 Style::default().fg(theme::BLUE),
@@ -307,7 +372,7 @@ mod tests {
         let backend = TestBackend::new(130, 30);
         let mut frame = ratatui::Terminal::new(backend).expect("test terminal");
         let reducer = reducer_with_progress();
-        frame.draw(|frame| draw(frame, Rect::new(0, 0, 130, 30), &reducer, &[], 0));
+        frame.draw(|frame| draw(frame, Rect::new(0, 0, 130, 30), &reducer, &[], 0, None));
         let buffer = frame.backend().buffer().clone();
         let text: String = buffer
             .content
@@ -317,6 +382,8 @@ mod tests {
         for needle in [
             "/context",
             "BREAKDOWN",
+            "ACTIONS",
+            "[/compact]",
             "system + tools",
             "tool results",
             "total (est.) 16.8K",
@@ -372,7 +439,7 @@ mod tests {
         )));
         let mut ops = loom_core::kernel::context::PruneOps::default();
         ops.dropped.insert("call_2".to_owned());
-        let items = items(&session, &ops, 6);
+        let items = items(&session, &ops, &Reducer::default(), 6);
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].label, "read_file src/a.rs", "biggest first");
         assert_eq!(items[0].tokens, 1_000);

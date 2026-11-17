@@ -63,6 +63,10 @@ pub enum TuiScene {
     Complete,
     Picker,
     Help,
+    Spec,
+    Narrow,
+    CompactA,
+    CompactB,
 }
 
 /// The engine-configuration flags shared by `loom run` and `loom chat`.

@@ -13,7 +13,6 @@ use crate::{picker::ModelPricing, reducer::Reducer, theme};
 
 use super::{
     LiveViewOptions, Scene, TaskStatus, fg, format_compact_tokens, heading, muted, status_label,
-    tinted,
 };
 
 /// Sidebar for the static preview scenes: every live counter is explicitly
@@ -90,7 +89,13 @@ pub(super) fn draw_scene_sidebar(
             lines.push(heading("RUN RECORD"));
             lines.push(muted("No completed task in this preview."));
         }
-        Scene::Main | Scene::Picker | Scene::Help => {}
+        Scene::Main
+        | Scene::Picker
+        | Scene::Help
+        | Scene::Spec
+        | Scene::Narrow
+        | Scene::CompactA
+        | Scene::CompactB => {}
     }
     lines.extend([
         heading("PREVIEW NOTES"),
@@ -124,7 +129,6 @@ pub(super) fn draw_runtime_sidebar(
     area: Rect,
     reducer: &Reducer,
     elapsed: Option<Duration>,
-    dropped: Option<u64>,
     pricing: Option<ModelPricing>,
     options: &LiveViewOptions<'_>,
 ) {
@@ -153,6 +157,7 @@ pub(super) fn draw_runtime_sidebar(
     if reducer.task.status.is_none()
         && reducer.execution_turns.is_empty()
         && reducer.original_instruction.is_none()
+        && !reducer.restored
         && reducer.task.display_prompts.is_empty()
         && reducer.context_progress.is_none()
         && reducer.summary.is_none()
@@ -172,6 +177,14 @@ pub(super) fn draw_runtime_sidebar(
         let turns = options
             .turn_limit
             .map_or_else(|| "unbounded".to_owned(), |limit| limit.to_string());
+        let tool_calls = options
+            .idle
+            .tool_call_budget
+            .map_or_else(|| "unbounded".to_owned(), |limit| limit.to_string());
+        let wall = options
+            .idle
+            .wall_budget
+            .map_or_else(|| "unbounded".to_owned(), format_duration);
         let lines = vec![
             heading("SESSION"),
             sidebar_budget_text("new", "no turns yet", width),
@@ -187,12 +200,12 @@ pub(super) fn draw_runtime_sidebar(
             ),
             heading("DEFAULT BUDGET"),
             sidebar_budget_text("turns", &turns, width),
-            sidebar_budget_text("tool calls", "unbounded", width),
-            sidebar_budget_text("wall", "unbounded", width),
+            sidebar_budget_text("tool calls", &tool_calls, width),
+            sidebar_budget_text("wall", &wall, width),
             heading("TOOLS"),
-            sidebar_budget_text("read", "allowed", width),
-            sidebar_budget_text("write", "ask", width),
-            sidebar_budget_text("shell", "ask", width),
+            sidebar_budget_text("read", options.idle.read_permission, width),
+            sidebar_budget_text("write", options.idle.write_permission, width),
+            sidebar_budget_text("shell", options.idle.shell_permission, width),
         ];
         frame.render_widget(
             Paragraph::new(lines)
@@ -211,7 +224,11 @@ pub(super) fn draw_runtime_sidebar(
         || "task id unavailable".to_owned(),
         |id| format!("t_{}", &id.to_string()[..8]),
     );
-    let status_color = if reducer.task.status == Some(TaskStatus::Running) {
+    let status_color = if options.approval.is_some()
+        || matches!(
+            reducer.task.status,
+            Some(TaskStatus::Running | TaskStatus::Paused)
+        ) {
         theme::AMBER
     } else if reducer.task.status == Some(TaskStatus::Completed) {
         theme::SAGE
@@ -220,14 +237,20 @@ pub(super) fn draw_runtime_sidebar(
     } else {
         theme::DIM
     };
+    let (status_glyph, status_text) =
+        if options.approval.is_some() || reducer.task.status == Some(TaskStatus::Paused) {
+            (
+                crate::glyphs::glyph(crate::glyphs::Glyph::Needs, super::glyph_set()),
+                "Needs you",
+            )
+        } else {
+            (super::status_glyph(reducer), status_label(reducer))
+        };
     let task_lines = vec![
         heading("TASK"),
         Line::from(vec![
-            Span::styled("◈ ", fg(status_color)),
-            Span::styled(
-                status_label(reducer),
-                fg(status_color).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(format!("{status_glyph} "), fg(status_color)),
+            Span::styled(status_text, fg(status_color).add_modifier(Modifier::BOLD)),
             Span::styled(format!("  {elapsed_label}"), fg(theme::DIM)),
         ]),
         muted(&task_id),
@@ -378,18 +401,6 @@ pub(super) fn draw_runtime_sidebar(
         )),
     ];
 
-    let event_count = match dropped {
-        Some(dropped) => tinted(
-            &format!("events {} · dropped {dropped}", reducer.event_count),
-            if dropped == 0 {
-                theme::DIM
-            } else {
-                theme::CORAL
-            },
-        ),
-        None => muted("event counters not available"),
-    };
-
     if let Some(summary) = &reducer.summary {
         let census = if summary.model_requests > 0 {
             format!(
@@ -482,7 +493,7 @@ pub(super) fn draw_runtime_sidebar(
                     format!("◇ {}", request.path),
                     fg(theme::AMBER).add_modifier(Modifier::BOLD),
                 )),
-                muted("y allow once   a always   n decline"),
+                muted("y once   a for this session   n deny"),
             ],
         ));
         sections_data.push(("PERMISSIONS", vec![muted("write  asks each time")]));
@@ -563,18 +574,14 @@ pub(super) fn draw_runtime_sidebar(
     } else {
         vec![heading("EVENTS")]
     };
-    let event_count_rows = usize::from(event_rows >= 2);
     event_lines.extend(
         reducer
             .recent_events
             .iter()
             .skip(options.sidebar_scroll_back)
-            .take(event_rows.saturating_sub(1 + event_count_rows))
+            .take(event_rows.saturating_sub(1))
             .map(|event| event_line(event)),
     );
-    if event_count_rows == 1 && event_lines.len() < event_rows {
-        event_lines.push(event_count);
-    }
     frame.render_widget(
         Paragraph::new(event_lines).style(Style::default().bg(theme::BG)),
         event_area,
@@ -686,7 +693,7 @@ pub(super) fn sidebar_budget_text(label: &str, value: &str, width: u16) -> Line<
     ])
 }
 
-pub(super) fn context_bar(census: ContextCensus, width: u16) -> Line<'static> {
+pub(crate) fn context_bar(census: ContextCensus, width: u16) -> Line<'static> {
     let segments = context_categories(census);
     let total = segments
         .iter()

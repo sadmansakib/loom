@@ -242,12 +242,14 @@ fn seeded_store_with_events(db: &std::path::Path) -> SessionId {
     let events = vec![
         EventEnvelope {
             schema_version: EVENT_SCHEMA_VERSION,
+            timestamp_millis: None,
             sequence: 0,
             task_id: task,
             kind: EventKind::TaskStarted,
         },
         EventEnvelope {
             schema_version: EVENT_SCHEMA_VERSION,
+            timestamp_millis: None,
             sequence: 1,
             task_id: task,
             kind: EventKind::ContextPruned {
@@ -265,6 +267,7 @@ fn seeded_store_with_events(db: &std::path::Path) -> SessionId {
         },
         EventEnvelope {
             schema_version: EVENT_SCHEMA_VERSION,
+            timestamp_millis: None,
             sequence: 2,
             task_id: task,
             kind: EventKind::FastPathHit {
@@ -274,6 +277,7 @@ fn seeded_store_with_events(db: &std::path::Path) -> SessionId {
         },
         EventEnvelope {
             schema_version: EVENT_SCHEMA_VERSION,
+            timestamp_millis: None,
             sequence: 3,
             task_id: task,
             kind: EventKind::TaskCompleted,

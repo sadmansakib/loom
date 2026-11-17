@@ -2,7 +2,7 @@
 //! before forwarding it.
 
 use super::sink::EventSink;
-use super::wire::{EVENT_SCHEMA_VERSION, EventEnvelope, EventKind};
+use super::wire::{EVENT_SCHEMA_VERSION, EventEnvelope, EventKind, now_millis};
 use crate::id::{SessionId, TaskId};
 use crate::store::SharedEventStore;
 use std::sync::Arc;
@@ -105,6 +105,7 @@ impl EventSink for PersistingEventSink<'_> {
         let envelope = EventEnvelope {
             schema_version: EVENT_SCHEMA_VERSION,
             sequence,
+            timestamp_millis: Some(now_millis()),
             task_id,
             kind,
         };

@@ -72,7 +72,19 @@ use serde::{Deserialize, Serialize};
 /// `false` from the operator's decision, not inferred from the tool status.
 /// v20 adds `PruneTrigger::Operator`: an operator drop (`/context` `x`)
 /// stubbed a result below the window trigger.
-pub const EVENT_SCHEMA_VERSION: u16 = 20;
+/// v21 adds [`EventEnvelope::timestamp_millis`]: observation time on the
+/// envelope so persisted history can restore real durations.
+pub const EVENT_SCHEMA_VERSION: u16 = 21;
+
+/// Current Unix epoch milliseconds, or `0` before the epoch.
+#[must_use]
+pub(crate) fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
 
 /// The evidence that justified a [`EventKind::TurnBudgetExtended`] grant
 /// (item 26): state the loop already tracks, never a model call.
@@ -142,6 +154,12 @@ pub struct EventEnvelope {
     /// a trace that ends early — and are surfaced by
     /// [`EventSink::dropped`][crate::event::EventSink::dropped] instead.
     pub sequence: u64,
+    /// When the sink observed the event: Unix epoch milliseconds, UTC.
+    ///
+    /// `None` for rows persisted before schema v21; replay must not
+    /// invent durations from a missing timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_millis: Option<u64>,
     /// The task this event belongs to.
     pub task_id: TaskId,
     /// What happened.

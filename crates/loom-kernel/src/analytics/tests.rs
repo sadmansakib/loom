@@ -433,6 +433,7 @@ fn mechanism_events() -> Vec<EventEnvelope> {
     let task = TaskId::new();
     let envelope = |sequence, kind| EventEnvelope {
         schema_version: EVENT_SCHEMA_VERSION,
+        timestamp_millis: None,
         sequence,
         task_id: task,
         kind,

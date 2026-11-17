@@ -9,11 +9,25 @@ use ratatui::{
 
 use crate::{
     glyphs::{self, Glyph, GlyphSet},
-    reducer::Reducer,
+    reducer::{Reducer, RestoredRun},
     theme,
 };
 
 use super::{Scene, TaskStatus, fg, format_compact_tokens, glyph_set, muted, tinted};
+
+/// A tool with no result yet is either running or paused on the approval
+/// box: arguments naming the paused write get the wireframe's needs-you
+/// marker instead of a lying "running".
+fn pending_state(
+    approval_path: Option<&str>,
+    arguments: &str,
+) -> (Glyph, ratatui::style::Color, &'static str) {
+    if approval_path.is_some_and(|path| !path.is_empty() && arguments.contains(path)) {
+        (Glyph::Needs, theme::AMBER, "awaiting")
+    } else {
+        (Glyph::Spinner, theme::AMBER, "running")
+    }
+}
 
 #[allow(clippy::too_many_lines, clippy::wildcard_enum_match_arm)] // transcript rendering preserves event and tool ordering; Item is non_exhaustive
 pub(super) fn draw_reducer_thread(
@@ -23,12 +37,14 @@ pub(super) fn draw_reducer_thread(
     compact: bool,
     thread_scroll_back: usize,
     scene: Option<Scene>,
+    approval_path: Option<&str>,
 ) {
     let mut lines = Vec::new();
-    if let Some(prompt) = reducer
-        .original_instruction
-        .as_deref()
-        .or_else(|| reducer.task.display_prompts.first().map(String::as_str))
+    if !reducer.restored
+        && let Some(prompt) = reducer
+            .original_instruction
+            .as_deref()
+            .or_else(|| reducer.task.display_prompts.first().map(String::as_str))
     {
         lines.push(Line::from(vec![
             Span::styled("❯ ", fg(theme::AMBER)),
@@ -52,7 +68,21 @@ pub(super) fn draw_reducer_thread(
         })
         .collect::<std::collections::BTreeSet<_>>();
 
+    let mut last_run = None;
     for (turn_number, turn) in &reducer.execution_turns {
+        if let Some(run_index) = turn.run
+            && last_run != Some(run_index)
+        {
+            last_run = Some(run_index);
+            if let Some(run) = reducer.restored_runs.get(&run_index) {
+                lines.push(restored_run_heading(run, run_index));
+            }
+        }
+        let display_turn = turn
+            .engine_turn
+            .or_else(|| turn.run.is_none().then_some(*turn_number));
+        let turn_label =
+            display_turn.map_or_else(|| "history".to_owned(), |number| format!("turn {number}"));
         if let Some((_, chars)) = reducer
             .compactions
             .iter()
@@ -64,14 +94,15 @@ pub(super) fn draw_reducer_thread(
                 Span::styled("── ", fg(theme::THREAD)),
                 Span::styled("compacted", fg(theme::AMBER)),
                 Span::styled(
-                    format!(" · turn {turn_number} · {chars} chars of handoff summary ──"),
+                    format!(" · {turn_label} · {chars} chars of handoff summary ──"),
                     fg(theme::DIM),
                 ),
             ]));
         }
-        let streaming = reducer.turn == Some(*turn_number) && reducer.has_provisional_output();
+        let streaming = display_turn == reducer.turn && reducer.has_provisional_output();
         lines.push(turn_heading(
             *turn_number,
+            display_turn,
             area.width.saturating_sub(1),
             streaming,
             reducer,
@@ -148,41 +179,26 @@ pub(super) fn draw_reducer_thread(
                         }
                     }
                     if !message.content.trim().is_empty() {
-                        // A Line does not split on newlines: markdown headings
-                        // and paragraphs must become their own rows or the
-                        // whole answer collapses onto one line.
-                        for text in human_readable_content(&message.content).lines() {
-                            let text = text.trim_end();
-                            if text.is_empty() {
-                                lines.push(Line::from(""));
-                            } else {
-                                lines.push(Line::from(Span::styled(
-                                    text.to_owned(),
-                                    fg(theme::IVORY),
-                                )));
-                            }
-                        }
+                        lines.extend(markdown_lines(&message.content));
                     }
                     for (call_index, call) in message.tool_calls.iter().enumerate() {
                         let call_id = call.id.to_string();
                         rendered_call_ids.insert(call_id.clone());
                         let state = reducer.tools.get(&call_id);
-                        let (marker, color, label) =
-                            state.map_or((Glyph::Spinner, theme::AMBER, "running"), |tool| {
-                                match tool.status {
-                                    Some(ToolStatus::Success) => {
-                                        (Glyph::Check, theme::SAGE, "done")
-                                    }
-                                    Some(ToolStatus::Error(_)) => {
-                                        (Glyph::Cross, theme::CORAL, "failed")
-                                    }
-                                    Some(ToolStatus::Cancelled { .. }) => {
-                                        (Glyph::Warning, theme::AMBER, "cancelled")
-                                    }
-                                    Some(_) => (Glyph::Check, theme::DIM, "finished"),
-                                    None => (Glyph::Spinner, theme::AMBER, "running"),
+                        let (marker, color, label) = match state {
+                            Some(tool) => match tool.status {
+                                Some(ToolStatus::Success) => (Glyph::Check, theme::SAGE, "done"),
+                                Some(ToolStatus::Error(_)) => {
+                                    (Glyph::Cross, theme::CORAL, "failed")
                                 }
-                            });
+                                Some(ToolStatus::Cancelled { .. }) => {
+                                    (Glyph::Warning, theme::AMBER, "cancelled")
+                                }
+                                Some(_) => (Glyph::Check, theme::DIM, "finished"),
+                                None => pending_state(approval_path, &call.arguments.to_string()),
+                            },
+                            None => pending_state(approval_path, &call.arguments.to_string()),
+                        };
                         let duration = state.and_then(|tool| {
                             tool.started_at_millis
                                 .zip(tool.completed_at_millis)
@@ -230,7 +246,11 @@ pub(super) fn draw_reducer_thread(
                     }
                 }
                 Item::ToolResult(result) => {
-                    lines.extend(tool_result_lines(result, reducer.expanded.tools));
+                    lines.extend(tool_result_lines(
+                        result,
+                        reducer.expanded.tools,
+                        area.width,
+                    ));
                 }
                 _ => {}
             }
@@ -255,7 +275,7 @@ pub(super) fn draw_reducer_thread(
                 Some(ToolStatus::Error(_)) => (Glyph::Cross, theme::CORAL, "failed"),
                 Some(ToolStatus::Cancelled { .. }) => (Glyph::Warning, theme::AMBER, "cancelled"),
                 Some(_) => (Glyph::Check, theme::DIM, "finished"),
-                None => (Glyph::Spinner, theme::AMBER, "running"),
+                None => pending_state(approval_path, tool.arguments.as_deref().unwrap_or("")),
             };
             let timing = tool
                 .started_at_millis
@@ -331,17 +351,19 @@ pub(super) fn draw_reducer_thread(
                 }
             }
             if !reducer.provisional.text.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::styled("", fg(theme::THREAD)),
-                    Span::styled(
-                        human_readable_content(&reducer.provisional.text),
-                        fg(theme::IVORY),
-                    ),
-                    Span::styled(
+                // Render partial markdown too: a streaming answer used to sit
+                // on a single wrapped line until the turn committed.
+                let mut rendered = markdown_lines(&reducer.provisional.text);
+                if rendered.is_empty() {
+                    rendered.push(Line::from(""));
+                }
+                if let Some(last) = rendered.last_mut() {
+                    last.spans.push(Span::styled(
                         streaming_cursor(),
                         fg(theme::AMBER).add_modifier(Modifier::BOLD),
-                    ),
-                ]));
+                    ));
+                }
+                lines.extend(rendered);
             }
         }
         lines.push(Line::from(""));
@@ -351,10 +373,7 @@ pub(super) fn draw_reducer_thread(
     if reducer.execution_turns.is_empty() {
         for item in &reducer.committed_transcript {
             if let Item::Assistant(message) = item {
-                lines.push(Line::from(Span::styled(
-                    human_readable_content(&message.content),
-                    fg(theme::IVORY),
-                )));
+                lines.extend(markdown_lines(&message.content));
             }
         }
     }
@@ -404,13 +423,50 @@ pub(super) fn draw_reducer_thread(
     }
 }
 
+#[allow(clippy::wildcard_enum_match_arm)] // TaskStatus is non_exhaustive
+fn restored_run_heading(run: &RestoredRun, run_index: u32) -> Line<'static> {
+    let (status, color) = match run.status {
+        Some(TaskStatus::Completed) => ("completed", theme::SAGE),
+        Some(TaskStatus::Failed) => ("failed", theme::CORAL),
+        Some(TaskStatus::Cancelled) => ("cancelled", theme::DIM),
+        Some(TaskStatus::Paused) => ("paused", theme::AMBER),
+        Some(TaskStatus::Running) => ("interrupted", theme::AMBER),
+        Some(_) => ("unknown", theme::DIM),
+        None => ("history", theme::DIM),
+    };
+    let mut spans = vec![
+        Span::styled("── ", fg(theme::THREAD)),
+        Span::styled(format!("run {run_index}"), fg(theme::AMBER)),
+        Span::styled(format!(" · {status}"), fg(color)),
+    ];
+    if run.turns > 0 {
+        spans.push(Span::styled(
+            format!(" · {} turns", run.turns),
+            fg(theme::DIM),
+        ));
+    }
+    if let Some(reason) = run
+        .failure_reason
+        .as_deref()
+        .filter(|reason| !reason.trim().is_empty())
+    {
+        spans.push(Span::styled(
+            format!(" · {}", truncate_chars(reason, 60)),
+            fg(theme::CORAL),
+        ));
+    }
+    spans.push(Span::styled(" ──", fg(theme::THREAD)));
+    Line::from(spans)
+}
+
 pub(super) fn turn_heading(
-    turn: u32,
+    turn_key: u32,
+    engine_turn: Option<u32>,
     width: u16,
     streaming: bool,
     reducer: &Reducer,
 ) -> Line<'static> {
-    let metrics = reducer.turn_metrics.get(&turn);
+    let metrics = reducer.turn_metrics.get(&turn_key);
     let usage = metrics
         .filter(|metrics| metrics.usage_reported)
         .map_or(String::new(), |metrics| {
@@ -444,7 +500,8 @@ pub(super) fn turn_heading(
     } else {
         String::new()
     };
-    let metadata = format!("turn {turn}{usage}{cached}{duration}{state}");
+    let label = engine_turn.map_or_else(|| "history".to_owned(), |turn| format!("turn {turn}"));
+    let metadata = format!("{label}{usage}{cached}{duration}{state}");
     let metadata = truncate_chars(&metadata, usize::from(width).saturating_sub(3));
     Line::from(vec![
         Span::styled(
@@ -505,6 +562,186 @@ pub(super) fn human_readable_content(raw: &str) -> String {
         return "(structured output hidden)".to_owned();
     }
     raw.to_owned()
+}
+
+/// Renders model prose as terminal lines: markdown syntax markers become
+/// styles instead of literal characters. Unknown constructs pass through, so
+/// a partial marker mid-stream stays visible until it closes.
+pub(super) fn markdown_lines(raw: &str) -> Vec<Line<'static>> {
+    let content = human_readable_content(raw);
+    if content == "(structured output hidden)" {
+        return vec![muted(&content)];
+    }
+    let mut lines = Vec::new();
+    let mut in_code = false;
+    for line in content.lines() {
+        let line = line.trim_end();
+        let trimmed = line.trim_start();
+        let indent = &line[..line.len() - trimmed.len()];
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{indent}  "), fg(theme::DIM)),
+                Span::styled(trimmed.to_owned(), fg(theme::TEAL)),
+            ]));
+            continue;
+        }
+        if trimmed.is_empty() {
+            lines.push(Line::from(""));
+        } else if let Some(text) = heading_text(trimmed) {
+            lines.push(Line::from(Span::styled(
+                text.to_owned(),
+                fg(theme::AMBER).add_modifier(Modifier::BOLD),
+            )));
+        } else if is_rule(trimmed) {
+            lines.push(Line::from(Span::styled("─".repeat(28), fg(theme::THREAD))));
+        } else if let Some(quote) = trimmed.strip_prefix("> ") {
+            let mut spans = vec![Span::styled(format!("{indent}│ "), fg(theme::THREAD))];
+            spans.extend(inline_spans(quote).into_iter().map(|span| {
+                Span::styled(span.content, fg(theme::DIM).add_modifier(Modifier::ITALIC))
+            }));
+            lines.push(Line::from(spans));
+        } else if is_table_separator(trimmed) {
+            // Column widths are not computed: separators carry no content.
+        } else if trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.len() > 1 {
+            let mut spans = Vec::new();
+            for (index, cell) in table_cells(trimmed).into_iter().enumerate() {
+                if index > 0 {
+                    spans.push(Span::styled(" │ ", fg(theme::THREAD)));
+                }
+                spans.extend(inline_spans(cell));
+            }
+            lines.push(Line::from(spans));
+        } else if let Some(body) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("+ "))
+        {
+            let mut spans = vec![Span::styled(format!("{indent}• "), fg(theme::AMBER))];
+            spans.extend(inline_spans(body));
+            lines.push(Line::from(spans));
+        } else if let Some((marker, body)) = numbered_item(trimmed) {
+            let mut spans = vec![Span::styled(format!("{indent}{marker} "), fg(theme::AMBER))];
+            spans.extend(inline_spans(body));
+            lines.push(Line::from(spans));
+        } else {
+            lines.push(Line::from(inline_spans(line)));
+        }
+    }
+    lines
+}
+
+fn heading_text(text: &str) -> Option<&str> {
+    let hashes = text
+        .chars()
+        .take_while(|character| *character == '#')
+        .count();
+    (1..=6)
+        .contains(&hashes)
+        .then(|| text[hashes..].strip_prefix(' '))
+        .flatten()
+}
+
+fn is_rule(text: &str) -> bool {
+    let mut markers = text.chars().filter(|character| !character.is_whitespace());
+    let Some(first) = markers.next() else {
+        return false;
+    };
+    matches!(first, '-' | '*' | '_')
+        && markers.clone().count() >= 2
+        && markers.all(|character| character == first)
+}
+
+fn numbered_item(text: &str) -> Option<(&str, &str)> {
+    let digits = text.chars().take_while(char::is_ascii_digit).count();
+    (digits > 0)
+        .then(|| text[digits..].strip_prefix(". "))
+        .flatten()
+        .map(|body| (&text[..digits], body))
+}
+
+fn is_table_separator(text: &str) -> bool {
+    text.starts_with('|')
+        && text.ends_with('|')
+        && text
+            .chars()
+            .all(|character| matches!(character, '|' | '-' | ':' | ' '))
+}
+
+fn table_cells(text: &str) -> Vec<&str> {
+    text.strip_prefix('|')
+        .and_then(|row| row.strip_suffix('|'))
+        .unwrap_or(text)
+        .split('|')
+        .map(str::trim)
+        .collect()
+}
+
+/// Turns inline markdown into styled spans: `code`, **bold**, *italic*, and
+/// links keep their text; the markers do not reach the screen.
+fn inline_spans(text: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut plain = String::new();
+    let mut rest = text;
+    while let Some(character) = rest.chars().next() {
+        if let Some(after) = rest.strip_prefix('`')
+            && let Some(end) = after.find('`')
+        {
+            flush_plain(&mut spans, &mut plain);
+            spans.push(Span::styled(after[..end].to_owned(), fg(theme::TEAL)));
+            rest = &after[end + 1..];
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("**")
+            && let Some(end) = after.find("**").filter(|index| *index > 0)
+        {
+            flush_plain(&mut spans, &mut plain);
+            spans.push(Span::styled(
+                after[..end].to_owned(),
+                fg(theme::IVORY).add_modifier(Modifier::BOLD),
+            ));
+            rest = &after[end + 2..];
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix('[')
+            && let Some(close) = after.find("](")
+            && let Some(end) = after[close + 2..].find(')')
+        {
+            flush_plain(&mut spans, &mut plain);
+            let label = &after[..close];
+            spans.push(Span::styled(label.to_owned(), fg(theme::IVORY)));
+            let url = &after[close + 2..close + 2 + end];
+            if url != label {
+                spans.push(Span::styled(format!(" ({url})"), fg(theme::DIM)));
+            }
+            rest = &after[close + 2 + end + 1..];
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix('*')
+            && let Some(end) = after.find('*').filter(|index| *index > 0)
+        {
+            flush_plain(&mut spans, &mut plain);
+            spans.push(Span::styled(
+                after[..end].to_owned(),
+                fg(theme::IVORY).add_modifier(Modifier::ITALIC),
+            ));
+            rest = &after[end + 1..];
+            continue;
+        }
+        plain.push(character);
+        rest = &rest[character.len_utf8()..];
+    }
+    flush_plain(&mut spans, &mut plain);
+    spans
+}
+
+fn flush_plain(spans: &mut Vec<Span<'static>>, plain: &mut String) {
+    if !plain.is_empty() {
+        spans.push(Span::styled(std::mem::take(plain), fg(theme::IVORY)));
+    }
 }
 
 /// Truncates to a character budget with an ellipsis marker.
@@ -595,7 +832,11 @@ pub(super) fn comment_line(text: &str) -> bool {
 /// Renders one committed tool result: a status line with the honest category,
 /// then a bounded, tool-aware preview (numbered file windows keep their
 /// gutter; everything else summarizes to its first meaningful line).
-pub(super) fn tool_result_lines(result: &ToolResult, expanded: bool) -> Vec<Line<'static>> {
+pub(super) fn tool_result_lines(
+    result: &ToolResult,
+    expanded: bool,
+    width: u16,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(read) = parse_numbered_read(&result.content) {
         let truncated = if result.truncated {
@@ -664,7 +905,13 @@ pub(super) fn tool_result_lines(result: &ToolResult, expanded: bool) -> Vec<Line
             ),
             fg(color),
         ),
-        Span::styled(tool_result_summary(&result.content), fg(color)),
+        Span::styled(
+            truncate_chars(
+                &tool_result_summary(&result.content),
+                usize::from(width).saturating_sub(12),
+            ),
+            fg(color),
+        ),
     ]));
     if expanded {
         let content_lines: Vec<&str> = result
@@ -695,19 +942,21 @@ pub(super) fn render_thread_scrolled(
     lines: Vec<Line<'_>>,
     thread_scroll_back: usize,
 ) {
-    let width = usize::from(area.width.max(1));
     let inner_height = usize::from(area.height);
-    let visual_lines = lines
-        .iter()
-        .map(|line| {
-            let chars = line
-                .spans
-                .iter()
-                .map(|span| span.content.chars().count())
-                .sum::<usize>();
-            chars.max(1).div_ceil(width)
-        })
-        .sum::<usize>();
+    let paragraph = Paragraph::new(lines)
+        .style(Style::default().bg(theme::BG))
+        .wrap(Wrap { trim: false });
+    // Reserve the last column for the scrollbar. Without the reservation the
+    // paragraph wraps to the full width and the scrollbar paints over the
+    // final character of every full row.
+    let full_width = usize::from(area.width.max(1));
+    let mut text_width = full_width;
+    let mut visual_lines = paragraph.line_count(area.width.max(1));
+    let scrollbar = visual_lines > inner_height && area.width > 1;
+    if scrollbar {
+        text_width = full_width.saturating_sub(1).max(1);
+        visual_lines = paragraph.line_count(u16::try_from(text_width).unwrap_or(u16::MAX));
+    }
     let max_scroll = visual_lines.saturating_sub(inner_height);
     let scroll = u16::try_from(
         max_scroll
@@ -715,13 +964,32 @@ pub(super) fn render_thread_scrolled(
             .min(usize::from(u16::MAX)),
     )
     .unwrap_or(u16::MAX);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().bg(theme::BG))
-            .scroll((scroll, 0))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    let text_area = Rect {
+        width: u16::try_from(text_width).unwrap_or(area.width),
+        ..area
+    };
+    frame.render_widget(paragraph.scroll((scroll, 0)), text_area);
+    if scrollbar {
+        let track = usize::from(area.height);
+        let thumb = (inner_height * track / visual_lines.max(1)).clamp(1, track);
+        let top = (usize::from(scroll) * track.saturating_sub(thumb))
+            .checked_div(max_scroll)
+            .unwrap_or(0);
+        let buffer = frame.buffer_mut();
+        for row in 0..track {
+            let (symbol, style) = if row >= top && row < top + thumb {
+                ("█", fg(theme::THREAD))
+            } else {
+                ("│", fg(theme::DOTTED))
+            };
+            buffer.set_string(
+                area.right().saturating_sub(1),
+                area.y + u16::try_from(row).unwrap_or(u16::MAX),
+                symbol,
+                style,
+            );
+        }
+    }
 }
 
 pub(super) fn render_preview_thread(

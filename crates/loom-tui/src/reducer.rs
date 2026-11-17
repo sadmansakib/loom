@@ -71,12 +71,34 @@ pub struct TurnMetrics {
 /// Event-backed hierarchy for one agent execution turn.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ExecutionTurn {
-    /// 1-based turn ordinal emitted by the engine.
+    /// Display key: the engine turn for live work, a session-wide key when
+    /// restored history from several tasks is flattened into one timeline.
     pub number: u32,
+    /// Engine turn number inside the run, when replayed from recorded events.
+    pub engine_turn: Option<u32>,
+    /// Restored run ordinal, when this turn belongs to recorded history.
+    pub run: Option<u32>,
     /// User-authored follow-ups applied at this turn boundary.
     pub user_inputs: Vec<String>,
     /// Assistant messages and reconciled tool results belonging to this turn.
     pub transcript: Vec<TranscriptItem>,
+}
+
+/// One recorded task run in a restored session's history.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestoredRun {
+    /// Task identity from the recorded run.
+    pub task_id: Option<loom_core::TaskId>,
+    /// Terminal state recorded for the run.
+    pub status: Option<TaskStatus>,
+    /// Number of model turns replayed for the run.
+    pub turns: u32,
+    /// Failure reason recorded by the run, when one was provided.
+    pub failure_reason: Option<String>,
+    /// Recorded task start time (Unix epoch milliseconds).
+    pub started_at_millis: Option<u64>,
+    /// Recorded terminal time (Unix epoch milliseconds).
+    pub completed_at_millis: Option<u64>,
 }
 
 /// Lifecycle projection for the task currently represented by this reducer.
@@ -153,6 +175,11 @@ pub struct Reducer {
     /// [`Reducer::reconcile_session`]. Event tool completions contain only a
     /// bounded content head, so this projection cannot replace the session.
     pub committed_transcript: Vec<TranscriptItem>,
+    /// Whether the transcript came from an existing session rather than the
+    /// current task, so idle home must not replace the restored history.
+    pub restored: bool,
+    /// Run metadata for restored history, keyed by run ordinal.
+    pub restored_runs: BTreeMap<u32, RestoredRun>,
     /// Turn hierarchy projected from engine turn and steering events.
     pub execution_turns: BTreeMap<u32, ExecutionTurn>,
     /// Original task instruction, displayed once above execution turns.
@@ -266,8 +293,9 @@ impl Reducer {
 
     /// Applies one event using the caller's explicit Unix epoch timestamp.
     ///
-    /// `timestamp_millis` is used only for task lifecycle timestamps; all
-    /// other state comes solely from the event and current reducer state.
+    /// `timestamp_millis` is the envelope observation time, used for task
+    /// lifecycle, turn, and tool durations; all other state comes solely
+    /// from the event and current reducer state.
     #[allow(clippy::too_many_lines)] // one exhaustive event-to-state transition table
     pub fn reduce(&mut self, event: &EventEnvelope, timestamp_millis: u64) {
         self.sequence = event.sequence;
@@ -316,6 +344,7 @@ impl Reducer {
                     .entry(*turn)
                     .or_insert_with(|| ExecutionTurn {
                         number: *turn,
+                        engine_turn: Some(*turn),
                         ..ExecutionTurn::default()
                     });
                 self.turn_metrics
@@ -450,6 +479,7 @@ impl Reducer {
                         .entry(*turn)
                         .or_insert_with(|| ExecutionTurn {
                             number: *turn,
+                            engine_turn: Some(*turn),
                             ..ExecutionTurn::default()
                         });
                 for _ in 0..*messages {
@@ -525,46 +555,368 @@ impl Reducer {
     #[allow(clippy::wildcard_enum_match_arm)] // Item is non_exhaustive: future items are skipped on rebuild
     pub fn reconcile_session(&mut self, session: &loom_core::Session) {
         self.committed_transcript.clone_from(&session.transcript);
+        // Keep the assistant messages this task actually projected. Matching
+        // session assistants by equality would pull in messages from earlier
+        // tasks in the same session once they share an execution turn.
+        let assistants = self
+            .execution_turns
+            .values()
+            .map(|turn| {
+                turn.transcript
+                    .iter()
+                    .filter(|item| matches!(item, TranscriptItem::Assistant(_)))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
         for turn in self.execution_turns.values_mut() {
             turn.transcript.clear();
         }
-        let mut unmatched_assistants = self
-            .committed_transcript
-            .iter()
-            .filter_map(|item| {
-                if let TranscriptItem::Assistant(message) = item {
-                    Some(message.clone())
-                } else {
-                    None
-                }
-            })
-            .zip(self.assistant_turns.iter().copied())
-            .collect::<Vec<_>>();
+        for (turn, items) in self.execution_turns.values_mut().zip(assistants) {
+            turn.transcript.extend(items);
+        }
+        // Replace event-projected result heads with the committed bodies.
         for item in &session.transcript {
-            match item {
-                TranscriptItem::Assistant(message) => {
-                    if let Some(position) = unmatched_assistants
-                        .iter()
-                        .position(|(candidate, _)| candidate == message)
-                    {
-                        let (_, turn) = unmatched_assistants.remove(position);
-                        if let Some(execution_turn) = self.execution_turns.get_mut(&turn) {
-                            execution_turn.transcript.push(item.clone());
-                        }
-                    }
-                }
-                TranscriptItem::ToolResult(result) => {
-                    if let Some(turn) = self.tool_call_turns.get(&result.call_id.to_string())
-                        && let Some(execution_turn) = self.execution_turns.get_mut(turn)
-                    {
-                        execution_turn.transcript.push(item.clone());
-                    }
-                }
-                _ => {}
+            let TranscriptItem::ToolResult(result) = item else {
+                continue;
+            };
+            let Some(turn) = self.tool_call_turns.get(&result.call_id.to_string()) else {
+                continue;
+            };
+            if let Some(execution_turn) = self.execution_turns.get_mut(turn) {
+                execution_turn.transcript.push(item.clone());
             }
         }
         self.provisional.clear();
         self.restore_display_prompt();
+    }
+
+    /// Restores a persisted session without an event stream.
+    ///
+    /// Kept for callers and old stores where no events were recorded. The
+    /// fallback has no turn boundaries, so turns are labelled as history
+    /// rather than renumbered as if they were engine turns.
+    pub fn restore_session(&mut self, session: &loom_core::Session) {
+        self.restore_session_with_events(session, &[]);
+    }
+
+    /// Restores a persisted session from its recorded event stream.
+    ///
+    /// Events are grouped by task and replayed in store order, so every
+    /// restored turn keeps its task-local engine number and every task stays
+    /// a separate run. Envelope timestamps restore durations; rows written
+    /// before schema v21 have none, so those runs leave durations unset.
+    #[allow(clippy::too_many_lines, clippy::wildcard_enum_match_arm)] // replay table; Item is non_exhaustive
+    pub fn restore_session_with_events(
+        &mut self,
+        session: &loom_core::Session,
+        events: &[EventEnvelope],
+    ) {
+        *self = Self::default();
+        self.restored = true;
+        self.committed_transcript.clone_from(&session.transcript);
+        if events.is_empty() {
+            self.restore_session_from_transcript(session);
+            return;
+        }
+
+        let prompts = session
+            .transcript
+            .iter()
+            .filter_map(|item| match item {
+                TranscriptItem::User { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut groups: Vec<(loom_core::TaskId, Vec<&EventEnvelope>)> = Vec::new();
+        for event in events {
+            if let Some((_, group)) = groups
+                .iter_mut()
+                .find(|(task_id, _)| *task_id == event.task_id)
+            {
+                group.push(event);
+            } else {
+                groups.push((event.task_id, vec![event]));
+            }
+        }
+        let records = session
+            .tasks
+            .iter()
+            .map(|task| (task.id, task))
+            .collect::<BTreeMap<_, _>>();
+        let mut prompt_cursor = 0;
+        let mut display_offset = 0u32;
+        let mut last_run = None;
+
+        for (index, (task_id, task_events)) in groups.into_iter().enumerate() {
+            let run_index = u32::try_from(index + 1).unwrap_or(u32::MAX);
+            let mut run = Reducer {
+                restored: true,
+                ..Reducer::default()
+            };
+            let prompt = prompts.get(prompt_cursor).cloned();
+            if let Some(prompt) = &prompt {
+                run.begin_task(prompt.clone());
+                // Keep later prompts available for SteeringApplied to consume;
+                // truncate back to the consumed prefix after replay.
+                for extra in prompts.iter().skip(prompt_cursor.saturating_add(1)) {
+                    run.task.display_prompts.push(extra.clone());
+                }
+            }
+            let timestamps_complete = task_events
+                .iter()
+                .all(|event| event.timestamp_millis.is_some());
+            for event in &task_events {
+                run.reduce(event, event.timestamp_millis.unwrap_or(0));
+            }
+
+            // Rows written before schema v21 carry no timestamp. Usage and
+            // status are still authoritative; durations are not available.
+            if !timestamps_complete {
+                run.task.started_at_millis = None;
+                run.task.completed_at_millis = None;
+                for metrics in run.turn_metrics.values_mut() {
+                    metrics.started_at_millis = None;
+                    metrics.completed_at_millis = None;
+                }
+                if let Some(progress) = run.context_progress.as_mut() {
+                    progress.elapsed_at_compile = None;
+                }
+                for tool in run.tools.values_mut() {
+                    tool.started_at_millis = None;
+                    tool.completed_at_millis = None;
+                }
+            }
+            for tool in run.tools.values_mut() {
+                if tool.status.is_none() {
+                    tool.status = Some(ToolStatus::Cancelled {
+                        started: tool.arguments.is_some(),
+                    });
+                }
+            }
+            if let Some(record) = records.get(&task_id) {
+                run.task.task_id = Some(record.id);
+                run.task.status = Some(record.status);
+                run.task.started_at_millis = Some(record.started_at_millis);
+                run.task.completed_at_millis = record.completed_at_millis;
+            }
+
+            // Event completions contain only a bounded output head. Overlay
+            // the exact committed result body by call id.
+            for item in &session.transcript {
+                let TranscriptItem::ToolResult(result) = item else {
+                    continue;
+                };
+                let Some(engine_turn) = run
+                    .tool_call_turns
+                    .get(&result.call_id.to_string())
+                    .copied()
+                else {
+                    continue;
+                };
+                if let Some(turn) = run.execution_turns.get_mut(&engine_turn) {
+                    turn.transcript.push(item.clone());
+                }
+                if let Some(tool) = run.tools.get_mut(&result.call_id.to_string()) {
+                    tool.status = Some(result.status);
+                    tool.content_head = Some(result.content.clone());
+                }
+            }
+
+            let consumed = if prompt.is_some() {
+                run.applied_display_prompts.max(1)
+            } else {
+                run.applied_display_prompts
+            };
+            prompt_cursor = prompt_cursor.saturating_add(consumed);
+            run.task.display_prompts.truncate(consumed);
+            run.original_instruction = None;
+            if let Some(prompt) = &prompt
+                && let Some(first) = run.execution_turns.values_mut().next()
+                && first.user_inputs.first() != Some(prompt)
+            {
+                first.user_inputs.insert(0, prompt.clone());
+            }
+
+            let turns = std::mem::take(&mut run.execution_turns);
+            let mut mapping = BTreeMap::new();
+            if turns.is_empty() {
+                if let Some(prompt) = prompt {
+                    display_offset = display_offset.saturating_add(1);
+                    self.execution_turns.insert(
+                        display_offset,
+                        ExecutionTurn {
+                            number: display_offset,
+                            engine_turn: None,
+                            run: Some(run_index),
+                            user_inputs: vec![prompt],
+                            transcript: Vec::new(),
+                        },
+                    );
+                }
+            } else {
+                for (engine_turn, mut turn) in turns {
+                    display_offset = display_offset.saturating_add(1);
+                    mapping.insert(engine_turn, display_offset);
+                    turn.number = display_offset;
+                    turn.engine_turn = Some(engine_turn);
+                    turn.run = Some(run_index);
+                    self.execution_turns.insert(display_offset, turn);
+                }
+            }
+
+            for (engine_turn, metrics) in std::mem::take(&mut run.turn_metrics) {
+                if let Some(display_turn) = mapping.get(&engine_turn) {
+                    self.turn_metrics.insert(*display_turn, metrics);
+                }
+            }
+            for mut retry in std::mem::take(&mut run.retries) {
+                retry.turn = retry
+                    .turn
+                    .and_then(|engine_turn| mapping.get(&engine_turn).copied());
+                self.retries.push(retry);
+            }
+            for (engine_turn, chars) in std::mem::take(&mut run.compactions) {
+                if let Some(display_turn) = mapping.get(&engine_turn) {
+                    self.compactions.push((*display_turn, chars));
+                }
+            }
+            for (call_id, tool) in std::mem::take(&mut run.tools) {
+                self.tools.insert(call_id, tool);
+            }
+            for (call_id, engine_turn) in std::mem::take(&mut run.tool_call_turns) {
+                if let Some(display_turn) = mapping.get(&engine_turn) {
+                    self.tool_call_turns.insert(call_id, *display_turn);
+                }
+            }
+            for engine_turn in std::mem::take(&mut run.assistant_turns) {
+                if let Some(display_turn) = mapping.get(&engine_turn) {
+                    self.assistant_turns.push(*display_turn);
+                }
+            }
+            self.tool_calls_started = self
+                .tool_calls_started
+                .saturating_add(run.tool_calls_started);
+            self.event_count = self.event_count.saturating_add(run.event_count);
+            self.sequence = run.sequence;
+            self.observed_model = run.observed_model.take().or(self.observed_model.take());
+            self.context_progress = run.context_progress.or(self.context_progress);
+            self.summary = run.summary.take().or(self.summary.take());
+            self.recent_events = std::mem::take(&mut run.recent_events);
+            self.attempt = run.attempt;
+
+            self.restored_runs.insert(
+                run_index,
+                RestoredRun {
+                    task_id: run.task.task_id.or(Some(task_id)),
+                    status: run.task.status,
+                    turns: u32::try_from(mapping.len()).unwrap_or(u32::MAX),
+                    failure_reason: run.task.failure_reason.clone(),
+                    started_at_millis: run.task.started_at_millis,
+                    completed_at_millis: run.task.completed_at_millis,
+                },
+            );
+            last_run = Some(run);
+        }
+
+        if let Some(run) = last_run {
+            self.task = run.task;
+            self.turn = run.turn;
+            self.usage = run.usage;
+            self.usage_reported = run.usage_reported;
+        }
+        self.committed_transcript.clone_from(&session.transcript);
+        self.provisional.clear();
+    }
+
+    /// Prompt-grouped fallback for sessions recorded before the event store.
+    #[allow(clippy::wildcard_enum_match_arm)] // Item is non_exhaustive: future items are skipped
+    fn restore_session_from_transcript(&mut self, session: &loom_core::Session) {
+        self.original_instruction = None;
+        let mut calls = BTreeMap::new();
+        for item in &session.transcript {
+            if let TranscriptItem::Assistant(message) = item {
+                for call in &message.tool_calls {
+                    calls.insert(
+                        call.id.to_string(),
+                        (call.name.clone(), call.arguments.to_string()),
+                    );
+                    self.tool_calls_started = self.tool_calls_started.saturating_add(1);
+                }
+            }
+        }
+        for item in &session.transcript {
+            let TranscriptItem::ToolResult(result) = item else {
+                continue;
+            };
+            let (name, arguments) = calls
+                .get(&result.call_id.to_string())
+                .cloned()
+                .unwrap_or_else(|| ("tool".to_owned(), String::new()));
+            self.tools.insert(
+                result.call_id.to_string(),
+                ToolState {
+                    name,
+                    arguments: Some(arguments),
+                    status: Some(result.status),
+                    content_head: Some(result.content.clone()),
+                    started_at_millis: None,
+                    completed_at_millis: None,
+                },
+            );
+        }
+        let mut groups: Vec<(String, Vec<TranscriptItem>)> = Vec::new();
+        for item in &session.transcript {
+            match item {
+                TranscriptItem::User { text } => groups.push((text.clone(), Vec::new())),
+                restored => {
+                    if let Some((_, transcript)) = groups.last_mut() {
+                        transcript.push(restored.clone());
+                    }
+                }
+            }
+        }
+        for (index, (prompt, transcript)) in groups.into_iter().enumerate() {
+            let number = u32::try_from(index + 1).unwrap_or(u32::MAX);
+            self.execution_turns.insert(
+                number,
+                ExecutionTurn {
+                    number,
+                    engine_turn: None,
+                    run: Some(number),
+                    user_inputs: vec![prompt],
+                    transcript,
+                },
+            );
+            self.restored_runs.insert(
+                number,
+                RestoredRun {
+                    task_id: None,
+                    status: None,
+                    turns: 0,
+                    failure_reason: None,
+                    started_at_millis: None,
+                    completed_at_millis: None,
+                },
+            );
+        }
+        if let Some(task) = session
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.status != TaskStatus::Running)
+        {
+            self.task.task_id = Some(task.id);
+            self.task.status = Some(task.status);
+            self.task.started_at_millis = Some(task.started_at_millis);
+            self.task.completed_at_millis = task.completed_at_millis;
+            self.turn = Some(task.turns);
+            self.usage = task.usage;
+            self.usage_reported = task.usage.input_tokens > 0
+                || task.usage.output_tokens > 0
+                || task.usage.cost_usd.is_some();
+        }
+        self.provisional.clear();
     }
 
     /// Whether the reducer currently has any provisional model output.
@@ -586,6 +938,14 @@ impl Reducer {
         timestamp_millis: u64,
         failure_reason: Option<String>,
     ) {
+        // A tool still waiting on approval when the task ends never sends a
+        // ToolCompleted; settle it so the thread does not spin forever.
+        for tool in self.tools.values_mut().filter(|tool| tool.status.is_none()) {
+            tool.status = Some(ToolStatus::Cancelled {
+                started: tool.started_at_millis.is_some(),
+            });
+            tool.completed_at_millis = Some(timestamp_millis);
+        }
         self.task.task_id = Some(event.task_id);
         self.task.status = Some(status);
         self.task.completed_at_millis = Some(timestamp_millis);
@@ -637,15 +997,16 @@ fn event_name(kind: &EventKind) -> &'static str {
 mod tests {
     use loom_core::kernel::event::EVENT_SCHEMA_VERSION;
     use loom_core::kernel::model::{ModelResponse, StopReason, Usage};
-    use loom_core::kernel::session::TaskStatus;
+    use loom_core::kernel::session::{TaskRecord, TaskStatus};
     use loom_core::kernel::transcript::{AssistantMessage, Item, ReasoningTrace};
     use loom_core::{EventEnvelope, EventKind, Session, SessionId, TaskId};
 
-    use super::{RECENT_EVENT_LIMIT, Reducer, RetryRecord, ToolStatus};
+    use super::{ExecutionTurn, RECENT_EVENT_LIMIT, Reducer, RetryRecord, ToolStatus};
 
     fn event(sequence: u64, task_id: TaskId, kind: EventKind) -> EventEnvelope {
         EventEnvelope {
             schema_version: EVENT_SCHEMA_VERSION,
+            timestamp_millis: None,
             sequence,
             task_id,
             kind,
@@ -1082,6 +1443,202 @@ mod tests {
     }
 
     #[test]
+    fn restore_session_rebuilds_readable_history_and_last_task() {
+        let assistant = |content: &str| AssistantMessage {
+            content: content.into(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            stop_reason: StopReason::EndTurn,
+        };
+        let mut session = Session::new(SessionId::new());
+        session
+            .push_item(Item::User {
+                text: "old prompt".into(),
+            })
+            .unwrap();
+        session
+            .push_item(Item::Assistant(assistant("old answer")))
+            .unwrap();
+        let task_id = TaskId::new();
+        session.tasks.push(TaskRecord {
+            id: task_id,
+            status: TaskStatus::Completed,
+            turns: 3,
+            usage: Usage::default(),
+            started_at_millis: 10,
+            completed_at_millis: Some(20),
+            effort: Some("high".into()),
+            end_reason: Some("end_turn".into()),
+        });
+
+        let mut reducer = Reducer::default();
+        reducer.restore_session(&session);
+
+        assert!(reducer.restored);
+        assert_eq!(reducer.task.task_id, Some(task_id));
+        assert_eq!(reducer.task.status, Some(TaskStatus::Completed));
+        assert_eq!(reducer.turn, Some(3));
+        let turn = &reducer.execution_turns[&1];
+        assert_eq!(turn.run, Some(1));
+        assert_eq!(turn.engine_turn, None, "no events means no invented turns");
+        assert_eq!(turn.user_inputs, ["old prompt"]);
+        assert!(matches!(
+            &turn.transcript[0],
+            Item::Assistant(message) if message.content == "old answer"
+        ));
+    }
+
+    #[test]
+    fn restore_replays_turns_per_run_without_synthetic_numbers() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let mut session = Session::new(SessionId::new());
+        session
+            .push_item(Item::User {
+                text: "first task".into(),
+            })
+            .unwrap();
+        session
+            .push_item(Item::Assistant(response("first answer").message))
+            .unwrap();
+        session
+            .push_item(Item::Assistant(response("first follow-up").message))
+            .unwrap();
+        session
+            .push_item(Item::User {
+                text: "second task".into(),
+            })
+            .unwrap();
+        session
+            .push_item(Item::Assistant(response("second answer").message))
+            .unwrap();
+        for (id, turns, started) in [(first, 2, 10), (second, 1, 30)] {
+            session.tasks.push(TaskRecord {
+                id,
+                status: TaskStatus::Completed,
+                turns,
+                usage: Usage::default(),
+                started_at_millis: started,
+                completed_at_millis: Some(started + 10),
+                effort: Some("high".into()),
+                end_reason: Some("end_turn".into()),
+            });
+        }
+        let mut events = vec![
+            event(0, first, EventKind::TaskStarted),
+            event(1, first, EventKind::TurnStarted { turn: 1 }),
+            event(
+                2,
+                first,
+                EventKind::ModelCompleted {
+                    response: response("first answer"),
+                },
+            ),
+            event(3, first, EventKind::TurnStarted { turn: 2 }),
+            event(
+                4,
+                first,
+                EventKind::ModelCompleted {
+                    response: response("first follow-up"),
+                },
+            ),
+            event(5, first, EventKind::TaskCompleted),
+            event(0, second, EventKind::TaskStarted),
+            event(1, second, EventKind::TurnStarted { turn: 1 }),
+            event(
+                2,
+                second,
+                EventKind::ModelCompleted {
+                    response: response("second answer"),
+                },
+            ),
+            event(3, second, EventKind::TaskCompleted),
+        ];
+        for (index, envelope) in events.iter_mut().enumerate() {
+            envelope.timestamp_millis =
+                Some(1000 + u64::try_from(index).unwrap_or(0).saturating_mul(10));
+        }
+
+        let mut reducer = Reducer::default();
+        reducer.restore_session_with_events(&session, &events);
+
+        assert_eq!(reducer.execution_turns.len(), 3);
+        let first_turn = &reducer.execution_turns[&1];
+        assert_eq!(first_turn.run, Some(1));
+        assert_eq!(first_turn.engine_turn, Some(1));
+        assert_eq!(first_turn.user_inputs, ["first task"]);
+        assert_eq!(reducer.execution_turns[&2].engine_turn, Some(2));
+        let second_run = &reducer.execution_turns[&3];
+        assert_eq!(second_run.run, Some(2));
+        assert_eq!(second_run.engine_turn, Some(1));
+        assert_eq!(second_run.user_inputs, ["second task"]);
+        assert_eq!(reducer.restored_runs[&1].turns, 2);
+        assert_eq!(reducer.restored_runs[&2].turns, 1);
+        assert_eq!(reducer.task.task_id, Some(second));
+        assert_eq!(reducer.turn_metrics[&1].started_at_millis, Some(1010));
+        assert_eq!(reducer.turn_metrics[&1].completed_at_millis, Some(1030));
+
+        for envelope in &mut events {
+            envelope.timestamp_millis = None;
+        }
+        let mut legacy = Reducer::default();
+        legacy.restore_session_with_events(&session, &events);
+        assert_eq!(legacy.turn_metrics[&1].started_at_millis, None);
+        assert_eq!(legacy.turn_metrics[&1].completed_at_millis, None);
+    }
+
+    #[test]
+    fn restore_uses_envelope_timestamps_for_tool_durations() {
+        use loom_core::kernel::transcript::ToolCallId;
+
+        let task_id = TaskId::new();
+        let call_id = ToolCallId::try_from("call-timed".to_owned()).unwrap();
+        let session = Session::new(SessionId::new());
+        let mut events = vec![
+            event(0, task_id, EventKind::TaskStarted),
+            event(1, task_id, EventKind::TurnStarted { turn: 1 }),
+            event(
+                2,
+                task_id,
+                EventKind::ToolStarted {
+                    name: "read_file".into(),
+                    call_id: call_id.clone(),
+                    arguments: "{}".into(),
+                },
+            ),
+            event(
+                3,
+                task_id,
+                EventKind::ToolCompleted {
+                    name: "read_file".into(),
+                    call_id,
+                    status: ToolStatus::Success,
+                    content_head: "done".into(),
+                },
+            ),
+            event(
+                4,
+                task_id,
+                EventKind::ModelCompleted {
+                    response: response("done"),
+                },
+            ),
+            event(5, task_id, EventKind::TaskCompleted),
+        ];
+        for (index, envelope) in events.iter_mut().enumerate() {
+            envelope.timestamp_millis =
+                Some(1000 + u64::try_from(index).unwrap_or(0).saturating_mul(10));
+        }
+
+        let mut reducer = Reducer::default();
+        reducer.restore_session_with_events(&session, &events);
+
+        let tool = &reducer.tools["call-timed"];
+        assert_eq!(tool.started_at_millis, Some(1020));
+        assert_eq!(tool.completed_at_millis, Some(1030));
+    }
+
+    #[test]
     fn restore_display_prompt_hides_expanded_attachment_body() {
         let mut reducer = Reducer::default();
         reducer.begin_task("Please read @README.md");
@@ -1140,5 +1697,85 @@ mod tests {
             reducer.execution_turns[&1].user_inputs,
             ["Now inspect @src/lib.rs"]
         );
+    }
+
+    #[test]
+    fn task_end_settles_a_tool_waiting_for_approval() {
+        use loom_core::kernel::transcript::ToolCallId;
+
+        let task_id = TaskId::new();
+        let mut reducer = Reducer::default();
+        reducer.begin_task("write a file");
+        reducer.reduce(&event(0, task_id, EventKind::TurnStarted { turn: 1 }), 1);
+        reducer.reduce(
+            &event(
+                1,
+                task_id,
+                EventKind::ToolStarted {
+                    name: "write_file".into(),
+                    call_id: ToolCallId::try_from("call-wait".to_string()).unwrap(),
+                    arguments: "{}".into(),
+                },
+            ),
+            2,
+        );
+        assert_eq!(reducer.tools["call-wait"].status, None);
+
+        reducer.reduce(&event(2, task_id, EventKind::TaskCancelled), 3);
+
+        assert!(matches!(
+            reducer.tools["call-wait"].status,
+            Some(ToolStatus::Cancelled { started: true })
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::wildcard_enum_match_arm)] // Item is non_exhaustive
+    fn reconcile_keeps_only_the_current_tasks_assistants() {
+        let assistant = |content: &str| AssistantMessage {
+            content: content.into(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            stop_reason: StopReason::EndTurn,
+        };
+        let mut session = Session::new(SessionId::new());
+        session
+            .push_item(Item::User {
+                text: "first".into(),
+            })
+            .unwrap();
+        session
+            .push_item(Item::Assistant(assistant("first answer")))
+            .unwrap();
+        session
+            .push_item(Item::User {
+                text: "second".into(),
+            })
+            .unwrap();
+        session
+            .push_item(Item::Assistant(assistant("second answer")))
+            .unwrap();
+
+        let mut reducer = Reducer::default();
+        reducer.begin_task("second");
+        reducer.execution_turns.insert(
+            1,
+            ExecutionTurn {
+                number: 1,
+                transcript: vec![Item::Assistant(assistant("second answer"))],
+                ..ExecutionTurn::default()
+            },
+        );
+        reducer.reconcile_session(&session);
+
+        let shown = reducer.execution_turns[&1]
+            .transcript
+            .iter()
+            .filter_map(|item| match item {
+                Item::Assistant(message) => Some(message.content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(shown, ["second answer"]);
     }
 }

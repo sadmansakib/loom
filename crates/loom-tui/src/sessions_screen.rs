@@ -23,13 +23,14 @@ use crate::theme;
 pub(crate) const SESSIONS_LIMIT: usize = 20;
 
 /// One RECENT row in the wireframe: id, outcome, prompt, turns, wall.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Row {
     pub(crate) id: String,
     pub(crate) status: Option<TaskStatus>,
     pub(crate) prompt: String,
     pub(crate) turns: u32,
     pub(crate) wall_millis: Option<u64>,
+    pub(crate) cost_usd: Option<f64>,
     pub(crate) started_millis: u64,
 }
 
@@ -63,6 +64,9 @@ pub(crate) struct SessionsScreen {
     /// Index into the filtered view, clamped by `key`.
     pub(crate) selected: usize,
     pub(crate) preview: Option<Preview>,
+    /// Workspace label for the modal header (`~/work/loom`).
+    pub(crate) workspace: String,
+    command: crate::command_line::CommandLine,
 }
 
 impl SessionsScreen {
@@ -101,6 +105,7 @@ impl SessionsScreen {
                         task.completed_at_millis
                             .map(|done| done.saturating_sub(task.started_at_millis))
                     }),
+                    cost_usd: last.and_then(|task| task.usage.cost_usd),
                     started_millis: last.map_or(0, |task| task.started_at_millis),
                 })
             })
@@ -204,6 +209,34 @@ impl SessionsScreen {
 
     /// Routes one keypress; `selected` is clamped to the filtered count.
     pub(crate) fn key(&mut self, key: KeyEvent) -> Option<SessionsAction> {
+        match self.command.key(key) {
+            crate::command_line::CommandKey::Ignore => {}
+            crate::command_line::CommandKey::Consumed | crate::command_line::CommandKey::Cancel => {
+                return Some(SessionsAction::Consumed);
+            }
+            crate::command_line::CommandKey::Run(command) => {
+                let selected_id = self
+                    .filtered()
+                    .get(self.selected)
+                    .map(|index| self.rows[*index].id.clone());
+                return Some(
+                    match command.split_whitespace().collect::<Vec<_>>().as_slice() {
+                        ["export"] => {
+                            selected_id.map_or(SessionsAction::Consumed, SessionsAction::Export)
+                        }
+                        ["delete"] => {
+                            selected_id.map_or(SessionsAction::Consumed, SessionsAction::Delete)
+                        }
+                        ["resume" | "open"] => {
+                            selected_id.map_or(SessionsAction::Consumed, SessionsAction::Resume)
+                        }
+                        ["new"] => SessionsAction::NewSession,
+                        ["close"] => SessionsAction::Close,
+                        _ => SessionsAction::Consumed,
+                    },
+                );
+            }
+        }
         let count = self.filtered().len();
         if key.code == KeyCode::Esc {
             return Some(SessionsAction::Close);
@@ -308,8 +341,9 @@ pub(crate) fn draw(frame: &mut Frame<'_>, area: Rect, screen: &SessionsScreen) {
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::AMBER))
+            .style(Style::default().bg(theme::BG))
             .title(Span::styled(
-                " sessions ",
+                " ◆ sessions  /sessions ",
                 Style::default()
                     .fg(theme::AMBER)
                     .add_modifier(Modifier::BOLD),
@@ -321,10 +355,39 @@ pub(crate) fn draw(frame: &mut Frame<'_>, area: Rect, screen: &SessionsScreen) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(6),
             Constraint::Length(1),
         ])
         .split(inner);
+    let filtered = screen.filtered();
+    let header = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Fill(1), Constraint::Length(28)])
+        .split(rows[0]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("RECENT · {} of {}", filtered.len(), screen.rows.len()),
+            Style::default().fg(theme::AMBER),
+        ))),
+        header[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            if screen.workspace.is_empty() {
+                format!("{} of {}", filtered.len(), screen.rows.len())
+            } else {
+                format!(
+                    "{} · {} of {}",
+                    screen.workspace,
+                    filtered.len(),
+                    screen.rows.len()
+                )
+            },
+            Style::default().fg(theme::DIM),
+        ))),
+        header[1],
+    );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("FILTER ", Style::default().fg(theme::AMBER)),
@@ -337,22 +400,21 @@ pub(crate) fn draw(frame: &mut Frame<'_>, area: Rect, screen: &SessionsScreen) {
                 Style::default().fg(theme::DIM),
             ),
         ])),
-        rows[0],
+        rows[1],
     );
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-        .split(rows[1]);
-    let filtered = screen.filtered();
+        .split(rows[2]);
     draw_list(frame, columns[0], screen, &filtered);
     draw_preview(frame, columns[1], screen, &filtered);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "↑↓ move · Enter resume · e export · d delete · ^N new · Esc close",
+    let footer = screen.command.line().unwrap_or_else(|| {
+        Line::from(Span::styled(
+            "↑↓ move · Enter resume · [/export] · [/delete] · /new · Esc close",
             Style::default().fg(theme::DIM),
-        ))),
-        rows[2],
-    );
+        ))
+    });
+    frame.render_widget(Paragraph::new(footer), rows[3]);
 }
 
 /// The RECENT column: three lines per session, cursor row highlighted.
@@ -381,7 +443,7 @@ fn draw_list(frame: &mut Frame<'_>, area: Rect, screen: &SessionsScreen, filtere
             Style::default().fg(theme::DIM)
         };
         lines.push(Line::from(vec![
-            Span::styled(format!("{mark} {} ", row.id), id_style),
+            Span::styled(format!("{mark} {} ", short_id(&row.id)), id_style),
             Span::styled(status, status_style),
             Span::styled(
                 format!("  {} · ", clock_label(row.started_millis)),
@@ -392,8 +454,15 @@ fn draw_list(frame: &mut Frame<'_>, area: Rect, screen: &SessionsScreen, filtere
             format!("  {}", row.prompt),
             Style::default().fg(theme::IVORY),
         )));
+        let cost = row
+            .cost_usd
+            .map_or_else(|| "—".to_owned(), |cost| format!("${cost:.4}"));
         lines.push(Line::from(Span::styled(
-            format!("  {} turns · {}", row.turns, wall_label(row.wall_millis)),
+            format!(
+                "  {} turns · {cost} · {}",
+                row.turns,
+                wall_label(row.wall_millis)
+            ),
             Style::default().fg(theme::DIM),
         )));
     }
@@ -418,19 +487,25 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, screen: &SessionsScreen, filt
                 Span::styled(preview.model.clone(), ivory),
             ]),
             Line::from(vec![
-                Span::styled("calls   ", amber),
+                Span::styled("tool calls ", amber),
+                Span::styled(preview.tool_calls.to_string(), ivory),
+            ]),
+            Line::from(vec![
+                Span::styled("cached     ", amber),
                 Span::styled(
-                    format!(
-                        "{} tool · {} events · {}",
-                        preview.tool_calls,
-                        preview.events,
-                        preview.cached_pct.map_or_else(
-                            || "no cache data".to_owned(),
-                            |pct| format!("{pct}% cached")
-                        ),
-                    ),
-                    ivory,
+                    preview
+                        .cached_pct
+                        .map_or_else(|| "no cache data".to_owned(), |pct| format!("{pct}%")),
+                    if preview.cached_pct.is_some() {
+                        Style::default().fg(theme::TEAL)
+                    } else {
+                        ivory
+                    },
                 ),
+            ]),
+            Line::from(vec![
+                Span::styled("events     ", amber),
+                Span::styled(preview.events.to_string(), ivory),
             ]),
             Line::from(Span::styled("answer", amber)),
             Line::from(Span::styled(
@@ -456,15 +531,24 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, screen: &SessionsScreen, filt
             Style::default().fg(theme::DIM),
         ))],
     };
+    let title = filtered.get(screen.selected).map_or_else(
+        || " PREVIEW ".into(),
+        |index| format!(" PREVIEW · {} ", short_id(&screen.rows[*index].id)),
+    );
     frame.render_widget(
         Paragraph::new(preview_lines).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme::DOTTED))
-                .title(Span::styled(" PREVIEW ", amber)),
+                .title(Span::styled(title, amber)),
         ),
         area,
     );
+}
+
+/// First 8 characters of a session id, as the wireframe's RECENT list shows it.
+fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
 }
 
 /// (first visible row, end) so the cursor stays in view.
@@ -497,6 +581,7 @@ mod tests {
             prompt: format!("prompt {id}"),
             turns: 3,
             wall_millis: Some(65_000),
+            cost_usd: Some(0.0034),
             started_millis: 1_730_000_000_000,
         }
     }

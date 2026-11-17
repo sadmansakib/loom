@@ -8,6 +8,7 @@
 //! — status is "declared" because servers attach when a session opens,
 //! not on demand.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -51,9 +52,13 @@ pub(crate) struct McpRow {
 pub(crate) struct ToolsScreen {
     mcp: Vec<McpRow>,
     selected: usize,
+    /// Completed calls per tool in this session, for the wireframe's count
+    /// column. Derived from the event log, never invented.
+    calls: BTreeMap<String, usize>,
     /// Snapshot of the persisted writes choice, refreshed by the owner
     /// after a toggle.
     pub(crate) writes_allowed: bool,
+    command: crate::command_line::CommandLine,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -95,11 +100,38 @@ impl ToolsScreen {
         Self {
             mcp,
             selected: 0,
+            calls: BTreeMap::new(),
             writes_allowed: loom_core::tools::trust::writes_allowed(workspace),
+            command: crate::command_line::CommandLine::default(),
         }
     }
 
+    /// Count completed tool calls from the recorded events. The wireframe's
+    /// right-hand column is real session data, not sample numbers.
+    pub(crate) fn with_calls(mut self, log: &[loom_core::EventEnvelope]) -> Self {
+        for envelope in log {
+            if let loom_core::EventKind::ToolCompleted { name, .. } = &envelope.kind {
+                *self.calls.entry(name.clone()).or_default() += 1;
+            }
+        }
+        self
+    }
+
     pub(crate) fn key(&mut self, key: KeyEvent) -> Option<ToolsAction> {
+        match self.command.key(key) {
+            crate::command_line::CommandKey::Ignore => {}
+            crate::command_line::CommandKey::Consumed | crate::command_line::CommandKey::Cancel => {
+                return Some(ToolsAction::Consumed);
+            }
+            crate::command_line::CommandKey::Run(command) => {
+                return Some(match command.as_str() {
+                    "permission" => ToolsAction::ToggleWrites,
+                    "retry" => ToolsAction::Retry,
+                    "close" => ToolsAction::Close,
+                    _ => ToolsAction::Consumed,
+                });
+            }
+        }
         if key.code == KeyCode::Esc {
             return Some(ToolsAction::Close);
         }
@@ -142,6 +174,54 @@ fn permission(name: &str, writes_allowed: bool) -> &'static str {
     }
 }
 
+/// The wireframe's right-hand pane for the selected tool.
+fn detail_lines(
+    screen: &ToolsScreen,
+    amber: Style,
+    dim: Style,
+    ivory: Style,
+) -> Vec<Line<'static>> {
+    let Some((name, class)) = BUILT_IN.get(screen.selected) else {
+        return vec![Line::from(Span::styled("MCP SERVER", amber))];
+    };
+    let (class_name, timeout, args) = match class {
+        Class::Read => ("read", "10 s", "path: string"),
+        Class::Write => ("write", "30 s", "path: string\ncontent: string"),
+        Class::Shell => ("shell", "30 s", "command: string"),
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(*name, ivory.add_modifier(Modifier::BOLD))),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("class      ", dim),
+            Span::styled(class_name, ivory),
+        ]),
+        Line::from(vec![
+            Span::styled("permission ", dim),
+            Span::styled(permission(name, screen.writes_allowed), ivory),
+        ]),
+        Line::from(vec![
+            Span::styled("timeout    ", dim),
+            Span::styled(timeout, ivory),
+        ]),
+        Line::from(Span::styled("ARGS", amber)),
+    ];
+    for arg in args.lines() {
+        lines.push(Line::from(Span::styled(format!("  {arg}"), dim)));
+    }
+    lines.push(Line::from(Span::styled("KEYS", amber)));
+    lines.push(Line::from(Span::styled(
+        "[/permission] cycle",
+        Style::default().fg(theme::IVORY),
+    )));
+    lines.push(Line::from(Span::styled(
+        "[/retry] server",
+        Style::default().fg(theme::IVORY),
+    )));
+    lines
+}
+
+#[allow(clippy::too_many_lines)] // two-column table plus per-tool detail pane
 pub(crate) fn draw(frame: &mut Frame<'_>, area: Rect, screen: &ToolsScreen) {
     let height = area.height.clamp(14, 26);
     let modal = crate::modal::centered(area, height);
@@ -151,8 +231,9 @@ pub(crate) fn draw(frame: &mut Frame<'_>, area: Rect, screen: &ToolsScreen) {
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::AMBER))
+            .style(Style::default().bg(theme::BG))
             .title(Span::styled(
-                " /tools ",
+                " ◆ tools  /tools ",
                 Style::default()
                     .fg(theme::AMBER)
                     .add_modifier(Modifier::BOLD),
@@ -176,7 +257,16 @@ pub(crate) fn draw(frame: &mut Frame<'_>, area: Rect, screen: &ToolsScreen) {
         rows[0],
     );
 
-    let mut lines = Vec::new();
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(52), Constraint::Length(34)])
+        .split(rows[1]);
+    let mut lines = vec![Line::from(vec![
+        Span::styled("  tool             ", dim),
+        Span::styled("class   ", dim),
+        Span::styled("permission        ", dim),
+        Span::styled("calls", dim),
+    ])];
     for (index, (name, class)) in BUILT_IN.iter().enumerate() {
         let selected = index == screen.selected;
         let (glyph, color) = match class {
@@ -186,50 +276,81 @@ pub(crate) fn draw(frame: &mut Frame<'_>, area: Rect, screen: &ToolsScreen) {
         };
         let label = match class {
             Class::Read => "read",
-            Class::Write => "read-write",
+            Class::Write => "write",
             Class::Shell => "shell",
         };
         lines.push(Line::from(vec![
             Span::styled(if selected { "❯ " } else { "  " }, amber),
             Span::styled(format!("{glyph} "), Style::default().fg(color)),
             Span::styled(
-                format!("{name:<14}"),
-                if selected {
-                    ivory.add_modifier(Modifier::BOLD)
+                format!("{name:<16}"),
+                Style::default().fg(theme::BLUE).add_modifier(if selected {
+                    Modifier::BOLD
                 } else {
-                    ivory
-                },
+                    Modifier::empty()
+                }),
             ),
-            Span::styled(format!("{label:<11}"), dim),
-            Span::styled(permission(name, screen.writes_allowed), dim),
+            Span::styled(format!("{label:<8}"), dim),
+            Span::styled(
+                format!("{:<18}", permission(name, screen.writes_allowed)),
+                dim,
+            ),
+            Span::styled(
+                format!("{:>4}", screen.calls.get(*name).copied().unwrap_or(0)),
+                Style::default().fg(theme::BLUE),
+            ),
         ]));
     }
-    if !screen.mcp.is_empty() {
-        lines.push(Line::from(Span::styled("MCP SERVERS", amber)));
-        for server in &screen.mcp {
-            let (glyph, tone, status) = match server.connected {
-                Some(true) => ("●", theme::SAGE, "connected"),
-                Some(false) => ("○", theme::CORAL, "failed to attach"),
-                None => ("·", theme::DIM, "attaches when a session opens"),
-            };
-            lines.push(Line::from(vec![
-                Span::styled(format!("{glyph} "), Style::default().fg(tone)),
-                Span::styled(format!("{:<14}", server.name), ivory),
-                Span::styled(format!("{status:<26}"), Style::default().fg(tone)),
-                Span::styled(server.command.clone(), dim),
-            ]));
-        }
-    }
-    frame.render_widget(Paragraph::new(lines), rows[1]);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!(
-                "{} built-in · {} MCP   Space permission · r retry · Esc back",
-                BUILT_IN.len(),
-                screen.mcp.len()
-            ),
+    lines.push(Line::from(Span::styled("MCP SERVERS", amber)));
+    if screen.mcp.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no servers declared in .loom/mcp.toml",
             dim,
-        ))),
+        )));
+    }
+    for server in &screen.mcp {
+        let (glyph, tone, status) = match server.connected {
+            Some(true) => ("●", theme::SAGE, "connected"),
+            Some(false) => ("✗", theme::CORAL, "failed to attach"),
+            None => ("○", theme::DIM, "attaches when a session opens"),
+        };
+        let mut row = vec![
+            Span::styled(format!("{glyph} "), Style::default().fg(tone)),
+            Span::styled(format!("{:<16}", server.name), ivory),
+            Span::styled(format!("{status:<16}"), Style::default().fg(tone)),
+        ];
+        // Status is the only thing that says whether the server's tools
+        // exist; the command is decorative, so drop it on narrow panes.
+        if columns[0].width >= 64 {
+            row.push(Span::styled(server.command.clone(), dim));
+        }
+        lines.push(Line::from(row));
+    }
+    frame.render_widget(Paragraph::new(lines), columns[0]);
+    let detail = detail_lines(screen, amber, dim, ivory);
+    frame.render_widget(
+        Paragraph::new(detail).block(
+            Block::default()
+                .borders(Borders::LEFT)
+                .border_style(Style::default().fg(theme::BORDER)),
+        ),
+        columns[1],
+    );
+    frame.render_widget(
+        Paragraph::new(screen.command.line().unwrap_or_else(|| {
+            Line::from(Span::styled(
+                if rows[2].width < 100 {
+                    "↑↓ move · [/permission] · [/retry] · Esc back".to_owned()
+                } else {
+                    format!(
+                        "↑↓ move · [/permission] permission · [/retry] retry server · Esc back   ·   {} built-in · {} MCP",
+                        BUILT_IN.len(),
+                        screen.mcp.len()
+                    )
+                },
+                dim,
+            ))
+        })),
         rows[2],
     );
 }
@@ -247,7 +368,9 @@ mod tests {
                 connected: Some(true),
             }],
             selected: 5,
+            calls: BTreeMap::from([("write_file".to_owned(), 3)]),
             writes_allowed: false,
+            command: crate::command_line::CommandLine::default(),
         }
     }
 
@@ -295,7 +418,10 @@ mod tests {
             "github",
             "connected",
             "9 built-in · 1 MCP",
-            "Space permission",
+            "[/permission]",
+            "class",
+            "timeout",
+            "ARGS",
         ] {
             assert!(text.contains(needle), "missing {needle}");
         }

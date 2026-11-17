@@ -14,7 +14,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 crossterm = "0.29"
 loom-core = { workspace = true }
-ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
 tokio = { workspace = true, features = ["rt", "time", "macros", "sync"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

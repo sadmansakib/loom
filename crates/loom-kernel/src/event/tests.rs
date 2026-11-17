@@ -26,6 +26,14 @@ fn sequences_are_contiguous_from_zero() {
         assert_eq!(event.sequence, expected);
         assert_eq!(event.schema_version, EVENT_SCHEMA_VERSION);
         assert_eq!(event.task_id, task);
+        assert!(
+            event.timestamp_millis.is_some(),
+            "live envelopes carry their observation time"
+        );
+        assert_eq!(
+            serde_json::to_value(&event).expect("event serializes")["timestamp_millis"],
+            event.timestamp_millis.unwrap()
+        );
         expected += 1;
     }
     assert_eq!(expected, 5);
@@ -61,6 +69,7 @@ fn context_pruned_serializes_the_nested_report() {
     };
     let envelope = EventEnvelope {
         schema_version: EVENT_SCHEMA_VERSION,
+        timestamp_millis: None,
         sequence: 7,
         task_id: TaskId::new(),
         kind: EventKind::ContextPruned { turn: 3, report },
@@ -88,6 +97,7 @@ fn awaiting_input_serializes_the_session_id() {
     let session_id = SessionId::new();
     let envelope = EventEnvelope {
         schema_version: EVENT_SCHEMA_VERSION,
+        timestamp_millis: None,
         sequence: 11,
         task_id: TaskId::new(),
         kind: EventKind::AwaitingInput { session_id },
@@ -109,6 +119,7 @@ fn awaiting_input_serializes_the_session_id() {
 fn task_paused_serializes_with_its_tag() {
     let envelope = EventEnvelope {
         schema_version: EVENT_SCHEMA_VERSION,
+        timestamp_millis: None,
         sequence: 7,
         task_id: TaskId::new(),
         kind: EventKind::TaskPaused,
@@ -168,6 +179,7 @@ fn surfaced_decisions_serialize_and_round_trip() {
     for (kind, tag, fields) in cases {
         let envelope = EventEnvelope {
             schema_version: EVENT_SCHEMA_VERSION,
+            timestamp_millis: None,
             sequence: 7,
             task_id: TaskId::new(),
             kind,
@@ -210,6 +222,7 @@ fn context_progress_serializes_budget_census_and_unbounded_resources() {
     .expect("remaining-budget fixture");
     let envelope = EventEnvelope {
         schema_version: EVENT_SCHEMA_VERSION,
+        timestamp_millis: None,
         sequence: 0,
         task_id: TaskId::new(),
         kind: EventKind::ContextProgress {
@@ -351,6 +364,7 @@ fn envelope_round_trips_through_json() {
     };
     let envelope = EventEnvelope {
         schema_version: EVENT_SCHEMA_VERSION,
+        timestamp_millis: None,
         sequence: 7,
         task_id: TaskId::new(),
         kind: EventKind::ModelCompleted { response },
@@ -366,6 +380,7 @@ fn event_kinds_use_snake_case_tags() {
     let task = TaskId::new();
     let retry = EventEnvelope {
         schema_version: EVENT_SCHEMA_VERSION,
+        timestamp_millis: None,
         sequence: 0,
         task_id: task,
         kind: EventKind::ModelRetry {
@@ -491,6 +506,10 @@ fn persisting_sink_round_trips_through_the_store() {
         assert_eq!(event.sequence, index as u64);
         assert_eq!(event.task_id, task);
         assert_eq!(event.schema_version, EVENT_SCHEMA_VERSION);
+        assert!(
+            event.timestamp_millis.is_some(),
+            "persisted envelopes keep their observation time"
+        );
     }
     assert_eq!(
         stored[2].kind,
@@ -846,6 +865,7 @@ fn status_snapshot_survives_a_json_round_trip() {
 fn todo_updated_serializes_the_full_list() {
     let envelope = EventEnvelope {
         schema_version: EVENT_SCHEMA_VERSION,
+        timestamp_millis: None,
         sequence: 7,
         task_id: TaskId::new(),
         kind: EventKind::TodoUpdated {
@@ -874,6 +894,7 @@ fn todo_updated_serializes_the_full_list() {
 fn turn_budget_extended_serializes_snake_case() {
     let envelope = EventEnvelope {
         schema_version: EVENT_SCHEMA_VERSION,
+        timestamp_millis: None,
         sequence: 3,
         task_id: TaskId::new(),
         kind: EventKind::TurnBudgetExtended {

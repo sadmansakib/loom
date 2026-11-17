@@ -10,7 +10,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
-mod sidebar;
+pub(crate) mod sidebar;
 mod thread;
 
 use sidebar::{draw_runtime_sidebar, draw_scene_sidebar};
@@ -42,10 +42,32 @@ pub enum Scene {
     Picker,
     /// Keyboard and event mapping guide.
     Help,
+    /// Design spec: palette, glyphs, grid and recipe.
+    Spec,
+    /// Narrow (under 90 columns) layout.
+    Narrow,
+    /// `/compact` notice hidden under the `/context` modal.
+    CompactA,
+    /// The compact notice revealed in the status bar after Esc.
+    CompactB,
+}
+
+/// Establish the application's ground colour across the whole frame before
+/// any widget runs. Ratatui patches styles cell by cell, so a region that no
+/// widget touches — or a widget with empty lines / unstyled spans — keeps the
+/// terminal's own default background. Ghostty's default differs from our
+/// near-black ground, which shows up as grey rectangles. Painting the base
+/// first makes every region own its background, in every terminal.
+pub(crate) fn paint_base(frame: &mut Frame<'_>) {
+    frame.render_widget(
+        Block::default().style(Style::default().bg(adapt_color(theme::BG))),
+        frame.area(),
+    );
 }
 
 /// Render a `--scene` route without inventing task history or runtime metrics.
 pub fn draw(frame: &mut Frame<'_>, scene: Scene) {
+    paint_base(frame);
     match scene {
         Scene::Main | Scene::Cancel | Scene::Retry | Scene::Complete => {
             draw_live(
@@ -61,6 +83,38 @@ pub fn draw(frame: &mut Frame<'_>, scene: Scene) {
         }
         Scene::Help => draw_help(frame),
         Scene::Picker => draw_empty_picker(frame),
+        Scene::Spec => crate::wireframe_scenes::draw_spec(frame),
+        Scene::Narrow => crate::wireframe_scenes::draw_narrow(frame),
+        Scene::CompactA => crate::wireframe_scenes::draw_compact_a(frame),
+        Scene::CompactB => crate::wireframe_scenes::draw_compact_b(frame),
+    }
+}
+
+/// Defaults and permissions shown on the idle sidebar. The TUI does not
+/// invent these: the app loop fills what the engine config exposes, and the
+/// rest comes from the resolved policy.
+///
+/// TODO(loom-cli): fill the tool permission modes from the resolved trust /
+/// approval policy once `EngineConfig` exposes it. Until then they default to
+/// the effective TUI behaviour: reads allowed, writes and shell ask.
+#[derive(Debug, Clone, Copy)]
+pub struct IdleFacts {
+    pub tool_call_budget: Option<u32>,
+    pub wall_budget: Option<Duration>,
+    pub read_permission: &'static str,
+    pub write_permission: &'static str,
+    pub shell_permission: &'static str,
+}
+
+impl Default for IdleFacts {
+    fn default() -> Self {
+        Self {
+            tool_call_budget: None,
+            wall_budget: None,
+            read_permission: "allowed",
+            write_permission: "ask",
+            shell_permission: "ask",
+        }
     }
 }
 
@@ -87,8 +141,15 @@ pub struct LiveViewOptions<'a> {
     pub palette_selected: usize,
     pub pricing: Option<ModelPricing>,
     pub scene: Option<Scene>,
+    /// Idle budget and permission summary; defaults are the TUI policy.
+    pub idle: IdleFacts,
+    /// Test/static override. `None` reads `LOOM_ASCII` at draw time.
+    pub glyph_set: Option<GlyphSet>,
+    /// Test/static override. `None` renders truecolor.
+    pub depth: Option<theme::Depth>,
 }
 
+#[allow(clippy::large_types_passed_by_value)] // one options value per frame
 pub fn draw_live(
     frame: &mut Frame<'_>,
     reducer: &Reducer,
@@ -100,6 +161,7 @@ pub fn draw_live(
 }
 
 #[allow(clippy::too_many_lines)] // ordered layout composition for the live screen
+#[allow(clippy::large_types_passed_by_value)]
 pub fn draw_live_scrolled(
     frame: &mut Frame<'_>,
     reducer: &Reducer,
@@ -116,12 +178,18 @@ pub fn draw_live_scrolled(
         pricing,
         scene,
         recent,
+        approval,
         ..
     } = options;
+    set_depth(options.depth.unwrap_or(theme::Depth::TrueColor));
+    let set = options.glyph_set.unwrap_or_else(glyph_set);
+    paint_base(frame);
     let area = frame.area();
     let compact = area.width < 90;
     let wide = area.width >= 120;
-    let prompt_label = if reducer.task.status == Some(TaskStatus::Running) {
+    let prompt_label = if approval.is_some() {
+        "Task paused. Answer the prompt above, or type to queue a follow-up."
+    } else if reducer.task.status == Some(TaskStatus::Running) {
         "Task running… type to queue a follow-up."
     } else {
         "Describe a task…"
@@ -140,13 +208,13 @@ pub fn draw_live_scrolled(
     // The `/` palette replaces the @file suggestion slot while open.
     let palette_open = crate::palette::is_open(input);
     let suggestion_height = if palette_open {
-        u16::try_from(crate::palette::matching(input).len().min(5) + 3).unwrap_or(8)
+        u16::try_from(crate::palette::matching(input).len().min(9) + 3).unwrap_or(12)
     } else if file_suggestions.is_empty() {
         0
     } else {
         u16::try_from(file_suggestions.len().min(5)).unwrap_or(5) + 2
     };
-    let header_height = if compact { 1 } else { 2 };
+    let header_height = 1;
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -157,15 +225,15 @@ pub fn draw_live_scrolled(
             ),
         ])
         .split(area);
-    draw_live_header(frame, rows[0], reducer, scene, &options);
+    draw_live_header(frame, rows[0], reducer, scene, &options, set);
     let footer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(input_rows + 2),
             Constraint::Length(
                 suggestion_height.min(rows[2].height.saturating_sub(input_rows + 4)),
             ),
-            Constraint::Length(2),
+            Constraint::Length(input_rows + 2),
+            Constraint::Length(1),
             Constraint::Length(u16::from(options.notice.is_some())),
             Constraint::Min(0),
         ])
@@ -193,9 +261,10 @@ pub fn draw_live_scrolled(
     if reducer.execution_turns.is_empty()
         && reducer.original_instruction.is_none()
         && reducer.task.display_prompts.is_empty()
+        && !reducer.restored
         && scene.is_none()
     {
-        draw_idle_home(frame, thread_area, recent);
+        draw_idle_home(frame, thread_area, recent, set);
     } else {
         draw_reducer_thread(
             frame,
@@ -204,23 +273,27 @@ pub fn draw_live_scrolled(
             compact,
             thread_scroll_back,
             scene,
+            options.approval.map(|request| request.path.as_str()),
         );
     }
-    let composer = gutter(footer[0]);
+    let composer = gutter(footer[1]);
     let (cursor_x, cursor_y, prompt_scroll) = prompt_cursor(input, cursor, composer);
     if let Some(request) = options.approval {
         draw_approval_box(frame, thread_area, request);
     }
     frame.set_cursor_position((cursor_x, cursor_y));
     let mut prompt_spans = vec![
-        Span::styled("❯ ", fg(theme::AMBER).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{} ", glyphs::glyph(Glyph::Prompt, set)),
+            fg(theme::AMBER).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             prompt_display,
-            fg(if input.is_empty() {
-                theme::DIM
+            if input.is_empty() {
+                fg(theme::DIM)
             } else {
-                theme::IVORY
-            }),
+                fg(theme::IVORY).add_modifier(Modifier::BOLD)
+            },
         ),
     ];
     if queue_count > 0 {
@@ -241,9 +314,9 @@ pub fn draw_live_scrolled(
             .wrap(Wrap { trim: false }),
         composer,
     );
-    if palette_open && footer[1].height > 0 {
-        draw_palette(frame, footer[1], input, options.palette_selected);
-    } else if !file_suggestions.is_empty() && footer[1].height > 0 {
+    if palette_open && footer[0].height > 0 {
+        draw_palette(frame, footer[0], input, options.palette_selected, set);
+    } else if !file_suggestions.is_empty() && footer[0].height > 0 {
         let suggestions = file_suggestions
             .iter()
             .map(|path| Line::from(Span::styled(format!("  @{path}"), fg(theme::BLUE))))
@@ -257,7 +330,7 @@ pub fn draw_live_scrolled(
                         .border_style(fg(theme::BORDER)),
                 )
                 .style(Style::default().bg(theme::BG)),
-            footer[1],
+            footer[0],
         );
     }
     let footer_hint = if scene.is_some() {
@@ -268,24 +341,65 @@ pub fn draw_live_scrolled(
             ("F1", "help"),
         ])
     } else if compact {
-        key_hint_line(&[("Esc", "cancel"), ("?", "help")])
+        // Narrow keeps one hint only; the counters share the status row.
+        key_hint_line(&[("/help", "help")])
     } else if reducer.task.status == Some(TaskStatus::Running) {
         key_hint_line(&[
             ("Esc", "cancel"),
             ("^O", "details"),
             ("^R", "reasoning"),
             ("↑↓", "scroll"),
-            ("?", "help"),
+            ("/help", "help"),
         ])
     } else {
         key_hint_line(&[
             ("Enter", "send"),
             ("/", "commands"),
-            ("Tab", "sidebar"),
-            ("?", "help"),
+            ("/help", "help"),
+            ("/new", "new session"),
         ])
     };
-    frame.render_widget(Paragraph::new(footer_hint), gutter(footer[2]));
+    let footer_area = gutter(footer[2]);
+    let (counters, counter_color) = if scene.is_some() {
+        (String::new(), theme::DIM)
+    } else {
+        match dropped {
+            Some(dropped) if dropped > 0 => (
+                format!(
+                    "events {} · dropped {dropped} · trace incomplete",
+                    reducer.event_count
+                ),
+                theme::CORAL,
+            ),
+            Some(dropped) => (
+                format!("events {} · dropped {dropped}", reducer.event_count),
+                theme::DIM,
+            ),
+            // Idle has no sink yet; zero events is a fact, not missing data.
+            None if reducer.task.status.is_none() => (
+                format!("events {} · dropped 0", reducer.event_count),
+                theme::DIM,
+            ),
+            None => ("events unavailable".to_owned(), theme::DIM),
+        }
+    };
+    let counter_width = u16::try_from(counters.chars().count()).unwrap_or(u16::MAX);
+    let footer_columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(counter_width.min(footer_area.width)),
+        ])
+        .split(footer_area);
+    frame.render_widget(Paragraph::new(footer_hint), footer_columns[0]);
+    if !counters.is_empty() {
+        frame.render_widget(
+            Paragraph::new(counters)
+                .style(fg(counter_color))
+                .alignment(Alignment::Right),
+            footer_columns[1],
+        );
+    }
     if let Some(notice) = options.notice {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -295,30 +409,9 @@ pub fn draw_live_scrolled(
             gutter(footer[3]),
         );
     }
-    if scene.is_none() {
-        let counters = match dropped {
-            Some(dropped) => format!("events {} · dropped {dropped}", reducer.event_count),
-            // Idle has no sink yet; zero events is a fact, not missing data.
-            None if reducer.task.status.is_none() => {
-                format!("events {} · dropped 0", reducer.event_count)
-            }
-            None => "events unavailable".to_owned(),
-        };
-        let footer = gutter(footer[2]);
-        frame.render_widget(
-            Paragraph::new(counters)
-                .style(fg(theme::DIM))
-                .alignment(Alignment::Right),
-            Rect {
-                x: footer.x + footer.width.saturating_sub(28),
-                width: 28,
-                ..footer
-            },
-        );
-    }
     let draw_side = |frame: &mut Frame<'_>, sidebar: Rect| match scene {
         None => {
-            draw_runtime_sidebar(frame, sidebar, reducer, elapsed, dropped, pricing, &options);
+            draw_runtime_sidebar(frame, sidebar, reducer, elapsed, pricing, &options);
         }
         Some(scene) => {
             draw_scene_sidebar(frame, sidebar, reducer, elapsed, scene, options.turn_limit);
@@ -331,7 +424,7 @@ pub fn draw_live_scrolled(
             area.x + area.width.saturating_sub(SIDEBAR_WIDTH),
             rows[1].y,
             area.width.min(SIDEBAR_WIDTH),
-            rows[1].height.min(12),
+            rows[1].height,
         );
         // The medium-width sidebar floats over the thread: clear the
         // cells first or the text underneath shows through the gaps.
@@ -349,7 +442,8 @@ fn prompt_cursor(input: &str, cursor: usize, area: Rect) -> (u16, u16, u16) {
     let inner_y = area.y.saturating_add(1);
     let width = area.width.saturating_sub(2).max(1) as usize;
     let before = &input[..cursor.min(input.len())];
-    let (mut row, mut column) = (0_usize, 0_usize);
+    // The prompt glyph and its trailing space occupy the first two cells.
+    let (mut row, mut column) = (0_usize, 2_usize.min(width));
     for character in before.chars() {
         if character == '\n' {
             row += 1;
@@ -378,6 +472,7 @@ fn prompt_cursor(input: &str, cursor: usize, area: Rect) -> (u16, u16, u16) {
 
 #[allow(clippy::too_many_lines)] // assembles picker rows and responsive detail pane together
 pub fn draw_picker(frame: &mut Frame<'_>, picker: &PickerState) {
+    paint_base(frame);
     let area = design_area(frame.area());
     let wide = area.width >= 120;
     let rows = Layout::default()
@@ -480,6 +575,14 @@ pub fn draw_picker(frame: &mut Frame<'_>, picker: &PickerState) {
                     heading("SELECTION"),
                     body(&format!("provider  {}", choice.provider)),
                     body(&format!("model     {}", choice.model)),
+                    body(&format!(
+                        "effort    {}",
+                        if choice.efforts.is_empty() {
+                            "not reported"
+                        } else {
+                            picker.effort.as_str()
+                        }
+                    )),
                     muted(""),
                     heading("CAPABILITIES"),
                     muted(&choice.capabilities.map_or_else(
@@ -594,10 +697,11 @@ fn draw_help(frame: &mut Frame<'_>) {
     render_panel(frame, columns[1], "event stream", right);
 }
 
-fn draw_idle_home(frame: &mut Frame<'_>, area: Rect, recent: &[RecentSession]) {
+fn draw_idle_home(frame: &mut Frame<'_>, area: Rect, recent: &[RecentSession], set: GlyphSet) {
     if area.width == 0 || area.height == 0 {
         return;
     }
+    let brand = format!("{} loom", glyphs::glyph(Glyph::Brand, set));
     let brand_rows = area.height.min(8);
     let brand_area = Rect {
         height: brand_rows,
@@ -608,7 +712,7 @@ fn draw_idle_home(frame: &mut Frame<'_>, area: Rect, recent: &[RecentSession]) {
             Line::from(""),
             Line::from(""),
             Line::from(Span::styled(
-                "◆ loom",
+                brand,
                 fg(theme::AMBER).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
@@ -630,20 +734,24 @@ fn draw_idle_home(frame: &mut Frame<'_>, area: Rect, recent: &[RecentSession]) {
         ..area
     };
     let width = usize::from(list_area.width);
+    // Section labels are uppercase and dim. A terminal cell cannot
+    // letter-space, so uppercase plus dim carries the label instead.
     let mut lines = vec![Line::from(Span::styled("RECENT", fg(theme::DIM)))];
     if recent.is_empty() {
         lines.push(Line::from(Span::styled(
             "no past sessions yet",
-            fg(theme::DOTTED),
+            fg(theme::DIM),
         )));
     }
-    for session in recent {
-        let (status, status_color) = match session.status {
-            Some(TaskStatus::Completed) => ("✓", theme::SAGE),
-            Some(TaskStatus::Failed) => ("✗", theme::CORAL),
-            Some(TaskStatus::Cancelled) => ("⊘", theme::DIM),
-            _ => ("○", theme::DIM),
+    let prompt = glyphs::glyph(Glyph::Prompt, set);
+    for session in recent.iter().take(3) {
+        let status = match session.status {
+            Some(TaskStatus::Completed) => glyphs::glyph(Glyph::Check, set),
+            Some(TaskStatus::Failed) => glyphs::glyph(Glyph::Cross, set),
+            Some(TaskStatus::Cancelled) => glyphs::glyph(Glyph::Cancel, set),
+            _ => glyphs::glyph(Glyph::Pending, set),
         };
+        // Outcome is metadata: glyph + word, dim, never colour alone.
         let tail = format!("{status} {} turns", session.turns);
         let room = width.saturating_sub(tail.chars().count() + 4).max(8);
         let title = thread::truncate_chars(&session.title, room);
@@ -651,10 +759,10 @@ fn draw_idle_home(frame: &mut Frame<'_>, area: Rect, recent: &[RecentSession]) {
             .saturating_sub(2 + title.chars().count() + tail.chars().count())
             .max(1);
         lines.push(Line::from(vec![
-            Span::styled("❯ ", fg(theme::AMBER)),
+            Span::styled(format!("{prompt} "), fg(theme::AMBER)),
             Span::styled(title, fg(theme::IVORY)),
             Span::raw(" ".repeat(gap)),
-            Span::styled(tail, fg(status_color)),
+            Span::styled(tail, fg(theme::DIM)),
         ]));
     }
     lines.push(Line::from(""));
@@ -666,19 +774,14 @@ fn draw_idle_home(frame: &mut Frame<'_>, area: Rect, recent: &[RecentSession]) {
     frame.render_widget(Paragraph::new(lines), list_area);
 }
 
-/// Amber box for a write waiting on the operator: path, a preview line, and
-/// the answer keys. Meaning is carried by text as well as color.
+/// Amber box for a write waiting on the operator: the wireframe's diff
+/// preview (`@@` header, `+` body, more-lines trailer), path with +N −0
+/// stats, and the answer keys. Meaning is carried by text as well as color.
 fn draw_approval_box(frame: &mut Frame<'_>, area: Rect, request: &crate::approval::Request) {
     // Inline at the bottom of the thread, like the wireframe: the paused
     // task, its prose and the pending tool row stay readable above it.
-    let height = area.height.min(6);
-    let box_area = Rect {
-        y: area.y + area.height.saturating_sub(height),
-        height,
-        ..area
-    };
-    let preview = request.content.lines().next().unwrap_or("");
-    let lines = vec![
+    let body: Vec<&str> = request.content.lines().collect();
+    let mut lines = vec![
         Line::from(Span::styled(
             "◇ Allow this write? The task is paused, not failed.",
             fg(theme::AMBER).add_modifier(Modifier::BOLD),
@@ -686,17 +789,76 @@ fn draw_approval_box(frame: &mut Frame<'_>, area: Rect, request: &crate::approva
         Line::from(vec![
             Span::styled("  ", fg(theme::DIM)),
             Span::styled(request.path.clone(), fg(theme::BLUE)),
-            Span::styled(format!("   {preview}"), fg(theme::DIM)),
+            Span::styled(format!("   +{} −0", body.len()), fg(theme::SAGE)),
         ]),
-        Line::from(Span::styled(
-            "  Writes touch your working tree. Reads never ask.",
-            fg(theme::DIM),
-        )),
-        Line::from(Span::styled(
-            "  [y] allow once   [a] allow for session   [n] deny, tell the model   [e] edit first",
-            fg(theme::IVORY),
-        )),
     ];
+    if !body.is_empty() {
+        // A proposal is a whole-file insert: every line is an addition.
+        let name = request
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or(request.path.as_str());
+        lines.push(Line::from(Span::styled(
+            format!("  @@ {name} · {} lines", body.len()),
+            fg(theme::DIM),
+        )));
+        let shown: Vec<&str> = body
+            .iter()
+            .filter(|line| !line.trim().is_empty())
+            .take(2)
+            .copied()
+            .collect();
+        for line in &shown {
+            lines.push(Line::from(vec![
+                Span::styled("  + ", fg(theme::SAGE)),
+                Span::styled(
+                    thread::truncate_chars(line, usize::from(area.width).saturating_sub(8)),
+                    fg(theme::SAGE),
+                ),
+            ]));
+        }
+        let non_empty = body.iter().filter(|line| !line.trim().is_empty()).count();
+        if non_empty > shown.len() {
+            lines.push(Line::from(Span::styled(
+                format!("  … {} more lines · ^O expand", non_empty - shown.len()),
+                fg(theme::DIM),
+            )));
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        "  Writes touch your working tree. Reads never ask.",
+        fg(theme::DIM),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  [y] once   [a] session   [n] deny   [e] edit first",
+        fg(theme::IVORY),
+    )));
+    let available = usize::from(area.height.saturating_sub(2)).max(1);
+    // When the thread pane is short, drop the diff before the answer keys:
+    // the operator must always see how to answer.
+    while lines.len() > available && lines.len() > 3 {
+        lines.remove(2);
+    }
+    if lines.len() > available {
+        lines.truncate(available.max(2));
+        let keys = Line::from(Span::styled(
+            "  [y] allow once   [a] allow for session   [n] deny   [e] edit",
+            fg(theme::IVORY),
+        ));
+        if available > 1 {
+            let last = lines.len().saturating_sub(1);
+            lines[last] = keys;
+        }
+    }
+    let height = area
+        .height
+        .min(u16::try_from(lines.len() + 2).unwrap_or(area.height));
+    let box_area = Rect {
+        y: area.y + area.height.saturating_sub(height),
+        height,
+        ..area
+    };
     frame.render_widget(Clear, box_area);
     frame.render_widget(
         Paragraph::new(lines)
@@ -712,14 +874,28 @@ fn draw_approval_box(frame: &mut Frame<'_>, area: Rect, request: &crate::approva
 
 /// Filtered `/` command list anchored over the composer. Selection is
 /// highlighted in amber; meaning is carried by the `❯` marker as well.
-fn draw_palette(frame: &mut Frame<'_>, area: Rect, input: &str, selected: usize) {
+fn draw_palette(frame: &mut Frame<'_>, area: Rect, input: &str, selected: usize, set: GlyphSet) {
     let matches = crate::palette::matching(input);
+    let prompt = glyphs::glyph(Glyph::Prompt, set);
+    // Keep the selected command on screen when the list is taller than its slot.
+    let rows = usize::from(area.height.saturating_sub(3)).max(1);
+    let start = if matches.len() > rows {
+        selected.saturating_sub(rows - 1).min(matches.len() - rows)
+    } else {
+        0
+    };
     let mut lines: Vec<Line<'_>> = matches
         .iter()
         .enumerate()
+        .skip(start)
+        .take(rows)
         .map(|(index, command)| {
             let selected_row = index == selected;
-            let marker = if selected_row { "❯ " } else { "  " };
+            let marker = if selected_row {
+                format!("{prompt} ")
+            } else {
+                "  ".to_owned()
+            };
             Line::from(vec![
                 Span::styled(
                     format!("{marker}{}", command.name),
@@ -750,23 +926,42 @@ fn draw_palette(frame: &mut Frame<'_>, area: Rect, input: &str, selected: usize)
     )));
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(" commands ")
-                .borders(Borders::ALL)
-                .border_style(fg(theme::AMBER)),
-        ),
+        Paragraph::new(lines)
+            .style(Style::default().bg(theme::BG))
+            .block(
+                Block::default()
+                    .title(" commands ")
+                    .borders(Borders::ALL)
+                    .border_style(fg(theme::AMBER)),
+            ),
         area,
     );
 }
 
+#[allow(clippy::too_many_lines)] // one header composition for wide and narrow
 fn draw_live_header(
     frame: &mut Frame<'_>,
     area: Rect,
     reducer: &Reducer,
     scene: Option<Scene>,
     options: &LiveViewOptions<'_>,
+    set: GlyphSet,
 ) {
+    // One-row header bar. Paint the bar first so every cell owns the shade.
+    frame.render_widget(
+        Block::default().style(Style::default().bg(adapt_color(theme::HEADER))),
+        area,
+    );
+    if area.width < 4 {
+        return;
+    }
+    let content = Rect {
+        x: area.x.saturating_add(2),
+        width: area.width.saturating_sub(4),
+        height: 1,
+        ..area
+    };
+    let brand = format!("{} loom", glyphs::glyph(Glyph::Brand, set));
     let model = if scene.is_some() {
         "model not available in static preview"
     } else {
@@ -777,130 +972,171 @@ fn draw_live_header(
             .unwrap_or("model not reported")
     };
     let workspace = options.workspace.unwrap_or("workspace unavailable");
-    let session = options.session_id.unwrap_or("session unavailable");
-    let effort = options.effort.unwrap_or("not reported");
-    let content = Rect {
-        height: area.height.saturating_sub(u16::from(area.height > 1)),
-        ..area
+    let session = options.session_id.map_or_else(
+        || "new".to_owned(),
+        |id| id.chars().take(8).collect::<String>(),
+    );
+
+    // Narrow: one status line carries state, turn and cost instead of the
+    // full header. The brand stays visible for orientation.
+    if scene.is_none() && area.width < 90 {
+        let (_, label, color) = header_state(reducer, options.approval.is_some(), set);
+        let turn = reducer.turn.unwrap_or(0);
+        let cost = if reducer.usage_reported {
+            pricing_label(pricing_value(options.pricing, reducer))
+        } else {
+            "—".to_owned()
+        };
+        let status = format!("{label} · turn {turn} · cost {cost}");
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(9), Constraint::Min(0)])
+            .split(content);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!("{} ", glyphs::glyph(Glyph::Brand, set)),
+                    header_fg(theme::AMBER).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("loom", header_fg(theme::AMBER).add_modifier(Modifier::BOLD)),
+            ]))
+            .style(Style::default().bg(adapt_color(theme::HEADER))),
+            columns[0],
+        );
+        frame.render_widget(
+            Paragraph::new(status)
+                .style(header_fg(color))
+                .alignment(Alignment::Right),
+            columns[1],
+        );
+        return;
+    }
+
+    let state = if scene.is_some() {
+        None
+    } else {
+        Some(header_state(reducer, options.approval.is_some(), set))
     };
+    let state_text = state.map(|(glyph, label, _)| {
+        if glyph.is_empty() {
+            label.to_owned()
+        } else {
+            format!("{glyph} {label}")
+        }
+    });
+    let effort = options.effort.unwrap_or("not reported");
+    let thinking = options.thinking.unwrap_or("not reported");
+    let model = thread::truncate_chars(model, 24);
+
+    let model_len = model.chars().count();
+    let state_len = state_text.as_ref().map_or(0, |text| text.chars().count());
+    let effort_len = 7 + effort.chars().count(); // "effort "
+    let thinking_len = 9 + thinking.chars().count(); // "thinking "
+    let mut right_len = state_len + 3 + model_len;
+    let room_for_right = usize::from(content.width).saturating_sub(20);
+    let show_effort = right_len + 3 + effort_len <= room_for_right;
+    if show_effort {
+        right_len += 3 + effort_len;
+    }
+    let show_thinking = show_effort && right_len + 3 + thinking_len <= room_for_right;
+    if show_thinking {
+        right_len += 3 + thinking_len;
+    }
+    let right_width = u16::try_from(right_len)
+        .unwrap_or(u16::MAX)
+        .min(content.width);
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .constraints([Constraint::Min(0), Constraint::Length(right_width)])
         .split(content);
     let left_width = usize::from(columns[0].width);
-    let right_width = usize::from(columns[1].width);
 
     let left = if scene.is_some() {
         Line::from(vec![
-            Span::styled("◆ loom", fg(theme::AMBER).add_modifier(Modifier::BOLD)),
-            Span::styled("  · preview · no live data", fg(theme::DIM)),
+            Span::styled(brand, header_fg(theme::AMBER).add_modifier(Modifier::BOLD)),
+            Span::styled("  · preview · no live data", header_fg(theme::DIM)),
         ])
     } else {
-        let suffix = if area.width >= 100 && options.session_id.is_some() {
-            format!(
-                "  ·  session {}",
-                session.chars().take(8).collect::<String>()
-            )
-        } else {
-            String::new()
-        };
-        let room = left_width.saturating_sub(9 + suffix.chars().count());
-        let workspace = thread::truncate_chars(workspace, room.max(8));
+        let meta = format!("{workspace} · session {session}");
+        let room = left_width.saturating_sub(brand.chars().count() + 3);
+        let meta = thread::truncate_chars(&meta, room.max(8));
         Line::from(vec![
-            Span::styled("◆ ", fg(theme::AMBER).add_modifier(Modifier::BOLD)),
-            Span::styled("loom", fg(theme::AMBER).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("   {workspace}"), fg(theme::DIM)),
-            Span::styled(suffix, fg(theme::DIM)),
+            Span::styled(brand, header_fg(theme::AMBER).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("   {meta}"), header_fg(theme::DIM)),
         ])
     };
 
-    let right = if scene.is_some() {
-        Line::from(Span::styled(model, fg(theme::BLUE)))
-    } else {
-        let state = header_state(reducer, options.approval.is_some());
-        let effort_visible = area.width >= 110 && options.effort.is_some();
-        let state_room = state.map_or(0, |(glyph, label, _)| {
-            glyph.chars().count() + label.chars().count() + 3
-        });
-        let effort_room = if effort_visible {
-            effort.chars().count() + 12
-        } else {
-            0
-        };
-        let model = thread::truncate_chars(
-            model,
-            right_width.saturating_sub(state_room + effort_room).max(10),
-        );
+    let right = if let Some((_, _, color)) = state {
         let mut spans = Vec::new();
-        if let Some((glyph, label, color)) = state {
+        if let Some(state_text) = state_text {
             spans.push(Span::styled(
-                format!("{glyph} {label}"),
-                fg(color).add_modifier(Modifier::BOLD),
+                state_text,
+                header_fg(color).add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw("   "));
         }
-        spans.push(Span::styled(model, fg(theme::BLUE)));
-        if effort_visible {
-            spans.push(Span::styled("   effort ", fg(theme::DIM)));
+        spans.push(Span::styled(model, header_fg(theme::BLUE)));
+        if show_effort {
+            spans.push(Span::styled("   effort ", header_fg(theme::DIM)));
             spans.push(Span::styled(
                 effort,
-                fg(theme::IVORY).add_modifier(Modifier::BOLD),
+                header_fg(theme::IVORY).add_modifier(Modifier::BOLD),
+            ));
+        }
+        if show_thinking {
+            spans.push(Span::styled("   thinking ", header_fg(theme::DIM)));
+            spans.push(Span::styled(
+                thinking,
+                header_fg(theme::IVORY).add_modifier(Modifier::BOLD),
             ));
         }
         Line::from(spans)
+    } else {
+        Line::from(Span::styled(model, header_fg(theme::BLUE)))
     };
 
     frame.render_widget(Paragraph::new(left), columns[0]);
     frame.render_widget(
-        Paragraph::new(right).alignment(Alignment::Right),
+        Paragraph::new(right)
+            .style(Style::default().bg(adapt_color(theme::HEADER)))
+            .alignment(Alignment::Right),
         columns[1],
     );
-    if area.height > 1 {
-        frame.render_widget(
-            Paragraph::new("─".repeat(usize::from(area.width))).style(fg(theme::BORDER)),
-            Rect {
-                y: area.y + area.height.saturating_sub(1),
-                height: 1,
-                ..area
-            },
-        );
-    }
+}
+
+/// `$0.0000` when both usage and pricing are known, otherwise `—`.
+fn pricing_value(pricing: Option<ModelPricing>, reducer: &Reducer) -> Option<f64> {
+    pricing.and_then(|pricing| {
+        pricing.estimate(
+            reducer
+                .usage
+                .input_tokens
+                .saturating_add(reducer.usage.cached_input_tokens.unwrap_or_default()),
+            reducer.usage.output_tokens,
+        )
+    })
+}
+
+fn pricing_label(cost: Option<f64>) -> String {
+    cost.map_or_else(|| "—".to_owned(), |cost| format!("${cost:.4}"))
 }
 
 /// Glyph + word + color: the design rule that state is never color alone.
 fn header_state(
     reducer: &Reducer,
     approval_pending: bool,
-) -> Option<(&'static str, &'static str, Color)> {
+    set: GlyphSet,
+) -> (&'static str, &'static str, Color) {
     if approval_pending || reducer.task.status == Some(TaskStatus::Paused) {
-        return Some((
-            glyphs::glyph(Glyph::Needs, glyph_set()),
-            "needs you",
-            theme::AMBER,
-        ));
+        return (glyphs::glyph(Glyph::Needs, set), "needs you", theme::AMBER);
     }
     match reducer.task.status {
-        Some(TaskStatus::Running) => Some((
-            glyphs::glyph(Glyph::Spinner, glyph_set()),
-            "running",
-            theme::AMBER,
-        )),
-        Some(TaskStatus::Completed) => Some((
-            glyphs::glyph(Glyph::Check, glyph_set()),
-            "done",
-            theme::SAGE,
-        )),
-        Some(TaskStatus::Failed) => Some((
-            glyphs::glyph(Glyph::Cross, glyph_set()),
-            "failed",
-            theme::CORAL,
-        )),
-        Some(TaskStatus::Cancelled) => Some((
-            glyphs::glyph(Glyph::Cancel, glyph_set()),
-            "cancelled",
-            theme::DIM,
-        )),
-        _ => None,
+        Some(TaskStatus::Running) => (glyphs::glyph(Glyph::Spinner, set), "running", theme::AMBER),
+        Some(TaskStatus::Completed) => (glyphs::glyph(Glyph::Check, set), "done", theme::SAGE),
+        Some(TaskStatus::Failed) => (glyphs::glyph(Glyph::Cross, set), "failed", theme::CORAL),
+        Some(TaskStatus::Cancelled) => (glyphs::glyph(Glyph::Cancel, set), "cancelled", theme::DIM),
+        // Idle is quiet: the word carries the meaning, no glyph needed.
+        _ => ("", "idle", theme::DIM),
     }
 }
 
@@ -1021,7 +1257,9 @@ fn key_hint_line(pairs: &[(&str, &str)]) -> Line<'static> {
         }
         spans.push(Span::styled(
             format!("[{key}]"),
-            fg(theme::IVORY).add_modifier(Modifier::BOLD),
+            fg(theme::IVORY)
+                .bg(adapt_color(theme::PANEL))
+                .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(format!(" {label}"), fg(theme::DIM)));
     }
@@ -1060,10 +1298,29 @@ fn status_label(reducer: &Reducer) -> &'static str {
         _ => "Idle",
     }
 }
+
+/// State glyph alone, for panels that print the word beside it.
+fn status_glyph(reducer: &Reducer) -> &'static str {
+    let set = glyph_set();
+    match reducer.task.status {
+        Some(TaskStatus::Running) => glyphs::glyph(Glyph::Spinner, set),
+        Some(TaskStatus::Completed) => glyphs::glyph(Glyph::Check, set),
+        Some(TaskStatus::Cancelled) => glyphs::glyph(Glyph::Cancel, set),
+        Some(TaskStatus::Failed) => glyphs::glyph(Glyph::Cross, set),
+        Some(TaskStatus::Paused) => glyphs::glyph(Glyph::Needs, set),
+        _ => glyphs::glyph(Glyph::Pending, set),
+    }
+}
 fn fg(color: Color) -> Style {
     Style::default()
         .fg(adapt_color(color))
         .bg(adapt_color(theme::BG))
+}
+/// Header spans sit on the header bar, not the ground.
+fn header_fg(color: Color) -> Style {
+    Style::default()
+        .fg(adapt_color(color))
+        .bg(adapt_color(theme::HEADER))
 }
 pub(crate) fn glyph_set() -> GlyphSet {
     if env::var_os("LOOM_ASCII").is_some_and(|value| value == "1") {
@@ -1072,12 +1329,17 @@ pub(crate) fn glyph_set() -> GlyphSet {
         GlyphSet::Unicode
     }
 }
+thread_local! {
+    /// Set once per draw from [`LiveViewOptions::depth`]. Rendering stays a
+    /// pure function of state plus this capability value.
+    static DEPTH: std::cell::Cell<theme::Depth> =
+        const { std::cell::Cell::new(theme::Depth::TrueColor) };
+}
+pub(crate) fn set_depth(depth: theme::Depth) {
+    DEPTH.with(|cell| cell.set(depth));
+}
 fn adapt_color(color: Color) -> Color {
-    if env::var_os("NO_COLOR").is_some() {
-        Color::Reset
-    } else {
-        color
-    }
+    DEPTH.with(|cell| theme::adapt(color, cell.get()))
 }
 
 #[cfg(test)]
@@ -1101,8 +1363,75 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
+    /// The live view must own its background on every cell. If any region is
+    /// left with the default background, terminals whose own background
+    /// differs from ours (notably Ghostty) paint it grey — the reported
+    /// "grey rectangle" corruption. This guards that root cause directly.
     #[test]
-    fn six_static_scenes_snapshot_text_and_styles_without_runtime_data() {
+    fn live_frame_owns_its_background_everywhere() {
+        let reducer = crate::reducer::Reducer::default();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_live(frame, &reducer, "", 0, LiveViewOptions::default());
+            })
+            .unwrap();
+        for cell in terminal.backend().buffer().content() {
+            assert_ne!(
+                cell.bg,
+                Color::Reset,
+                "a cell fell back to the terminal default background"
+            );
+        }
+    }
+
+    #[test]
+    fn restored_history_renders_run_boundaries_and_exact_turns() {
+        use crate::reducer::{ExecutionTurn, RestoredRun};
+
+        let mut reducer = Reducer::default();
+        reducer.restored = true;
+        reducer.task.status = Some(TaskStatus::Completed);
+        for (key, run, prompt) in [(1, 1, "first task"), (2, 2, "second task")] {
+            reducer.execution_turns.insert(
+                key,
+                ExecutionTurn {
+                    number: key,
+                    engine_turn: Some(1),
+                    run: Some(run),
+                    user_inputs: vec![prompt.into()],
+                    transcript: Vec::new(),
+                },
+            );
+            reducer.restored_runs.insert(
+                run,
+                RestoredRun {
+                    status: Some(TaskStatus::Completed),
+                    turns: 1,
+                    ..RestoredRun::default()
+                },
+            );
+        }
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_live(frame, &reducer, "", 0, LiveViewOptions::default());
+            })
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("run 1 · completed"));
+        assert!(rendered.contains("run 2 · completed"));
+        assert_eq!(rendered.matches("turn 1").count(), 2);
+    }
+
+    #[test]
+    fn static_scenes_snapshot_text_and_styles_without_runtime_data() {
         use std::{fmt::Write as _, fs, path::PathBuf};
 
         let scenes = [
@@ -1112,6 +1441,10 @@ mod tests {
             ("complete", Scene::Complete),
             ("picker", Scene::Picker),
             ("help", Scene::Help),
+            ("spec", Scene::Spec),
+            ("narrow", Scene::Narrow),
+            ("compact-a", Scene::CompactA),
+            ("compact-b", Scene::CompactB),
         ];
         let mut actual = String::new();
         for (name, scene) in scenes {
@@ -1126,6 +1459,175 @@ mod tests {
             fs::write(path, &actual).unwrap();
         }
         assert_eq!(actual, include_str!("../tests/snapshots/scenes.snap"));
+    }
+
+    #[test]
+    fn idle_screen_snapshots_at_three_widths_in_both_glyph_modes() {
+        use std::{fmt::Write as _, fs, path::PathBuf};
+
+        let recent = [
+            crate::recent::RecentSession {
+                title: "Read every module that touches the event sink and report the call chain"
+                    .to_owned(),
+                turns: 5,
+                status: Some(TaskStatus::Completed),
+            },
+            crate::recent::RecentSession {
+                title: "Add a regression test for the retry loop".to_owned(),
+                turns: 4,
+                status: Some(TaskStatus::Cancelled),
+            },
+        ];
+        let mut actual = String::new();
+        for (width, height) in [(140, 40), (100, 30), (70, 24)] {
+            for (mode, set) in [("unicode", GlyphSet::Unicode), ("ascii", GlyphSet::Ascii)] {
+                for (state, input) in [("closed", ""), ("open", "/")] {
+                    let _ = writeln!(actual, "=== {width}x{height} {mode} {state} ===");
+                    let options = LiveViewOptions {
+                        workspace: Some("~/work/loom"),
+                        session_id: Some("0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c"),
+                        model: Some("deepseek-flash"),
+                        effort: Some("high"),
+                        thinking: Some("on"),
+                        turn_limit: Some(50),
+                        idle: IdleFacts {
+                            tool_call_budget: Some(200),
+                            wall_budget: Some(Duration::from_secs(600)),
+                            ..IdleFacts::default()
+                        },
+                        recent: &recent,
+                        glyph_set: Some(set),
+                        depth: Some(theme::Depth::TrueColor),
+                        ..LiveViewOptions::default()
+                    };
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    terminal
+                        .draw(|frame| {
+                            draw_live(frame, &Reducer::default(), input, 0, options);
+                        })
+                        .unwrap();
+                    actual.push_str(&snapshot(terminal.backend().buffer()));
+                }
+            }
+        }
+
+        if env::var_os("UPDATE_TUI_SNAPSHOTS").is_some() {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots/idle.snap");
+            fs::write(path, &actual).unwrap();
+        }
+        assert_eq!(actual, include_str!("../tests/snapshots/idle.snap"));
+    }
+
+    fn idle_options() -> LiveViewOptions<'static> {
+        LiveViewOptions {
+            workspace: Some("~/work/loom"),
+            session_id: Some("0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c"),
+            model: Some("deepseek-flash"),
+            effort: Some("high"),
+            thinking: Some("on"),
+            turn_limit: Some(50),
+            idle: IdleFacts {
+                tool_call_budget: Some(200),
+                wall_budget: Some(Duration::from_secs(600)),
+                ..IdleFacts::default()
+            },
+            glyph_set: Some(GlyphSet::Unicode),
+            depth: Some(theme::Depth::TrueColor),
+            ..LiveViewOptions::default()
+        }
+    }
+
+    #[allow(clippy::large_types_passed_by_value)]
+    fn text_rows(
+        width: u16,
+        height: u16,
+        input: &str,
+        options: LiveViewOptions<'_>,
+    ) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_live(frame, &Reducer::default(), input, 0, options);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wide_layout_reserves_exactly_38_columns_for_the_sidebar() {
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        let options = LiveViewOptions {
+            sidebar_visible: true,
+            ..idle_options()
+        };
+        terminal
+            .draw(|frame| {
+                draw_live(frame, &Reducer::default(), "", 0, options);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in [2_u16, 10, 20, 30] {
+            assert_eq!(
+                buffer.cell((140 - SIDEBAR_WIDTH, y)).unwrap().symbol(),
+                "│",
+                "sidebar must start 38 columns from the right at row {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn medium_hides_the_sidebar_until_it_is_opened() {
+        let closed = text_rows(
+            100,
+            30,
+            "",
+            LiveViewOptions {
+                sidebar_visible: false,
+                ..idle_options()
+            },
+        );
+        assert!(!closed.iter().any(|row| row.contains("DEFAULT BUDGET")));
+        let open = text_rows(
+            100,
+            30,
+            "",
+            LiveViewOptions {
+                sidebar_visible: true,
+                ..idle_options()
+            },
+        );
+        assert!(open.iter().any(|row| row.contains("DEFAULT BUDGET")));
+        assert!(open.iter().any(|row| row.contains("no turns yet")));
+    }
+
+    #[test]
+    fn no_color_ascii_and_16_colour_still_carry_words_and_glyphs() {
+        for depth in [theme::Depth::NoColor, theme::Depth::Ansi16] {
+            let rows = text_rows(
+                140,
+                40,
+                "",
+                LiveViewOptions {
+                    sidebar_visible: true,
+                    glyph_set: Some(GlyphSet::Ascii),
+                    depth: Some(depth),
+                    ..idle_options()
+                },
+            );
+            let text = rows.join("\n");
+            assert!(text.contains("# loom"), "missing ASCII brand: {text}");
+            assert!(text.contains("> Describe a task…"));
+            assert!(text.contains("SESSION"));
+            assert!(text.contains("no turns yet"));
+            assert!(text.contains("[/help] help"));
+        }
     }
 
     fn snapshot(buffer: &ratatui::buffer::Buffer) -> String {
@@ -1179,13 +1681,19 @@ mod tests {
                 Scene::Cancel => assert!(rendered.contains("No cancellation event")),
                 Scene::Retry => assert!(rendered.contains("No retry events")),
                 Scene::Complete => assert!(rendered.contains("No completed task")),
-                Scene::Main | Scene::Picker | Scene::Help => {}
+                Scene::Main
+                | Scene::Picker
+                | Scene::Help
+                | Scene::Spec
+                | Scene::Narrow
+                | Scene::CompactA
+                | Scene::CompactB => {}
             }
         }
     }
 
     #[test]
-    fn narrow_view_uses_one_status_line_for_key_hints() {
+    fn narrow_view_puts_status_in_the_header_and_keeps_one_hint() {
         let reducer = Reducer::default();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
@@ -1201,10 +1709,32 @@ mod tests {
             .collect();
         assert!(
             rows.iter()
-                .any(|row| row.contains("[Esc]") && row.contains("cancel")),
+                .any(|row| row.contains("idle · turn") && row.contains("cost")),
             "no status line in {rows:#?}"
         );
-        assert!(!rows.iter().any(|row| row.contains("models")));
+        assert!(rows.iter().any(|row| row.contains("[/help] help")));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("[Esc]") || row.contains("models"))
+        );
+    }
+
+    #[test]
+    fn command_palette_scrolls_to_keep_the_selected_command_visible() {
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal
+            .draw(|frame| draw_palette(frame, frame.area(), "/", 14, GlyphSet::Unicode))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(rows.iter().any(|row| row.contains("/quit")));
     }
 
     #[test]
@@ -1410,6 +1940,7 @@ mod tests {
         reducer.reduce(
             &loom_core::EventEnvelope {
                 schema_version: loom_core::kernel::event::EVENT_SCHEMA_VERSION,
+                timestamp_millis: None,
                 sequence: 0,
                 task_id: loom_core::TaskId::new(),
                 kind: loom_core::EventKind::TurnStarted { turn: 1 },
@@ -1419,6 +1950,7 @@ mod tests {
         reducer.reduce(
             &loom_core::EventEnvelope {
                 schema_version: loom_core::kernel::event::EVENT_SCHEMA_VERSION,
+                timestamp_millis: None,
                 sequence: 1,
                 task_id: loom_core::TaskId::new(),
                 kind: loom_core::EventKind::ToolStarted {
@@ -1446,6 +1978,7 @@ mod tests {
         reducer.reduce(
             &loom_core::EventEnvelope {
                 schema_version: loom_core::kernel::event::EVENT_SCHEMA_VERSION,
+                timestamp_millis: None,
                 sequence: 2,
                 task_id: loom_core::TaskId::new(),
                 kind: loom_core::EventKind::ToolCompleted {
@@ -1498,6 +2031,7 @@ mod tests {
         reducer.reduce(
             &loom_core::EventEnvelope {
                 schema_version: loom_core::kernel::event::EVENT_SCHEMA_VERSION,
+                timestamp_millis: None,
                 sequence: 0,
                 task_id: loom_core::TaskId::new(),
                 kind: loom_core::EventKind::TurnStarted { turn: 1 },
@@ -1510,6 +2044,7 @@ mod tests {
         reducer.reduce(
             &loom_core::EventEnvelope {
                 schema_version: EVENT_SCHEMA_VERSION,
+                timestamp_millis: None,
                 sequence: 1,
                 task_id: loom_core::TaskId::new(),
                 kind: loom_core::EventKind::ModelCompleted {
@@ -1536,6 +2071,7 @@ mod tests {
         reducer.reduce(
             &loom_core::EventEnvelope {
                 schema_version: EVENT_SCHEMA_VERSION,
+                timestamp_millis: None,
                 sequence: 2,
                 task_id: loom_core::TaskId::new(),
                 kind: loom_core::EventKind::ToolStarted {
@@ -1551,6 +2087,7 @@ mod tests {
         reducer.reduce(
             &loom_core::EventEnvelope {
                 schema_version: loom_core::kernel::event::EVENT_SCHEMA_VERSION,
+                timestamp_millis: None,
                 sequence: 3,
                 task_id: loom_core::TaskId::new(),
                 kind: loom_core::EventKind::ToolCompleted {
@@ -1603,6 +2140,7 @@ mod tests {
         reducer.reduce(
             &loom_core::EventEnvelope {
                 schema_version: loom_core::kernel::event::EVENT_SCHEMA_VERSION,
+                timestamp_millis: None,
                 sequence: 0,
                 task_id: loom_core::TaskId::new(),
                 kind: loom_core::EventKind::TurnStarted { turn: 1 },
@@ -1645,7 +2183,7 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
 
-        assert!(rendered.contains("Awaiting input"));
+        assert!(rendered.contains("Needs you"));
         assert!(!rendered.contains("Paused"));
     }
 
@@ -1741,6 +2279,58 @@ mod tests {
     }
 
     #[test]
+    fn markdown_is_rendered_without_syntax_markers() {
+        let lines = markdown_lines(
+            "## Repo state\n`main`, **59 commits ahead**\n\n- first item\n- second *emphasis*\n\n\
+             ```rust\nfn main() {}\n```\n| a | b |\n|---|---|\n| 1 | 2 |\n\n> quoted",
+        );
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rendered[0], "Repo state");
+        assert_eq!(rendered[1], "main, 59 commits ahead");
+        assert!(rendered.iter().any(|line| line == "• first item"));
+        assert!(rendered.iter().any(|line| line == "• second emphasis"));
+        assert!(rendered.iter().any(|line| line.trim() == "fn main() {}"));
+        assert!(rendered.iter().any(|line| line == "a │ b"));
+        assert!(rendered.iter().any(|line| line == "│ quoted"));
+        assert!(
+            rendered.iter().all(|line| !line.contains("**")
+                && !line.contains('`')
+                && !line.contains("---")
+                && !line.contains("##")),
+            "markdown markers must not reach the screen: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn thread_text_does_not_run_under_the_scrollbar() {
+        let mut terminal = Terminal::new(TestBackend::new(20, 10)).unwrap();
+        let mut lines: Vec<Line<'static>> = (0..12).map(|_| Line::from("filler")).collect();
+        lines.push(Line::from("aaaa bbbb cccc ddddd"));
+        terminal
+            .draw(|frame| render_thread_scrolled(frame, frame.area(), lines, 0))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(
+            text.contains("ddddd"),
+            "wrapped text must not be overwritten by the scrollbar: {text:?}"
+        );
+    }
+
+    #[test]
     fn structured_payloads_are_not_dumped_into_the_thread() {
         assert_eq!(
             human_readable_content(r#"{"type":"thinking","secret":"x"}"#),
@@ -1762,10 +2352,12 @@ mod tests {
     }
 
     #[test]
-    fn prompt_cursor_scrolls_with_wrapped_input() {
+    fn prompt_cursor_sits_after_the_prompt_glyph_and_scrolls_with_wrapped_input() {
         let area = Rect::new(4, 7, 12, 3);
+        assert_eq!(prompt_cursor("", 0, area), (7, 8, 0));
+        assert_eq!(prompt_cursor("abc", 3, area), (10, 8, 0));
         let input = "abcdefghijklmno";
-        assert_eq!(prompt_cursor(input, input.len(), area), (10, 8, 1));
+        assert_eq!(prompt_cursor(input, input.len(), area), (12, 8, 1));
     }
 
     #[test]
@@ -1853,8 +2445,7 @@ mod tests {
             "#1283 ModelRequestStarted".into(),
             "#1282 TurnStarted".into(),
         ];
-        // At screenshot-scale terminal heights the sidebar must still retain
-        // its EVENTS heading, at least one event, and the counter.
+        // The footer owns the event counter; the sidebar must NOT repeat it.
         let mut terminal = Terminal::new(TestBackend::new(154, 40)).unwrap();
         terminal
             .draw(|frame| {
@@ -1886,7 +2477,11 @@ mod tests {
             );
         }
         assert!(rendered.contains("#1284 ReasoningDelta"));
-        assert!(rendered.contains("events 1284 · dropped 0"));
+        assert_eq!(
+            rendered.matches("events 1284 · dropped 0").count(),
+            1,
+            "the event counter must render exactly once, in the footer only"
+        );
     }
 
     #[test]
@@ -2128,14 +2723,47 @@ mod approval_render_tests {
             .collect::<String>();
         assert!(text.contains("Allow this write?"), "prompt missing");
         assert!(text.contains("notes.md"), "path missing");
-        for key in [
-            "[y] allow once",
-            "[a] allow for session",
-            "[n] deny",
-            "[e] edit first",
-        ] {
+        for key in ["[y] once", "[a] session", "[n] deny", "[e] edit first"] {
             assert!(text.contains(key), "key hint `{key}` missing");
         }
+    }
+
+    #[test]
+    fn approval_box_shows_the_wireframe_diff_preview() {
+        let (reply, _rx) = oneshot::channel();
+        let content = "alpha\n\nbeta\ngamma\ndelta\n".to_owned();
+        let request = Request {
+            path: "notes.md".to_owned(),
+            content,
+            reply,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                super::draw_approval_box(frame, area, &request);
+            })
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        // Whole-file insert: +N −0 stats, @@ header, two preview lines,
+        // then the more-lines trailer pointing at ^O.
+        assert!(text.contains("+5 −0"), "line stats missing: {text}");
+        assert!(
+            text.contains("@@ notes.md · 5 lines"),
+            "diff header missing"
+        );
+        assert!(text.contains("+ alpha"), "first preview line missing");
+        assert!(text.contains("+ beta"), "second preview line missing");
+        assert!(
+            text.contains("2 more lines · ^O expand"),
+            "trailer missing: {text}"
+        );
     }
 }
 
@@ -2176,9 +2804,100 @@ mod pending_sidebar_tests {
             "pending path missing from sidebar"
         );
         assert!(
-            text.contains("y allow once   a always   n decline"),
+            text.contains("y once   a for this session   n deny"),
             "pending keys missing"
         );
+    }
+
+    #[test]
+    fn blocked_write_row_reads_awaiting_not_running() {
+        use loom_core::EventEnvelope;
+        use loom_core::EventKind;
+        use loom_core::TaskId;
+        use loom_core::kernel::event::EVENT_SCHEMA_VERSION;
+        use loom_core::kernel::model::{ModelResponse, StopReason, Usage};
+        use loom_core::kernel::transcript::{
+            AssistantMessage, ToolArguments, ToolCall, ToolCallId,
+        };
+
+        let mut reducer = crate::reducer::Reducer::default();
+        reducer.begin_task("write the notes");
+        let call = ToolCallId::try_from("w-1".to_owned()).unwrap();
+        reducer.reduce(
+            &EventEnvelope {
+                schema_version: EVENT_SCHEMA_VERSION,
+                timestamp_millis: None,
+                sequence: 0,
+                task_id: TaskId::new(),
+                kind: EventKind::TurnStarted { turn: 1 },
+            },
+            1,
+        );
+        reducer.reduce(
+            &EventEnvelope {
+                schema_version: EVENT_SCHEMA_VERSION,
+                timestamp_millis: None,
+                sequence: 1,
+                task_id: TaskId::new(),
+                kind: EventKind::ModelCompleted {
+                    response: ModelResponse {
+                        message: AssistantMessage {
+                            content: String::new(),
+                            reasoning: None,
+                            tool_calls: vec![ToolCall {
+                                id: call.clone(),
+                                name: "write_file".to_owned(),
+                                arguments: ToolArguments::try_from(serde_json::json!({
+                                    "path": "notes.md"
+                                }))
+                                .unwrap(),
+                            }],
+                            stop_reason: StopReason::ToolCalls,
+                        },
+                        usage: Usage::default(),
+                    },
+                },
+            },
+            100,
+        );
+        reducer.reduce(
+            &EventEnvelope {
+                schema_version: EVENT_SCHEMA_VERSION,
+                timestamp_millis: None,
+                sequence: 2,
+                task_id: TaskId::new(),
+                kind: EventKind::ToolStarted {
+                    name: "write_file".into(),
+                    call_id: call,
+                    arguments: r#"{"path":"notes.md"}"#.to_owned(),
+                },
+            },
+            200,
+        );
+        let (reply, _rx) = oneshot::channel();
+        let request = Request {
+            path: "notes.md".to_owned(),
+            content: "hello".to_owned(),
+            reply,
+        };
+        let options = LiveViewOptions {
+            approval: Some(&request),
+            sidebar_visible: true,
+            ..LiveViewOptions::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(154, 80)).unwrap();
+        terminal
+            .draw(|frame| draw_live(frame, &reducer, "", 0, options))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("write_file"), "tool row missing");
+        assert!(text.contains("awaiting"), "needs-you state missing");
     }
 }
 

@@ -107,6 +107,7 @@ pub fn draw_welcome(frame: &mut ratatui::Frame<'_>, flow: &Welcome, workspace: &
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Paragraph, Wrap};
 
+    crate::scene_views::paint_base(frame);
     let fg = |color| Style::default().fg(color);
     let area = frame.area();
     let rows = Layout::default()

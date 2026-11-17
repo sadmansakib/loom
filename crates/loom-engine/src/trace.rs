@@ -374,6 +374,7 @@ mod tests {
     fn envelope(sequence: u64, task_id: TaskId, kind: EventKind) -> EventEnvelope {
         EventEnvelope {
             schema_version: EVENT_SCHEMA_VERSION,
+            timestamp_millis: None,
             sequence,
             task_id,
             kind,

@@ -225,6 +225,7 @@ fn memory_event_store_round_trips_in_write_order() {
     let task = TaskId::new();
     let envelope = |sequence, kind| EventEnvelope {
         schema_version: crate::event::EVENT_SCHEMA_VERSION,
+        timestamp_millis: None,
         sequence,
         task_id: task,
         kind,
@@ -263,6 +264,7 @@ fn memory_event_store_rejects_an_unknown_session() {
             &SessionId::new(),
             &EventEnvelope {
                 schema_version: crate::event::EVENT_SCHEMA_VERSION,
+                timestamp_millis: None,
                 sequence: 0,
                 task_id: TaskId::new(),
                 kind: EventKind::TaskStarted,

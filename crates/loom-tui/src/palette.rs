@@ -46,30 +46,86 @@ pub const COMMANDS: &[Command] = &[
         blurb: "compact the context",
     },
     Command {
+        name: "/copy",
+        blurb: "copy the final answer",
+    },
+    Command {
         name: "/export",
         blurb: "export this task as NDJSON + manifest",
+    },
+    Command {
+        name: "/reasoning",
+        blurb: "show or hide reasoning",
+    },
+    Command {
+        name: "/sidebar",
+        blurb: "focus the sidebar",
     },
     Command {
         name: "/help",
         blurb: "keys and help",
     },
+    Command {
+        name: "/quit",
+        blurb: "quit",
+    },
 ];
+
+/// What a slash command means to the app loop. The palette only produces
+/// this value; the handlers live in the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Action {
+    Model,
+    Effort,
+    Account,
+    Sessions,
+    New,
+    Context,
+    Tools,
+    Copy,
+    Export,
+    Reasoning,
+    Sidebar,
+    Help,
+    Quit,
+    Compare,
+    Compact,
+}
+
+/// Map a command name to its action. `None` is an unknown command.
+pub(crate) fn action_for(name: &str) -> Option<Action> {
+    Some(match name {
+        "/model" => Action::Model,
+        "/effort" => Action::Effort,
+        "/account" => Action::Account,
+        "/sessions" => Action::Sessions,
+        "/new" => Action::New,
+        "/context" => Action::Context,
+        "/tools" => Action::Tools,
+        "/copy" => Action::Copy,
+        "/export" => Action::Export,
+        "/reasoning" => Action::Reasoning,
+        "/sidebar" => Action::Sidebar,
+        "/help" => Action::Help,
+        "/quit" => Action::Quit,
+        "/compare" => Action::Compare,
+        "/compact" => Action::Compact,
+        _ => return None,
+    })
+}
 
 /// The palette is open whenever the composer text starts with `/`.
 pub(crate) fn is_open(input: &str) -> bool {
     input.starts_with('/')
 }
 
-/// Commands whose name or blurb contains the filter (case-insensitive).
+/// Commands whose name starts with the filter (case-insensitive). The
+/// composer always types a leading `/`, so `/mo` narrows to `/model`.
 pub(crate) fn matching(filter: &str) -> Vec<&'static Command> {
     let needle = filter.trim_start_matches('/').to_lowercase();
     COMMANDS
         .iter()
-        .filter(|command| {
-            needle.is_empty()
-                || command.name.to_lowercase().contains(&needle)
-                || command.blurb.to_lowercase().contains(&needle)
-        })
+        .filter(|command| command.name.trim_start_matches('/').starts_with(&needle))
         .collect()
 }
 
@@ -80,6 +136,8 @@ pub(crate) enum PaletteAction {
     Run,
     /// Close the palette without running.
     Close,
+    /// Fill the composer with the selected command name.
+    Complete,
     /// The key was consumed (selection moved); keep typing.
     Consumed,
 }
@@ -93,6 +151,10 @@ pub(crate) fn key(
 ) -> Option<PaletteAction> {
     if key.code == crossterm::event::KeyCode::Esc {
         return Some(PaletteAction::Close);
+    }
+    // Shift+Enter still inserts a newline; modified keys are not palette keys.
+    if !key.modifiers.is_empty() {
+        return None;
     }
     if match_count == 0 {
         // An unmatched `/word` must never fall through to the composer and
@@ -112,6 +174,8 @@ pub(crate) fn key(
         Some(PaletteAction::Consumed)
     } else if key.code == crossterm::event::KeyCode::Enter {
         Some(PaletteAction::Run)
+    } else if key.code == crossterm::event::KeyCode::Tab {
+        Some(PaletteAction::Complete)
     } else {
         None
     }
@@ -136,6 +200,21 @@ mod tests {
     }
 
     #[test]
+    fn every_listed_command_maps_to_an_action() {
+        assert_eq!(action_for("/model"), Some(Action::Model));
+        assert_eq!(action_for("/help"), Some(Action::Help));
+        assert_eq!(action_for("/quit"), Some(Action::Quit));
+        assert_eq!(action_for("/nope"), None);
+        for command in COMMANDS {
+            assert!(
+                action_for(command.name).is_some(),
+                "{} has no action",
+                command.name
+            );
+        }
+    }
+
+    #[test]
     fn keys_move_run_and_close() {
         let mut selected = 5; // past the end after a filter shrank
         let action = key(plain(KeyCode::Down), &mut selected, 3);
@@ -154,7 +233,21 @@ mod tests {
             key(plain(KeyCode::Esc), &mut selected, 3),
             Some(PaletteAction::Close)
         );
+        // Tab completes the selection instead of toggling the sidebar.
+        assert_eq!(
+            key(plain(KeyCode::Tab), &mut selected, 3),
+            Some(PaletteAction::Complete)
+        );
         // Typing falls through to the composer.
         assert_eq!(key(plain(KeyCode::Char('x')), &mut selected, 3), None);
+        // Shift+Enter keeps its newline meaning even with the list open.
+        assert_eq!(
+            key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+                &mut selected,
+                3
+            ),
+            None
+        );
     }
 }

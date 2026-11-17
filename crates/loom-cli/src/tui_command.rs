@@ -30,6 +30,10 @@ impl From<TuiScene> for loom_tui::Scene {
             TuiScene::Complete => Self::Complete,
             TuiScene::Picker => Self::Picker,
             TuiScene::Help => Self::Help,
+            TuiScene::Spec => Self::Spec,
+            TuiScene::Narrow => Self::Narrow,
+            TuiScene::CompactA => Self::CompactA,
+            TuiScene::CompactB => Self::CompactB,
         }
     }
 }
@@ -58,5 +62,18 @@ mod tests {
             loom_tui::Scene::Picker
         );
         assert_eq!(loom_tui::Scene::from(TuiScene::Help), loom_tui::Scene::Help);
+        assert_eq!(loom_tui::Scene::from(TuiScene::Spec), loom_tui::Scene::Spec);
+        assert_eq!(
+            loom_tui::Scene::from(TuiScene::Narrow),
+            loom_tui::Scene::Narrow
+        );
+        assert_eq!(
+            loom_tui::Scene::from(TuiScene::CompactA),
+            loom_tui::Scene::CompactA
+        );
+        assert_eq!(
+            loom_tui::Scene::from(TuiScene::CompactB),
+            loom_tui::Scene::CompactB
+        );
     }
 }

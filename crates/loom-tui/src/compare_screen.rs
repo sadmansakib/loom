@@ -46,6 +46,7 @@ pub(crate) struct CompareScreen {
     filter: String,
     selected: usize,
     baseline: Option<usize>,
+    command: crate::command_line::CommandLine,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -121,6 +122,7 @@ impl CompareScreen {
             filter: String::new(),
             selected: 0,
             baseline: None,
+            command: crate::command_line::CommandLine::default(),
         }
     }
 
@@ -146,6 +148,32 @@ impl CompareScreen {
     }
 
     pub(crate) fn key(&mut self, key: KeyEvent) -> Option<CompareAction> {
+        match self.command.key(key) {
+            crate::command_line::CommandKey::Ignore => {}
+            crate::command_line::CommandKey::Consumed | crate::command_line::CommandKey::Cancel => {
+                return Some(CompareAction::Consumed);
+            }
+            crate::command_line::CommandKey::Run(command) => {
+                return Some(
+                    match command.split_whitespace().collect::<Vec<_>>().as_slice() {
+                        ["export"] => CompareAction::ExportNdjson,
+                        ["export", "csv"] => CompareAction::ExportCsv,
+                        ["baseline" | "mark"] => {
+                            self.baseline = self.filtered().get(self.selected).copied();
+                            CompareAction::Consumed
+                        }
+                        ["open"] => self
+                            .filtered()
+                            .get(self.selected)
+                            .map_or(CompareAction::Consumed, |index| {
+                                CompareAction::Open(self.rows[*index].session.clone())
+                            }),
+                        ["close"] => CompareAction::Close,
+                        _ => CompareAction::Consumed,
+                    },
+                );
+            }
+        }
         if key.code == KeyCode::Esc {
             return Some(CompareAction::Close);
         }
@@ -160,9 +188,7 @@ impl CompareScreen {
         }
         if key.modifiers.is_empty() {
             if key.code == KeyCode::Char(' ') || key.code == KeyCode::Char('b') {
-                let visible = self.filtered();
-                let index = visible.get(self.selected).copied();
-                self.baseline = index;
+                self.baseline = self.filtered().get(self.selected).copied();
                 return Some(CompareAction::Consumed);
             }
             if key.code == KeyCode::Enter {
@@ -240,70 +266,151 @@ fn cache_label(row: &RunRow) -> String {
     }
 }
 
-/// One table row line: baseline marker, selection, status, model,
-/// numbers, prompt.
+/// Truncate to `width` cells, adding an ellipsis only when something was cut.
+fn clip(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let kept: String = text.chars().take(width.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
+
+fn cell(text: &str, width: usize, style: Style) -> Span<'static> {
+    Span::styled(format!("{:<width$}", clip(text, width)), style)
+}
+
+/// Width of the elastic model column for a table of `width` cells.
+fn model_width(width: u16) -> usize {
+    (usize::from(width).saturating_sub(57)).clamp(4, 24)
+}
+
+fn status_mark(status: Option<TaskStatus>) -> (&'static str, ratatui::style::Color) {
+    use crate::glyphs::{Glyph, glyph};
+    let set = crate::scene_views::glyph_set();
+    match status {
+        Some(TaskStatus::Completed) | None => (glyph(Glyph::Check, set), theme::SAGE),
+        Some(TaskStatus::Failed) => (glyph(Glyph::Cross, set), theme::CORAL),
+        Some(TaskStatus::Cancelled) => (glyph(Glyph::Cancel, set), theme::DIM),
+        Some(TaskStatus::Paused) => (glyph(Glyph::Needs, set), theme::AMBER),
+        Some(TaskStatus::Running) => (glyph(Glyph::Spinner, set), theme::AMBER),
+        Some(_) => (glyph(Glyph::Pending, set), theme::DIM),
+    }
+}
+
+/// Header for the same columns as [`row_line`].
+fn header_line(width: u16) -> Line<'static> {
+    let dim = Style::default().fg(theme::DIM);
+    let model = model_width(width);
+    Line::from(vec![
+        cell("", 3, dim),
+        cell("task", 8, dim),
+        cell("model", model, dim),
+        cell("", 1, dim),
+        cell("effort", 7, dim),
+        cell("ok", 3, dim),
+        cell("turns", 6, dim),
+        cell("calls", 6, dim),
+        cell("wall", 9, dim),
+        cell("cost", 9, dim),
+        cell("cache", 6, dim),
+    ])
+}
+
+/// Table rows plus the baseline delta and the cost-vs-wall chart, fitted
+/// to the body height so the footer never scrolls away.
+fn table_lines(
+    screen: &CompareScreen,
+    pricing: Option<ModelPricing>,
+    width: u16,
+    height: u16,
+) -> Vec<Line<'static>> {
+    let amber = Style::default().fg(theme::AMBER);
+    let dim = Style::default().fg(theme::DIM);
+    let visible = screen.filtered();
+    let mut lines = Vec::new();
+    let diff = baseline_diff(screen);
+    // Chart first, so the row window can reserve its height instead of
+    // pushing rows out of the modal.
+    let chart = if height >= 14 {
+        chart_lines(screen, &visible, pricing, amber, dim)
+    } else {
+        Vec::new()
+    };
+    let reserved = chart.len() + usize::from(diff.is_some()) + usize::from(visible.is_empty());
+    let capacity = usize::from(height).saturating_sub(reserved).max(1);
+    let start = if visible.len() > capacity {
+        (screen.selected + 1).saturating_sub(capacity)
+    } else {
+        0
+    };
+    for (position, index) in visible.iter().enumerate().skip(start).take(capacity) {
+        let row = &screen.rows[*index];
+        let is_baseline = screen
+            .baseline
+            .is_some_and(|i| screen.rows.get(i).is_some_and(|base| base.task == row.task));
+        lines.push(row_line(
+            row,
+            position == screen.selected,
+            is_baseline,
+            pricing,
+            width,
+        ));
+    }
+    if let Some(diff) = diff {
+        lines.push(Line::from(Span::styled(
+            clip(&diff, usize::from(width)),
+            Style::default().fg(theme::SAGE),
+        )));
+    }
+    if visible.is_empty() {
+        lines.push(Line::from(Span::styled("no runs match the filter", dim)));
+    }
+    lines.extend(chart);
+    lines
+}
+
+/// One table row line: baseline marker, task id, compact model, effort,
+/// outcome glyph, then the numbers the wireframe's table shows.
 fn row_line(
     row: &RunRow,
     selected: bool,
     is_baseline: bool,
     pricing: Option<ModelPricing>,
-    ivory: Style,
-    amber: Style,
-    dim: Style,
+    width: u16,
 ) -> Line<'static> {
+    let amber = Style::default().fg(theme::AMBER);
+    let ivory = Style::default().fg(theme::IVORY);
+    let dim = Style::default().fg(theme::DIM);
     let marker = if is_baseline { "◆" } else { " " };
-    let mut spans = vec![Span::styled(
-        if selected {
-            format!("{marker}❯ ")
-        } else {
-            format!("{marker}  ")
-        },
-        amber,
-    )];
-    spans.push(Span::styled(
-        format!("{:<10} ", row.task),
-        if selected {
-            ivory.add_modifier(Modifier::BOLD)
-        } else {
-            ivory
-        },
-    ));
-    spans.push(Span::styled(
-        format!("{:<9} ", status_label(row.status)),
-        Style::default().fg(match row.status {
-            Some(TaskStatus::Completed) | None => theme::SAGE,
-            Some(TaskStatus::Failed | TaskStatus::Cancelled) => theme::CORAL,
-            _ => theme::DIM,
-        }),
-    ));
-    spans.push(Span::styled(
-        format!("{:<16} ", row.model),
-        Style::default().fg(theme::BLUE),
-    ));
-    spans.push(Span::styled(
-        format!(
-            "{:<6} ",
-            row.effort
-                .as_deref()
-                .map_or_else(|| "—".into(), str::to_owned)
+    let (mark, status_color) = status_mark(row.status);
+    let model = model_width(width);
+    Line::from(vec![
+        Span::styled(
+            format!("{marker}{} ", if selected { "❯" } else { " " }),
+            amber,
         ),
-        dim,
-    ));
-    spans.push(Span::styled(
-        format!(
-            "{:<5} {:<5} {:<8} ",
-            row.turns,
-            row.calls,
-            wall_label(row.wall_millis)
+        cell(
+            &row.task,
+            8,
+            if selected {
+                ivory.add_modifier(Modifier::BOLD)
+            } else {
+                ivory
+            },
         ),
-        dim,
-    ));
-    spans.push(Span::styled(
-        format!("{:<8} {}", cost_label(row, pricing), cache_label(row)),
-        dim,
-    ));
-    spans.push(Span::styled(format!("  {}", row.prompt), dim));
-    Line::from(spans)
+        cell(&row.model, model, Style::default().fg(theme::BLUE)),
+        cell("", 1, dim),
+        cell(row.effort.as_deref().unwrap_or("—"), 7, dim),
+        cell(mark, 3, Style::default().fg(status_color)),
+        cell(&row.turns.to_string(), 6, dim),
+        cell(&row.calls.to_string(), 6, dim),
+        cell(&wall_label(row.wall_millis), 9, dim),
+        cell(&cost_label(row, pricing), 9, dim),
+        cell(&cache_label(row), 6, dim),
+    ])
 }
 
 /// Cost-vs-wall chart under the table (wireframe `COST VS WALL TIME`):
@@ -340,9 +447,9 @@ fn chart_lines(
     };
     let mut lines = vec![
         Line::from(Span::styled("", dim)),
-        Line::from(Span::styled("COST VS WALL", amber)),
+        Line::from(Span::styled("COST VS WALL TIME", amber)),
     ];
-    for row in rows.iter().take(8) {
+    for row in rows.iter().take(4) {
         let cost = cost_of(row);
         let wall = row.wall_millis;
         let mut spans = vec![
@@ -426,8 +533,9 @@ pub(crate) fn draw(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::AMBER))
+            .style(Style::default().bg(theme::BG))
             .title(Span::styled(
-                " runs · compare ",
+                " ◆ runs · compare ",
                 Style::default()
                     .fg(theme::AMBER)
                     .add_modifier(Modifier::BOLD),
@@ -453,59 +561,116 @@ pub(crate) fn draw(
             Span::styled("FILTER ", amber),
             Span::styled(
                 if screen.filter.is_empty() {
-                    "all runs".into()
+                    "all runs · type to filter".into()
                 } else {
                     screen.filter.clone()
                 },
-                ivory,
+                if screen.filter.is_empty() { dim } else { ivory },
             ),
         ])),
         rows[0],
     );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "task        st        model            effort turns calls wall     cost    cache",
-            dim,
-        ))),
-        rows[1],
-    );
+    // The sidebar needs room for its labels; below that the table owns the
+    // full modal. This is the one screen whose header is part of the table.
+    let wide = inner.width >= 100;
+    let body = if wide {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(50), Constraint::Length(32)])
+            .split(rows[2])
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(100)])
+            .split(rows[2])
+    };
+    let table_width = body[0].width;
+    frame.render_widget(Paragraph::new(header_line(table_width)), rows[1]);
 
-    let visible = screen.filtered();
-    let mut lines = Vec::new();
-    for (position, index) in visible.iter().enumerate() {
-        let row = &screen.rows[*index];
-        let is_baseline = screen
-            .baseline
-            .is_some_and(|i| screen.rows.get(i).is_some_and(|base| base.task == row.task));
-        lines.push(row_line(
-            row,
-            position == screen.selected,
-            is_baseline,
-            pricing,
-            ivory,
-            amber,
-            dim,
-        ));
-    }
-    if let Some(diff) = baseline_diff(screen) {
-        lines.push(Line::from(Span::styled("", dim)));
-        lines.push(Line::from(Span::styled(
-            diff,
-            Style::default().fg(theme::SAGE),
-        )));
-    }
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled("no runs match the filter", dim)));
-    }
-    lines.extend(chart_lines(screen, &visible, pricing, amber, dim));
-    frame.render_widget(Paragraph::new(lines), rows[2]);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "↑↓ move · Space baseline · Enter open · e ndjson · c csv · Esc back",
-            dim,
-        ))),
-        rows[3],
+        Paragraph::new(table_lines(screen, pricing, table_width, body[0].height)),
+        body[0],
     );
+    if wide {
+        let sidebar = Paragraph::new(sidebar_lines(screen, amber, dim, ivory, body[1].width))
+            .block(
+                Block::default()
+                    .borders(Borders::LEFT)
+                    .border_style(Style::default().fg(theme::BORDER)),
+            );
+        frame.render_widget(sidebar, body[1]);
+    }
+    let footer = screen.command.line().unwrap_or_else(|| {
+        Line::from(Span::styled(
+            "↑↓ move · [/mark] mark · Enter open · [/baseline] baseline · Esc back",
+            dim,
+        ))
+    });
+    frame.render_widget(Paragraph::new(footer), rows[3]);
+}
+
+/// The wireframe's right-hand pane: selected run, baseline delta, filters
+/// and export commands. Every value comes from the loaded run records.
+fn sidebar_lines(
+    screen: &CompareScreen,
+    amber: Style,
+    dim: Style,
+    ivory: Style,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let room = usize::from(width.saturating_sub(1)).max(8);
+    let selected = screen
+        .filtered()
+        .get(screen.selected)
+        .and_then(|index| screen.rows.get(*index));
+    let mut lines = vec![Line::from(Span::styled("SELECTED", amber))];
+    if let Some(row) = selected {
+        lines.push(Line::from(vec![Span::styled(
+            clip(&format!("{} · {}", row.task, row.model), room),
+            amber,
+        )]));
+        lines.push(Line::from(Span::styled(
+            status_label(row.status),
+            if row.status == Some(TaskStatus::Completed) {
+                Style::default().fg(theme::SAGE)
+            } else {
+                dim
+            },
+        )));
+        lines.push(muted(&clip(&format!("t_{}", short_id(&row.session)), room)));
+    } else {
+        lines.push(muted("no run selected"));
+    }
+    lines.push(Line::from(Span::styled("VS BASELINE (ROW 1)", amber)));
+    lines.push(muted(&clip(
+        &baseline_diff(screen).unwrap_or_else(|| "no baseline set".into()),
+        room,
+    )));
+    lines.push(Line::from(Span::styled("FILTER", amber)));
+    lines.push(muted(&clip(
+        &format!(
+            "task    {}",
+            if screen.filter.is_empty() {
+                "all"
+            } else {
+                &screen.filter
+            }
+        ),
+        room,
+    )));
+    lines.push(muted("status  any"));
+    lines.push(muted("model   all"));
+    lines.push(Line::from(Span::styled("EXPORT", amber)));
+    lines.push(Line::from(Span::styled("[/export] runs NDJSON", ivory)));
+    lines.push(Line::from(Span::styled("[/export csv] comparison", ivory)));
+    lines
+}
+
+fn muted(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_owned(),
+        Style::default().fg(theme::DIM),
+    ))
 }
 
 /// The `VS BASELINE` deltas: selected run against the marked baseline.
@@ -629,6 +794,7 @@ mod tests {
             filter: String::new(),
             selected: 0,
             baseline: None,
+            command: crate::command_line::CommandLine::default(),
         };
         let amber = Style::default();
         let dim = Style::default();
@@ -669,5 +835,38 @@ mod tests {
     #[test]
     fn short_ids_take_the_last_six() {
         assert_eq!(short_id("01a1dfa6-5835-76f8-8fe0-3e9d43e78c36"), "e78c36");
+    }
+
+    #[test]
+    fn draw_shows_the_selected_baseline_filter_and_export_pane() {
+        let screen = CompareScreen {
+            rows: vec![row("a1b2c3", Some(0.01), Some(60_000))],
+            filter: String::new(),
+            selected: 0,
+            baseline: Some(0),
+            command: crate::command_line::CommandLine::default(),
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(130, 30)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, frame.area(), &screen, None))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        for needle in [
+            "SELECTED",
+            "VS BASELINE (ROW 1)",
+            "FILTER",
+            "EXPORT",
+            "comparison",
+            "COST VS WALL TIME",
+        ] {
+            assert!(text.contains(needle), "missing {needle}");
+        }
     }
 }

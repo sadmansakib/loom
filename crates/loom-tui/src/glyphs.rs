@@ -18,8 +18,11 @@ pub enum Glyph {
     Pending,
     Arrow,
     DownArrow,
+    Prompt,
     Branch,
+    BranchLast,
     Vertical,
+    Dotted,
     Horizontal,
     Warning,
     Needs,
@@ -34,11 +37,11 @@ pub struct GlyphPair {
     pub ascii: &'static str,
 }
 
-pub const TABLE: [GlyphPair; 17] = [
+pub const TABLE: [GlyphPair; 20] = [
     GlyphPair {
         glyph: Glyph::Brand,
         unicode: "◆",
-        ascii: "*",
+        ascii: "#",
     },
     GlyphPair {
         glyph: Glyph::Bullet,
@@ -68,7 +71,7 @@ pub const TABLE: [GlyphPair; 17] = [
     GlyphPair {
         glyph: Glyph::Spinner,
         unicode: "⠇",
-        ascii: "o",
+        ascii: "-",
     },
     GlyphPair {
         glyph: Glyph::Pending,
@@ -86,14 +89,29 @@ pub const TABLE: [GlyphPair; 17] = [
         ascii: "v",
     },
     GlyphPair {
+        glyph: Glyph::Prompt,
+        unicode: "❯",
+        ascii: ">",
+    },
+    GlyphPair {
         glyph: Glyph::Branch,
-        unicode: "├",
-        ascii: "+",
+        unicode: "├─",
+        ascii: "|-",
+    },
+    GlyphPair {
+        glyph: Glyph::BranchLast,
+        unicode: "└─",
+        ascii: "\\-",
     },
     GlyphPair {
         glyph: Glyph::Vertical,
         unicode: "│",
         ascii: "|",
+    },
+    GlyphPair {
+        glyph: Glyph::Dotted,
+        unicode: "┊",
+        ascii: ":",
     },
     GlyphPair {
         glyph: Glyph::Horizontal,
@@ -105,6 +123,8 @@ pub const TABLE: [GlyphPair; 17] = [
         unicode: "⚠",
         ascii: "!",
     },
+    // "?" is the documented ASCII stand-in for "needs you"; it is unused by
+    // any other glyph in the table.
     GlyphPair {
         glyph: Glyph::Needs,
         unicode: "◇",
@@ -143,12 +163,19 @@ mod tests {
 
     #[test]
     fn every_glyph_has_both_representations() {
-        assert_eq!(TABLE.len(), 17);
+        assert_eq!(TABLE.len(), 20);
         for pair in TABLE {
             assert_ne!(pair.unicode, "");
             assert_ne!(pair.ascii, "");
             assert_eq!(glyph(pair.glyph, GlyphSet::Unicode), pair.unicode);
             assert_eq!(glyph(pair.glyph, GlyphSet::Ascii), pair.ascii);
         }
+    }
+
+    #[test]
+    fn ascii_prompts_and_brand_match_the_design_table() {
+        assert_eq!(glyph(Glyph::Brand, GlyphSet::Ascii), "#");
+        assert_eq!(glyph(Glyph::Prompt, GlyphSet::Ascii), ">");
+        assert_eq!(glyph(Glyph::Spinner, GlyphSet::Ascii), "-");
     }
 }

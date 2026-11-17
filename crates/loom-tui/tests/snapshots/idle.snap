@@ -1,0 +1,388 @@
+=== 140x40 unicode closed ===
+[Reset/Rgb(22, 18, 16)/NONE]  [Rgb(227, 168, 87)/Rgb(22, 18, 16)/BOLD]◆ loom[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   ~/work/loom · session 0194a7e2[Reset/Rgb(22, 18, 16)/NONE]                                                [Rgb(154, 146, 133)/Rgb(22, 18, 16)/BOLD]idle[Reset/Rgb(22, 18, 16)/NONE]   [Rgb(141, 180, 232)/Rgb(22, 18, 16)/NONE]deepseek-flash[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   effort [Rgb(233, 227, 215)/Rgb(22, 18, 16)/BOLD]high[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   thinking [Rgb(233, 227, 215)/Rgb(22, 18, 16)/BOLD]on
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]SESSION
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]new[Reset/Rgb(18, 16, 14)/NONE]                    [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]no turns yet
+[Reset/Rgb(18, 16, 14)/NONE]                                                [Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]◆ loom[Reset/Rgb(18, 16, 14)/NONE]                                                [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]model[Reset/Rgb(18, 16, 14)/NONE]                [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]deepseek-flash
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]effort / thinking[Reset/Rgb(18, 16, 14)/NONE]         [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]high · on
+[Reset/Rgb(18, 16, 14)/NONE]                                [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Describe a task. It runs as one thread.[Reset/Rgb(18, 16, 14)/NONE]                               [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]DEFAULT BUDGET
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]turns[Reset/Rgb(18, 16, 14)/NONE]                            [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]50
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]RECENT[Reset/Rgb(18, 16, 14)/NONE]                                                                                              [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]tool calls[Reset/Rgb(18, 16, 14)/NONE]                      [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]200
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]❯ [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]Read every module that touches the event sink and report the call chain[Reset/Rgb(18, 16, 14)/NONE]                [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]✓ 5 turns[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]wall[Reset/Rgb(18, 16, 14)/NONE]                          [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]10:00
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]❯ [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]Add a regression test for the retry loop[Reset/Rgb(18, 16, 14)/NONE]                                               [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]⊘ 4 turns[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]TOOLS
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]read[Reset/Rgb(18, 16, 14)/NONE]                        [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]allowed
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]TRY[Reset/Rgb(18, 16, 14)/NONE]                                                                                                 [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]write[Reset/Rgb(18, 16, 14)/NONE]                           [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]ask
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Explain this crate · Find where X is defined · Add a test for Y[Reset/Rgb(18, 16, 14)/NONE]                                     [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]shell[Reset/Rgb(18, 16, 14)/NONE]                           [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]ask
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]❯ [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Describe a task…[Reset/Rgb(18, 16, 14)/NONE]                                                                                                                    [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][Enter][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] send[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] commands[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/help][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] help[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/new][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] new session[Reset/Rgb(18, 16, 14)/NONE]                                                     [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]events 0 · dropped 0
+
+=== 140x40 unicode open ===
+[Reset/Rgb(22, 18, 16)/NONE]  [Rgb(227, 168, 87)/Rgb(22, 18, 16)/BOLD]◆ loom[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   ~/work/loom · session 0194a7e2[Reset/Rgb(22, 18, 16)/NONE]                                                [Rgb(154, 146, 133)/Rgb(22, 18, 16)/BOLD]idle[Reset/Rgb(22, 18, 16)/NONE]   [Rgb(141, 180, 232)/Rgb(22, 18, 16)/NONE]deepseek-flash[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   effort [Rgb(233, 227, 215)/Rgb(22, 18, 16)/BOLD]high[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   thinking [Rgb(233, 227, 215)/Rgb(22, 18, 16)/BOLD]on
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]SESSION
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]new[Reset/Rgb(18, 16, 14)/NONE]                    [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]no turns yet
+[Reset/Rgb(18, 16, 14)/NONE]                                                [Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]◆ loom[Reset/Rgb(18, 16, 14)/NONE]                                                [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]model[Reset/Rgb(18, 16, 14)/NONE]                [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]deepseek-flash
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]effort / thinking[Reset/Rgb(18, 16, 14)/NONE]         [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]high · on
+[Reset/Rgb(18, 16, 14)/NONE]                                [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Describe a task. It runs as one thread.[Reset/Rgb(18, 16, 14)/NONE]                               [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]DEFAULT BUDGET
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]turns[Reset/Rgb(18, 16, 14)/NONE]                            [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]50
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]RECENT[Reset/Rgb(18, 16, 14)/NONE]                                                                                              [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]tool calls[Reset/Rgb(18, 16, 14)/NONE]                      [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]200
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]❯ [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]Read every module that touches the event sink and report the call chain[Reset/Rgb(18, 16, 14)/NONE]                [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]✓ 5 turns[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]wall[Reset/Rgb(18, 16, 14)/NONE]                          [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]10:00
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]❯ [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]Add a regression test for the retry loop[Reset/Rgb(18, 16, 14)/NONE]                                               [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]⊘ 4 turns[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]TOOLS
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]read[Reset/Rgb(18, 16, 14)/NONE]                        [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]allowed
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]TRY[Reset/Rgb(18, 16, 14)/NONE]                                                                                                 [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]write[Reset/Rgb(18, 16, 14)/NONE]                           [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]ask
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Explain this crate · Find where X is defined · Add a test for Y[Reset/Rgb(18, 16, 14)/NONE]                                     [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]shell[Reset/Rgb(18, 16, 14)/NONE]                           [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]ask
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]┌ commands ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]❯ /model[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   pick a model and capabilities[Reset/Rgb(18, 16, 14)/NONE]                                                                                                  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /effort[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   set reasoning effort[Reset/Rgb(18, 16, 14)/NONE]                                                                                                          [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /context[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   inspect what the next request will contain[Reset/Rgb(18, 16, 14)/NONE]                                                                                   [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /tools[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   built-in tools and MCP servers[Reset/Rgb(18, 16, 14)/NONE]                                                                                                 [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /account[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   providers, keys, and the active account[Reset/Rgb(18, 16, 14)/NONE]                                                                                      [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /compare[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   recent runs side by side[Reset/Rgb(18, 16, 14)/NONE]                                                                                                     [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /sessions[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   browse, resume, export, or delete past sessions[Reset/Rgb(18, 16, 14)/NONE]                                                                             [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /new[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   start a fresh session[Reset/Rgb(18, 16, 14)/NONE]                                                                                                            [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /compact[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   compact the context[Reset/Rgb(18, 16, 14)/NONE]                                                                                                          [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] ↑↓ move · Enter run · Esc close[Reset/Rgb(18, 16, 14)/NONE]                                                                                                          [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]❯ [Rgb(233, 227, 215)/Rgb(18, 16, 14)/BOLD]/[Reset/Rgb(18, 16, 14)/NONE]                                                                                                                                   [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][Enter][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] send[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] commands[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/help][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] help[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/new][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] new session[Reset/Rgb(18, 16, 14)/NONE]                                                     [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]events 0 · dropped 0
+
+=== 140x40 ascii closed ===
+[Reset/Rgb(22, 18, 16)/NONE]  [Rgb(227, 168, 87)/Rgb(22, 18, 16)/BOLD]# loom[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   ~/work/loom · session 0194a7e2[Reset/Rgb(22, 18, 16)/NONE]                                                [Rgb(154, 146, 133)/Rgb(22, 18, 16)/BOLD]idle[Reset/Rgb(22, 18, 16)/NONE]   [Rgb(141, 180, 232)/Rgb(22, 18, 16)/NONE]deepseek-flash[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   effort [Rgb(233, 227, 215)/Rgb(22, 18, 16)/BOLD]high[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   thinking [Rgb(233, 227, 215)/Rgb(22, 18, 16)/BOLD]on
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]SESSION
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]new[Reset/Rgb(18, 16, 14)/NONE]                    [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]no turns yet
+[Reset/Rgb(18, 16, 14)/NONE]                                                [Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]# loom[Reset/Rgb(18, 16, 14)/NONE]                                                [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]model[Reset/Rgb(18, 16, 14)/NONE]                [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]deepseek-flash
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]effort / thinking[Reset/Rgb(18, 16, 14)/NONE]         [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]high · on
+[Reset/Rgb(18, 16, 14)/NONE]                                [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Describe a task. It runs as one thread.[Reset/Rgb(18, 16, 14)/NONE]                               [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]DEFAULT BUDGET
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]turns[Reset/Rgb(18, 16, 14)/NONE]                            [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]50
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]RECENT[Reset/Rgb(18, 16, 14)/NONE]                                                                                              [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]tool calls[Reset/Rgb(18, 16, 14)/NONE]                      [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]200
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]> [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]Read every module that touches the event sink and report the call chain[Reset/Rgb(18, 16, 14)/NONE]                [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]+ 5 turns[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]wall[Reset/Rgb(18, 16, 14)/NONE]                          [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]10:00
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]> [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]Add a regression test for the retry loop[Reset/Rgb(18, 16, 14)/NONE]                                               [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]/ 4 turns[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]TOOLS
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]read[Reset/Rgb(18, 16, 14)/NONE]                        [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]allowed
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]TRY[Reset/Rgb(18, 16, 14)/NONE]                                                                                                 [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]write[Reset/Rgb(18, 16, 14)/NONE]                           [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]ask
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Explain this crate · Find where X is defined · Add a test for Y[Reset/Rgb(18, 16, 14)/NONE]                                     [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]shell[Reset/Rgb(18, 16, 14)/NONE]                           [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]ask
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]> [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Describe a task…[Reset/Rgb(18, 16, 14)/NONE]                                                                                                                    [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][Enter][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] send[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] commands[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/help][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] help[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/new][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] new session[Reset/Rgb(18, 16, 14)/NONE]                                                     [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]events 0 · dropped 0
+
+=== 140x40 ascii open ===
+[Reset/Rgb(22, 18, 16)/NONE]  [Rgb(227, 168, 87)/Rgb(22, 18, 16)/BOLD]# loom[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   ~/work/loom · session 0194a7e2[Reset/Rgb(22, 18, 16)/NONE]                                                [Rgb(154, 146, 133)/Rgb(22, 18, 16)/BOLD]idle[Reset/Rgb(22, 18, 16)/NONE]   [Rgb(141, 180, 232)/Rgb(22, 18, 16)/NONE]deepseek-flash[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   effort [Rgb(233, 227, 215)/Rgb(22, 18, 16)/BOLD]high[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   thinking [Rgb(233, 227, 215)/Rgb(22, 18, 16)/BOLD]on
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]SESSION
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]new[Reset/Rgb(18, 16, 14)/NONE]                    [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]no turns yet
+[Reset/Rgb(18, 16, 14)/NONE]                                                [Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]# loom[Reset/Rgb(18, 16, 14)/NONE]                                                [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]model[Reset/Rgb(18, 16, 14)/NONE]                [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]deepseek-flash
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]effort / thinking[Reset/Rgb(18, 16, 14)/NONE]         [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]high · on
+[Reset/Rgb(18, 16, 14)/NONE]                                [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Describe a task. It runs as one thread.[Reset/Rgb(18, 16, 14)/NONE]                               [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]DEFAULT BUDGET
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]turns[Reset/Rgb(18, 16, 14)/NONE]                            [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]50
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]RECENT[Reset/Rgb(18, 16, 14)/NONE]                                                                                              [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]tool calls[Reset/Rgb(18, 16, 14)/NONE]                      [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]200
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]> [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]Read every module that touches the event sink and report the call chain[Reset/Rgb(18, 16, 14)/NONE]                [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]+ 5 turns[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]wall[Reset/Rgb(18, 16, 14)/NONE]                          [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]10:00
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]> [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]Add a regression test for the retry loop[Reset/Rgb(18, 16, 14)/NONE]                                               [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]/ 4 turns[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]TOOLS
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]read[Reset/Rgb(18, 16, 14)/NONE]                        [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]allowed
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]TRY[Reset/Rgb(18, 16, 14)/NONE]                                                                                                 [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]write[Reset/Rgb(18, 16, 14)/NONE]                           [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]ask
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Explain this crate · Find where X is defined · Add a test for Y[Reset/Rgb(18, 16, 14)/NONE]                                     [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]shell[Reset/Rgb(18, 16, 14)/NONE]                           [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]ask
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]                                                                                                      [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]┌ commands ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]> /model[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   pick a model and capabilities[Reset/Rgb(18, 16, 14)/NONE]                                                                                                  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /effort[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   set reasoning effort[Reset/Rgb(18, 16, 14)/NONE]                                                                                                          [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /context[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   inspect what the next request will contain[Reset/Rgb(18, 16, 14)/NONE]                                                                                   [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /tools[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   built-in tools and MCP servers[Reset/Rgb(18, 16, 14)/NONE]                                                                                                 [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /account[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   providers, keys, and the active account[Reset/Rgb(18, 16, 14)/NONE]                                                                                      [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /compare[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   recent runs side by side[Reset/Rgb(18, 16, 14)/NONE]                                                                                                     [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /sessions[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   browse, resume, export, or delete past sessions[Reset/Rgb(18, 16, 14)/NONE]                                                                             [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /new[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   start a fresh session[Reset/Rgb(18, 16, 14)/NONE]                                                                                                            [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /compact[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   compact the context[Reset/Rgb(18, 16, 14)/NONE]                                                                                                          [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] ↑↓ move · Enter run · Esc close[Reset/Rgb(18, 16, 14)/NONE]                                                                                                          [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]> [Rgb(233, 227, 215)/Rgb(18, 16, 14)/BOLD]/[Reset/Rgb(18, 16, 14)/NONE]                                                                                                                                   [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][Enter][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] send[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] commands[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/help][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] help[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/new][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] new session[Reset/Rgb(18, 16, 14)/NONE]                                                     [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]events 0 · dropped 0
+
+=== 100x30 unicode closed ===
+[Reset/Rgb(22, 18, 16)/NONE]  [Rgb(227, 168, 87)/Rgb(22, 18, 16)/BOLD]◆ loom[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   ~/work/loom · session 0194a7e2[Reset/Rgb(22, 18, 16)/NONE]        [Rgb(154, 146, 133)/Rgb(22, 18, 16)/BOLD]idle[Reset/Rgb(22, 18, 16)/NONE]   [Rgb(141, 180, 232)/Rgb(22, 18, 16)/NONE]deepseek-flash[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   effort [Rgb(233, 227, 215)/Rgb(22, 18, 16)/BOLD]high[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   thinking [Rgb(233, 227, 215)/Rgb(22, 18, 16)/BOLD]on
+
+
+[Reset/Rgb(18, 16, 14)/NONE]                                               [Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]◆ loom
+
+[Reset/Rgb(18, 16, 14)/NONE]                               [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Describe a task. It runs as one thread.
+
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]RECENT
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]❯ [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]Read every module that touches the event sink and report the call chain[Reset/Rgb(18, 16, 14)/NONE]              [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]✓ 5 turns
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]❯ [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]Add a regression test for the retry loop[Reset/Rgb(18, 16, 14)/NONE]                                             [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]⊘ 4 turns
+
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]TRY
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Explain this crate · Find where X is defined · Add a test for Y
+
+
+
+
+
+
+
+
+
+
+
+
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]❯ [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Describe a task…[Reset/Rgb(18, 16, 14)/NONE]                                                                            [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]└──────────────────────────────────────────────────────────────────────────────────────────────┘
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][Enter][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] send[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] commands[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/help][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] help[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/new][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] new session[Reset/Rgb(18, 16, 14)/NONE]             [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]events 0 · dropped 0
+
+=== 100x30 unicode open ===
+[Reset/Rgb(22, 18, 16)/NONE]  [Rgb(227, 168, 87)/Rgb(22, 18, 16)/BOLD]◆ loom[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   ~/work/loom · session 0194a7e2[Reset/Rgb(22, 18, 16)/NONE]        [Rgb(154, 146, 133)/Rgb(22, 18, 16)/BOLD]idle[Reset/Rgb(22, 18, 16)/NONE]   [Rgb(141, 180, 232)/Rgb(22, 18, 16)/NONE]deepseek-flash[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   effort [Rgb(233, 227, 215)/Rgb(22, 18, 16)/BOLD]high[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   thinking [Rgb(233, 227, 215)/Rgb(22, 18, 16)/BOLD]on
+
+
+[Reset/Rgb(18, 16, 14)/NONE]                                               [Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]◆ loom
+
+[Reset/Rgb(18, 16, 14)/NONE]                               [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Describe a task. It runs as one thread.
+
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]RECENT
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]❯ [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]Read every module that touches the event sink and report the call chain[Reset/Rgb(18, 16, 14)/NONE]              [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]✓ 5 turns
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]❯ [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]Add a regression test for the retry loop[Reset/Rgb(18, 16, 14)/NONE]                                             [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]⊘ 4 turns
+
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]TRY
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Explain this crate · Find where X is defined · Add a test for Y
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]┌ commands ────────────────────────────────────────────────────────────────────────────────────────┐
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]❯ /model[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   pick a model and capabilities[Reset/Rgb(18, 16, 14)/NONE]                                                          [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /effort[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   set reasoning effort[Reset/Rgb(18, 16, 14)/NONE]                                                                  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /context[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   inspect what the next request will contain[Reset/Rgb(18, 16, 14)/NONE]                                           [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /tools[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   built-in tools and MCP servers[Reset/Rgb(18, 16, 14)/NONE]                                                         [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /account[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   providers, keys, and the active account[Reset/Rgb(18, 16, 14)/NONE]                                              [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /compare[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   recent runs side by side[Reset/Rgb(18, 16, 14)/NONE]                                                             [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /sessions[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   browse, resume, export, or delete past sessions[Reset/Rgb(18, 16, 14)/NONE]                                     [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /new[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   start a fresh session[Reset/Rgb(18, 16, 14)/NONE]                                                                    [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /compact[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   compact the context[Reset/Rgb(18, 16, 14)/NONE]                                                                  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] ↑↓ move · Enter run · Esc close[Reset/Rgb(18, 16, 14)/NONE]                                                                  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]❯ [Rgb(233, 227, 215)/Rgb(18, 16, 14)/BOLD]/[Reset/Rgb(18, 16, 14)/NONE]                                                                                           [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]└──────────────────────────────────────────────────────────────────────────────────────────────┘
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][Enter][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] send[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] commands[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/help][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] help[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/new][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] new session[Reset/Rgb(18, 16, 14)/NONE]             [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]events 0 · dropped 0
+
+=== 100x30 ascii closed ===
+[Reset/Rgb(22, 18, 16)/NONE]  [Rgb(227, 168, 87)/Rgb(22, 18, 16)/BOLD]# loom[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   ~/work/loom · session 0194a7e2[Reset/Rgb(22, 18, 16)/NONE]        [Rgb(154, 146, 133)/Rgb(22, 18, 16)/BOLD]idle[Reset/Rgb(22, 18, 16)/NONE]   [Rgb(141, 180, 232)/Rgb(22, 18, 16)/NONE]deepseek-flash[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   effort [Rgb(233, 227, 215)/Rgb(22, 18, 16)/BOLD]high[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   thinking [Rgb(233, 227, 215)/Rgb(22, 18, 16)/BOLD]on
+
+
+[Reset/Rgb(18, 16, 14)/NONE]                                               [Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]# loom
+
+[Reset/Rgb(18, 16, 14)/NONE]                               [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Describe a task. It runs as one thread.
+
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]RECENT
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]> [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]Read every module that touches the event sink and report the call chain[Reset/Rgb(18, 16, 14)/NONE]              [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]+ 5 turns
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]> [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]Add a regression test for the retry loop[Reset/Rgb(18, 16, 14)/NONE]                                             [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]/ 4 turns
+
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]TRY
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Explain this crate · Find where X is defined · Add a test for Y
+
+
+
+
+
+
+
+
+
+
+
+
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]> [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Describe a task…[Reset/Rgb(18, 16, 14)/NONE]                                                                            [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]└──────────────────────────────────────────────────────────────────────────────────────────────┘
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][Enter][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] send[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] commands[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/help][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] help[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/new][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] new session[Reset/Rgb(18, 16, 14)/NONE]             [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]events 0 · dropped 0
+
+=== 100x30 ascii open ===
+[Reset/Rgb(22, 18, 16)/NONE]  [Rgb(227, 168, 87)/Rgb(22, 18, 16)/BOLD]# loom[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   ~/work/loom · session 0194a7e2[Reset/Rgb(22, 18, 16)/NONE]        [Rgb(154, 146, 133)/Rgb(22, 18, 16)/BOLD]idle[Reset/Rgb(22, 18, 16)/NONE]   [Rgb(141, 180, 232)/Rgb(22, 18, 16)/NONE]deepseek-flash[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   effort [Rgb(233, 227, 215)/Rgb(22, 18, 16)/BOLD]high[Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]   thinking [Rgb(233, 227, 215)/Rgb(22, 18, 16)/BOLD]on
+
+
+[Reset/Rgb(18, 16, 14)/NONE]                                               [Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]# loom
+
+[Reset/Rgb(18, 16, 14)/NONE]                               [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Describe a task. It runs as one thread.
+
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]RECENT
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]> [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]Read every module that touches the event sink and report the call chain[Reset/Rgb(18, 16, 14)/NONE]              [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]+ 5 turns
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]> [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]Add a regression test for the retry loop[Reset/Rgb(18, 16, 14)/NONE]                                             [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]/ 4 turns
+
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]TRY
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Explain this crate · Find where X is defined · Add a test for Y
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]┌ commands ────────────────────────────────────────────────────────────────────────────────────────┐
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]> /model[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   pick a model and capabilities[Reset/Rgb(18, 16, 14)/NONE]                                                          [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /effort[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   set reasoning effort[Reset/Rgb(18, 16, 14)/NONE]                                                                  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /context[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   inspect what the next request will contain[Reset/Rgb(18, 16, 14)/NONE]                                           [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /tools[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   built-in tools and MCP servers[Reset/Rgb(18, 16, 14)/NONE]                                                         [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /account[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   providers, keys, and the active account[Reset/Rgb(18, 16, 14)/NONE]                                              [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /compare[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   recent runs side by side[Reset/Rgb(18, 16, 14)/NONE]                                                             [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /sessions[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   browse, resume, export, or delete past sessions[Reset/Rgb(18, 16, 14)/NONE]                                     [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /new[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   start a fresh session[Reset/Rgb(18, 16, 14)/NONE]                                                                    [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /compact[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   compact the context[Reset/Rgb(18, 16, 14)/NONE]                                                                  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] ↑↓ move · Enter run · Esc close[Reset/Rgb(18, 16, 14)/NONE]                                                                  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]> [Rgb(233, 227, 215)/Rgb(18, 16, 14)/BOLD]/[Reset/Rgb(18, 16, 14)/NONE]                                                                                           [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]└──────────────────────────────────────────────────────────────────────────────────────────────┘
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][Enter][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] send[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] commands[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/help][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] help[Reset/Rgb(18, 16, 14)/NONE]   [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/new][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] new session[Reset/Rgb(18, 16, 14)/NONE]             [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]events 0 · dropped 0
+
+=== 70x24 unicode closed ===
+[Reset/Rgb(22, 18, 16)/NONE]  [Rgb(227, 168, 87)/Rgb(22, 18, 16)/BOLD]◆ loom[Reset/Rgb(22, 18, 16)/NONE]   [Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]                                   idle · turn 0 · cost —
+
+
+[Reset/Rgb(18, 16, 14)/NONE]                                [Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]◆ loom
+
+[Reset/Rgb(18, 16, 14)/NONE]                [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Describe a task. It runs as one thread.
+
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]RECENT
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]❯ [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]Read every module that touches the event sink and re…[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]✓ 5 turns
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]❯ [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]Add a regression test for the retry loop[Reset/Rgb(18, 16, 14)/NONE]               [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]⊘ 4 turns
+
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]TRY
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Explain this crate · Find where X is defined · Add a test for Y
+
+
+
+
+
+
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]┌────────────────────────────────────────────────────────────────┐
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]❯ [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Describe a task…[Reset/Rgb(18, 16, 14)/NONE]                                              [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]└────────────────────────────────────────────────────────────────┘
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/help][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] help[Reset/Rgb(18, 16, 14)/NONE]                                  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]events 0 · dropped 0
+
+=== 70x24 unicode open ===
+[Reset/Rgb(22, 18, 16)/NONE]  [Rgb(227, 168, 87)/Rgb(22, 18, 16)/BOLD]◆ loom[Reset/Rgb(22, 18, 16)/NONE]   [Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]                                   idle · turn 0 · cost —
+
+
+[Reset/Rgb(18, 16, 14)/NONE]                                [Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]◆ loom
+
+[Reset/Rgb(18, 16, 14)/NONE]                [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Describe a task. It runs as one thread.
+
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]┌ commands ──────────────────────────────────────────────────────────┐
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]❯ /model[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   pick a model and capabilities[Reset/Rgb(18, 16, 14)/NONE]                            [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /effort[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   set reasoning effort[Reset/Rgb(18, 16, 14)/NONE]                                    [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /context[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   inspect what the next request will contain[Reset/Rgb(18, 16, 14)/NONE]             [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /tools[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   built-in tools and MCP servers[Reset/Rgb(18, 16, 14)/NONE]                           [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /account[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   providers, keys, and the active account[Reset/Rgb(18, 16, 14)/NONE]                [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /compare[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   recent runs side by side[Reset/Rgb(18, 16, 14)/NONE]                               [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /sessions[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   browse, resume, export, or delete past sessions[Reset/Rgb(18, 16, 14)/NONE]       [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /new[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   start a fresh session[Reset/Rgb(18, 16, 14)/NONE]                                      [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /compact[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   compact the context[Reset/Rgb(18, 16, 14)/NONE]                                    [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] ↑↓ move · Enter run · Esc close[Reset/Rgb(18, 16, 14)/NONE]                                    [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]└────────────────────────────────────────────────────────────────────┘
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]┌────────────────────────────────────────────────────────────────┐
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]❯ [Rgb(233, 227, 215)/Rgb(18, 16, 14)/BOLD]/[Reset/Rgb(18, 16, 14)/NONE]                                                             [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]└────────────────────────────────────────────────────────────────┘
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/help][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] help[Reset/Rgb(18, 16, 14)/NONE]                                  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]events 0 · dropped 0
+
+=== 70x24 ascii closed ===
+[Reset/Rgb(22, 18, 16)/NONE]  [Rgb(227, 168, 87)/Rgb(22, 18, 16)/BOLD]# loom[Reset/Rgb(22, 18, 16)/NONE]   [Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]                                   idle · turn 0 · cost —
+
+
+[Reset/Rgb(18, 16, 14)/NONE]                                [Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]# loom
+
+[Reset/Rgb(18, 16, 14)/NONE]                [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Describe a task. It runs as one thread.
+
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]RECENT
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]> [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]Read every module that touches the event sink and re…[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]+ 5 turns
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]> [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]Add a regression test for the retry loop[Reset/Rgb(18, 16, 14)/NONE]               [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]/ 4 turns
+
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]TRY
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Explain this crate · Find where X is defined · Add a test for Y
+
+
+
+
+
+
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]┌────────────────────────────────────────────────────────────────┐
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]> [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Describe a task…[Reset/Rgb(18, 16, 14)/NONE]                                              [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]└────────────────────────────────────────────────────────────────┘
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/help][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] help[Reset/Rgb(18, 16, 14)/NONE]                                  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]events 0 · dropped 0
+
+=== 70x24 ascii open ===
+[Reset/Rgb(22, 18, 16)/NONE]  [Rgb(227, 168, 87)/Rgb(22, 18, 16)/BOLD]# loom[Reset/Rgb(22, 18, 16)/NONE]   [Rgb(154, 146, 133)/Rgb(22, 18, 16)/NONE]                                   idle · turn 0 · cost —
+
+
+[Reset/Rgb(18, 16, 14)/NONE]                                [Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]# loom
+
+[Reset/Rgb(18, 16, 14)/NONE]                [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Describe a task. It runs as one thread.
+
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]┌ commands ──────────────────────────────────────────────────────────┐
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]> /model[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   pick a model and capabilities[Reset/Rgb(18, 16, 14)/NONE]                            [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /effort[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   set reasoning effort[Reset/Rgb(18, 16, 14)/NONE]                                    [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /context[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   inspect what the next request will contain[Reset/Rgb(18, 16, 14)/NONE]             [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /tools[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   built-in tools and MCP servers[Reset/Rgb(18, 16, 14)/NONE]                           [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /account[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   providers, keys, and the active account[Reset/Rgb(18, 16, 14)/NONE]                [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /compare[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   recent runs side by side[Reset/Rgb(18, 16, 14)/NONE]                               [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /sessions[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   browse, resume, export, or delete past sessions[Reset/Rgb(18, 16, 14)/NONE]       [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /new[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   start a fresh session[Reset/Rgb(18, 16, 14)/NONE]                                      [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]  /compact[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]   compact the context[Reset/Rgb(18, 16, 14)/NONE]                                    [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] ↑↓ move · Enter run · Esc close[Reset/Rgb(18, 16, 14)/NONE]                                    [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]└────────────────────────────────────────────────────────────────────┘
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]┌────────────────────────────────────────────────────────────────┐
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]> [Rgb(233, 227, 215)/Rgb(18, 16, 14)/BOLD]/[Reset/Rgb(18, 16, 14)/NONE]                                                             [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]│
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]└────────────────────────────────────────────────────────────────┘
+[Reset/Rgb(18, 16, 14)/NONE]  [Rgb(233, 227, 215)/Rgb(26, 22, 18)/BOLD][/help][Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE] help[Reset/Rgb(18, 16, 14)/NONE]                                  [Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]events 0 · dropped 0
+

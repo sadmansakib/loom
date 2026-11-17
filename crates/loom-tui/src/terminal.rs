@@ -57,6 +57,8 @@ pub(crate) struct LiveFrame<'a> {
     /// highlighted row.
     pub(crate) context_items: &'a [crate::context_screen::ContextItem],
     pub(crate) context_selected: usize,
+    /// The `/command` being typed inside the context modal, if any.
+    pub(crate) context_command: Option<ratatui::text::Line<'static>>,
     pub(crate) config: &'a EngineConfig,
     pub(crate) session_id: Option<&'a str>,
     pub(crate) capabilities: Option<ModelCapabilities>,
@@ -90,6 +92,7 @@ pub(crate) fn draw_live(frame: &mut ratatui::Frame<'_>, view: &LiveFrame<'_>) {
         accounts,
         context_items,
         context_selected,
+        ref context_command,
         config,
         session_id,
         capabilities,
@@ -107,6 +110,7 @@ pub(crate) fn draw_live(frame: &mut ratatui::Frame<'_>, view: &LiveFrame<'_>) {
             reducer,
             context_items,
             context_selected,
+            context_command.clone(),
         );
     } else if let Some(screen) = tools {
         crate::tools_screen::draw(frame, frame.area(), screen);
@@ -148,6 +152,15 @@ pub(crate) fn draw_live(frame: &mut ratatui::Frame<'_>, view: &LiveFrame<'_>) {
                 ),
                 turn_limit: Some(config.max_turns),
                 scene: None,
+                // TODO(loom-cli): fill tool permissions and non-turn budget
+                // defaults from the resolved policy once EngineConfig exposes
+                // them. Until then the idle sidebar shows the TUI's effective
+                // defaults (reads allowed, writes/shell ask, unbounded caps).
+                idle: scene_views::IdleFacts::default(),
+                // The terminal's colour depth is a capability, resolved here
+                // rather than read from the environment inside `draw`.
+                depth: Some(crate::theme::Depth::detect()),
+                glyph_set: Some(scene_views::glyph_set()),
             },
         );
     }
@@ -172,6 +185,11 @@ pub(crate) fn terminal_session<T>(
     crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen)
         .context("enter alternate screen")?;
     guard.alternate_screen = true;
+    // The composer shows a block cursor, independent of the terminal's
+    // configured shape, and restores the user's shape on exit.
+    crossterm::execute!(io::stdout(), crossterm::cursor::SetCursorStyle::SteadyBlock)
+        .context("set block cursor")?;
+    guard.cursor_style = true;
     crossterm::execute!(io::stdout(), event::EnableMouseCapture).context("enable mouse capture")?;
     guard.mouse_capture = true;
     crossterm::execute!(io::stdout(), event::EnableBracketedPaste)
@@ -192,12 +210,21 @@ pub(crate) fn terminal_session<T>(
 pub(crate) struct TerminalGuard {
     raw_mode: bool,
     alternate_screen: bool,
+    cursor_style: bool,
     mouse_capture: bool,
     bracketed_paste: bool,
 }
 
 impl TerminalGuard {
     pub(crate) fn restore(&mut self, output: &mut impl io::Write) -> Result<()> {
+        // ratatui hides the cursor on every draw but never shows it again.
+        // Without this, Ghostty leaves you with an invisible prompt after exit.
+        crossterm::execute!(output, crossterm::cursor::Show).context("show cursor")?;
+        if self.cursor_style {
+            crossterm::execute!(output, crossterm::cursor::SetCursorStyle::DefaultUserShape)
+                .context("restore cursor shape")?;
+            self.cursor_style = false;
+        }
         if self.alternate_screen {
             crossterm::execute!(output, crossterm::terminal::LeaveAlternateScreen)
                 .context("restore terminal screen")?;
@@ -223,6 +250,12 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        if self.cursor_style {
+            let _ = crossterm::execute!(
+                io::stdout(),
+                crossterm::cursor::SetCursorStyle::DefaultUserShape
+            );
+        }
         if self.alternate_screen {
             let _ = crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen);
         }

@@ -1,7 +1,7 @@
 //! Event sinks: the best-effort delivery contract, the channel sink
 //! that numbers and forwards envelopes, and the fan-out combinator.
 
-use super::wire::{EVENT_SCHEMA_VERSION, EventEnvelope, EventKind};
+use super::wire::{EVENT_SCHEMA_VERSION, EventEnvelope, EventKind, now_millis};
 use crate::id::TaskId;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -9,8 +9,8 @@ use tokio::sync::mpsc;
 /// Best-effort sink for task events.
 ///
 /// Implementations assign [`EventEnvelope::sequence`] (unique, strictly
-/// increasing) and must never block or fail the task on delivery
-/// problems. The canonical iteration-1 implementation is
+/// increasing) and [`EventEnvelope::timestamp_millis`] (observation time),
+/// and must never block or fail the task on delivery problems. The canonical iteration-1 implementation is
 /// [`ChannelEventSink`]; the CLI's NDJSON writer lives on the consumer
 /// side of the channel. Several sinks compose into one with
 /// [`FanoutSink`] — the shape multi-consumer frontends (GUI, TUI) fan
@@ -106,6 +106,7 @@ impl EventSink for ChannelEventSink {
         let envelope = EventEnvelope {
             schema_version: EVENT_SCHEMA_VERSION,
             sequence,
+            timestamp_millis: Some(now_millis()),
             task_id,
             kind,
         };

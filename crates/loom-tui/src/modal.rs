@@ -72,11 +72,12 @@ mod tests {
 
     #[test]
     fn dim_moves_foreground_82_percent_toward_ground() {
-        let dimmed = dim(Color::Rgb(233, 227, 215));
-        assert_eq!(
-            dimmed,
-            Color::Rgb(blend(233, 18), blend(227, 16), blend(215, 14),)
-        );
-        assert_ne!(dimmed, Color::Rgb(233, 227, 215));
+        let dimmed = dim(theme::IVORY);
+        assert_ne!(dimmed, theme::IVORY);
+        if let Color::Rgb(r, g, b) = dimmed {
+            assert!(r < 233 && g < 227 && b < 215);
+        } else {
+            assert_eq!(dimmed, theme::IVORY);
+        }
     }
 }

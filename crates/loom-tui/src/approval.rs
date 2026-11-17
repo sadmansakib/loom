@@ -20,16 +20,23 @@ pub struct Request {
 }
 
 /// Builds the engine hook that forwards each write to the live loop.
+///
+/// `session_allow` is the operator's `a` answer: it lasts until this TUI
+/// exits and is never written to the trust store.
 pub fn hook(
     workspace: std::path::PathBuf,
     requests: mpsc::UnboundedSender<Request>,
+    session_allow: Arc<std::sync::atomic::AtomicBool>,
 ) -> WriteApproval {
     Arc::new(move |path, content| {
         let requests = requests.clone();
         let workspace = workspace.clone();
+        let session_allow = session_allow.clone();
         Box::pin(async move {
             // "Never ask again" was recorded in the trust store by an earlier answer.
-            if loom_core::tools::trust::writes_allowed(&workspace) {
+            if session_allow.load(std::sync::atomic::Ordering::Relaxed)
+                || loom_core::tools::trust::writes_allowed(&workspace)
+            {
                 return WriteDecision::Allow;
             }
             let (reply, answer) = oneshot::channel();
@@ -96,11 +103,25 @@ mod tests {
     async fn dropped_loop_declines_instead_of_hanging() {
         let (tx, rx) = mpsc::unbounded_channel();
         drop(rx);
-        let decision = hook(std::env::temp_dir().join("loom-approval-test-ws"), tx)(
-            "a.txt".to_string(),
-            "body".to_string(),
-        )
+        let decision = hook(
+            std::env::temp_dir().join("loom-approval-test-ws"),
+            tx,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )("a.txt".to_string(), "body".to_string())
         .await;
         assert_eq!(decision, WriteDecision::Decline);
+    }
+
+    #[tokio::test]
+    async fn session_grant_skips_the_prompt() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let allow = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let decision = hook(
+            std::env::temp_dir().join("loom-approval-test-ws"),
+            tx,
+            allow,
+        )("a.txt".to_string(), "body".to_string())
+        .await;
+        assert_eq!(decision, WriteDecision::Allow);
     }
 }

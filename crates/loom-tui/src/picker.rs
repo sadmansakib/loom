@@ -559,6 +559,9 @@ impl PickerState {
             return;
         }
         let choice = self.selected();
+        if config.provider != choice.provider {
+            config.account = None;
+        }
         config.provider.clone_from(&choice.provider);
         config.model.clone_from(&choice.model);
         if choice.efforts.contains(&self.effort) {

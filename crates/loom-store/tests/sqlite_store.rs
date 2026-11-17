@@ -360,6 +360,7 @@ fn a_newer_schema_version_is_refused() {
 fn envelope(sequence: u64, task: TaskId, kind: EventKind) -> EventEnvelope {
     EventEnvelope {
         schema_version: EVENT_SCHEMA_VERSION,
+        timestamp_millis: Some(1_700_000_000_000 + sequence),
         sequence,
         task_id: task,
         kind,
