@@ -9,7 +9,12 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use crate::{picker::ModelPricing, reducer::Reducer, theme};
+use crate::{
+    glyphs::{self, Glyph},
+    picker::ModelPricing,
+    reducer::{FailureKind, Reducer},
+    theme,
+};
 
 use super::{
     LiveViewOptions, Scene, TaskStatus, fg, format_compact_tokens, heading, muted, status_label,
@@ -237,15 +242,34 @@ pub(super) fn draw_runtime_sidebar(
     } else {
         theme::DIM
     };
+    let retrying = reducer.is_retrying();
     let (status_glyph, status_text) =
         if options.approval.is_some() || reducer.task.status == Some(TaskStatus::Paused) {
             (
                 crate::glyphs::glyph(crate::glyphs::Glyph::Needs, super::glyph_set()),
                 "Needs you",
             )
+        } else if retrying {
+            (
+                crate::glyphs::glyph(crate::glyphs::Glyph::Retry, super::glyph_set()),
+                "Retrying",
+            )
         } else {
             (super::status_glyph(reducer), status_label(reducer))
         };
+    let task_detail = if retrying {
+        let turn = reducer.turn.unwrap_or(0);
+        let limit = options
+            .turn_limit
+            .map_or_else(|| "?".to_owned(), |limit| limit.to_string());
+        format!("{task_id} · turn {turn} of {limit}")
+    } else {
+        format!(
+            "{task_id} · {} · {}",
+            options.task_mode.unwrap_or("mode unavailable"),
+            options.task_label.unwrap_or("no label"),
+        )
+    };
     let task_lines = vec![
         heading("TASK"),
         {
@@ -259,11 +283,7 @@ pub(super) fn draw_runtime_sidebar(
                 Span::styled(elapsed_label.clone(), fg(theme::DIM)),
             ])
         },
-        muted(&format!(
-            "{task_id} · {} · {}",
-            options.task_mode.unwrap_or("mode unavailable"),
-            options.task_label.unwrap_or("no label"),
-        )),
+        muted(&task_detail),
     ];
 
     let turns = reducer.turn.map(u64::from);
@@ -489,14 +509,36 @@ pub(super) fn draw_runtime_sidebar(
         ]);
     }
 
+    let show_retry = retrying || !reducer.retries.is_empty() || reducer.failure.is_some();
+    let retry_sections = if show_retry {
+        Some((
+            retry_attempt_lines(reducer, content.width),
+            retry_policy_lines(reducer, content.width),
+            kind_lines(true, content.width),
+            kind_lines(false, content.width),
+        ))
+    } else {
+        None
+    };
+
     // Reserve space for every sidebar section first. Compress informational
     // rows before sacrificing the event panel at shorter terminal heights.
-    let mut sections_data = vec![
-        ("TASK", task_lines),
-        ("BUDGET", budget_lines),
-        ("NEXT REQUEST · CONTEXT", context_lines),
-        ("COST", cost_lines),
-    ];
+    let mut sections_data = if let Some((attempts, policy, retried, never)) = retry_sections {
+        vec![
+            ("TASK", task_lines),
+            ("ATTEMPTS", attempts),
+            ("POLICY", policy),
+            ("RETRIED", retried),
+            ("NEVER RETRIED", never),
+        ]
+    } else {
+        vec![
+            ("TASK", task_lines),
+            ("BUDGET", budget_lines),
+            ("NEXT REQUEST · CONTEXT", context_lines),
+            ("COST", cost_lines),
+        ]
+    };
     if reducer.task.status.is_none() {
         sections_data.push((
             "SESSION",
@@ -544,13 +586,17 @@ pub(super) fn draw_runtime_sidebar(
     // Each bordered section consumes a bottom-rule row in addition to its
     // text. Account for that row so natural section heights do not overrun the
     // sidebar and push EVENTS below the viewport.
-    let mut minimums = vec![4_u16, 6, 5, 3, 3];
-    if options.approval.is_some() {
+    let mut minimums = if show_retry {
+        vec![4_u16, 5, 5, 3, 3, 3]
+    } else {
+        vec![4, 6, 5, 3, 3]
+    };
+    if !show_retry && options.approval.is_some() {
         minimums.insert(4, 3);
         minimums.insert(5, 3);
         minimums.insert(6, 3);
     }
-    if reducer.task.status.is_none() {
+    if !show_retry && reducer.task.status.is_none() {
         minimums.insert(4, 3);
         minimums.insert(5, 3);
     }
@@ -625,6 +671,220 @@ pub(super) fn draw_runtime_sidebar(
         Paragraph::new(event_lines).style(Style::default().bg(theme::BG)),
         event_area,
     );
+}
+
+fn retry_attempt_lines(reducer: &Reducer, width: u16) -> Vec<Line<'static>> {
+    let set = super::glyph_set();
+    let policy = reducer.retry_policy;
+    let mut lines = vec![heading(&format!("ATTEMPTS · MAX {}", policy.max_attempts))];
+    let final_attempt = reducer.failure.as_ref().map(|failure| failure.attempts);
+    let rows = final_attempt.unwrap_or(policy.max_attempts).max(1).max(
+        reducer
+            .retry_wait
+            .as_ref()
+            .map_or(1, |wait| wait.next_attempt),
+    );
+    for attempt in 1..=rows {
+        let record = reducer
+            .retries
+            .iter()
+            .find(|retry| retry.attempt == attempt);
+        let waiting = reducer
+            .retry_wait
+            .as_ref()
+            .filter(|wait| wait.next_attempt == attempt);
+        let final_failure = reducer
+            .failure
+            .as_ref()
+            .filter(|failure| failure.attempts == attempt && record.is_none());
+        let (glyph, color, label, right) = if let Some(record) = record {
+            (
+                Glyph::Cross,
+                theme::CORAL,
+                format!("{attempt} · {}", record.kind),
+                format!("{} wait", retry_seconds(record.delay_ms)),
+            )
+        } else if let Some(wait) = waiting {
+            (
+                Glyph::Spinner,
+                theme::AMBER,
+                format!("{attempt} · pending"),
+                retry_seconds(wait.remaining_millis()),
+            )
+        } else if reducer.task.status == Some(TaskStatus::Running)
+            && reducer.attempt == Some(attempt)
+        {
+            (
+                Glyph::Spinner,
+                theme::AMBER,
+                format!("{attempt} · streaming"),
+                String::new(),
+            )
+        } else if let Some(failure) = final_failure {
+            let kind = match failure.kind {
+                FailureKind::MaxTokens => "max_tokens",
+                FailureKind::QuotaExhausted => "quota_exhausted",
+                FailureKind::ContentFilter => "content_filter",
+                FailureKind::ContextLimit => "context_limit",
+                FailureKind::RetriesExhausted => failure.retry_kind.as_deref().unwrap_or("error"),
+                FailureKind::Other => "error",
+            };
+            (
+                Glyph::Cross,
+                theme::CORAL,
+                format!("{attempt} · {kind}"),
+                if failure.kind == FailureKind::RetriesExhausted {
+                    "gave up".to_owned()
+                } else {
+                    "not retried".to_owned()
+                },
+            )
+        } else {
+            (
+                Glyph::Pending,
+                theme::DIM,
+                attempt.to_string(),
+                if attempt == policy.max_attempts
+                    && reducer.task.status == Some(TaskStatus::Running)
+                {
+                    "last chance".to_owned()
+                } else {
+                    String::new()
+                },
+            )
+        };
+        lines.push(aligned_spans(
+            vec![
+                Span::styled(format!("{} ", glyphs::glyph(glyph, set)), fg(color)),
+                Span::styled(
+                    label,
+                    fg(color).add_modifier(if waiting.is_some() {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+                ),
+            ],
+            right,
+            width,
+        ));
+    }
+    lines
+}
+
+fn retry_policy_lines(reducer: &Reducer, width: u16) -> Vec<Line<'static>> {
+    let policy = reducer.retry_policy;
+    let backoff = format!(
+        "{} × {}, cap {}",
+        compact_seconds(policy.initial_backoff_ms),
+        policy.backoff_factor,
+        compact_seconds(policy.max_backoff_ms)
+    );
+    let jitter = format!("±{} %", policy.jitter_percent);
+    let idle = policy
+        .idle_timeout_ms
+        .map_or_else(|| "not exposed".to_owned(), compact_seconds);
+    vec![
+        heading("POLICY"),
+        aligned_spans(
+            vec![Span::styled("backoff", fg(theme::DIM))],
+            backoff,
+            width,
+        ),
+        aligned_spans(vec![Span::styled("jitter", fg(theme::DIM))], jitter, width),
+        aligned_spans(
+            vec![Span::styled("retry_after", fg(theme::DIM))],
+            "overrides delay".to_owned(),
+            width,
+        ),
+        aligned_spans(
+            vec![Span::styled("idle timeout", fg(theme::DIM))],
+            idle,
+            width,
+        ),
+    ]
+}
+
+fn kind_lines(retryable: bool, width: u16) -> Vec<Line<'static>> {
+    use loom_core::kernel::model::ModelErrorKind;
+    const KINDS: [ModelErrorKind; 10] = [
+        ModelErrorKind::Auth,
+        ModelErrorKind::InvalidRequest,
+        ModelErrorKind::ContextOverflow,
+        ModelErrorKind::RateLimited,
+        ModelErrorKind::Overloaded,
+        ModelErrorKind::QuotaExhausted,
+        ModelErrorKind::Transport,
+        ModelErrorKind::Server,
+        ModelErrorKind::Protocol,
+        ModelErrorKind::Cancelled,
+    ];
+    let names = KINDS
+        .iter()
+        .filter(|kind| kind.is_retryable() == retryable)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let color = if retryable { theme::SAGE } else { theme::CORAL };
+    let mut lines = vec![heading(if retryable {
+        "RETRIED"
+    } else {
+        "NEVER RETRIED"
+    })];
+    for row in wrap_tokens(&names, usize::from(width).max(8)) {
+        lines.push(Line::from(Span::styled(row, fg(color))));
+    }
+    lines
+}
+
+fn aligned_spans(mut left: Vec<Span<'static>>, right: String, width: u16) -> Line<'static> {
+    let left_width = left
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum::<usize>();
+    let right_width = right.chars().count();
+    let gap = usize::from(width)
+        .saturating_sub(left_width + right_width)
+        .max(1);
+    left.push(Span::raw(" ".repeat(gap)));
+    if !right.is_empty() {
+        left.push(Span::styled(right, fg(theme::DIM)));
+    }
+    Line::from(left)
+}
+
+fn wrap_tokens(names: &[String], width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for (index, name) in names.iter().enumerate() {
+        let separator = if index == 0 { "" } else { " · " };
+        if !current.is_empty() && current.chars().count() + separator.len() + name.len() > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push_str(separator);
+        }
+        current.push_str(name);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn compact_seconds(millis: u64) -> String {
+    if millis.is_multiple_of(1_000) {
+        format!("{} s", millis / 1_000)
+    } else {
+        format!("{}.{} s", millis / 1_000, millis % 1_000 / 100)
+    }
+}
+
+fn retry_seconds(millis: u64) -> String {
+    if millis >= 10_000 {
+        format!("{} s", (millis + 500) / 1_000)
+    } else {
+        format!("{}.{} s", millis / 1_000, millis % 1_000 / 100)
+    }
 }
 
 pub(super) fn render_sidebar_section(

@@ -1,0 +1,5 @@
+{"schema_version":21,"sequence":0,"timestamp_millis":1760000000000,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"task_started"}}
+{"schema_version":21,"sequence":1,"timestamp_millis":1760000000010,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"turn_started","turn":1}}
+{"schema_version":21,"sequence":2,"timestamp_millis":1760000000020,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"model_request_started","attempt":1}}
+{"schema_version":21,"sequence":3,"timestamp_millis":1760000001000,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"model_retry","attempt":1,"kind":"transport","delay_ms":5000,"response_started":false}}
+{"schema_version":21,"sequence":4,"timestamp_millis":1760000002000,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"task_cancelled"}}

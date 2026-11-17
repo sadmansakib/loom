@@ -10,6 +10,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
+mod failure_cards;
 pub(crate) mod sidebar;
 mod thread;
 mod thread_live;
@@ -264,7 +265,25 @@ pub fn draw_live_scrolled(
         width: area.width.saturating_sub(4),
         ..area
     };
-    let thread_area = gutter(body[0]);
+    let panel_height = if reducer.is_retrying() && body[0].height >= 9 {
+        4
+    } else {
+        0
+    };
+    let failure_height = if reducer.failure.is_some() && body[0].height >= 14 {
+        if body[0].width >= 120 { 7 } else { 9 }
+    } else {
+        0
+    };
+    let main = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(5),
+            Constraint::Length(panel_height),
+            Constraint::Length(failure_height),
+        ])
+        .split(body[0]);
+    let thread_area = gutter(main[0]);
     if reducer.execution_turns.is_empty()
         && reducer.original_instruction.is_none()
         && reducer.task.display_prompts.is_empty()
@@ -282,6 +301,14 @@ pub fn draw_live_scrolled(
             scene,
             options.approval.map(|request| request.path.as_str()),
         );
+    }
+    if panel_height > 0 {
+        draw_retry_panel(frame, gutter(main[1]));
+    }
+    if failure_height > 0
+        && let Some(failure) = &reducer.failure
+    {
+        failure_cards::draw(frame, gutter(main[2]), failure);
     }
     let composer = gutter(footer[1]);
     let (cursor_x, cursor_y, prompt_scroll) = prompt_cursor(input, cursor, composer);
@@ -354,6 +381,15 @@ pub fn draw_live_scrolled(
     } else if compact {
         // Narrow keeps one hint only; the counters share the status row.
         key_hint_line(&[("/help", "help")])
+    } else if reducer.is_retrying() {
+        key_hint_line(&[
+            ("Esc", "cancel"),
+            ("/retry", "retry now"),
+            ("^O", "expand"),
+            ("/help", "help"),
+        ])
+    } else if reducer.failure.is_some() {
+        key_hint_line(&[("/retry", "retry"), ("^O", "expand"), ("/help", "help")])
     } else if reducer.task.status == Some(TaskStatus::Running) {
         let mut hints = vec![
             ("Esc", "cancel"),
@@ -789,9 +825,41 @@ fn draw_idle_home(frame: &mut Frame<'_>, area: Rect, recent: &[RecentSession], s
     frame.render_widget(Paragraph::new(lines), list_area);
 }
 
-/// Amber box for a write waiting on the operator: the wireframe's diff
-/// preview (`@@` header, `+` body, more-lines trailer), path with +N −0
-/// stats, and the answer keys. Meaning is carried by text as well as color.
+/// Amber box for the backoff wait; the countdown itself lives in the thread.
+fn draw_retry_panel(frame: &mut Frame<'_>, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let hints = Line::from(vec![
+        Span::styled("[Esc]", fg(theme::IVORY)),
+        Span::styled(" cancel now  ·  ", fg(theme::DIM)),
+        Span::styled("[/retry]", fg(theme::IVORY)),
+        Span::styled(" retry immediately", fg(theme::DIM)),
+    ]);
+    let mut lines = vec![Line::from(Span::styled(
+        "Waiting to retry. Your task is still running.",
+        fg(theme::AMBER).add_modifier(Modifier::BOLD),
+    ))];
+    if area.height >= 5 {
+        lines.push(Line::from(Span::styled(
+            "The failed attempt was discarded; nothing from it can be committed.",
+            fg(theme::DIM),
+        )));
+    }
+    lines.push(hints);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(fg(theme::AMBER)),
+            )
+            .style(Style::default().bg(theme::BG))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn draw_approval_box(frame: &mut Frame<'_>, area: Rect, request: &crate::approval::Request) {
     // Inline at the bottom of the thread, like the wireframe: the paused
     // task, its prose and the pending tool row stay readable above it.
@@ -1173,6 +1241,16 @@ fn live_header_state(
     {
         let (glyph, label, color) = header_state(reducer, approval_pending, set);
         return Some((glyph.to_owned(), label.to_owned(), color));
+    }
+    if let Some(wait) = &reducer.retry_wait {
+        return Some((
+            glyphs::glyph(Glyph::Retry, set).to_owned(),
+            format!(
+                "retrying {} / {}",
+                wait.next_attempt, reducer.retry_policy.max_attempts
+            ),
+            theme::AMBER,
+        ));
     }
     reducer.provisional.attempt.map(|attempt| {
         (
@@ -1769,7 +1847,7 @@ mod tests {
     fn command_palette_scrolls_to_keep_the_selected_command_visible() {
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
         terminal
-            .draw(|frame| draw_palette(frame, frame.area(), "/", 14, GlyphSet::Unicode))
+            .draw(|frame| draw_palette(frame, frame.area(), "/", 15, GlyphSet::Unicode))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let rows: Vec<String> = (0..buffer.area.height)
@@ -3114,5 +3192,214 @@ mod idle_sidebar_tests {
         assert!(text.contains("effort / thinking"), "session effort missing");
         assert!(text.contains("TOOLS"), "tool permissions missing");
         assert!(text.contains("ask"), "tool permission missing");
+    }
+}
+
+#[cfg(test)]
+mod retry_scene_tests {
+    use std::fmt::Write as _;
+    use std::time::Duration;
+
+    use loom_core::EventEnvelope;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    use crate::glyphs::GlyphSet;
+    use crate::picker::ModelPricing;
+    use crate::reducer::Reducer;
+    use crate::theme;
+
+    use super::{LiveViewOptions, draw_live};
+
+    fn events(fixture: &str) -> Vec<EventEnvelope> {
+        fixture
+            .lines()
+            .map(serde_json::from_str::<EventEnvelope>)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("fixture is valid NDJSON")
+    }
+
+    fn options(glyph_set: GlyphSet) -> LiveViewOptions<'static> {
+        LiveViewOptions {
+            sidebar_visible: true,
+            elapsed: Some(Duration::from_secs(19)),
+            dropped: Some(0),
+            workspace: Some("~/work/loom"),
+            session_id: Some("0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c"),
+            model: Some("deepseek-flash"),
+            effort: Some("high"),
+            thinking: Some("on"),
+            task_mode: Some("read-only"),
+            task_label: Some("benchmark B1"),
+            billing_period: Some("off-peak"),
+            turn_limit: Some(50),
+            pricing: Some(ModelPricing {
+                input_per_million: Some(0.14),
+                output_per_million: Some(0.28),
+            }),
+            depth: Some(theme::Depth::TrueColor),
+            glyph_set: Some(glyph_set),
+            ..LiveViewOptions::default()
+        }
+    }
+
+    fn render(reducer: &Reducer, width: u16, height: u16, glyph_set: GlyphSet) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw_live(frame, reducer, "", 0, options(glyph_set)))
+            .unwrap();
+        super::tests::snapshot(terminal.backend().buffer())
+    }
+
+    fn render_plain(reducer: &Reducer, width: u16, height: u16, glyph_set: GlyphSet) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw_live(frame, reducer, "", 0, options(glyph_set)))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(usize::from(width))
+            .map(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn push_snapshots(out: &mut String, reducer: &Reducer, name: &str, now: u64) {
+        let mut state = reducer.clone();
+        state.tick(now);
+        for (width, height) in [(140, 40), (100, 30), (70, 24)] {
+            for (mode, glyph_set) in [("unicode", GlyphSet::Unicode), ("ascii", GlyphSet::Ascii)] {
+                let _ = writeln!(out, "=== {name} {width}x{height} {mode} ===");
+                out.push_str(&render(&state, width, height, glyph_set));
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn retry_fixture_replays_at_deterministic_checkpoints() {
+        let fixture = include_str!("../tests/fixtures/retry-then-success.ndjson");
+        let trace = events(fixture);
+        let mut reducer = Reducer::default();
+        reducer.begin_task("Explain how the DeepSeek adapter normalizes finish reasons.");
+        let mut snapshots = String::new();
+
+        for event in &trace {
+            let timestamp = event.timestamp_millis.unwrap_or(0);
+            reducer.reduce(event, timestamp);
+            match &event.kind {
+                loom_core::EventKind::ModelRetry { attempt: 2, .. } => {
+                    push_snapshots(&mut snapshots, &reducer, "waiting", timestamp);
+                    push_snapshots(&mut snapshots, &reducer, "mid-countdown", timestamp + 1_500);
+                }
+                loom_core::EventKind::ModelRequestStarted { attempt: 3 } => {
+                    push_snapshots(&mut snapshots, &reducer, "attempt-started", timestamp);
+                }
+                _ => {}
+            }
+        }
+
+        let failures = events(include_str!("../tests/fixtures/retries-exhausted.ndjson"));
+        let mut failed = Reducer::default();
+        failed.begin_task("Explain how the DeepSeek adapter normalizes finish reasons.");
+        for event in &failures {
+            failed.reduce(event, event.timestamp_millis.unwrap_or(0));
+        }
+        push_snapshots(
+            &mut snapshots,
+            &failed,
+            "retries-exhausted",
+            failures
+                .last()
+                .and_then(|event| event.timestamp_millis)
+                .unwrap_or(0),
+        );
+
+        if std::env::var_os("UPDATE_TUI_SNAPSHOTS").is_some() {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/snapshots/retry-replay.snap");
+            std::fs::write(path, &snapshots).unwrap();
+        }
+        assert_eq!(
+            snapshots,
+            include_str!("../tests/snapshots/retry-replay.snap")
+        );
+    }
+
+    #[test]
+    fn terminal_failure_fixtures_render_their_card_and_never_raw_reason_only() {
+        for (fixture, expected, action) in [
+            (
+                include_str!("../tests/fixtures/max-tokens.ndjson"),
+                "MaxTokens",
+                "Raise --max-tokens or narrow the task.",
+            ),
+            (
+                include_str!("../tests/fixtures/quota-exhausted.ndjson"),
+                "QuotaExhausted",
+                "Top up, or loom auth switch deepseek <label>",
+            ),
+            (
+                include_str!("../tests/fixtures/content-filter.ndjson"),
+                "ContentFilter",
+                "Rephrase the task and run it again.",
+            ),
+        ] {
+            let mut reducer = Reducer::default();
+            reducer.begin_task("Explain how the DeepSeek adapter normalizes finish reasons.");
+            for event in events(fixture) {
+                reducer.reduce(&event, event.timestamp_millis.unwrap_or(0));
+            }
+            for (width, height, set) in [
+                (140, 40, GlyphSet::Unicode),
+                (140, 40, GlyphSet::Ascii),
+                (70, 24, GlyphSet::Ascii),
+            ] {
+                let text = render_plain(&reducer, width, height, set);
+                assert!(text.contains(expected), "{expected} missing\n{text}");
+                assert!(text.contains(action), "{action} clipped\n{text}");
+                assert!(!text.contains("Task failed ·"), "raw reason leaked\n{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn retry_after_fixture_uses_the_event_delay() {
+        let mut reducer = Reducer::default();
+        reducer.begin_task("Explain the retry policy.");
+        for event in events(include_str!("../tests/fixtures/retry-after.ndjson")) {
+            let timestamp = event.timestamp_millis.unwrap_or(0);
+            reducer.reduce(&event, timestamp);
+            if matches!(
+                &event.kind,
+                loom_core::EventKind::ModelRetry { attempt: 1, .. }
+            ) {
+                assert_eq!(reducer.retry_wait.as_ref().unwrap().delay_ms, 1_234);
+                reducer.tick(timestamp + 1_000);
+                assert_eq!(reducer.retry_wait.as_ref().unwrap().remaining_millis(), 234);
+            }
+        }
+    }
+
+    #[test]
+    fn esc_during_backoff_cancels_without_starting_another_attempt() {
+        let mut reducer = Reducer::default();
+        reducer.begin_task("Explain the retry policy.");
+        for event in events(include_str!("../tests/fixtures/esc-during-backoff.ndjson")) {
+            reducer.reduce(&event, event.timestamp_millis.unwrap_or(0));
+        }
+        assert_eq!(
+            reducer.task.status,
+            Some(loom_core::kernel::session::TaskStatus::Cancelled)
+        );
+        assert!(!reducer.is_retrying());
+        assert_eq!(reducer.retries.len(), 1);
+        assert_eq!(reducer.attempt, Some(2));
+        assert!(reducer.failure.is_none());
     }
 }

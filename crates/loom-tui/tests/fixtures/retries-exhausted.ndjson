@@ -1,0 +1,13 @@
+{"schema_version":21,"sequence":0,"timestamp_millis":1760000000000,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"task_started"}}
+{"schema_version":21,"sequence":1,"timestamp_millis":1760000000010,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"turn_started","turn":1}}
+{"schema_version":21,"sequence":2,"timestamp_millis":1760000000020,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"model_request_started","attempt":1}}
+{"schema_version":21,"sequence":3,"timestamp_millis":1760000001000,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"model_completed","response":{"message":{"content":"The adapter normalizes finish reasons before the loop sees them.","reasoning":{"text":"Read the adapter finish-reason mapping.","provider_data":null},"tool_calls":[],"stop_reason":"end_turn"},"usage":{"input_tokens":1200,"output_tokens":120,"cost_usd":0.0002}}}}
+{"schema_version":21,"sequence":4,"timestamp_millis":1760000002000,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"turn_started","turn":2}}
+{"schema_version":21,"sequence":5,"timestamp_millis":1760000002010,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"model_request_started","attempt":1}}
+{"schema_version":21,"sequence":6,"timestamp_millis":1760000004000,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"model_retry","attempt":1,"kind":"overloaded","delay_ms":2000,"response_started":false}}
+{"schema_version":21,"sequence":7,"timestamp_millis":1760000006000,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"model_request_started","attempt":2}}
+{"schema_version":21,"sequence":8,"timestamp_millis":1760000009000,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"model_retry","attempt":2,"kind":"overloaded","delay_ms":4000,"response_started":false}}
+{"schema_version":21,"sequence":9,"timestamp_millis":1760000013000,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"model_request_started","attempt":3}}
+{"schema_version":21,"sequence":10,"timestamp_millis":1760000021000,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"model_retry","attempt":3,"kind":"overloaded","delay_ms":8000,"response_started":false}}
+{"schema_version":21,"sequence":11,"timestamp_millis":1760000029000,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"model_request_started","attempt":4}}
+{"schema_version":21,"sequence":12,"timestamp_millis":1760000046000,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"task_failed","reason":"model request failed: [overloaded] HTTP 503 upstream overloaded"}}

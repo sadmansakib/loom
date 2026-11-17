@@ -71,16 +71,6 @@ pub(super) fn draw(
             Span::styled(prompt, fg(theme::IVORY).add_modifier(Modifier::BOLD)),
         ]));
     }
-    if let Some(reason) = &reducer.task.failure_reason {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{} ", glyphs::glyph(Glyph::Cross, set)),
-                fg(theme::CORAL),
-            ),
-            Span::styled(format!("Task failed · {reason}"), fg(theme::CORAL)),
-        ]));
-    }
-
     let mut rendered_retries = BTreeSet::new();
     let mut rendered_call_ids = BTreeSet::new();
     let mut selected_anchor = None;
@@ -116,9 +106,18 @@ pub(super) fn draw(
 
         let live = display_turn == reducer.turn
             && reducer.task.status == Some(loom_core::kernel::session::TaskStatus::Running);
+        let wait = reducer
+            .retry_wait
+            .as_ref()
+            .filter(|wait| wait.turn == Some(*turn_number));
+        let retrying = live && wait.is_some();
         let streaming =
             live && (reducer.has_provisional_output() || reducer.provisional.attempt.is_some());
-        let rail = if streaming {
+        let has_retries = reducer
+            .retries
+            .iter()
+            .any(|retry| retry.turn == Some(*turn_number));
+        let rail = if streaming || retrying || has_retries {
             Rail::Provisional
         } else {
             Rail::Committed
@@ -135,6 +134,7 @@ pub(super) fn draw(
             display_turn,
             width.saturating_sub(2),
             streaming,
+            retrying,
             turn_selected,
             rail,
             reducer,
@@ -161,20 +161,51 @@ pub(super) fn draw(
             .filter(|(_, retry)| retry.turn == Some(*turn_number))
         {
             rendered_retries.insert(retry_index);
+            let discarded = retry
+                .discarded_reasoning_chars
+                .saturating_add(retry.discarded_text_chars);
             lines.push(rail_line(
                 rail,
                 vec![
                     Span::styled(
                         format!(
-                            "{} attempt {} · discarded",
+                            "{} attempt {} · discarded {discarded} reasoning chars · ",
                             glyphs::glyph(Glyph::Retry, set),
                             retry.attempt
                         ),
                         fg(theme::DIM),
                     ),
-                    Span::styled(format!(" · {}", retry.kind), fg(theme::DIM)),
+                    Span::styled(retry.kind.clone(), fg(theme::CORAL)),
                 ],
             ));
+        }
+        if let Some(wait) = wait {
+            lines.push(rail_line(
+                rail,
+                vec![
+                    Span::styled(
+                        format!(
+                            "{} attempt {} · ",
+                            glyphs::glyph(Glyph::Spinner, set),
+                            wait.next_attempt
+                        ),
+                        fg(theme::AMBER),
+                    ),
+                    Span::styled(
+                        format!("waiting {}", seconds(wait.remaining_millis())),
+                        fg(theme::AMBER).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(
+                            " (backoff {} ±{}%)",
+                            seconds(reducer.retry_policy.base_backoff_ms(wait.next_attempt)),
+                            reducer.retry_policy.jitter_percent
+                        ),
+                        fg(theme::DIM),
+                    ),
+                ],
+            ));
+            lines.push(rail_line(rail, progress_spans(wait.progress(), width, set)));
         }
 
         for item in &turn.transcript {
@@ -370,6 +401,7 @@ fn turn_heading(
     engine_turn: Option<u32>,
     width: usize,
     streaming: bool,
+    retrying: bool,
     selected: bool,
     rail: Rail,
     reducer: &Reducer,
@@ -402,12 +434,26 @@ fn turn_heading(
             ),
             fg(theme::AMBER),
         ));
+    } else if retrying && let Some(wait) = &reducer.retry_wait {
+        spans.push(Span::styled(
+            format!(
+                "  {} retry {} / {}",
+                glyphs::glyph(Glyph::Retry, set),
+                wait.next_attempt,
+                reducer.retry_policy.max_attempts
+            ),
+            fg(theme::AMBER),
+        ));
     }
     let left = spans
         .iter()
         .map(|span| span.content.chars().count())
         .sum::<usize>();
-    let right = turn_usage(reducer, turn_key, streaming);
+    let right = if retrying {
+        "nothing from failed attempts is committed".to_owned()
+    } else {
+        turn_usage(reducer, turn_key, streaming)
+    };
     let gap = width
         .saturating_sub(left)
         .saturating_sub(right.chars().count())
@@ -466,6 +512,21 @@ fn turn_duration(reducer: &Reducer, turn: u32) -> String {
             ))
         })
         .map_or(String::new(), |duration| format!(" · {duration}"))
+}
+
+fn progress_spans(progress: f64, width: usize, set: crate::glyphs::GlyphSet) -> Vec<Span<'static>> {
+    let bar_width = width.saturating_sub(6).max(4);
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    let filled = ((progress.clamp(0.0, 1.0) * bar_width as f64).round() as usize).min(bar_width);
+    let glyph = glyphs::glyph(Glyph::Horizontal, set);
+    vec![
+        Span::styled(format!("    {}", glyph.repeat(filled)), fg(theme::AMBER)),
+        Span::styled(glyph.repeat(bar_width - filled), fg(theme::DOTTED)),
+    ]
 }
 
 fn seconds(millis: u64) -> String {
