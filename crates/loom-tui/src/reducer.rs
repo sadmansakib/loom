@@ -53,6 +53,313 @@ pub struct RetryRecord {
     pub response_started: bool,
     /// Turn whose model request was retried.
     pub turn: Option<u32>,
+    /// Reasoning characters discarded from the failed attempt.
+    pub discarded_reasoning_chars: u64,
+    /// Assistant text characters discarded from the failed attempt.
+    pub discarded_text_chars: u64,
+}
+
+/// A backoff wait between a failed attempt and the next one.
+///
+/// `now_millis` is injected by [`Reducer::tick`]; the reducer never reads a
+/// clock, so replaying the same ticks produces the same countdown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryWait {
+    /// Attempt that just failed.
+    pub failed_attempt: u32,
+    /// Attempt that will start when the wait ends.
+    pub next_attempt: u32,
+    /// Stable model error classification for the failure.
+    pub kind: String,
+    /// Authoritative wait from `ModelRetry.delay_ms`.
+    pub delay_ms: u64,
+    /// Turn whose request is waiting.
+    pub turn: Option<u32>,
+    /// Event timestamp when the wait began.
+    pub started_at_millis: u64,
+    /// Most recent caller-injected time.
+    pub now_millis: u64,
+}
+
+impl RetryWait {
+    /// Milliseconds left in the wait, saturating at zero.
+    #[must_use]
+    pub fn remaining_millis(&self) -> u64 {
+        self.started_at_millis
+            .saturating_add(self.delay_ms)
+            .saturating_sub(self.now_millis)
+    }
+
+    /// Fraction of the wait already elapsed, in `[0, 1]`.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn progress(&self) -> f64 {
+        if self.delay_ms == 0 {
+            return 1.0;
+        }
+        let elapsed = self
+            .now_millis
+            .saturating_sub(self.started_at_millis)
+            .min(self.delay_ms);
+        elapsed as f64 / self.delay_ms as f64
+    }
+}
+
+/// Terminal failure shape shown as a card in the thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// Provider stopped at the output-token ceiling.
+    MaxTokens,
+    /// Provider account has insufficient balance.
+    QuotaExhausted,
+    /// Provider filtered the reply.
+    ContentFilter,
+    /// Request exceeded the context window.
+    ContextLimit,
+    /// Every allowed attempt failed.
+    RetriesExhausted,
+    /// Any other task failure.
+    Other,
+}
+
+/// Presentation-independent facts for one terminal failure card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureState {
+    /// Stable failure shape.
+    pub kind: FailureKind,
+    /// Card headline.
+    pub title: String,
+    /// Optional qualifier such as `overloaded ×4`.
+    pub subtitle: Option<String>,
+    /// HTTP status when it can be recovered from the failure reason.
+    pub http_status: Option<u16>,
+    /// Plain-language explanation.
+    pub body: String,
+    /// Plain-language next step.
+    pub action: String,
+    /// Part of `action` rendered as a command.
+    pub command: Option<String>,
+    /// Last retry classification, for retry-exhausted cards.
+    pub retry_kind: Option<String>,
+    /// Attempts made before giving up.
+    pub attempts: u32,
+    /// Completed turns retained by the session.
+    pub intact_turn: u32,
+    /// Total task wall time at failure.
+    pub elapsed_ms: Option<u64>,
+}
+
+/// TUI-side mirror of the retry policy for labels and attempt rows.
+///
+/// TODO: `RetryPolicy` exposes only `max_attempts()` and `backoff()` today.
+/// Replace the mirrored backoff/jitter fields with getters (or carry the
+/// policy on the event stream) once loom-core exposes them. There is no
+/// idle-timeout setting in the kernel at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicyView {
+    /// Total attempts allowed per model request.
+    pub max_attempts: u32,
+    /// First retry backoff in milliseconds.
+    pub initial_backoff_ms: u64,
+    /// Exponential growth factor.
+    pub backoff_factor: u32,
+    /// Cap on computed backoff in milliseconds.
+    pub max_backoff_ms: u64,
+    /// Jitter percentage around the computed backoff.
+    pub jitter_percent: u32,
+    /// Kernel liveness timeout, when one exists.
+    pub idle_timeout_ms: Option<u64>,
+}
+
+impl Default for RetryPolicyView {
+    fn default() -> Self {
+        let max_attempts = loom_core::kernel::agent::RetryPolicy::default().max_attempts();
+        Self {
+            max_attempts,
+            initial_backoff_ms: 2_000,
+            backoff_factor: 2,
+            max_backoff_ms: 30_000,
+            jitter_percent: 25,
+            idle_timeout_ms: None,
+        }
+    }
+}
+
+impl FailureState {
+    fn classify(
+        reason: &str,
+        retries: &[RetryRecord],
+        attempt: Option<u32>,
+        policy: &RetryPolicyView,
+        intact_turn: u32,
+        elapsed_ms: Option<u64>,
+    ) -> Self {
+        let lower = reason.to_lowercase();
+        let http_status = http_status(reason);
+        if lower.contains("max_tokens") || lower.contains("max tokens") {
+            return Self {
+                kind: FailureKind::MaxTokens,
+                title: "MaxTokens".to_owned(),
+                subtitle: None,
+                http_status,
+                body:
+                    "Reply hit the output limit. Partial text kept; tool calls dropped, none run."
+                        .to_owned(),
+                action: "Raise --max-tokens or narrow the task.".to_owned(),
+                command: Some("--max-tokens".to_owned()),
+                retry_kind: None,
+                attempts: attempt.unwrap_or(1),
+                intact_turn,
+                elapsed_ms,
+            };
+        }
+        if lower.contains("content_filter") || lower.contains("content filter") {
+            return Self {
+                kind: FailureKind::ContentFilter,
+                title: "ContentFilter".to_owned(),
+                subtitle: None,
+                http_status,
+                body: "Reply was filtered. Stored, but hidden from later turns.".to_owned(),
+                action: "Rephrase the task and run it again.".to_owned(),
+                command: None,
+                retry_kind: None,
+                attempts: attempt.unwrap_or(1),
+                intact_turn,
+                elapsed_ms,
+            };
+        }
+        if lower.contains("quota_exhausted") || lower.contains("quota exhausted") {
+            return Self {
+                kind: FailureKind::QuotaExhausted,
+                title: "QuotaExhausted".to_owned(),
+                subtitle: None,
+                http_status,
+                body: "DeepSeek reports insufficient balance. Not retried.".to_owned(),
+                action: "Top up, or loom auth switch deepseek <label>".to_owned(),
+                command: Some("loom auth switch deepseek <label>".to_owned()),
+                retry_kind: None,
+                attempts: attempt.unwrap_or(1),
+                intact_turn,
+                elapsed_ms,
+            };
+        }
+        if lower.contains("context_limit") || lower.contains("context limit") {
+            return Self {
+                kind: FailureKind::ContextLimit,
+                title: "ContextLimit".to_owned(),
+                subtitle: None,
+                http_status,
+                body: "The request no longer fits the model's context window.".to_owned(),
+                action: "Compact the session or narrow the task.".to_owned(),
+                command: Some("/compact".to_owned()),
+                retry_kind: None,
+                attempts: attempt.unwrap_or(1),
+                intact_turn,
+                elapsed_ms,
+            };
+        }
+        if let Some(failure) = retries_exhausted(
+            reason,
+            retries,
+            attempt,
+            policy,
+            intact_turn,
+            elapsed_ms,
+            http_status,
+        ) {
+            return failure;
+        }
+        Self {
+            kind: FailureKind::Other,
+            title: "Task failed".to_owned(),
+            subtitle: None,
+            http_status,
+            body: reason.to_owned(),
+            action: "Review the failure and run the task again.".to_owned(),
+            command: Some("/retry".to_owned()),
+            retry_kind: None,
+            attempts: attempt.unwrap_or(1),
+            intact_turn,
+            elapsed_ms,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retries_exhausted(
+    reason: &str,
+    retries: &[RetryRecord],
+    attempt: Option<u32>,
+    policy: &RetryPolicyView,
+    intact_turn: u32,
+    elapsed_ms: Option<u64>,
+    http_status: Option<u16>,
+) -> Option<FailureState> {
+    let last = retries.last()?;
+    let final_kind = reason_error_kind(reason);
+    if !reason.contains("model request failed")
+        || final_kind.is_some_and(|kind| !is_retryable_kind(kind))
+    {
+        return None;
+    }
+    let attempts = attempt
+        .unwrap_or_else(|| u32::try_from(retries.len()).unwrap_or(u32::MAX))
+        .max(u32::try_from(retries.len()).unwrap_or(u32::MAX))
+        .max(policy.max_attempts);
+    let duration = elapsed_ms.map_or_else(
+        || "an unknown time".to_owned(),
+        |millis| format!("{} s", millis / 1_000),
+    );
+    Some(FailureState {
+        kind: FailureKind::RetriesExhausted,
+        title: "Retries exhausted".to_owned(),
+        subtitle: Some(format!("{} ×{attempts}", last.kind)),
+        http_status,
+        body: format!("Gave up after {duration}. Session intact at turn {intact_turn}."),
+        action: "/retry re-run the task".to_owned(),
+        command: Some("/retry".to_owned()),
+        retry_kind: Some(last.kind.clone()),
+        attempts,
+        intact_turn,
+        elapsed_ms,
+    })
+}
+
+fn http_status(reason: &str) -> Option<u16> {
+    let marker = reason.find("HTTP ")? + "HTTP ".len();
+    reason[marker..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+fn reason_error_kind(reason: &str) -> Option<&str> {
+    let start = reason.find('[')? + 1;
+    let end = reason[start..].find(']')? + start;
+    Some(&reason[start..end])
+}
+
+fn is_retryable_kind(kind: &str) -> bool {
+    matches!(kind, "transport" | "rate_limited" | "overloaded" | "server")
+}
+
+impl RetryPolicyView {
+    /// Base backoff before the retry that follows `failed_attempt`.
+    #[must_use]
+    pub fn base_backoff_ms(&self, failed_attempt: u32) -> u64 {
+        let mut millis = u128::from(self.initial_backoff_ms);
+        for _ in 1..failed_attempt {
+            millis = millis.saturating_mul(u128::from(self.backoff_factor));
+            if millis >= u128::from(self.max_backoff_ms) {
+                return self.max_backoff_ms;
+            }
+        }
+        u64::try_from(millis)
+            .unwrap_or(u64::MAX)
+            .min(self.max_backoff_ms)
+    }
 }
 
 /// Runtime measurements for one agent turn, based only on emitted events.
@@ -188,6 +495,12 @@ pub struct Reducer {
     pub provisional: ProvisionalResponse,
     /// Retry history in event order.
     pub retries: Vec<RetryRecord>,
+    /// Backoff wait currently in progress, if any.
+    pub retry_wait: Option<RetryWait>,
+    /// Retry policy labels shown by the sidebar.
+    pub retry_policy: RetryPolicyView,
+    /// Terminal failure card, when the task failed.
+    pub failure: Option<FailureState>,
     /// Tool state indexed by call ID.
     pub tools: BTreeMap<String, ToolState>,
     /// Number of tool executions started for this task.
@@ -369,6 +682,11 @@ impl Reducer {
                 self.expanded_result = None;
                 self.cacheable_prefix_tokens = None;
                 self.cacheable_prefix_stable = None;
+                self.retries.clear();
+                self.retry_wait = None;
+                self.failure = None;
+                self.attempt = None;
+                self.provisional.clear();
             }
             EventKind::TurnStarted { turn } => {
                 if let Some(previous) = self.turn
@@ -390,9 +708,11 @@ impl Reducer {
                     .started_at_millis = Some(timestamp_millis);
             }
             EventKind::ModelRequestStarted { attempt } => {
-                self.attempt = Some(*attempt);
+                let attempt = (*attempt).min(self.retry_policy.max_attempts).max(1);
+                self.attempt = Some(attempt);
+                self.retry_wait = None;
                 self.provisional.clear();
-                self.provisional.attempt = Some(*attempt);
+                self.provisional.attempt = Some(attempt);
             }
             EventKind::TextDelta { text } => {
                 self.provisional.text.push_str(text);
@@ -406,20 +726,43 @@ impl Reducer {
                 delay_ms,
                 response_started,
             } => {
+                let discarded_reasoning_chars =
+                    u64::try_from(self.provisional.reasoning.chars().count()).unwrap_or(u64::MAX);
+                let discarded_text_chars =
+                    u64::try_from(self.provisional.text.chars().count()).unwrap_or(u64::MAX);
+                let attempt = (*attempt).min(self.retry_policy.max_attempts).max(1);
                 self.retries.push(RetryRecord {
-                    attempt: *attempt,
+                    attempt,
                     kind: kind.to_string(),
                     delay_ms: *delay_ms,
                     response_started: *response_started,
                     turn: self.turn,
+                    discarded_reasoning_chars,
+                    discarded_text_chars,
                 });
                 self.provisional.clear();
-                self.attempt = Some(*attempt);
+                let next_attempt = attempt
+                    .saturating_add(1)
+                    .min(self.retry_policy.max_attempts);
+                self.attempt = Some(next_attempt);
+                if self.task.status == Some(TaskStatus::Running) {
+                    self.retry_wait = Some(RetryWait {
+                        failed_attempt: attempt,
+                        next_attempt,
+                        kind: kind.to_string(),
+                        delay_ms: *delay_ms,
+                        turn: self.turn,
+                        started_at_millis: timestamp_millis,
+                        now_millis: timestamp_millis,
+                    });
+                }
             }
             EventKind::ModelCompleted { response } => {
                 // Deltas are intentionally not used here: the complete
                 // response is the sole authority for committed output.
                 self.provisional.clear();
+                self.retry_wait = None;
+                self.retries.clear();
                 self.usage_reported |= response.usage.input_tokens > 0
                     || response.usage.output_tokens > 0
                     || response.usage.cached_input_tokens.is_some()
@@ -562,6 +905,28 @@ impl Reducer {
         if matches!(&event.kind, EventKind::ContextPruned { .. }) {
             self.cacheable_prefix_stable = Some(false);
         }
+    }
+
+    /// Advances time-dependent presentation state with a caller-supplied
+    /// monotonic timestamp. No clock is read here; replay stays deterministic.
+    pub fn tick(&mut self, now_millis: u64) {
+        if let Some(wait) = &mut self.retry_wait {
+            wait.now_millis = now_millis.max(wait.started_at_millis);
+        }
+    }
+
+    /// Whether a backoff wait is currently pending.
+    #[must_use]
+    pub fn is_retrying(&self) -> bool {
+        self.retry_wait.is_some() && self.task.status == Some(TaskStatus::Running)
+    }
+
+    /// Number of attempts made so far, including a failed final attempt.
+    #[must_use]
+    pub fn attempts_used(&self) -> u32 {
+        self.attempt
+            .unwrap_or_else(|| u32::try_from(self.retries.len()).unwrap_or(u32::MAX))
+            .max(u32::try_from(self.retries.len()).unwrap_or(u32::MAX))
     }
 
     /// Updates the externally-owned queued follow-up indicator.
@@ -1068,7 +1433,23 @@ impl Reducer {
         {
             metrics.completed_at_millis = Some(timestamp_millis);
         }
-        self.task.failure_reason = failure_reason;
+        self.task.failure_reason.clone_from(&failure_reason);
+        self.retry_wait = None;
+        self.failure = failure_reason.map(|reason| {
+            let intact_turn = self.assistant_turns.iter().copied().max().unwrap_or(0);
+            let elapsed_ms = self
+                .task
+                .started_at_millis
+                .map(|started| timestamp_millis.saturating_sub(started));
+            FailureState::classify(
+                &reason,
+                &self.retries,
+                self.attempt,
+                &self.retry_policy,
+                intact_turn,
+                elapsed_ms,
+            )
+        });
         self.provisional.clear();
     }
 }
@@ -1109,6 +1490,7 @@ fn event_name(kind: &EventKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::FailureKind;
     use loom_core::kernel::event::EVENT_SCHEMA_VERSION;
     use loom_core::kernel::model::{ModelResponse, StopReason, Usage};
     use loom_core::kernel::session::{TaskRecord, TaskStatus};
@@ -1194,6 +1576,8 @@ mod tests {
                 delay_ms: 250,
                 response_started: true,
                 turn: None,
+                discarded_reasoning_chars: 15,
+                discarded_text_chars: 7,
             }]
         );
     }
@@ -2017,5 +2401,251 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(shown, ["second answer"]);
+    }
+
+    #[test]
+    fn countdown_depends_only_on_injected_time() {
+        use loom_core::kernel::model::ModelErrorKind;
+
+        let task_id = TaskId::new();
+        let mut reducer = Reducer::default();
+        reducer.reduce(&event(0, task_id, EventKind::TaskStarted), 1_000);
+        reducer.reduce(
+            &event(1, task_id, EventKind::TurnStarted { turn: 1 }),
+            1_000,
+        );
+        reducer.reduce(
+            &event(2, task_id, EventKind::ModelRequestStarted { attempt: 1 }),
+            1_100,
+        );
+        reducer.reduce(
+            &event(
+                3,
+                task_id,
+                EventKind::ModelRetry {
+                    attempt: 1,
+                    kind: ModelErrorKind::Transport,
+                    delay_ms: 5_000,
+                    response_started: false,
+                },
+            ),
+            2_000,
+        );
+
+        assert_eq!(
+            reducer.retry_wait.as_ref().unwrap().remaining_millis(),
+            5_000
+        );
+        reducer.tick(4_500);
+        assert_eq!(
+            reducer.retry_wait.as_ref().unwrap().remaining_millis(),
+            2_500
+        );
+        reducer.tick(1_000);
+        assert_eq!(
+            reducer.retry_wait.as_ref().unwrap().remaining_millis(),
+            5_000
+        );
+        reducer.tick(8_000);
+        assert_eq!(reducer.retry_wait.as_ref().unwrap().remaining_millis(), 0);
+        assert_eq!(reducer.retry_wait.as_ref().unwrap().progress(), 1.0);
+    }
+
+    #[test]
+    fn failed_attempt_output_is_never_committed() {
+        use loom_core::kernel::model::ModelErrorKind;
+
+        let task_id = TaskId::new();
+        let mut reducer = Reducer::default();
+        reducer.begin_task("inspect");
+        reducer.reduce(&event(0, task_id, EventKind::TaskStarted), 1);
+        reducer.reduce(&event(1, task_id, EventKind::TurnStarted { turn: 1 }), 2);
+        reducer.reduce(
+            &event(2, task_id, EventKind::ModelRequestStarted { attempt: 1 }),
+            3,
+        );
+        reducer.reduce(
+            &event(
+                3,
+                task_id,
+                EventKind::TextDelta {
+                    text: "not committed".into(),
+                },
+            ),
+            4,
+        );
+        reducer.reduce(
+            &event(
+                4,
+                task_id,
+                EventKind::ModelRetry {
+                    attempt: 1,
+                    kind: ModelErrorKind::Server,
+                    delay_ms: 100,
+                    response_started: true,
+                },
+            ),
+            5,
+        );
+
+        assert!(!reducer.committed_transcript.iter().any(|item| matches!(
+            item,
+            Item::Assistant(message) if message.content.contains("not committed")
+        )));
+        assert_eq!(reducer.retries[0].discarded_text_chars, 13);
+    }
+
+    #[test]
+    fn cancelled_request_clears_the_backoff_and_is_never_retried() {
+        use loom_core::kernel::model::ModelErrorKind;
+
+        let task_id = TaskId::new();
+        let mut reducer = Reducer::default();
+        reducer.reduce(&event(0, task_id, EventKind::TaskStarted), 1);
+        reducer.reduce(&event(1, task_id, EventKind::TurnStarted { turn: 1 }), 2);
+        reducer.reduce(
+            &event(2, task_id, EventKind::ModelRequestStarted { attempt: 1 }),
+            3,
+        );
+        reducer.reduce(
+            &event(
+                3,
+                task_id,
+                EventKind::ModelRetry {
+                    attempt: 1,
+                    kind: ModelErrorKind::Transport,
+                    delay_ms: 5_000,
+                    response_started: false,
+                },
+            ),
+            4,
+        );
+        assert!(reducer.is_retrying());
+
+        reducer.reduce(&event(4, task_id, EventKind::TaskCancelled), 5);
+
+        assert!(!reducer.is_retrying());
+        assert_eq!(reducer.task.status, Some(TaskStatus::Cancelled));
+        assert_eq!(reducer.retries.len(), 1);
+    }
+
+    #[test]
+    fn unknown_failure_reason_renders_an_other_card_without_panicking() {
+        let task_id = TaskId::new();
+        let mut reducer = Reducer::default();
+        reducer.reduce(&event(0, task_id, EventKind::TaskStarted), 1);
+        reducer.reduce(
+            &event(
+                1,
+                task_id,
+                EventKind::TaskFailed {
+                    reason: "something new happened".into(),
+                },
+            ),
+            2,
+        );
+
+        let failure = reducer.failure.expect("failure card");
+        assert_eq!(failure.kind, FailureKind::Other);
+        assert_eq!(failure.body, "something new happened");
+    }
+
+    #[test]
+    fn attempt_numbers_are_clamped_to_the_policy_maximum() {
+        let task_id = TaskId::new();
+        let mut reducer = Reducer::default();
+        reducer.reduce(
+            &event(0, task_id, EventKind::ModelRequestStarted { attempt: 99 }),
+            1,
+        );
+        assert_eq!(reducer.attempts_used(), reducer.retry_policy.max_attempts);
+        assert_eq!(
+            reducer.provisional.attempt,
+            Some(reducer.retry_policy.max_attempts)
+        );
+    }
+
+    #[test]
+    fn failure_cards_classify_the_four_reference_shapes() {
+        use loom_core::kernel::model::ModelErrorKind;
+
+        let task_id = TaskId::new();
+        let mut quota = Reducer::default();
+        quota.reduce(&event(0, task_id, EventKind::TaskStarted), 1);
+        quota.reduce(
+            &event(
+                1,
+                task_id,
+                EventKind::TaskFailed {
+                    reason: "model request failed: [quota_exhausted] HTTP 402".into(),
+                },
+            ),
+            2,
+        );
+        let card = quota.failure.unwrap();
+        assert_eq!(card.kind, FailureKind::QuotaExhausted);
+        assert_eq!(card.http_status, Some(402));
+
+        let mut max_tokens = Reducer::default();
+        max_tokens.reduce(&event(0, task_id, EventKind::TaskStarted), 1);
+        max_tokens.reduce(
+            &event(
+                1,
+                task_id,
+                EventKind::TaskFailed {
+                    reason: "model stopped with `max_tokens`".into(),
+                },
+            ),
+            2,
+        );
+        assert_eq!(max_tokens.failure.unwrap().kind, FailureKind::MaxTokens);
+
+        let mut filtered = Reducer::default();
+        filtered.reduce(&event(0, task_id, EventKind::TaskStarted), 1);
+        filtered.reduce(
+            &event(
+                1,
+                task_id,
+                EventKind::TaskFailed {
+                    reason: "model stopped with `content_filter`".into(),
+                },
+            ),
+            2,
+        );
+        assert_eq!(filtered.failure.unwrap().kind, FailureKind::ContentFilter);
+
+        let mut exhausted = Reducer::default();
+        exhausted.reduce(&event(0, task_id, EventKind::TaskStarted), 1);
+        exhausted.reduce(&event(1, task_id, EventKind::TurnStarted { turn: 1 }), 2);
+        exhausted.reduce(
+            &event(2, task_id, EventKind::ModelRequestStarted { attempt: 1 }),
+            3,
+        );
+        exhausted.reduce(
+            &event(
+                3,
+                task_id,
+                EventKind::ModelRetry {
+                    attempt: 1,
+                    kind: ModelErrorKind::Overloaded,
+                    delay_ms: 10,
+                    response_started: false,
+                },
+            ),
+            4,
+        );
+        exhausted.reduce(
+            &event(
+                4,
+                task_id,
+                EventKind::TaskFailed {
+                    reason: "model request failed: [overloaded] HTTP 503".into(),
+                },
+            ),
+            5,
+        );
+        let card = exhausted.failure.unwrap();
+        assert_eq!(card.kind, FailureKind::RetriesExhausted);
+        assert_eq!(card.subtitle.as_deref(), Some("overloaded ×4"));
     }
 }

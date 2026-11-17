@@ -46,6 +46,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "compact the context",
     },
     Command {
+        name: "/retry",
+        blurb: "re-run the failed task",
+    },
+    Command {
         name: "/copy",
         blurb: "copy the final answer",
     },
@@ -90,6 +94,7 @@ pub(crate) enum Action {
     Quit,
     Compare,
     Compact,
+    Retry,
 }
 
 /// Map a command name to its action. `None` is an unknown command.
@@ -110,6 +115,7 @@ pub(crate) fn action_for(name: &str) -> Option<Action> {
         "/quit" => Action::Quit,
         "/compare" => Action::Compare,
         "/compact" => Action::Compact,
+        "/retry" => Action::Retry,
         _ => return None,
     })
 }

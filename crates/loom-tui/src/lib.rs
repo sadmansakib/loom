@@ -639,6 +639,7 @@ async fn run_interactive(
                         break Some(result);
                     }
                     () = tokio::time::sleep(FRAME_TICK) => {
+                        reducer.tick(epoch_millis());
                         if event::poll(Duration::ZERO)? {
                             let event = event::read()?;
                             // Esc and ^C cancel through the token. A second
@@ -678,6 +679,15 @@ async fn run_interactive(
                                     }
                                     "/reasoning" => reducer.toggle_reasoning(),
                                     "/sidebar" => sidebar = !sidebar,
+                                    "/retry" => {
+                                        // TODO: the kernel backoff has no wake
+                                        // channel; add TaskControl::retry_now
+                                        // rather than faking a skip in the UI.
+                                        notice = Some(
+                                            "retry now is not wired to the kernel yet · Esc cancels"
+                                                .into(),
+                                        );
+                                    }
                                     "/quit" => should_quit = true,
                                     other => {
                                         notice = Some(format!(
@@ -1293,6 +1303,18 @@ async fn run_interactive(
                                             reducer.summary.as_ref(),
                                         ));
                                     }
+                                    palette::Action::Retry => {
+                                        if reducer.failure.is_some() {
+                                            if let Some(task) = reducer.original_instruction.clone()
+                                            {
+                                                pending_display_prompt = Some(task.clone());
+                                                pending_task = Some(task);
+                                                notice = Some("re-running the task…".into());
+                                            }
+                                        } else {
+                                            notice = Some("no failed task to retry".to_owned());
+                                        }
+                                    }
                                     palette::Action::Copy => {
                                         notice = Some(
                                             match final_answer(&reducer)
@@ -1755,6 +1777,7 @@ mod tests {
             "/new",
             "/context",
             "/tools",
+            "/retry",
             "/copy",
             "/export",
             "/reasoning",
