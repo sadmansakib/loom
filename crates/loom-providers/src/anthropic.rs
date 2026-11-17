@@ -118,6 +118,10 @@ impl ModelProvider for AnthropicProvider {
         model_capabilities(model)
     }
 
+    fn idle_timeout_millis(&self) -> Option<u64> {
+        Some(self.config.timeouts.idle_millis())
+    }
+
     fn stream<'a>(&'a self, request: &'a ModelRequest) -> ModelStream<'a> {
         let state = State::Send {
             provider: self.clone(),

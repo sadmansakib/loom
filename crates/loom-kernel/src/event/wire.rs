@@ -78,7 +78,11 @@ use serde::{Deserialize, Serialize};
 /// HTTP status reaches `ModelRetry`, `ModelRetry` carries the effective
 /// [`RetryPolicySnapshot`], and `TaskFailed` names the model kind, HTTP
 /// status, and stop reason instead of leaving consumers to parse `reason`.
-pub const EVENT_SCHEMA_VERSION: u16 = 22;
+/// v23 adds `ModelRetry.idle_timeout_ms`: the provider's own stream
+/// liveness window, so a frontend labels the real number. It is not part
+/// of [`RetryPolicySnapshot`] — the policy decides *whether* to retry,
+/// this decides when a silent stream counts as a failure.
+pub const EVENT_SCHEMA_VERSION: u16 = 23;
 
 /// Current Unix epoch milliseconds, or `0` before the epoch.
 #[must_use]
@@ -348,6 +352,12 @@ pub enum EventKind {
         /// written before schema v22.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy: Option<RetryPolicySnapshot>,
+        /// The provider's stream-liveness window in milliseconds: the
+        /// silent gap after which this attempt would fail as a transport
+        /// error. Not a retry-policy value. Absent in traces written
+        /// before schema v23.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idle_timeout_ms: Option<u64>,
     },
     /// The model finished; carries the authoritative
     /// [`ModelResponse`] (complete message + stop reason + usage). This is

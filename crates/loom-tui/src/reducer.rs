@@ -11,7 +11,9 @@ const RECENT_EVENT_LIMIT: usize = 256;
 use loom_core::{EventEnvelope, EventKind};
 
 use loom_core::kernel::agent::RemainingBudget;
-use loom_core::kernel::context::{ContextBudget, ContextCensus};
+use loom_core::kernel::context::{
+    ContextBudget, ContextCensus, HeuristicEstimator, TokenEstimator,
+};
 use loom_core::kernel::model::{ModelErrorKind, Usage};
 use loom_core::kernel::session::TaskStatus;
 /// Transcript facade aliases used by the reducer's public projection types.
@@ -53,10 +55,13 @@ pub struct RetryRecord {
     pub response_started: bool,
     /// Turn whose model request was retried.
     pub turn: Option<u32>,
-    /// Reasoning characters discarded from the failed attempt.
-    pub discarded_reasoning_chars: u64,
-    /// Assistant text characters discarded from the failed attempt.
-    pub discarded_text_chars: u64,
+    /// Reasoning tokens discarded from the failed attempt. Estimated: a
+    /// failed request reports no usage, so the count is the kernel's
+    /// heuristic over the provisional deltas, not a billed figure.
+    pub discarded_reasoning_tokens: u64,
+    /// Assistant text tokens discarded from the failed attempt. Same
+    /// estimate as [`Self::discarded_reasoning_tokens`].
+    pub discarded_text_tokens: u64,
     /// HTTP status that produced the failure, when the provider reported one.
     pub http_status: Option<u16>,
 }
@@ -166,8 +171,10 @@ pub struct FailureState {
 /// defaults only fill traces written before schema v22 (and keep replay
 /// deterministic); they are never used to decide a retry.
 ///
-/// There is deliberately no idle-timeout field: 300 s is the provider's HTTP
-/// `TimeoutConfig.idle`, not a retry-policy value.
+/// `idle_timeout_ms` is not a retry-policy value: it comes from the
+/// provider's own stream liveness window (`ModelRetry.idle_timeout_ms`,
+/// schema v23) and is shown in the same panel because both answer "how
+/// long before this attempt gives up".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicyView {
     /// Total attempts allowed per model request.
@@ -759,6 +766,7 @@ impl Reducer {
                 response_started,
                 http_status,
                 policy,
+                idle_timeout_ms,
             } => {
                 if let Some(policy) = policy {
                     self.retry_policy = RetryPolicyView {
@@ -770,10 +778,14 @@ impl Reducer {
                         idle_timeout_ms: None,
                     };
                 }
-                let discarded_reasoning_chars =
-                    u64::try_from(self.provisional.reasoning.chars().count()).unwrap_or(u64::MAX);
-                let discarded_text_chars =
-                    u64::try_from(self.provisional.text.chars().count()).unwrap_or(u64::MAX);
+                self.retry_policy.idle_timeout_ms = *idle_timeout_ms;
+                // A failed attempt reports no usage, so the discarded count
+                // can only be estimated; the kernel's heuristic keeps it
+                // deterministic and provider-independent.
+                let estimator = HeuristicEstimator;
+                let discarded_reasoning_tokens =
+                    u64::from(estimator.estimate(&self.provisional.reasoning));
+                let discarded_text_tokens = u64::from(estimator.estimate(&self.provisional.text));
                 let attempt = (*attempt).min(self.retry_policy.max_attempts).max(1);
                 self.retries.push(RetryRecord {
                     attempt,
@@ -781,8 +793,8 @@ impl Reducer {
                     delay_ms: *delay_ms,
                     response_started: *response_started,
                     turn: self.turn,
-                    discarded_reasoning_chars,
-                    discarded_text_chars,
+                    discarded_reasoning_tokens,
+                    discarded_text_tokens,
                     http_status: *http_status,
                 });
                 self.provisional.clear();
@@ -1618,6 +1630,7 @@ mod tests {
                     response_started: true,
                     http_status: None,
                     policy: None,
+                    idle_timeout_ms: None,
                 },
             ),
             13,
@@ -1634,8 +1647,8 @@ mod tests {
                 response_started: true,
                 http_status: None,
                 turn: None,
-                discarded_reasoning_chars: 15,
-                discarded_text_chars: 7,
+                discarded_reasoning_tokens: 5,
+                discarded_text_tokens: 2,
             }]
         );
     }
@@ -2493,6 +2506,7 @@ mod tests {
                     response_started: false,
                     http_status: None,
                     policy: None,
+                    idle_timeout_ms: None,
                 },
             ),
             2_000,
@@ -2551,6 +2565,7 @@ mod tests {
                     response_started: true,
                     http_status: None,
                     policy: None,
+                    idle_timeout_ms: None,
                 },
             ),
             5,
@@ -2560,7 +2575,7 @@ mod tests {
             item,
             Item::Assistant(message) if message.content.contains("not committed")
         )));
-        assert_eq!(reducer.retries[0].discarded_text_chars, 13);
+        assert_eq!(reducer.retries[0].discarded_text_tokens, 4);
     }
 
     #[test]
@@ -2586,6 +2601,7 @@ mod tests {
                     response_started: false,
                     http_status: None,
                     policy: None,
+                    idle_timeout_ms: None,
                 },
             ),
             4,
@@ -2662,6 +2678,7 @@ mod tests {
                         max_backoff_ms: 20_000,
                         jitter_percent: 10,
                     }),
+                    idle_timeout_ms: Some(300_000),
                 },
             ),
             2,
@@ -2672,6 +2689,7 @@ mod tests {
         assert_eq!(reducer.retry_policy.backoff_factor, 3);
         assert_eq!(reducer.retry_policy.max_backoff_ms, 20_000);
         assert_eq!(reducer.retry_policy.jitter_percent, 10);
+        assert_eq!(reducer.retry_policy.idle_timeout_ms, Some(300_000));
         assert_eq!(reducer.retries[0].http_status, Some(503));
         assert_eq!(reducer.retry_wait.as_ref().unwrap().next_attempt, 2);
     }
@@ -2752,6 +2770,7 @@ mod tests {
                     response_started: false,
                     http_status: None,
                     policy: None,
+                    idle_timeout_ms: None,
                 },
             ),
             4,

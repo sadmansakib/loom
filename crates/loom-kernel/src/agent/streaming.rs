@@ -60,6 +60,7 @@ impl Agent {
                                 response_started,
                                 http_status: error.http_status,
                                 policy: Some(policy),
+                                idle_timeout_ms: self.provider.idle_timeout_millis(),
                             },
                         );
                         if self.sleep_or_cancel(delay, cancellation, control).await {

@@ -369,6 +369,10 @@ impl ModelProvider for DeepSeekProvider {
         model_capabilities(model)
     }
 
+    fn idle_timeout_millis(&self) -> Option<u64> {
+        Some(self.config.timeouts.idle_millis())
+    }
+
     fn stream<'a>(&'a self, request: &'a ModelRequest) -> ModelStream<'a> {
         stream_endpoint(self, request)
     }
@@ -462,6 +466,12 @@ mod tests {
         let provider = DeepSeekProvider::new(config).unwrap();
         let rendered = format!("{provider:?}");
         assert!(!rendered.contains("sk-live-secret-value"), "{rendered}");
+    }
+
+    #[test]
+    fn reports_the_configured_idle_window() {
+        let provider = DeepSeekProvider::new(DeepSeekConfig::new("sk-test")).unwrap();
+        assert_eq!(provider.idle_timeout_millis(), Some(300_000));
     }
 
     #[test]

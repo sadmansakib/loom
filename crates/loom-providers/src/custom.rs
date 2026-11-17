@@ -276,6 +276,10 @@ impl ModelProvider for CustomProvider {
         self.catalog.capabilities(model)
     }
 
+    fn idle_timeout_millis(&self) -> Option<u64> {
+        Some(self.config.timeouts.idle_millis())
+    }
+
     fn stream<'a>(&'a self, request: &'a ModelRequest) -> ModelStream<'a> {
         stream_endpoint(self, request)
     }

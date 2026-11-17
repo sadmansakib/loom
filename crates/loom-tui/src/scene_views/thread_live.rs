@@ -18,7 +18,7 @@ use crate::{
 };
 
 use super::{
-    fg, glyph_set,
+    fg, format_compact_tokens, glyph_set,
     thread::{self},
 };
 
@@ -162,14 +162,15 @@ pub(super) fn draw(
         {
             rendered_retries.insert(retry_index);
             let discarded = retry
-                .discarded_reasoning_chars
-                .saturating_add(retry.discarded_text_chars);
+                .discarded_reasoning_tokens
+                .saturating_add(retry.discarded_text_tokens);
             let mut spans = vec![
                 Span::styled(
                     format!(
-                        "{} attempt {} · discarded {discarded} reasoning chars · ",
+                        "{} attempt {} · discarded ~{} reasoning tokens · ",
                         glyphs::glyph(Glyph::Retry, set),
-                        retry.attempt
+                        retry.attempt,
+                        format_compact_tokens(discarded)
                     ),
                     fg(theme::DIM),
                 ),

@@ -47,6 +47,14 @@ impl Default for TimeoutConfig {
     }
 }
 
+impl TimeoutConfig {
+    /// The idle window in whole milliseconds, as reported on the wire.
+    #[must_use]
+    pub fn idle_millis(&self) -> u64 {
+        u64::try_from(self.idle.as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
 /// Cap on bytes read from an error-response body: enough for the
 /// classification excerpt, small enough that a hostile server cannot
 /// balloon memory.

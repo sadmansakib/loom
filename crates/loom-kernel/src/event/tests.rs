@@ -396,6 +396,7 @@ fn event_kinds_use_snake_case_tags() {
                 max_backoff_ms: 30_000,
                 jitter_percent: 25,
             }),
+            idle_timeout_ms: Some(300_000),
         },
     };
     let json = serde_json::to_value(&retry).unwrap();
@@ -530,6 +531,7 @@ fn persisting_sink_round_trips_through_the_store() {
             response_started: false,
             http_status: None,
             policy: None,
+            idle_timeout_ms: None,
         },
     );
 
@@ -563,6 +565,7 @@ fn persisting_sink_round_trips_through_the_store() {
             response_started: false,
             http_status: None,
             policy: None,
+            idle_timeout_ms: None,
         }
     );
     assert_eq!(sink.persist_failures(), 0);

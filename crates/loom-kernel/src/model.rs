@@ -369,6 +369,16 @@ pub trait ModelProvider: Send + Sync {
         "provider-table"
     }
 
+    /// Longest silent gap the adapter tolerates on an open stream, in
+    /// milliseconds; `None` when the adapter enforces no liveness window.
+    ///
+    /// Display metadata for the retry screen, not a retry knob: the
+    /// adapter turns the window's expiry into a retryable
+    /// [`ModelErrorKind::Transport`] failure on its own.
+    fn idle_timeout_millis(&self) -> Option<u64> {
+        None
+    }
+
     /// Starts a request and returns its event stream.
     ///
     /// Lazy: nothing is sent until first poll. Dropping the stream cancels
