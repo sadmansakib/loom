@@ -100,6 +100,31 @@ impl RetryPolicy {
         self.max_attempts
     }
 
+    /// Backoff before the first retry.
+    #[must_use]
+    pub fn initial_backoff(&self) -> Duration {
+        self.initial_backoff
+    }
+
+    /// Exponential growth factor between retries.
+    #[must_use]
+    pub fn backoff_factor(&self) -> u32 {
+        self.backoff_factor
+    }
+
+    /// Upper bound on the computed backoff.
+    #[must_use]
+    pub fn max_backoff(&self) -> Duration {
+        self.max_backoff
+    }
+
+    /// Jitter as a whole percentage of the computed backoff, for display.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn jitter_percent(&self) -> u32 {
+        (self.jitter_fraction * 100.0).round() as u32
+    }
+
     /// Whether `error` is retryable and `attempt` (1-based, the attempt that
     /// just failed) leaves budget for another try.
     ///

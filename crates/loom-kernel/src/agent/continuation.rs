@@ -3,6 +3,7 @@
 //! item 12) — and the bounded `max_tokens` continuation reminders.
 
 use super::Agent;
+use super::TaskControl;
 use super::TaskError;
 use super::summary::Accounting;
 use crate::context::PruneCheckpoint;
@@ -22,12 +23,14 @@ impl Agent {
     /// emitted, retries honored). `None` when the reply is unusable —
     /// wrong stop reason, tool calls, or empty text — in which case the
     /// caller surfaces the original budget overrun.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn attempt_handoff(
         &self,
         session: &Session,
         task_id: TaskId,
         sink: &dyn EventSink,
         cancellation: &CancellationToken,
+        control: &TaskControl,
         accounting: &mut Accounting,
         turn: u32,
     ) -> Result<Option<PruneCheckpoint>, TaskError> {
@@ -54,7 +57,7 @@ impl Agent {
             session_id: Some(session.id.to_string()),
         };
         let response = self
-            .stream_with_retry(&request, task_id, sink, cancellation, accounting)
+            .stream_with_retry(&request, task_id, sink, cancellation, control, accounting)
             .await?;
         accounting.usage = accounting.usage + response.usage;
         let summary = response.message;

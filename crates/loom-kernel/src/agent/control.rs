@@ -9,6 +9,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 /// Cooperative stop control for one task run: the operator's two
@@ -29,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 ///
 /// Clones share state, so a UI thread can hold one copy while the
 /// driving task consumes another.
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Debug)]
 pub struct TaskControl {
     /// The hard stop honored by the stream and tool paths (§6.5–§6.6).
     pub(super) hard: CancellationToken,
@@ -44,6 +45,23 @@ pub struct TaskControl {
     /// instead of waiting for a budget overrun. `Arc` so clones share
     /// one latch, matching token semantics.
     pub(super) compaction: Arc<AtomicBool>,
+    /// Retry-now wake-up for an in-flight model-request backoff. The value is
+    /// a generation counter, so a press made before a wait begins is consumed
+    /// by that wait's initial `borrow_and_update` and cannot skip a later one.
+    pub(super) retry: Arc<watch::Sender<u64>>,
+}
+
+impl Default for TaskControl {
+    fn default() -> Self {
+        let (retry, _) = watch::channel(0);
+        Self {
+            hard: CancellationToken::new(),
+            soft: CancellationToken::new(),
+            steering: Arc::new(Mutex::new(Vec::new())),
+            compaction: Arc::new(AtomicBool::new(false)),
+            retry: Arc::new(retry),
+        }
+    }
 }
 
 impl TaskControl {
@@ -74,6 +92,19 @@ impl TaskControl {
     #[must_use]
     pub fn is_paused(&self) -> bool {
         self.soft.is_cancelled()
+    }
+
+    /// Skip the rest of an in-flight retry backoff and start the next attempt
+    /// immediately. A no-op when no backoff is running; the signal never
+    /// cancels the request or restarts the turn.
+    pub fn retry_now(&self) {
+        self.retry
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    /// A receiver that wakes when [`retry_now`](TaskControl::retry_now) fires.
+    pub(super) fn retry_receiver(&self) -> watch::Receiver<u64> {
+        self.retry.subscribe()
     }
 
     /// Queue a user message for the running task (item 25). Applied at
@@ -120,6 +151,7 @@ impl From<CancellationToken> for TaskControl {
             soft: CancellationToken::new(),
             steering: Arc::new(Mutex::new(Vec::new())),
             compaction: Arc::new(AtomicBool::new(false)),
+            retry: Arc::new(watch::channel(0).0),
         }
     }
 }

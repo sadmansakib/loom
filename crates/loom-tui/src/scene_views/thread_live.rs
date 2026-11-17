@@ -164,20 +164,21 @@ pub(super) fn draw(
             let discarded = retry
                 .discarded_reasoning_chars
                 .saturating_add(retry.discarded_text_chars);
-            lines.push(rail_line(
-                rail,
-                vec![
-                    Span::styled(
-                        format!(
-                            "{} attempt {} · discarded {discarded} reasoning chars · ",
-                            glyphs::glyph(Glyph::Retry, set),
-                            retry.attempt
-                        ),
-                        fg(theme::DIM),
+            let mut spans = vec![
+                Span::styled(
+                    format!(
+                        "{} attempt {} · discarded {discarded} reasoning chars · ",
+                        glyphs::glyph(Glyph::Retry, set),
+                        retry.attempt
                     ),
-                    Span::styled(retry.kind.clone(), fg(theme::CORAL)),
-                ],
-            ));
+                    fg(theme::DIM),
+                ),
+                Span::styled(retry.kind.clone(), fg(theme::CORAL)),
+            ];
+            if let Some(status) = retry.http_status {
+                spans.push(Span::styled(format!(" · HTTP {status}"), fg(theme::DIM)));
+            }
+            lines.push(rail_line(rail, spans));
         }
         if let Some(wait) = wait {
             lines.push(rail_line(

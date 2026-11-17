@@ -3,9 +3,10 @@
 //! backoff, and the provider stream itself.
 
 use super::Agent;
+use super::TaskControl;
 use super::TaskError;
 use super::summary::{Accounting, duration_millis};
-use crate::event::{EventKind, EventSink};
+use crate::event::{EventKind, EventSink, RetryPolicySnapshot};
 use crate::id::TaskId;
 use crate::model::{ModelError, ModelErrorKind, ModelEvent, ModelRequest, ModelResponse};
 use futures::StreamExt;
@@ -21,6 +22,7 @@ impl Agent {
         task_id: TaskId,
         sink: &dyn EventSink,
         cancellation: &CancellationToken,
+        control: &TaskControl,
         accounting: &mut Accounting,
     ) -> Result<ModelResponse, TaskError> {
         let mut attempt: u32 = 1;
@@ -42,6 +44,13 @@ impl Agent {
                     }
                     if self.retry.should_retry(attempt, &error) {
                         let delay = self.retry.delay(attempt, &error);
+                        let policy = RetryPolicySnapshot {
+                            max_attempts: self.retry.max_attempts(),
+                            initial_backoff_ms: duration_millis(self.retry.initial_backoff()),
+                            backoff_factor: self.retry.backoff_factor(),
+                            max_backoff_ms: duration_millis(self.retry.max_backoff()),
+                            jitter_percent: self.retry.jitter_percent(),
+                        };
                         sink.emit(
                             task_id,
                             EventKind::ModelRetry {
@@ -49,9 +58,11 @@ impl Agent {
                                 kind: error.kind,
                                 delay_ms: duration_millis(delay),
                                 response_started,
+                                http_status: error.http_status,
+                                policy: Some(policy),
                             },
                         );
-                        if self.sleep_or_cancel(delay, cancellation).await {
+                        if self.sleep_or_cancel(delay, cancellation, control).await {
                             return Err(TaskError::Cancelled);
                         }
                         attempt = attempt.saturating_add(1);
@@ -121,16 +132,21 @@ impl Agent {
         }
     }
 
-    /// Waits for `delay` unless the task is cancelled first. Returns `true`
-    /// when cancellation won.
+    /// Waits for `delay` unless the task is cancelled or the user asks to
+    /// retry now. Returns `true` when cancellation won.
     pub(super) async fn sleep_or_cancel(
         &self,
         delay: Duration,
         cancellation: &CancellationToken,
+        control: &TaskControl,
     ) -> bool {
+        let mut retry = control.retry_receiver();
+        // A press made before this wait started must not skip it.
+        retry.borrow_and_update();
         tokio::select! {
             biased;
             () = cancellation.cancelled() => true,
+            _ = retry.changed() => false,
             () = tokio::time::sleep(delay) => false,
         }
     }

@@ -269,6 +269,7 @@ impl WireEndpoint for OpenRouterProvider {
             kind = ModelErrorKind::ContextOverflow;
         }
         ModelError::new(kind, format!("HTTP {status}: {}", body_excerpt(body)))
+            .with_http_status(status.as_u16())
     }
 }
 

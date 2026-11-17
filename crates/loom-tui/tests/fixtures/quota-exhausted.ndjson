@@ -1,4 +1,4 @@
-{"schema_version":21,"sequence":0,"timestamp_millis":1760000000000,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"task_started"}}
-{"schema_version":21,"sequence":1,"timestamp_millis":1760000000010,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"turn_started","turn":1}}
-{"schema_version":21,"sequence":2,"timestamp_millis":1760000000020,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"model_request_started","attempt":1}}
-{"schema_version":21,"sequence":3,"timestamp_millis":1760000000200,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"task_failed","reason":"model request failed: [quota_exhausted] HTTP 402 insufficient balance"}}
+{"schema_version":22,"sequence":0,"timestamp_millis":1760000000000,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"task_started"}}
+{"schema_version":22,"sequence":1,"timestamp_millis":1760000000010,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"turn_started","turn":1}}
+{"schema_version":22,"sequence":2,"timestamp_millis":1760000000020,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"model_request_started","attempt":1}}
+{"schema_version":22,"sequence":3,"timestamp_millis":1760000000200,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"task_failed","reason":"model request failed: [quota_exhausted] HTTP 402 insufficient balance","model_kind":"quota_exhausted","http_status":402}}

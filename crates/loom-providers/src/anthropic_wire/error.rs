@@ -32,7 +32,7 @@ pub(crate) fn classify_status(status: reqwest::StatusCode, body: &str) -> ModelE
         || format!("HTTP {status} from the Messages API"),
         |detail| format!("HTTP {status}: {detail}"),
     );
-    ModelError::new(kind, message)
+    ModelError::new(kind, message).with_http_status(status.as_u16())
 }
 
 /// Maps an `error` event carried inside the stream to its kind.

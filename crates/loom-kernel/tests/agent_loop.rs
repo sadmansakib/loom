@@ -1404,6 +1404,73 @@ async fn retryable_failure_is_retried_and_partial_output_discarded() {
     assert!(matches!(kinds.last().unwrap(), EventKind::TaskCompleted));
 }
 
+/// `retry_now` skips the remaining backoff without restarting the request.
+/// The backoff is 30 s, so this test passing within its 2 s bound is the
+/// assertion that the signal woke the wait rather than the timer.
+#[tokio::test]
+async fn retry_now_skips_the_backoff_wait() {
+    let failed: Script = vec![Err(
+        ModelError::new(ModelErrorKind::Overloaded, "busy").with_http_status(503)
+    )];
+    let provider = FakeProvider::new(
+        capabilities(),
+        vec![
+            failed,
+            completed(
+                assistant("recovered", StopReason::EndTurn, Vec::new()),
+                usage(4, 1, None),
+            ),
+        ],
+    );
+    let mut session = Session::new(SessionId::new());
+    let (sink, mut receiver) = ChannelEventSink::new();
+    let control = TaskControl::new();
+    let agent = agent_with_retry(
+        provider,
+        ToolRegistry::new(),
+        10,
+        RetryPolicy::new()
+            .with_max_attempts(2)
+            .with_initial_backoff(Duration::from_secs(30))
+            .with_jitter_fraction(0.0),
+    );
+
+    let mut run = Box::pin(agent.run_task(&mut session, "go", &sink, &control));
+    let mut retry_event = None;
+    let summary = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                envelope = receiver.recv() => {
+                    if let Some(envelope) = envelope
+                        && let EventKind::ModelRetry {
+                            delay_ms,
+                            http_status,
+                            policy,
+                            ..
+                        } = envelope.kind
+                    {
+                        retry_event = Some((delay_ms, http_status, policy));
+                        control.retry_now();
+                    }
+                }
+                result = &mut run => break result.unwrap(),
+            }
+        }
+    })
+    .await
+    .expect("retry_now did not wake the 30 s backoff");
+
+    assert_eq!(summary.model_requests, 2);
+    let retry = retry_event.expect("retry event");
+    assert_eq!(retry.0, 30_000);
+    assert_eq!(retry.1, Some(503));
+    let policy = retry.2.expect("policy snapshot");
+    assert_eq!(policy.max_attempts, 2);
+    assert_eq!(policy.initial_backoff_ms, 30_000);
+    assert_eq!(policy.jitter_percent, 0);
+    assert_eq!(summary.turns, 1);
+}
+
 #[tokio::test]
 async fn a_pre_cancelled_task_commits_nothing() {
     let provider = FakeProvider::new(

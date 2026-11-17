@@ -194,11 +194,16 @@ impl ChunkAccumulator {
             ));
         }
         if let Some(error) = &self.wire_error {
-            let kind = (policy.classify_wire_error)(error.status(), &error.excerpt());
-            return Some(ModelError::new(
+            let status = error.status();
+            let kind = (policy.classify_wire_error)(status, &error.excerpt());
+            let mut failure = ModelError::new(
                 kind,
                 format!("provider reported a mid-stream error: {}", error.excerpt()),
-            ));
+            );
+            if let Some(status) = status {
+                failure = failure.with_http_status(status);
+            }
+            return Some(failure);
         }
         if let Some(kind) = self
             .finish_reason

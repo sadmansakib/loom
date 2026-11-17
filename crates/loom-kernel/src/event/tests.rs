@@ -1,7 +1,7 @@
 use super::{
     ChannelEventSink, EVENT_SCHEMA_VERSION, EventEnvelope, EventKind, EventSink, FanoutSink,
-    PersistingEventSink, StatusRecorder, StatusSnapshot, StrictSink, TaskPhase, TurnBudgetReason,
-    text_head,
+    PersistingEventSink, RetryPolicySnapshot, StatusRecorder, StatusSnapshot, StrictSink,
+    TaskPhase, TurnBudgetReason, text_head,
 };
 use crate::context::{PruneReport, PruneTrigger, PrunedCall, StubReason};
 use crate::id::{SessionId, TaskId};
@@ -388,6 +388,14 @@ fn event_kinds_use_snake_case_tags() {
             kind: ModelErrorKind::RateLimited,
             delay_ms: 4000,
             response_started: true,
+            http_status: Some(429),
+            policy: Some(RetryPolicySnapshot {
+                max_attempts: 4,
+                initial_backoff_ms: 2000,
+                backoff_factor: 2,
+                max_backoff_ms: 30_000,
+                jitter_percent: 25,
+            }),
         },
     };
     let json = serde_json::to_value(&retry).unwrap();
@@ -396,6 +404,39 @@ fn event_kinds_use_snake_case_tags() {
     assert_eq!(json["kind"]["attempt"], 2);
     assert_eq!(json["kind"]["delay_ms"], 4000);
     assert_eq!(json["kind"]["response_started"], true);
+    assert_eq!(json["kind"]["http_status"], 429);
+    assert_eq!(json["kind"]["policy"]["max_attempts"], 4);
+    assert_eq!(json["kind"]["policy"]["jitter_percent"], 25);
+}
+
+#[test]
+fn task_failed_keeps_structured_failure_metadata() {
+    let envelope = EventEnvelope {
+        schema_version: EVENT_SCHEMA_VERSION,
+        timestamp_millis: None,
+        sequence: 0,
+        task_id: TaskId::new(),
+        kind: EventKind::TaskFailed {
+            reason: "model request failed: [quota_exhausted] HTTP 402".to_owned(),
+            model_kind: Some(ModelErrorKind::QuotaExhausted),
+            http_status: Some(402),
+            stop_reason: None,
+        },
+    };
+    let back: EventEnvelope =
+        serde_json::from_value(serde_json::to_value(envelope).unwrap()).unwrap();
+    let EventKind::TaskFailed {
+        model_kind,
+        http_status,
+        stop_reason,
+        ..
+    } = back.kind
+    else {
+        panic!("expected task_failed");
+    };
+    assert_eq!(model_kind, Some(ModelErrorKind::QuotaExhausted));
+    assert_eq!(http_status, Some(402));
+    assert_eq!(stop_reason, None);
 }
 
 #[test]
@@ -487,6 +528,8 @@ fn persisting_sink_round_trips_through_the_store() {
             kind: ModelErrorKind::RateLimited,
             delay_ms: 500,
             response_started: false,
+            http_status: None,
+            policy: None,
         },
     );
 
@@ -518,6 +561,8 @@ fn persisting_sink_round_trips_through_the_store() {
             kind: ModelErrorKind::RateLimited,
             delay_ms: 500,
             response_started: false,
+            http_status: None,
+            policy: None,
         }
     );
     assert_eq!(sink.persist_failures(), 0);

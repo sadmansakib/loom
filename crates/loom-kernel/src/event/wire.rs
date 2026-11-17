@@ -74,7 +74,11 @@ use serde::{Deserialize, Serialize};
 /// stubbed a result below the window trigger.
 /// v21 adds [`EventEnvelope::timestamp_millis`]: observation time on the
 /// envelope so persisted history can restore real durations.
-pub const EVENT_SCHEMA_VERSION: u16 = 21;
+/// v22 adds structured failure metadata: [`ModelError`](crate::model::ModelError)'s
+/// HTTP status reaches `ModelRetry`, `ModelRetry` carries the effective
+/// [`RetryPolicySnapshot`], and `TaskFailed` names the model kind, HTTP
+/// status, and stop reason instead of leaving consumers to parse `reason`.
+pub const EVENT_SCHEMA_VERSION: u16 = 22;
 
 /// Current Unix epoch milliseconds, or `0` before the epoch.
 #[must_use]
@@ -164,6 +168,28 @@ pub struct EventEnvelope {
     pub task_id: TaskId,
     /// What happened.
     pub kind: EventKind,
+}
+
+/// The effective model-request retry policy for one task, as values the
+/// frontend can label (§6.3).
+///
+/// This is a wire projection of the kernel's private
+/// [`RetryPolicy`](crate::agent::RetryPolicy), not a separate policy: the
+/// kernel remains the only authority that decides retries. Carried on
+/// `ModelRetry` so a frontend never mirrors backoff defaults that an
+/// embedder may have overridden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryPolicySnapshot {
+    /// Total attempts allowed per request.
+    pub max_attempts: u32,
+    /// First retry backoff, in milliseconds.
+    pub initial_backoff_ms: u64,
+    /// Exponential growth between retries.
+    pub backoff_factor: u32,
+    /// Cap on the computed backoff, in milliseconds.
+    pub max_backoff_ms: u64,
+    /// Jitter around the computed backoff, in whole percent.
+    pub jitter_percent: u32,
 }
 
 /// What happened during a task.
@@ -315,6 +341,13 @@ pub enum EventKind {
         delay_ms: u64,
         /// Whether the failed attempt had begun receiving a response.
         response_started: bool,
+        /// HTTP status that produced the failure, when there was one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        http_status: Option<u16>,
+        /// The effective policy that decided this retry. Absent in traces
+        /// written before schema v22.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy: Option<RetryPolicySnapshot>,
     },
     /// The model finished; carries the authoritative
     /// [`ModelResponse`] (complete message + stop reason + usage). This is
@@ -448,6 +481,17 @@ pub enum EventKind {
     TaskFailed {
         /// Human-readable failure cause.
         reason: String,
+        /// Stable model-error classification, when the task failed in a
+        /// model request. Absent in traces written before schema v22.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_kind: Option<ModelErrorKind>,
+        /// HTTP status behind a model failure, when there was one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        http_status: Option<u16>,
+        /// Normalized stop reason that ended the task, for the fatal
+        /// `max_tokens` / `content_filter` / `context_limit` stops.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
     },
     /// The task was cancelled (cooperative cancellation won).
     TaskCancelled,

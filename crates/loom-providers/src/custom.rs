@@ -237,6 +237,7 @@ impl WireEndpoint for CustomProvider {
             kind = ModelErrorKind::ContextOverflow;
         }
         ModelError::new(kind, format!("HTTP {status}: {}", body_excerpt(body)))
+            .with_http_status(status.as_u16())
     }
 
     /// Many gateways (`LiteLLM` and `OpenRouter`-format proxies alike)

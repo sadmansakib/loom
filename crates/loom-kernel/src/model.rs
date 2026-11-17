@@ -295,6 +295,12 @@ pub struct ModelError {
     /// Provider-supplied hint for when a retry may proceed, overriding the
     /// policy's computed backoff (§6.3).
     pub retry_after: Option<std::time::Duration>,
+    /// HTTP status that produced this failure, when it came from a response.
+    ///
+    /// Adapters must set this through [`ModelError::with_http_status`] rather
+    /// than leaving the status only in [`ModelError::message`]: the TUI and
+    /// other consumers render it as structured metadata.
+    pub http_status: Option<u16>,
 }
 
 impl ModelError {
@@ -304,6 +310,7 @@ impl ModelError {
             kind,
             message: message.into(),
             retry_after: None,
+            http_status: None,
         }
     }
 
@@ -311,6 +318,13 @@ impl ModelError {
     #[must_use]
     pub fn with_retry_after(mut self, retry_after: std::time::Duration) -> Self {
         self.retry_after = Some(retry_after);
+        self
+    }
+
+    /// Attaches the HTTP status that produced this failure (builder style).
+    #[must_use]
+    pub fn with_http_status(mut self, http_status: u16) -> Self {
+        self.http_status = Some(http_status);
         self
     }
 

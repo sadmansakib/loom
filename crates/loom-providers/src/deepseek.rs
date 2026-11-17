@@ -356,6 +356,7 @@ impl WireEndpoint for DeepSeekProvider {
         // (live-verified: OpenAI-style error object) and needs no
         // parsing — the excerpt carries error.message for logs/CLI.
         ModelError::new(kind, format!("HTTP {status}: {}", body_excerpt(body)))
+            .with_http_status(status.as_u16())
     }
 }
 
@@ -413,6 +414,7 @@ mod tests {
             let status = reqwest::StatusCode::from_u16(code).unwrap();
             let error = DeepSeekProvider::classify_status(status, "body");
             assert_eq!(error.kind, kind, "HTTP {code}");
+            assert_eq!(error.http_status, Some(code), "HTTP {code}");
             assert_eq!(error.is_retryable(), kind.is_retryable(), "HTTP {code}");
         }
     }

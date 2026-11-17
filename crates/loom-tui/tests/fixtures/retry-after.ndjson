@@ -1,7 +1,7 @@
-{"schema_version":21,"sequence":0,"timestamp_millis":1760000000000,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"task_started"}}
-{"schema_version":21,"sequence":1,"timestamp_millis":1760000000010,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"turn_started","turn":1}}
-{"schema_version":21,"sequence":2,"timestamp_millis":1760000000020,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"model_request_started","attempt":1}}
-{"schema_version":21,"sequence":3,"timestamp_millis":1760000001000,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"model_retry","attempt":1,"kind":"rate_limited","delay_ms":1234,"response_started":false}}
-{"schema_version":21,"sequence":4,"timestamp_millis":1760000002234,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"model_request_started","attempt":2}}
-{"schema_version":21,"sequence":5,"timestamp_millis":1760000003000,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"model_completed","response":{"message":{"content":"Retry-after was honoured.","reasoning":null,"tool_calls":[],"stop_reason":"end_turn"},"usage":{"input_tokens":1000,"output_tokens":40,"cost_usd":0.0001}}}}
-{"schema_version":21,"sequence":6,"timestamp_millis":1760000003100,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"task_completed"}}
+{"schema_version":22,"sequence":0,"timestamp_millis":1760000000000,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"task_started"}}
+{"schema_version":22,"sequence":1,"timestamp_millis":1760000000010,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"turn_started","turn":1}}
+{"schema_version":22,"sequence":2,"timestamp_millis":1760000000020,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"model_request_started","attempt":1}}
+{"schema_version":22,"sequence":3,"timestamp_millis":1760000001000,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"model_retry","attempt":1,"kind":"rate_limited","delay_ms":1234,"response_started":false,"http_status":429,"policy":{"max_attempts":4,"initial_backoff_ms":2000,"backoff_factor":2,"max_backoff_ms":30000,"jitter_percent":25}}}
+{"schema_version":22,"sequence":4,"timestamp_millis":1760000002234,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"model_request_started","attempt":2}}
+{"schema_version":22,"sequence":5,"timestamp_millis":1760000003000,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"model_completed","response":{"message":{"content":"Retry-after was honoured.","reasoning":null,"tool_calls":[],"stop_reason":"end_turn"},"usage":{"input_tokens":1000,"output_tokens":40,"cost_usd":0.0001}}}}
+{"schema_version":22,"sequence":6,"timestamp_millis":1760000003100,"task_id":"0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c","kind":{"type":"task_completed"}}

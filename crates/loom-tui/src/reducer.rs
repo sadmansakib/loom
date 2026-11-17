@@ -12,7 +12,7 @@ use loom_core::{EventEnvelope, EventKind};
 
 use loom_core::kernel::agent::RemainingBudget;
 use loom_core::kernel::context::{ContextBudget, ContextCensus};
-use loom_core::kernel::model::Usage;
+use loom_core::kernel::model::{ModelErrorKind, Usage};
 use loom_core::kernel::session::TaskStatus;
 /// Transcript facade aliases used by the reducer's public projection types.
 pub use loom_core::kernel::transcript::{Item as TranscriptItem, ToolStatus};
@@ -57,6 +57,17 @@ pub struct RetryRecord {
     pub discarded_reasoning_chars: u64,
     /// Assistant text characters discarded from the failed attempt.
     pub discarded_text_chars: u64,
+    /// HTTP status that produced the failure, when the provider reported one.
+    pub http_status: Option<u16>,
+}
+
+/// Structured facts carried by a terminal `TaskFailed` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskFailure {
+    reason: String,
+    model_kind: Option<ModelErrorKind>,
+    http_status: Option<u16>,
+    stop_reason: Option<String>,
 }
 
 /// A backoff wait between a failed attempt and the next one.
@@ -149,12 +160,14 @@ pub struct FailureState {
     pub elapsed_ms: Option<u64>,
 }
 
-/// TUI-side mirror of the retry policy for labels and attempt rows.
+/// TUI-side view of the effective retry policy for labels and attempt rows.
 ///
-/// TODO: `RetryPolicy` exposes only `max_attempts()` and `backoff()` today.
-/// Replace the mirrored backoff/jitter fields with getters (or carry the
-/// policy on the event stream) once loom-core exposes them. There is no
-/// idle-timeout setting in the kernel at all.
+/// Replaced from `ModelRetry.policy` whenever the kernel reports it. The
+/// defaults only fill traces written before schema v22 (and keep replay
+/// deterministic); they are never used to decide a retry.
+///
+/// There is deliberately no idle-timeout field: 300 s is the provider's HTTP
+/// `TimeoutConfig.idle`, not a retry-policy value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicyView {
     /// Total attempts allowed per model request.
@@ -186,17 +199,23 @@ impl Default for RetryPolicyView {
 }
 
 impl FailureState {
+    #[allow(clippy::too_many_lines)]
     fn classify(
-        reason: &str,
+        failure: &TaskFailure,
         retries: &[RetryRecord],
         attempt: Option<u32>,
         policy: &RetryPolicyView,
         intact_turn: u32,
         elapsed_ms: Option<u64>,
     ) -> Self {
+        let reason = failure.reason.as_str();
         let lower = reason.to_lowercase();
-        let http_status = http_status(reason);
-        if lower.contains("max_tokens") || lower.contains("max tokens") {
+        let http_status = failure.http_status.or_else(|| http_status(reason));
+        let stop_reason = failure.stop_reason.as_deref();
+        if stop_reason == Some("max_tokens")
+            || lower.contains("max_tokens")
+            || lower.contains("max tokens")
+        {
             return Self {
                 kind: FailureKind::MaxTokens,
                 title: "MaxTokens".to_owned(),
@@ -213,7 +232,10 @@ impl FailureState {
                 elapsed_ms,
             };
         }
-        if lower.contains("content_filter") || lower.contains("content filter") {
+        if stop_reason == Some("content_filter")
+            || lower.contains("content_filter")
+            || lower.contains("content filter")
+        {
             return Self {
                 kind: FailureKind::ContentFilter,
                 title: "ContentFilter".to_owned(),
@@ -228,7 +250,10 @@ impl FailureState {
                 elapsed_ms,
             };
         }
-        if lower.contains("quota_exhausted") || lower.contains("quota exhausted") {
+        if failure.model_kind == Some(ModelErrorKind::QuotaExhausted)
+            || lower.contains("quota_exhausted")
+            || lower.contains("quota exhausted")
+        {
             return Self {
                 kind: FailureKind::QuotaExhausted,
                 title: "QuotaExhausted".to_owned(),
@@ -243,7 +268,11 @@ impl FailureState {
                 elapsed_ms,
             };
         }
-        if lower.contains("context_limit") || lower.contains("context limit") {
+        if stop_reason == Some("context_limit")
+            || failure.model_kind == Some(ModelErrorKind::ContextOverflow)
+            || lower.contains("context_limit")
+            || lower.contains("context limit")
+        {
             return Self {
                 kind: FailureKind::ContextLimit,
                 title: "ContextLimit".to_owned(),
@@ -259,7 +288,7 @@ impl FailureState {
             };
         }
         if let Some(failure) = retries_exhausted(
-            reason,
+            failure,
             retries,
             attempt,
             policy,
@@ -287,7 +316,7 @@ impl FailureState {
 
 #[allow(clippy::too_many_arguments)]
 fn retries_exhausted(
-    reason: &str,
+    failure: &TaskFailure,
     retries: &[RetryRecord],
     attempt: Option<u32>,
     policy: &RetryPolicyView,
@@ -296,9 +325,12 @@ fn retries_exhausted(
     http_status: Option<u16>,
 ) -> Option<FailureState> {
     let last = retries.last()?;
-    let final_kind = reason_error_kind(reason);
-    if !reason.contains("model request failed")
-        || final_kind.is_some_and(|kind| !is_retryable_kind(kind))
+    let final_kind = failure
+        .model_kind
+        .map(|kind| kind.to_string())
+        .or_else(|| reason_error_kind(&failure.reason).map(str::to_owned));
+    if failure.model_kind.is_none() && !failure.reason.contains("model request failed")
+        || final_kind.is_some_and(|kind| !is_retryable_kind(&kind))
     {
         return None;
     }
@@ -725,7 +757,19 @@ impl Reducer {
                 kind,
                 delay_ms,
                 response_started,
+                http_status,
+                policy,
             } => {
+                if let Some(policy) = policy {
+                    self.retry_policy = RetryPolicyView {
+                        max_attempts: policy.max_attempts,
+                        initial_backoff_ms: policy.initial_backoff_ms,
+                        backoff_factor: policy.backoff_factor,
+                        max_backoff_ms: policy.max_backoff_ms,
+                        jitter_percent: policy.jitter_percent,
+                        idle_timeout_ms: None,
+                    };
+                }
                 let discarded_reasoning_chars =
                     u64::try_from(self.provisional.reasoning.chars().count()).unwrap_or(u64::MAX);
                 let discarded_text_chars =
@@ -739,6 +783,7 @@ impl Reducer {
                     turn: self.turn,
                     discarded_reasoning_chars,
                     discarded_text_chars,
+                    http_status: *http_status,
                 });
                 self.provisional.clear();
                 let next_attempt = attempt
@@ -874,12 +919,22 @@ impl Reducer {
             EventKind::TaskCompleted => {
                 self.finish_task(event, TaskStatus::Completed, timestamp_millis, None);
             }
-            EventKind::TaskFailed { reason } => {
+            EventKind::TaskFailed {
+                reason,
+                model_kind,
+                http_status,
+                stop_reason,
+            } => {
                 self.finish_task(
                     event,
                     TaskStatus::Failed,
                     timestamp_millis,
-                    Some(reason.clone()),
+                    Some(&TaskFailure {
+                        reason: reason.clone(),
+                        model_kind: *model_kind,
+                        http_status: *http_status,
+                        stop_reason: stop_reason.clone(),
+                    }),
                 );
             }
             EventKind::TaskCancelled => {
@@ -1415,7 +1470,7 @@ impl Reducer {
         event: &EventEnvelope,
         status: TaskStatus,
         timestamp_millis: u64,
-        failure_reason: Option<String>,
+        failure: Option<&TaskFailure>,
     ) {
         // A tool still waiting on approval when the task ends never sends a
         // ToolCompleted; settle it so the thread does not spin forever.
@@ -1433,16 +1488,16 @@ impl Reducer {
         {
             metrics.completed_at_millis = Some(timestamp_millis);
         }
-        self.task.failure_reason.clone_from(&failure_reason);
+        self.task.failure_reason = failure.map(|failure| failure.reason.clone());
         self.retry_wait = None;
-        self.failure = failure_reason.map(|reason| {
+        self.failure = failure.map(|failure| {
             let intact_turn = self.assistant_turns.iter().copied().max().unwrap_or(0);
             let elapsed_ms = self
                 .task
                 .started_at_millis
                 .map(|started| timestamp_millis.saturating_sub(started));
             FailureState::classify(
-                &reason,
+                failure,
                 &self.retries,
                 self.attempt,
                 &self.retry_policy,
@@ -1492,7 +1547,7 @@ fn event_name(kind: &EventKind) -> &'static str {
 mod tests {
     use super::FailureKind;
     use loom_core::kernel::event::EVENT_SCHEMA_VERSION;
-    use loom_core::kernel::model::{ModelResponse, StopReason, Usage};
+    use loom_core::kernel::model::{ModelErrorKind, ModelResponse, StopReason, Usage};
     use loom_core::kernel::session::{TaskRecord, TaskStatus};
     use loom_core::kernel::transcript::{AssistantMessage, Item, ReasoningTrace};
     use loom_core::{EventEnvelope, EventKind, Session, SessionId, TaskId};
@@ -1561,6 +1616,8 @@ mod tests {
                     kind: loom_core::kernel::model::ModelErrorKind::Transport,
                     delay_ms: 250,
                     response_started: true,
+                    http_status: None,
+                    policy: None,
                 },
             ),
             13,
@@ -1575,6 +1632,7 @@ mod tests {
                 kind: "transport".into(),
                 delay_ms: 250,
                 response_started: true,
+                http_status: None,
                 turn: None,
                 discarded_reasoning_chars: 15,
                 discarded_text_chars: 7,
@@ -1735,6 +1793,9 @@ mod tests {
             EventKind::TaskCompleted,
             EventKind::TaskFailed {
                 reason: "provider gave up".into(),
+                model_kind: None,
+                http_status: None,
+                stop_reason: None,
             },
             EventKind::TaskCancelled,
             EventKind::TaskPaused,
@@ -1756,6 +1817,9 @@ mod tests {
                 task_id,
                 EventKind::TaskFailed {
                     reason: "provider failed".into(),
+                    model_kind: None,
+                    http_status: None,
+                    stop_reason: None,
                 },
             ),
             2345,
@@ -2427,6 +2491,8 @@ mod tests {
                     kind: ModelErrorKind::Transport,
                     delay_ms: 5_000,
                     response_started: false,
+                    http_status: None,
+                    policy: None,
                 },
             ),
             2_000,
@@ -2483,6 +2549,8 @@ mod tests {
                     kind: ModelErrorKind::Server,
                     delay_ms: 100,
                     response_started: true,
+                    http_status: None,
+                    policy: None,
                 },
             ),
             5,
@@ -2516,6 +2584,8 @@ mod tests {
                     kind: ModelErrorKind::Transport,
                     delay_ms: 5_000,
                     response_started: false,
+                    http_status: None,
+                    policy: None,
                 },
             ),
             4,
@@ -2540,6 +2610,9 @@ mod tests {
                 task_id,
                 EventKind::TaskFailed {
                     reason: "something new happened".into(),
+                    model_kind: None,
+                    http_status: None,
+                    stop_reason: None,
                 },
             ),
             2,
@@ -2566,6 +2639,44 @@ mod tests {
     }
 
     #[test]
+    fn retry_event_policy_replaces_the_mirrored_defaults() {
+        use loom_core::kernel::event::RetryPolicySnapshot;
+
+        let task_id = TaskId::new();
+        let mut reducer = Reducer::default();
+        reducer.reduce(&event(0, task_id, EventKind::TaskStarted), 1);
+        reducer.reduce(
+            &event(
+                1,
+                task_id,
+                EventKind::ModelRetry {
+                    attempt: 1,
+                    kind: ModelErrorKind::Overloaded,
+                    delay_ms: 4_000,
+                    response_started: false,
+                    http_status: Some(503),
+                    policy: Some(RetryPolicySnapshot {
+                        max_attempts: 7,
+                        initial_backoff_ms: 500,
+                        backoff_factor: 3,
+                        max_backoff_ms: 20_000,
+                        jitter_percent: 10,
+                    }),
+                },
+            ),
+            2,
+        );
+
+        assert_eq!(reducer.retry_policy.max_attempts, 7);
+        assert_eq!(reducer.retry_policy.initial_backoff_ms, 500);
+        assert_eq!(reducer.retry_policy.backoff_factor, 3);
+        assert_eq!(reducer.retry_policy.max_backoff_ms, 20_000);
+        assert_eq!(reducer.retry_policy.jitter_percent, 10);
+        assert_eq!(reducer.retries[0].http_status, Some(503));
+        assert_eq!(reducer.retry_wait.as_ref().unwrap().next_attempt, 2);
+    }
+
+    #[test]
     fn failure_cards_classify_the_four_reference_shapes() {
         use loom_core::kernel::model::ModelErrorKind;
 
@@ -2578,6 +2689,9 @@ mod tests {
                 task_id,
                 EventKind::TaskFailed {
                     reason: "model request failed: [quota_exhausted] HTTP 402".into(),
+                    model_kind: Some(ModelErrorKind::QuotaExhausted),
+                    http_status: Some(402),
+                    stop_reason: None,
                 },
             ),
             2,
@@ -2594,6 +2708,9 @@ mod tests {
                 task_id,
                 EventKind::TaskFailed {
                     reason: "model stopped with `max_tokens`".into(),
+                    model_kind: None,
+                    http_status: None,
+                    stop_reason: Some("max_tokens".into()),
                 },
             ),
             2,
@@ -2608,6 +2725,9 @@ mod tests {
                 task_id,
                 EventKind::TaskFailed {
                     reason: "model stopped with `content_filter`".into(),
+                    model_kind: None,
+                    http_status: None,
+                    stop_reason: Some("content_filter".into()),
                 },
             ),
             2,
@@ -2630,6 +2750,8 @@ mod tests {
                     kind: ModelErrorKind::Overloaded,
                     delay_ms: 10,
                     response_started: false,
+                    http_status: None,
+                    policy: None,
                 },
             ),
             4,
@@ -2640,6 +2762,9 @@ mod tests {
                 task_id,
                 EventKind::TaskFailed {
                     reason: "model request failed: [overloaded] HTTP 503".into(),
+                    model_kind: Some(ModelErrorKind::Overloaded),
+                    http_status: Some(503),
+                    stop_reason: None,
                 },
             ),
             5,

@@ -40,5 +40,5 @@ pub use strict::StrictSink;
 pub(crate) use wire::head_bytes;
 pub use wire::{
     ARGUMENTS_EVENT_HEAD, CONTENT_EVENT_HEAD, EVENT_SCHEMA_VERSION, EventEnvelope, EventKind,
-    TurnBudgetReason, text_head,
+    RetryPolicySnapshot, TurnBudgetReason, text_head,
 };

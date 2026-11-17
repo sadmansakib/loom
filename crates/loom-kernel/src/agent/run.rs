@@ -229,6 +229,7 @@ impl Agent {
     /// finished before the summary is returned so callers can read
     /// either; `events_dropped` is sampled after the terminal emit so a
     /// closed sink's drop of that event is counted too (§11).
+    #[allow(clippy::wildcard_enum_match_arm)]
     pub(super) fn finalize_task(
         &self,
         session: &mut Session,
@@ -264,12 +265,24 @@ impl Agent {
             Ok(_) => sink.emit(task_id, EventKind::TaskCompleted),
             Err(error) if error.is_cancelled() => sink.emit(task_id, EventKind::TaskCancelled),
             Err(error) if error.is_paused() => sink.emit(task_id, EventKind::TaskPaused),
-            Err(error) => sink.emit(
-                task_id,
-                EventKind::TaskFailed {
-                    reason: error.to_string(),
-                },
-            ),
+            Err(error) => {
+                let (model_kind, http_status, stop_reason) = match error {
+                    TaskError::Model(model) => (Some(model.kind), model.http_status, None),
+                    TaskError::UnrecoverableStop { stop_reason } => {
+                        (None, None, Some((*stop_reason).to_owned()))
+                    }
+                    _ => (None, None, None),
+                };
+                sink.emit(
+                    task_id,
+                    EventKind::TaskFailed {
+                        reason: error.to_string(),
+                        model_kind,
+                        http_status,
+                        stop_reason,
+                    },
+                );
+            }
         }
         let events_dropped = sink.dropped();
         let last_context_census = outcome.as_ref().ok().copied().unwrap_or_default();
@@ -555,7 +568,7 @@ impl Agent {
                     .is_none_or(|frozen| frozen.handoff.is_none())
                 && control.take_compaction_request()
                 && let Some(checkpoint) = self
-                    .attempt_handoff(session, task_id, sink, &hard, accounting, turn)
+                    .attempt_handoff(session, task_id, sink, &hard, control, accounting, turn)
                     .await?
             {
                 prune_checkpoint = Some(checkpoint);
@@ -585,7 +598,7 @@ impl Agent {
                             .is_none_or(|frozen| frozen.handoff.is_none()) =>
                 {
                     let Some(checkpoint) = self
-                        .attempt_handoff(session, task_id, sink, &hard, accounting, turn)
+                        .attempt_handoff(session, task_id, sink, &hard, control, accounting, turn)
                         .await?
                     else {
                         return Err(overrun);
@@ -631,7 +644,7 @@ impl Agent {
             // b. Stream with bounded retry (§6.3). Only a `Completed` event
             //    produces a response; failed attempts leave no trace.
             let response = self
-                .stream_with_retry(&request, task_id, sink, &hard, accounting)
+                .stream_with_retry(&request, task_id, sink, &hard, control, accounting)
                 .await?;
             accounting.usage = accounting.usage + response.usage;
             let assistant = response.message;

@@ -680,13 +680,13 @@ async fn run_interactive(
                                     "/reasoning" => reducer.toggle_reasoning(),
                                     "/sidebar" => sidebar = !sidebar,
                                     "/retry" => {
-                                        // TODO: the kernel backoff has no wake
-                                        // channel; add TaskControl::retry_now
-                                        // rather than faking a skip in the UI.
-                                        notice = Some(
-                                            "retry now is not wired to the kernel yet · Esc cancels"
-                                                .into(),
-                                        );
+                                        if reducer.is_retrying() {
+                                            task_control.retry_now();
+                                            notice = Some("retrying now…".into());
+                                        } else {
+                                            notice =
+                                                Some("nothing is waiting to retry · Esc cancels".into());
+                                        }
                                     }
                                     "/quit" => should_quit = true,
                                     other => {
