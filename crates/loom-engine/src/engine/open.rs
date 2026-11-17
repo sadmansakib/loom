@@ -713,7 +713,7 @@ impl Engine {
         let lsp = if config.lsp && !overrides.bare_loop {
             let workspace = std::fs::canonicalize(&config.workspace)
                 .unwrap_or_else(|_| config.workspace.clone());
-            loom_tools::lsp::attach_lsp(&workspace, config.budgets).await
+            loom_tools::lsp::attach_lsp(&workspace).await
         } else {
             loom_tools::lsp::LspAttachment::default()
         };
@@ -765,7 +765,7 @@ impl Engine {
         let lsp = if config.lsp && !overrides.bare_loop {
             let workspace = std::fs::canonicalize(&config.workspace)
                 .unwrap_or_else(|_| config.workspace.clone());
-            loom_tools::lsp::attach_lsp(&workspace, config.budgets).await
+            loom_tools::lsp::attach_lsp(&workspace).await
         } else {
             loom_tools::lsp::LspAttachment::default()
         };

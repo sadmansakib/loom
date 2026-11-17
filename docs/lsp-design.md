@@ -47,7 +47,7 @@ default-enabled set; LazyVim keymaps `gd/gr/gI/gy/gD/K/ cr`):
 | Workspace symbols | `workspace/symbol` | cross-repo symbol search |
 | Hover | `textDocument/hover` | types + docs, no file read |
 | Diagnostics | `textDocument/diagnostic` (pull) else `publishDiagnostics` (push cache) | errors without running the build |
-| Rename | `textDocument/prepareRename` + `rename` → `WorkspaceEdit` | correct multi-file rename |
+| Rename | `textDocument/rename` → `WorkspaceEdit` (loom applies) | correct multi-file rename |
 | Call hierarchy | `callHierarchy/prepare` + `incoming`/`outgoing` | callers/callees |
 
 Skip v1, with reasons on record: completion / signatureHelp / inlayHints /
@@ -55,12 +55,11 @@ codeLens / folding / semanticTokens / documentHighlight (editor-interaction
 surface, no agent value — each still costs capability negotiation and
 handler surface); **codeAction + `executeCommand`** (server-chosen
 arbitrary command execution = the MCP sampling/puppet class; revisit only
-with an allowlist design); `willSaveWaitUntil`; formatting (E2 candidate —
-useful but edit-shaped, ships with rename's edit-apply machinery).
+with an allowlist design); `willSaveWaitUntil`.
 
 ### Token economics
 
-- Fixed tool count regardless of server count (~8 tools) — unlike MCP
+- Fixed tool count regardless of server count (~9 tools) — unlike MCP
   there is **no schema explosion**, so no deferral machinery needed.
 - Result bigness is the risk, not tool count: references and hover can be
   huge. Adopt Serena's shortening: locations rendered `path:line` (1-based),
@@ -95,16 +94,21 @@ useful but edit-shaped, ships with rename's edit-apply machinery).
 
 ### Breadth: built-in server table + manifest override (the nvim-lspconfig move)
 
-`crates/loom-tools/src/lsp.rs` ships a `KNOWN_SERVERS` table (start:
+`crates/loom-tools/src/lsp/` ships a `KNOWN_SERVERS` table (start:
 rust_analyzer→`rust-analyzer`, gopls, clangd, pyright,
 typescript_language_server→`typescript-language-server --stdio`, zls,
-lua_language_server, bash_language_server, gopls-alikes; grow over time —
-data, not code). Auto-attach rule: server applies when (a) `--lsp` given,
-(b) its binary resolves on PATH, (c) the workspace contains files in its
-language set. `.loom/lsp.toml` overrides/extends entries and adds servers;
-explicit manifest entries always win over the table. Missing binary =
-skip with a warning, never fail the run (fail-open per server, fail-closed
-only for invalid manifest — same semantics as MCP).
+lua_language_server, bash_language_server, shell_lsp→`shell-lsp` for zsh;
+grow over time — data, not code). Auto-attach rule: server applies when
+(a) `--lsp` given, (b) its binary resolves on PATH, (c) a known marker
+file is present in the workspace root — or, for a table entry with no
+canonical marker, a file with one of its suffixes exists nearby (bounded
+scan; this is how the shell servers attach). `.loom/lsp.toml` overrides
+table entries, and adds servers
+with `command` + `suffixes` (a manifest-only name is reachable by the
+path tools only when it declares the suffixes it owns); explicit manifest
+entries always win over the table. Missing binary = skip with a warning,
+never fail the run (fail-open per server, fail-closed only for invalid
+manifest — same semantics as MCP).
 
 ### Client core
 
@@ -116,12 +120,15 @@ only for invalid manifest — same semantics as MCP).
   kill_on_drop, per-request timeout (ToolContext timeout as wall bound,
   like MCP).
 - Initialize: rootUri = workspace, workspaceFolders, client capabilities
-  declaring only what we do — lazy didOpen/didChange/didClose (full-sync),
-  `didChangeWatchedFiles` **without** dynamic registration (static
-  capability; we send notifications from engine-reported changes),
-  `positionEncoding: ["utf-8", "utf-16"]` preference, hover/references/
-  documentSymbol/workspaceSymbol/prepareRename/rename/definition-family/
-  callHierarchy/pullDiagnostics as *consumed* capabilities.
+  declaring only what we do — lazy didOpen/didChange (full-sync; open
+  documents live for the session), `didChangeWatchedFiles` **without**
+  dynamic registration (static capability; notifications come from
+  engine-reported changes), UTF-8 position encoding, publishDiagnostics
+  (the push cache), and the consumed read features: definition,
+  references, hover, documentSymbol, workspaceSymbol, pull diagnostics,
+  workspace.configuration. `applyEdit` is declined; rename,
+  documentChanges, call hierarchy and formatting are used when the
+  server advertises them, without a client declaration.
 - Server→client requests routed and answered deterministically:
   `workspace/configuration` → manifest settings for that server;
   `client/registerCapability` → accept and record (watchers registered
@@ -141,8 +148,9 @@ only for invalid manifest — same semantics as MCP).
   `DidChangeWatchedFiles` Deleted. Deterministic, no fs watcher threads.
 - Diagnostics: prefer pull (`textDocument/diagnostic`); else serve the
   cached `publishDiagnostics` stream. Servers analyze asynchronously — the
-  diagnostics tool bounds its wait (short poll with timeout) and reports
-  `unresolved/settling` honestly rather than returning stale-as-fresh.
+  diagnostics tool polls briefly and appends a note when the push cache
+  predates the latest open version (possibly stale), rather than
+  presenting stale-as-fresh.
 
 ### Positions (the classic LSP trap)
 
@@ -153,26 +161,28 @@ negotiated). Tool input is model-friendly and drift-tolerant: 1-based
 Conversion (char ↔ utf-8/utf-16) is explicit, tested with multibyte
 fixtures (é, 中). Output rendered as `path:line:col`, 1-based.
 
-### Tools (E1 read surface; fixed count, no deferral)
+### Tools (fixed count, no deferral)
 
-`lsp_goto` (target: definition|type_definition|implementation|declaration),
-`lsp_references`, `lsp_symbols` (file outline, flattened with kinds),
-`lsp_workspace_symbols`, `lsp_hover`, `lsp_diagnostics` (file or workspace),
-plus E2 write surface: `lsp_rename` (prepareRename → rename → apply
+`lsp_definition`, `lsp_references`, `lsp_symbols` (file outline, nested
+with kinds), `lsp_workspace_symbols`, `lsp_hover`, `lsp_diagnostics`
+(file or workspace). Write-shaped surface: `lsp_rename` (rename → apply
 WorkspaceEdit through loom's file-write machinery — documentChanges with
 Create/Delete/RenameFile, edits applied bottom-up; effects recorded like
-edit_file: files_written, notices) and `lsp_format`. E3:
-`lsp_callers`/`lsp_callees`. Engine wiring mirrors MCP: `--lsp` opt-in
-flag, attach in `open_async_with`, per-server fail-soft, facts-block menu
-(`lsp_menu` KnownFacts slot, ~10 tokens: active servers + languages).
+edit_file: files_written, notices) and `lsp_format`. `lsp_call_hierarchy`
+covers incoming/outgoing callers. Engine wiring mirrors MCP: `--lsp`
+opt-in flag, attach in `open_async_with`, per-server fail-soft,
+facts-block menu (`lsp_menu` KnownFacts slot, ~100 tokens: active servers
+and tool list).
 
 ### Phasing + measurement
 
 - **E1**: client core + sync + read tools + manifest/table + sandbox +
   facts menu. Tests: in-repo mock LSP server (re-exec test binary, like
   the MCP mock) covering handshake, sync-after-edit, position conversion,
-  shortening; real-server smoke (rust-analyzer, gopls, clangd — present on
-  this machine) behind an env flag, skipped where servers absent.
+  shortening; live smoke tests against real servers in
+  `crates/loom-tools/tests/lsp_live.rs` (every test `#[ignore]`d; run
+  `cargo test -p loom-tools --test lsp_live -- --ignored`; each test
+  skips when its server binary is absent).
 - **E2**: rename + format (WorkspaceEdit application; write-shaped —
   notices + effects; policy verdicts unchanged: they are loom tools).
 - **E3**: call hierarchy + the probe. $0, nano gateway, rust fixture with
@@ -190,9 +200,14 @@ flag, attach in `open_async_with`, per-server fail-soft, facts-block menu
   as correct as the attached server; mock tests pin our behavior, not the
   servers'.
 - Stale-analysis windows after edits are inherent to async servers;
-  bounded-wait + settling labels mitigate, never eliminate.
-- Grandchild sandbox behavior (cargo/go subprocesses under Seatbelt) is
-  unverified until the E3 probe; do not claim confined flycheck before it.
+  bounded-wait + version notes mitigate, never eliminate. Cold start is
+  covered by a bounded empty-result retry (10 s warm window, 3 s budget);
+  deep indexing can still outlast it.
+- Grandchild sandbox behavior is verified for Go in the live smoke test
+  (gopls spawns `go` under the sandbox and needs the granted `GOCACHE`);
+  other toolchains' deep subprocesses (e.g. rust-analyzer running
+  `cargo check` for flycheck) remain unverified — do not claim confined
+  flycheck before a probe.
 - Breadth claim is honest only as "generic client + config table +
   auto-discovery": ≈380 nvim-lspconfig servers exist; loom starts with a
   small table and grows it as data.

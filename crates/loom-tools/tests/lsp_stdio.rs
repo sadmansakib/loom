@@ -22,7 +22,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use loom_kernel::tool::{Tool, ToolContext};
-use loom_tools::ToolBudgets;
 use loom_tools::lsp::{LspAttachment, attach_lsp};
 use tokio_util::sync::CancellationToken;
 
@@ -74,6 +73,15 @@ fn send_notification(out: &mut impl Write, method: &str, params: &serde_json::Va
     write_frame(
         out,
         &format!(r#"{{"jsonrpc":"2.0","method":"{method}","params":{params}}}"#),
+    );
+}
+
+fn send_error(out: &mut impl Write, id: &serde_json::Value, code: i64, message: &str) {
+    write_frame(
+        out,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":{code},"message":"{message}"}}}}"#
+        ),
     );
 }
 
@@ -132,6 +140,17 @@ fn mock_server_loop() -> ! {
     let no_rename = std::env::var("LOOM_LSP_NO_RENAME").is_ok();
     let no_call_hierarchy = std::env::var("LOOM_LSP_NO_CALLHIERARCHY").is_ok();
     let settings_probe = std::env::var("LOOM_LSP_SETTINGS_PROBE").is_ok();
+    // Warmup simulation: fail the first client request with
+    // `content modified` (-32801), or answer the first definition with
+    // `null`, to pin the client's retry behavior.
+    let mut content_modified_left =
+        usize::from(std::env::var("LOOM_LSP_CONTENT_MODIFIED_ONCE").is_ok());
+    let mut empty_definition_left =
+        usize::from(std::env::var("LOOM_LSP_EMPTY_FIRST_DEFINITION").is_ok());
+    // Push-only servers (typescript-language-server, pyright) stay
+    // silent unless the client advertises publishDiagnostics, so the
+    // mock mirrors that: without the capability, no pushes.
+    let mut publish_diagnostics = false;
     let mut out = std::io::stdout();
     // libtest writes its progress line without a newline; start on a
     // fresh line so the first frame stays parseable for the client.
@@ -150,8 +169,25 @@ fn mock_server_loop() -> ! {
         if method.is_empty() {
             continue;
         }
+        if content_modified_left > 0 && id.is_some() && method != "initialize" {
+            content_modified_left -= 1;
+            if let Some(id) = &id {
+                send_error(&mut out, id, -32801, "content modified");
+            }
+            continue;
+        }
         match method {
             "initialize" => {
+                publish_diagnostics = nested(
+                    &msg,
+                    &[
+                        "params",
+                        "capabilities",
+                        "textDocument",
+                        "publishDiagnostics",
+                    ],
+                )
+                .is_some();
                 let mut caps = serde_json::json!({
                     "positionEncoding": "utf-16",
                     "definitionProvider": true,
@@ -207,6 +243,29 @@ fn mock_server_loop() -> ! {
                         }
                     }
                     let uri = file_uri(&format!("{}/src/probe.rs", ws_root()));
+                    if publish_diagnostics {
+                        send_notification(
+                            &mut out,
+                            "textDocument/publishDiagnostics",
+                            &serde_json::json!({
+                                "uri": uri,
+                                "diagnostics": [{
+                                    "range": {
+                                        "start": {"line": 0, "character": 0},
+                                        "end": {"line": 0, "character": 1}
+                                    },
+                                    "severity": 2,
+                                    "message": format!("settings seen: {served}")
+                                }]
+                            }),
+                        );
+                    }
+                    continue;
+                }
+                // Push one diagnostic for src/other.rs (absolute URI —
+                // the handler keys the cache by file path).
+                let uri = file_uri(&format!("{}/src/other.rs", ws_root()));
+                if publish_diagnostics {
                     send_notification(
                         &mut out,
                         "textDocument/publishDiagnostics",
@@ -218,32 +277,20 @@ fn mock_server_loop() -> ! {
                                     "end": {"line": 0, "character": 1}
                                 },
                                 "severity": 2,
-                                "message": format!("settings seen: {served}")
+                                "message": "pushed mock diagnostic"
                             }]
                         }),
                     );
-                    continue;
                 }
-                // Push one diagnostic for src/other.rs (absolute URI —
-                // the handler keys the cache by file path).
-                let uri = file_uri(&format!("{}/src/other.rs", ws_root()));
-                send_notification(
-                    &mut out,
-                    "textDocument/publishDiagnostics",
-                    &serde_json::json!({
-                        "uri": uri,
-                        "diagnostics": [{
-                            "range": {
-                                "start": {"line": 0, "character": 0},
-                                "end": {"line": 0, "character": 1}
-                            },
-                            "severity": 2,
-                            "message": "pushed mock diagnostic"
-                        }]
-                    }),
-                );
             }
             "textDocument/definition" => {
+                if empty_definition_left > 0 {
+                    empty_definition_left -= 1;
+                    if let Some(id) = &id {
+                        send_response(&mut out, id, &serde_json::Value::Null);
+                    }
+                    continue;
+                }
                 let uri = nested(&msg, &["params", "textDocument", "uri"])
                     .and_then(|u| u.as_str())
                     .unwrap_or_default()
@@ -490,6 +537,12 @@ fn manifest(dir: &Path, extra_env: &[(&str, &str)]) {
 /// Manifest writer with extra `[servers.rust_analyzer]` declaration
 /// lines appended (e.g. a `settings` table for the E2 probe).
 fn manifest_with(dir: &Path, extra_env: &[(&str, &str)], decl_extra: &str) {
+    write_manifest(dir, "rust_analyzer", extra_env, decl_extra);
+}
+
+/// Writes a manifest for one mock server under an arbitrary name, so
+/// manifest-only servers (no `KNOWN_SERVERS` entry) can be exercised.
+fn write_manifest(dir: &Path, name: &str, extra_env: &[(&str, &str)], decl_extra: &str) {
     let exe = std::env::current_exe().unwrap().display().to_string();
     let mut env_pairs = vec![
         (String::from("LOOM_LSP_MOCK"), String::from("1")),
@@ -504,7 +557,7 @@ fn manifest_with(dir: &Path, extra_env: &[(&str, &str)], decl_extra: &str) {
         .collect::<Vec<_>>()
         .join(", ");
     let body = format!(
-        "[servers.rust_analyzer]\ncommand = {}\nenv = {{ {env_body} }}\n{decl_extra}",
+        "[servers.{name}]\ncommand = {}\nenv = {{ {env_body} }}\n{decl_extra}",
         mock_command_lines(&exe)
     );
     std::fs::write(dir.join(".loom/lsp.toml"), body).unwrap();
@@ -519,7 +572,7 @@ fn build_runtime() -> tokio::runtime::Runtime {
 
 fn attach(dir: &Path) -> LspAttachment {
     let rt = build_runtime();
-    rt.block_on(attach_lsp(dir, ToolBudgets::default()))
+    rt.block_on(attach_lsp(dir))
 }
 
 fn context(dir: &Path) -> ToolContext {
@@ -548,7 +601,14 @@ fn missing_manifest_attaches_nothing() {
     std::fs::remove_dir_all(dir.join(".loom")).unwrap();
     let attachment = attach(&dir);
     assert!(attachment.tools.is_empty());
-    assert!(attachment.menu.is_none());
+    assert!(
+        attachment
+            .menu
+            .as_deref()
+            .is_some_and(|m| m.contains("no servers attached")),
+        "menu: {:?}",
+        attachment.menu
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -558,7 +618,14 @@ fn invalid_manifest_fails_closed() {
     std::fs::write(dir.join(".loom/lsp.toml"), "not [ valid toml").unwrap();
     let attachment = attach(&dir);
     assert!(attachment.tools.is_empty());
-    assert!(attachment.menu.is_none());
+    assert!(
+        attachment
+            .menu
+            .as_deref()
+            .is_some_and(|m| m.contains("invalid")),
+        "menu: {:?}",
+        attachment.menu
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -572,7 +639,68 @@ fn missing_binary_skips_server() {
     .unwrap();
     let attachment = attach(&dir);
     assert!(attachment.tools.is_empty());
-    assert!(attachment.menu.is_none());
+    assert!(
+        attachment
+            .menu
+            .as_deref()
+            .is_some_and(|m| m.contains("no servers attached")),
+        "menu: {:?}",
+        attachment.menu
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn manifest_only_server_owns_its_suffix() {
+    let dir = workspace("manifest-only");
+    std::fs::write(dir.join("src/thing.mojo"), LIB_RS).unwrap();
+    write_manifest(&dir, "mojo_lsp", &[], "suffixes = [\".mojo\"]\n");
+    let rt = build_runtime();
+    let attachment = rt.block_on(attach_lsp(&dir));
+    assert_eq!(attachment.servers.len(), 1, "menu: {:?}", attachment.menu);
+    assert_eq!(attachment.servers[0].name, "mojo_lsp");
+    let tool = find_tool(&attachment.tools, "lsp_definition");
+    let out = rt
+        .block_on(tool.call(
+            serde_json::json!({"path": "src/thing.mojo", "symbol": "median"}),
+            &context(&dir),
+        ))
+        .expect("definition call");
+    assert!(out.content.contains("thing.mojo"), "{}", out.content);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn content_modified_is_retried() {
+    let dir = workspace("content-modified");
+    manifest(&dir, &[("LOOM_LSP_CONTENT_MODIFIED_ONCE", "1")]);
+    let rt = build_runtime();
+    let attachment = rt.block_on(attach_lsp(&dir));
+    let tool = find_tool(&attachment.tools, "lsp_definition");
+    let out = rt
+        .block_on(tool.call(
+            serde_json::json!({"path": "src/lib.rs", "symbol": "median"}),
+            &context(&dir),
+        ))
+        .expect("definition call");
+    assert!(out.content.contains(":3:8"), "{}", out.content);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn empty_definition_is_retried_while_warming() {
+    let dir = workspace("warming");
+    manifest(&dir, &[("LOOM_LSP_EMPTY_FIRST_DEFINITION", "1")]);
+    let rt = build_runtime();
+    let attachment = rt.block_on(attach_lsp(&dir));
+    let tool = find_tool(&attachment.tools, "lsp_definition");
+    let out = rt
+        .block_on(tool.call(
+            serde_json::json!({"path": "src/lib.rs", "symbol": "median"}),
+            &context(&dir),
+        ))
+        .expect("definition call");
+    assert!(out.content.contains(":3:8"), "{}", out.content);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -613,7 +741,7 @@ fn definition_via_symbol_and_utf16_echo() {
     let dir = workspace("definition");
     manifest(&dir, &[]);
     let rt = build_runtime();
-    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let attachment = rt.block_on(attach_lsp(&dir));
     let tool = find_tool(&attachment.tools, "lsp_definition");
     let ctx = context(&dir);
 
@@ -651,7 +779,7 @@ fn references_render_two_locations() {
     let dir = workspace("references");
     manifest(&dir, &[]);
     let rt = build_runtime();
-    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let attachment = rt.block_on(attach_lsp(&dir));
     let tool = find_tool(&attachment.tools, "lsp_references");
     let ctx = context(&dir);
     let out = rt
@@ -671,7 +799,7 @@ fn symbols_outline_nested() {
     let dir = workspace("symbols");
     manifest(&dir, &[]);
     let rt = build_runtime();
-    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let attachment = rt.block_on(attach_lsp(&dir));
     let tool = find_tool(&attachment.tools, "lsp_symbols");
     let ctx = context(&dir);
     let out = rt
@@ -687,7 +815,7 @@ fn workspace_symbols_flat_response() {
     let dir = workspace("workspace-symbols");
     manifest(&dir, &[]);
     let rt = build_runtime();
-    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let attachment = rt.block_on(attach_lsp(&dir));
     let tool = find_tool(&attachment.tools, "lsp_workspace_symbols");
     let ctx = context(&dir);
     let out = rt
@@ -703,7 +831,7 @@ fn hover_renders_markup() {
     let dir = workspace("hover");
     manifest(&dir, &[]);
     let rt = build_runtime();
-    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let attachment = rt.block_on(attach_lsp(&dir));
     let tool = find_tool(&attachment.tools, "lsp_hover");
     let ctx = context(&dir);
     let out = rt
@@ -725,7 +853,7 @@ fn diagnostics_pull_preferred() {
     let dir = workspace("diagnostics-pull");
     manifest(&dir, &[]);
     let rt = build_runtime();
-    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let attachment = rt.block_on(attach_lsp(&dir));
     let tool = find_tool(&attachment.tools, "lsp_diagnostics");
     let ctx = context(&dir);
     let out = rt
@@ -745,7 +873,7 @@ fn diagnostics_fall_back_to_pushed_cache() {
     let dir = workspace("diagnostics-push");
     manifest(&dir, &[("LOOM_LSP_NO_PULL", "1")]);
     let rt = build_runtime();
-    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let attachment = rt.block_on(attach_lsp(&dir));
     let tool = find_tool(&attachment.tools, "lsp_diagnostics");
     let ctx = context(&dir);
     let out = rt
@@ -764,7 +892,7 @@ fn unowned_suffix_is_rejected_with_guidance() {
     let dir = workspace("unowned");
     manifest(&dir, &[]);
     let rt = build_runtime();
-    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let attachment = rt.block_on(attach_lsp(&dir));
     let tool = find_tool(&attachment.tools, "lsp_definition");
     let ctx = context(&dir);
     let err = rt
@@ -790,7 +918,7 @@ fn recent_changes_sync_does_not_break_queries() {
     let dir = workspace("sync");
     manifest(&dir, &[]);
     let rt = build_runtime();
-    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let attachment = rt.block_on(attach_lsp(&dir));
     let tool = find_tool(&attachment.tools, "lsp_definition");
     let ctx = context(&dir);
     // Simulate loom's change feed: lib.rs was rewritten (the mock
@@ -814,7 +942,7 @@ fn rename_applies_edits_and_moves_files() {
     let dir = workspace("rename");
     manifest(&dir, &[]);
     let rt = build_runtime();
-    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let attachment = rt.block_on(attach_lsp(&dir));
     let tool = find_tool(&attachment.tools, "lsp_rename");
     let ctx = context(&dir);
     let out = rt
@@ -844,7 +972,7 @@ fn rename_without_capability_errors() {
     let dir = workspace("rename-unsupported");
     manifest(&dir, &[("LOOM_LSP_NO_RENAME", "1")]);
     let rt = build_runtime();
-    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let attachment = rt.block_on(attach_lsp(&dir));
     let tool = find_tool(&attachment.tools, "lsp_rename");
     let ctx = context(&dir);
     let err = rt
@@ -868,7 +996,7 @@ fn format_trims_trailing_whitespace() {
     let dir = workspace("format");
     manifest(&dir, &[]);
     let rt = build_runtime();
-    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let attachment = rt.block_on(attach_lsp(&dir));
     let tool = find_tool(&attachment.tools, "lsp_format");
     let ctx = context(&dir);
     let out = rt
@@ -893,7 +1021,7 @@ fn settings_reach_workspace_configuration() {
         "settings = { rust_probe_value = \"probe-77\" }\n",
     );
     let rt = build_runtime();
-    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let attachment = rt.block_on(attach_lsp(&dir));
     let tool = find_tool(&attachment.tools, "lsp_diagnostics");
     let ctx = context(&dir);
     let out = rt
@@ -912,7 +1040,7 @@ fn call_hierarchy_incoming_renders_callers() {
     let dir = workspace("callh-in");
     manifest(&dir, &[]);
     let rt = build_runtime();
-    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let attachment = rt.block_on(attach_lsp(&dir));
     let tool = find_tool(&attachment.tools, "lsp_call_hierarchy");
     let ctx = context(&dir);
     let out = rt
@@ -937,7 +1065,7 @@ fn call_hierarchy_outgoing_renders_callees() {
     let dir = workspace("callh-out");
     manifest(&dir, &[]);
     let rt = build_runtime();
-    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let attachment = rt.block_on(attach_lsp(&dir));
     let tool = find_tool(&attachment.tools, "lsp_call_hierarchy");
     let ctx = context(&dir);
     let out = rt
@@ -962,7 +1090,7 @@ fn call_hierarchy_without_capability_errors() {
     let dir = workspace("callh-unsupported");
     manifest(&dir, &[("LOOM_LSP_NO_CALLHIERARCHY", "1")]);
     let rt = build_runtime();
-    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let attachment = rt.block_on(attach_lsp(&dir));
     let tool = find_tool(&attachment.tools, "lsp_call_hierarchy");
     let ctx = context(&dir);
     let err = rt
@@ -1001,7 +1129,7 @@ fn fast_path_rename_falls_back_to_lsp_on_collision() {
     std::fs::write(dir.join("src/other.rs"), "// the mean string collides\n").unwrap();
     manifest(&dir, &[]);
     let rt = build_runtime();
-    let attachment = rt.block_on(attach_lsp(&dir, ToolBudgets::default()));
+    let attachment = rt.block_on(attach_lsp(&dir));
     let policy = loom_tools::CommandPolicy::cargo_only();
 
     // Without servers the same attempt stays a collision decline.

@@ -10,8 +10,9 @@
 //! writes), and `window/*` chatter goes to tracing.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_lsp::concurrency::ConcurrencyBuilder;
 use async_lsp::panic::CatchUnwindBuilder;
@@ -32,6 +33,14 @@ use crate::sandbox::{Sandbox, SandboxGrants};
 const INIT_TIMEOUT_SECS: u64 = 60;
 /// Wall-time cap for one LSP request.
 const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// A server counts as warming up this long after spawn: read tools
+/// retry empty answers in that window instead of reporting "nothing
+/// there" while the analysis is still loading.
+const WARM_WINDOW: Duration = Duration::from_secs(10);
+/// Total retry budget for empty read answers while warming.
+const SETTLE_TOTAL: Duration = Duration::from_secs(3);
+/// Spacing between settle retries.
+const SETTLE_STEP: Duration = Duration::from_millis(200);
 
 /// Push diagnostics cache entry: latest diagnostics plus the document
 /// version they were computed against (`None` when the server omitted
@@ -68,6 +77,11 @@ pub struct LspServer {
     opening: tokio::sync::Mutex<()>,
     /// True when the server negotiated UTF-8 position encoding.
     utf8_positions: bool,
+    /// File suffixes this server owns (normalized: lowercase, dot first).
+    suffixes: Vec<String>,
+    /// Spawn time: empty read answers are retried while the server is
+    /// still warming up.
+    started_at: Instant,
     /// Workspace root (file paths resolve against it).
     root: std::path::PathBuf,
 }
@@ -101,12 +115,11 @@ impl LspServer {
             .map_or_default(|m| m.keys().cloned().collect())
     }
 
-    /// Language id for a file path, from the table's suffix map.
+    /// Language id for a file path, from the server's suffix map.
     pub fn language_id(&self, path: &str) -> Option<String> {
         let suffix = path.rsplit('.').next()?.to_ascii_lowercase();
         let suffix = format!(".{suffix}");
-        self.known?
-            .suffixes
+        self.suffixes
             .iter()
             .find(|s| **s == suffix)
             .map(|s| s.trim_start_matches('.').to_string())
@@ -368,18 +381,100 @@ impl LspServer {
         }
     }
 
-    /// Runs one typed request with the per-request wall cap.
+    /// Sends one request with a wall-time cap. `content modified`
+    /// (-32801) is retried a couple of times: servers emit it while
+    /// their analysis is reloading, and the request is idempotent.
     pub(crate) async fn request<R>(&self, params: R::Params) -> Result<R::Result, String>
     where
         R: lsp_types::request::Request,
+        R::Params: Clone,
     {
-        let fut = self.socket.request::<R>(params);
-        match tokio::time::timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS), fut).await
-        {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(e)) => Err(format!("lsp request failed: {e}")),
-            Err(_) => Err(format!("lsp request {} timed out", R::METHOD)),
+        let mut attempt = 0u32;
+        loop {
+            let fut = self.socket.request::<R>(params.clone());
+            match tokio::time::timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), fut).await {
+                Ok(Ok(result)) => return Ok(result),
+                Ok(Err(async_lsp::Error::Response(err)))
+                    if err.code == ErrorCode::CONTENT_MODIFIED && attempt < 2 =>
+                {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt))).await;
+                }
+                Ok(Err(e)) => return Err(format!("lsp request failed: {e}")),
+                Err(_) => return Err(format!("lsp request {} timed out", R::METHOD)),
+            }
         }
+    }
+
+    /// Read-tool request: while the server is still warming up, an
+    /// empty answer may mean "analysis not loaded yet", so retry it
+    /// for a short bounded budget before reporting nothing.
+    pub(crate) async fn request_settled<R>(&self, params: R::Params) -> Result<R::Result, String>
+    where
+        R: lsp_types::request::Request,
+        R::Params: Clone,
+        R::Result: SettleEmpty,
+    {
+        let deadline = Instant::now() + SETTLE_TOTAL;
+        loop {
+            let result = self.request::<R>(params.clone()).await?;
+            if !result.empty_for_settle() || !self.warming() || Instant::now() >= deadline {
+                return Ok(result);
+            }
+            tokio::time::sleep(SETTLE_STEP).await;
+        }
+    }
+
+    fn warming(&self) -> bool {
+        self.started_at.elapsed() < WARM_WINDOW
+    }
+}
+
+/// Whether a read response carries no data (retryable while warming).
+pub(crate) trait SettleEmpty {
+    fn empty_for_settle(&self) -> bool;
+}
+
+impl<T> SettleEmpty for Option<Vec<T>> {
+    fn empty_for_settle(&self) -> bool {
+        self.as_ref().is_none_or(Vec::is_empty)
+    }
+}
+
+impl SettleEmpty for Option<lsp_types::GotoDefinitionResponse> {
+    fn empty_for_settle(&self) -> bool {
+        match self {
+            None => true,
+            Some(lsp_types::GotoDefinitionResponse::Array(locations)) => locations.is_empty(),
+            Some(lsp_types::GotoDefinitionResponse::Link(links)) => links.is_empty(),
+            Some(lsp_types::GotoDefinitionResponse::Scalar(_)) => false,
+        }
+    }
+}
+
+impl SettleEmpty for Option<lsp_types::DocumentSymbolResponse> {
+    fn empty_for_settle(&self) -> bool {
+        match self {
+            None => true,
+            Some(lsp_types::DocumentSymbolResponse::Flat(items)) => items.is_empty(),
+            Some(lsp_types::DocumentSymbolResponse::Nested(items)) => items.is_empty(),
+        }
+    }
+}
+
+impl SettleEmpty for Option<lsp_types::WorkspaceSymbolResponse> {
+    fn empty_for_settle(&self) -> bool {
+        match self {
+            None => true,
+            Some(lsp_types::WorkspaceSymbolResponse::Flat(items)) => items.is_empty(),
+            Some(lsp_types::WorkspaceSymbolResponse::Nested(items)) => items.is_empty(),
+        }
+    }
+}
+
+impl SettleEmpty for Option<lsp_types::Hover> {
+    fn empty_for_settle(&self) -> bool {
+        self.is_none()
     }
 }
 
@@ -416,6 +511,12 @@ fn client_capabilities() -> lsp_types::ClientCapabilities {
             }),
             document_symbol: Some(DocumentSymbolClientCapabilities {
                 dynamic_registration: Some(false),
+                ..Default::default()
+            }),
+            // Push-only servers (typescript-language-server) publish
+            // nothing unless this is advertised.
+            publish_diagnostics: Some(lsp_types::PublishDiagnosticsClientCapabilities {
+                version_support: Some(true),
                 ..Default::default()
             }),
             diagnostic: Some(DiagnosticClientCapabilities {
@@ -539,23 +640,100 @@ impl<R: futures::AsyncRead + Unpin> futures::AsyncRead for PreambleSkip<R> {
     }
 }
 
+/// Environment a language server child inherits.
+///
+/// Toolchain-backed servers need more than PATH: rustup shims abort
+/// without `HOME`/`CARGO_HOME`/`RUSTUP_HOME` ("failed to determine
+/// cargo home"), and children without `TMPDIR` fall back to `/tmp`,
+/// which the sandbox does not allow (its writable temp is the
+/// platform temp dir). Everything else stays cleared; the manifest
+/// `env` table overrides or extends these.
+const SERVER_ENV: &[&str] = &["PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME", "TMPDIR"];
+
+fn server_env() -> Vec<(String, String)> {
+    server_env_from(|key| std::env::var(key).ok())
+}
+
+fn server_env_from(lookup: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+    SERVER_ENV
+        .iter()
+        .filter_map(|key| lookup(key).map(|value| ((*key).to_owned(), value)))
+        .collect()
+}
+
+/// Toolchain cache a server must be able to write, beyond the
+/// workspace. gopls cannot load packages while Go's build cache is
+/// read-only ("no package metadata for file", every query empty), and
+/// it cannot create that cache itself under the sandbox.
+fn server_cache(candidate: &ServerCandidate) -> Option<PathBuf> {
+    let program = Path::new(candidate.command.first()?).file_name()?;
+    if program != "gopls" {
+        return None;
+    }
+    go_build_cache()
+}
+
+/// Go's default build cache (`GOCACHE`, else the platform cache dir).
+fn go_build_cache() -> Option<PathBuf> {
+    let cache = go_build_cache_from(|key| std::env::var_os(key))?;
+    let _ = std::fs::create_dir_all(&cache);
+    Some(cache)
+}
+
+fn go_build_cache_from(lookup: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    if let Some(cache) = lookup("GOCACHE") {
+        return Some(PathBuf::from(cache));
+    }
+    let home = PathBuf::from(lookup("HOME")?);
+    Some(if cfg!(target_os = "macos") {
+        home.join("Library/Caches/go-build")
+    } else if let Some(cache) = lookup("XDG_CACHE_HOME") {
+        PathBuf::from(cache).join("go-build")
+    } else {
+        home.join(".cache/go-build")
+    })
+}
+
+/// Builds the sandboxed command for one server: scrubbed environment
+/// (allowlist + manifest overrides), piped stdio, dies with the session.
+fn server_command(
+    program: &str,
+    args: &[String],
+    candidate: &ServerCandidate,
+    go_cache: Option<&Path>,
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .env_clear()
+        .envs(server_env())
+        .envs(go_cache.map(|cache| ("GOCACHE", cache)))
+        .envs(&candidate.env)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    command
+}
+
 /// Spawns one server candidate and completes the LSP handshake.
 ///
 /// The child is sandboxed exactly like every other loom-spawned command
 /// (network off unless the manifest grants it), inherits no
-/// environment beyond PATH plus the manifest allowlist, and dies with
-/// the session (`kill_on_drop`).
+/// environment beyond [`SERVER_ENV`] plus the manifest allowlist, and
+/// dies with the session (`kill_on_drop`).
 pub(crate) async fn spawn_server(
     candidate: &ServerCandidate,
     workspace: &Path,
     settings: serde_json::Value,
 ) -> Result<Arc<LspServer>, String> {
+    let server_cache = server_cache(candidate);
     let sandbox = Sandbox::resolve(
         workspace,
         SandboxGrants {
             enabled: true,
             network: candidate.network,
-            extra_writable: Vec::new(),
+            extra_writable: server_cache.iter().cloned().collect(),
         },
     );
     let (program, rest) = candidate
@@ -564,19 +742,14 @@ pub(crate) async fn spawn_server(
         .ok_or_else(|| "empty command".to_string())?;
     let (wrapped_program, wrapped_args) = sandbox.wrap(program, rest);
 
-    let mut command = tokio::process::Command::new(&wrapped_program);
-    command
-        .args(&wrapped_args)
-        .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .envs(&candidate.env)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("cannot spawn {}: {e}", candidate.name))?;
+    let mut child = server_command(
+        &wrapped_program,
+        &wrapped_args,
+        candidate,
+        server_cache.as_deref(),
+    )
+    .spawn()
+    .map_err(|e| format!("cannot spawn {}: {e}", candidate.name))?;
     let stdin = child
         .stdin
         .take()
@@ -652,6 +825,8 @@ pub(crate) async fn spawn_server(
         open_files: Mutex::new(BTreeMap::new()),
         opening: tokio::sync::Mutex::new(()),
         utf8_positions,
+        suffixes: candidate.suffixes.clone(),
+        started_at: Instant::now(),
         root: workspace.to_path_buf(),
     }))
 }
@@ -733,7 +908,43 @@ fn build_router(state: Arc<ServerState>) -> Router<Arc<ServerState>> {
 
 #[cfg(test)]
 mod tests {
-    use super::find_header_start;
+    use super::{find_header_start, go_build_cache_from, server_env_from};
+
+    #[test]
+    fn server_env_passes_toolchain_vars_and_skips_missing() {
+        let env = server_env_from(|key| match key {
+            "PATH" => Some("/bin".to_owned()),
+            "HOME" => Some("/home/me".to_owned()),
+            "RUSTUP_HOME" => Some("/rustup".to_owned()),
+            "CARGO_HOME" | "TMPDIR" => None,
+            other => panic!("unexpected key {other}"),
+        });
+        assert_eq!(
+            env,
+            vec![
+                ("PATH".to_owned(), "/bin".to_owned()),
+                ("HOME".to_owned(), "/home/me".to_owned()),
+                ("RUSTUP_HOME".to_owned(), "/rustup".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn go_build_cache_prefers_env_then_home_default() {
+        let from_env = go_build_cache_from(|key| {
+            (key == "GOCACHE").then(|| std::ffi::OsString::from("/tmp/gocache"))
+        });
+        assert_eq!(from_env, Some(std::path::PathBuf::from("/tmp/gocache")));
+        let from_home = go_build_cache_from(|key| (key == "HOME").then(|| "/home/me".into()));
+        assert_eq!(
+            from_home,
+            Some(std::path::PathBuf::from(if cfg!(target_os = "macos") {
+                "/home/me/Library/Caches/go-build"
+            } else {
+                "/home/me/.cache/go-build"
+            }))
+        );
+    }
 
     #[test]
     fn header_at_stream_start() {

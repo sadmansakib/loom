@@ -59,7 +59,7 @@ impl Tool for LspDefinitionTool {
                 partial_result_params: lsp_types::PartialResultParams::default(),
             };
             let result = server
-                .request::<GotoDefinition>(params)
+                .request_settled::<GotoDefinition>(params)
                 .await
                 .map_err(ToolError::Execution)?;
             let mut body = String::new();
@@ -135,7 +135,7 @@ impl Tool for LspReferencesTool {
                 },
             };
             let result = server
-                .request::<References>(params)
+                .request_settled::<References>(params)
                 .await
                 .map_err(ToolError::Execution)?;
             let mut body = String::new();
@@ -214,7 +214,7 @@ impl Tool for LspSymbolsTool {
                 partial_result_params: lsp_types::PartialResultParams::default(),
             };
             let result = server
-                .request::<DocumentSymbolRequest>(params)
+                .request_settled::<DocumentSymbolRequest>(params)
                 .await
                 .map_err(ToolError::Execution)?;
             let mut body = String::new();
@@ -273,7 +273,10 @@ impl Tool for LspWorkspaceSymbolsTool {
                     work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
                     partial_result_params: lsp_types::PartialResultParams::default(),
                 };
-                let Ok(result) = server.request::<WorkspaceSymbolRequest>(params).await else {
+                let Ok(result) = server
+                    .request_settled::<WorkspaceSymbolRequest>(params)
+                    .await
+                else {
                     continue;
                 };
                 match result {
@@ -351,7 +354,7 @@ impl Tool for LspHoverTool {
                 work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
             };
             let result = server
-                .request::<HoverRequest>(params)
+                .request_settled::<HoverRequest>(params)
                 .await
                 .map_err(ToolError::Execution)?;
             let mut body = String::new();
@@ -580,7 +583,7 @@ impl Tool for LspCallHierarchyTool {
                 work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
             };
             let items = server
-                .request::<CallHierarchyPrepare>(params)
+                .request_settled::<CallHierarchyPrepare>(params)
                 .await
                 .map_err(ToolError::Execution)?;
             let Some(item) = items.unwrap_or_default().into_iter().next() else {
@@ -601,7 +604,7 @@ impl Tool for LspCallHierarchyTool {
             body.push('\n');
             if outgoing {
                 let calls = server
-                    .request::<CallHierarchyOutgoingCalls>(
+                    .request_settled::<CallHierarchyOutgoingCalls>(
                         lsp_types::CallHierarchyOutgoingCallsParams {
                             item,
                             work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
@@ -615,7 +618,7 @@ impl Tool for LspCallHierarchyTool {
                 }
             } else {
                 let calls = server
-                    .request::<CallHierarchyIncomingCalls>(
+                    .request_settled::<CallHierarchyIncomingCalls>(
                         lsp_types::CallHierarchyIncomingCallsParams {
                             item,
                             work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),

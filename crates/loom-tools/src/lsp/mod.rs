@@ -2,10 +2,10 @@
 //!
 //! Opt-in via `--lsp`: attaches language servers from the built-in
 //! `KNOWN_SERVERS` table plus `.loom/lsp.toml`, spawns them under the
-//! same OS sandbox as every loom command (network off unless granted,
-//! no environment inheritance), and exposes a fixed set of read-only
-//! semantic tools. Without the flag nothing here runs and the default
-//! tool surface is byte-identical.
+//! same OS sandbox as every loom command (network off unless granted, a
+//! minimal inherited environment), and exposes a fixed set of semantic
+//! tools (reads plus rename/format). Without the flag nothing here runs
+//! and the default tool surface is byte-identical.
 
 mod apply;
 mod client;
@@ -25,15 +25,14 @@ pub use manifest::{
 };
 pub(crate) use tools::edit_op_count;
 
-use crate::budget::ToolBudgets;
 use tools::LspInner;
 
 /// What attaching LSP servers yields for the engine.
 #[derive(Default)]
 pub struct LspAttachment {
-    /// The six read tools (empty when no server attached).
+    /// The attached LSP tools (empty when no server attached).
     pub tools: Vec<Box<dyn loom_kernel::tool::Tool>>,
-    /// Facts-block menu text (None when no server attached).
+    /// Facts-block menu text (a short note when no server attached).
     pub menu: Option<String>,
     /// Live server handles (empty when none attached). The fast-path
     /// LSP rename fallback (roadmap item 34) speaks to these directly;
@@ -61,23 +60,42 @@ fn render_menu(servers: &[Arc<LspServer>]) -> String {
     )
 }
 
+/// One-line surface note when `--lsp` is on but nothing attached: a
+/// silent no-op hides a broken install or manifest.
+fn no_servers() -> LspAttachment {
+    LspAttachment {
+        menu: Some(
+            "LSP enabled, but no servers attached (install a language server or check \
+             .loom/lsp.toml)"
+                .to_string(),
+        ),
+        ..LspAttachment::default()
+    }
+}
+
 /// Attaches every eligible LSP server for the workspace.
 ///
 /// Fail-closed on an invalid manifest (no servers, recorded error);
 /// individual spawn/handshake failures warn and skip — LSP is an
 /// accelerator, never a hard dependency.
-pub async fn attach_lsp(workspace: &Path, budgets: ToolBudgets) -> LspAttachment {
+pub async fn attach_lsp(workspace: &Path) -> LspAttachment {
     let manifest = match manifest_for(workspace) {
         Ok(Some(m)) => m,
         Ok(None) => LspManifest::default(),
         Err(e) => {
             tracing::warn!("{e}; attaching no LSP servers");
-            return LspAttachment::default();
+            return LspAttachment {
+                menu: Some(format!(
+                    "LSP disabled: invalid {} (see logs)",
+                    manifest::MANIFEST_RELATIVE_PATH
+                )),
+                ..LspAttachment::default()
+            };
         }
     };
     let candidates = candidates_for(workspace, &manifest);
     if candidates.is_empty() {
-        return LspAttachment::default();
+        return no_servers();
     }
 
     let mut servers: Vec<Arc<LspServer>> = Vec::new();
@@ -102,12 +120,11 @@ pub async fn attach_lsp(workspace: &Path, budgets: ToolBudgets) -> LspAttachment
         }
     }
     if servers.is_empty() {
-        return LspAttachment::default();
+        return no_servers();
     }
     let menu = render_menu(&servers);
     let inner = Arc::new(LspInner {
         servers: servers.clone(),
-        budgets,
     });
     LspAttachment {
         tools: tools::lsp_tools(inner),

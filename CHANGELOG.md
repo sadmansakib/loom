@@ -3,6 +3,27 @@
 All notable changes to Loom. Format loosely follows Keep a Changelog; this
 project versions by iteration, not semver.
 
+## 2026-11 — LSP client fixes and coverage
+
+- `fix(lsp)`: language servers now inherit `HOME`, `CARGO_HOME`,
+  `RUSTUP_HOME` and `TMPDIR` alongside `PATH`. Rustup shims previously
+  aborted with "failed to determine cargo home", leaving `--lsp` silently
+  server-less; gopls also gets a writable Go build cache.
+- `fix(lsp)`: advertise `textDocument.publishDiagnostics`, so push-only
+  servers (typescript-language-server, pyright) actually publish into the
+  diagnostics cache.
+- `feat(lsp)`: manifest-only servers can own file suffixes
+  (`suffixes = [".foo"]`); `content modified` responses are retried, and
+  empty read answers are retried for 3 s during the first 10 s after
+  attach. An attach with no servers now leaves a menu note instead of
+  staying silent.
+- `feat(lsp)`: table entries with no canonical marker now auto-attach when
+  a file with one of their suffixes exists (bounded scan), so the shell
+  servers stop being unreachable; `.bashrc` is a bash suffix and zsh is
+  covered by `shell-lsp` (`.zsh`, `.zshrc`).
+- `test(lsp)`: ignored live smoke tests for Rust, Go, C, TypeScript and
+  Python in `crates/loom-tools/tests/lsp_live.rs`.
+
 ## 2026-11 — dependency maintenance
 
 - `deps`: update direct dependencies to current stable releases: `schemars`

@@ -5,7 +5,7 @@ use loom_kernel::tool::{ToolContext, ToolError, ToolOutput, ToolSpec};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::budget::{ToolBudgets, head_only};
+use crate::budget::head_only;
 use crate::lsp::client::LspServer;
 use crate::lsp::position::{locate_symbol, render_position};
 
@@ -17,8 +17,6 @@ pub(super) const HEAD_BYTES: usize = 16 * 1024;
 pub(crate) struct LspInner {
     /// Attached servers, spawn order.
     pub servers: Vec<Arc<LspServer>>,
-    #[allow(dead_code)]
-    pub budgets: ToolBudgets,
 }
 
 impl LspInner {

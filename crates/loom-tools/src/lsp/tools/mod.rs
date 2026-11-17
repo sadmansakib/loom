@@ -1,4 +1,4 @@
-//! The six read-only LSP tools (docs/lsp-design.md §2/§3).
+//! The LSP tools (docs/lsp-design.md §2/§3).
 //!
 //! The tool count is fixed regardless of how many servers attach; each
 //! tool routes by file suffix to the owning server. Positions are
@@ -24,7 +24,7 @@ use read::{
 };
 use write::{LspFormatTool, LspRenameTool};
 
-/// Builds all eight LSP tools (six read + rename/format) over the
+/// Builds all nine LSP tools (seven read + rename/format) over the
 /// attached servers.
 pub(crate) fn lsp_tools(inner: Arc<LspInner>) -> Vec<Box<dyn Tool>> {
     vec![
