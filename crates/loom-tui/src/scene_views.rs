@@ -1156,7 +1156,10 @@ fn draw_live_header(
             Span::styled("  · preview · no live data", header_fg(theme::DIM)),
         ])
     } else {
-        let meta = format!("{workspace} · session {session}");
+        let mode = options
+            .task_mode
+            .map_or_default(|mode| format!(" · {mode}"));
+        let meta = format!("{workspace} · session {session}{mode}");
         let room = left_width.saturating_sub(brand.chars().count() + 3);
         let meta = thread::truncate_chars(&meta, room.max(8));
         Line::from(vec![
@@ -2121,6 +2124,36 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("configured-model"));
         assert!(!rendered.contains("model not reported"));
+    }
+
+    #[test]
+    fn read_only_profile_is_visible_in_the_header() {
+        let reducer = Reducer::default();
+        let mut terminal = Terminal::new(TestBackend::new(154, 40)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_live(
+                    frame,
+                    &reducer,
+                    "",
+                    0,
+                    LiveViewOptions {
+                        task_mode: Some("read-only"),
+                        ..LiveViewOptions::default()
+                    },
+                );
+            })
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("read-only"));
+        assert!(rendered.contains("blocked"));
+        assert!(!rendered.contains("asks each time"));
     }
 
     #[test]

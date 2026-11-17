@@ -581,8 +581,8 @@ also summarized here so this section is the single source of truth.
   and cached tokens / cost / wall time / tool-cache hits, per-task
   aggregates and a gated-pass-rate suite headline; strict and tolerant
   modes.
-- **Verification bar.** 1,631 tests passing, 14 live-API tests ignored by
-  default (1,645 total), clippy clean, fmt clean.
+- **Verification bar.** 1,633 tests passing, 14 live-API tests ignored by
+  default (1,647 total), clippy clean, fmt clean.
 
 ---
 
@@ -2160,6 +2160,8 @@ model tier under them (arXiv 2607.06906).
       display; show the selected profile and its task/tool/time budgets.
       Surface reasoning-effort controls only for models that support
       them, with the effective setting visible before the first request.
+      Shipped: `--read-only` on `loom run`/`loom chat` and `/profile` in
+      the TUI filter the engine registry; the header shows the mode.
     - **Decision-relevant live telemetry.** Show request/turn and retry
       state (including eligible retry countdown and an explicit retry-now
       action), per-source context census, current and next-request context

@@ -74,6 +74,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "focus the sidebar",
     },
     Command {
+        name: "/profile",
+        blurb: "toggle full or read-only tools",
+    },
+    Command {
         name: "/help",
         blurb: "keys and help",
     },
@@ -100,6 +104,7 @@ pub(crate) enum Action {
     Export,
     Reasoning,
     Sidebar,
+    Profile,
     Help,
     Quit,
     Compare,
@@ -123,6 +128,7 @@ pub(crate) fn action_for(name: &str) -> Option<Action> {
         "/export" => Action::Export,
         "/reasoning" => Action::Reasoning,
         "/sidebar" => Action::Sidebar,
+        "/profile" => Action::Profile,
         "/help" => Action::Help,
         "/quit" => Action::Quit,
         "/compare" => Action::Compare,

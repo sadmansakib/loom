@@ -1,7 +1,7 @@
 # Loom
 
 [![Status: Early release](https://img.shields.io/badge/status-early%20release-blue)]()
-[![Tests: 1645](https://img.shields.io/badge/tests-1645-brightgreen)]()
+[![Tests: 1647](https://img.shields.io/badge/tests-1647-brightgreen)]()
 [![SWE-bench Verified: 90/100 frozen subset](https://img.shields.io/badge/SWE--bench%20Verified-90%2F100%20frozen%20subset-blue)]()
 
 > **Early release.** The headless agent core is usable today: the `loom`
@@ -172,6 +172,10 @@ about, or denied via the `[policy]` verdict layer.
   — via known servers (rust-analyzer, gopls, clangd, pyright,
   typescript-language-server, zls, and more; overrides in
   `.loom/lsp.toml`).
+- Run profiles (`--read-only`, or `/profile` before the first TUI task):
+  filter the engine registry to read-only tools, so writes, edits, shell
+  commands, and deferred MCP tools are never exposed; the header shows
+  `read-only`.
 - Scout subagent (`--scout` + `--scout-model`): a cheap read-only child
   agent answers focused workspace questions; optional cascade
   (`--scout-escalation`/`--scout-escalation-model`) retries on a
@@ -241,7 +245,7 @@ so the shortcut set can be audited, not guessed at.
 - Slash-first palette: `/model`, `/effort`, `/context`, `/tools`,
   `/account`, `/compare`, `/sessions`, `/new`, `/clear`,
   `/clear-history`, `/compact`, `/retry`, `/copy`, `/export`,
-  `/reasoning`, `/sidebar`, `/help`, `/quit`.
+  `/reasoning`, `/sidebar`, `/profile`, `/help`, `/quit`.
 - Sidebar telemetry: task status, turn/tool/wall budgets, context
   census, cost, retry policy, and events. Always on at 120+ columns;
   Tab opens it at 90-119.
@@ -301,8 +305,8 @@ and its honesty rules.
 
 Full terminal-harness parity (roadmap item 40): the TUI ships the live
 task loop, cancel/retry, sessions, tools, accounts, compare, and context,
-but run profiles, live per-call batch progress, and a complete published
-key map remain open. The argument-provenance gate (roadmap item 38) and
+but live per-call batch progress and a complete published key map remain
+open. The argument-provenance gate (roadmap item 38) and
 repro-test tie-breaker (item 39) ran their evidence gates and are
 deferred. Delegation economics at best-of-N > 1 remain a measurement
 question (roadmap item 19 trigger).

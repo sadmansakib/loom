@@ -1,7 +1,7 @@
 use super::*;
 use futures::stream;
 
-use super::assembly::{bare_registry, build_registry};
+use super::assembly::{bare_registry, build_registry, read_only_registry};
 use super::budgets::prune_config_for;
 use crate::auth;
 use loom_kernel::agent::{TaskError, TurnBudget};

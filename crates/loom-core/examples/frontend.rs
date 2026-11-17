@@ -54,6 +54,7 @@ fn main() -> anyhow::Result<()> {
         context_editing: None,
         db_path: loom_core::paths::db_path(),
         persist: false,
+        read_only: false,
         catalog: None,
         scout: None,
         routing: None,

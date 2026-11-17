@@ -247,6 +247,7 @@ fn default_config(
         context_editing: None,
         db_path: loom_core::paths::db_path(),
         persist: true,
+        read_only: false,
         catalog: None,
         scout: None,
         routing: None,
@@ -1382,6 +1383,37 @@ async fn run_interactive(
                                     }
                                     palette::Action::Reasoning => reducer.toggle_reasoning(),
                                     palette::Action::Sidebar => sidebar = !sidebar,
+                                    palette::Action::Profile => {
+                                        // The engine's registry is fixed once
+                                        // opened. Reset an empty session so the
+                                        // toggle works from the launch screen;
+                                        // a session with history needs /new.
+                                        if active.is_some() && !event_log.is_empty() {
+                                            notice = Some(
+                                                "start a new session with /new to switch profile"
+                                                    .into(),
+                                            );
+                                        } else {
+                                            if active.is_some() {
+                                                clear_live_view(
+                                                    &mut active,
+                                                    &mut reducer,
+                                                    &mut event_log,
+                                                    &mut last_elapsed,
+                                                    &mut last_dropped,
+                                                    &mut recent,
+                                                    &config.db_path,
+                                                );
+                                            }
+                                            config.read_only = !config.read_only;
+                                            notice = Some(if config.read_only {
+                                                "read-only profile · writes and shell disabled"
+                                                    .into()
+                                            } else {
+                                                "full profile".into()
+                                            });
+                                        }
+                                    }
                                     palette::Action::Quit => should_quit = true,
                                 }
                             } else {
@@ -1867,6 +1899,7 @@ mod tests {
             "/export",
             "/reasoning",
             "/sidebar",
+            "/profile",
             "/help",
             "/quit",
         ] {

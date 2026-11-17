@@ -120,6 +120,11 @@ pub struct EngineConfig {
     /// When false the run is entirely in memory: a frontend that wants
     /// durability for the session must opt in. `--no-save` clears it.
     pub persist: bool,
+    /// Restrict the run to read-only tools (roadmap item 40): the
+    /// registry keeps only tools whose [`loom_kernel::tool::Tool::is_read_only`]
+    /// is true, so writes, edits, shell commands, and deferred MCP tools
+    /// are never exposed. Defaults off; the bare-loop baseline ignores it.
+    pub read_only: bool,
     /// Model catalog for catalog-driven adapters, handed in as data.
     ///
     /// A frontend that already holds a snapshot passes the matching
@@ -241,6 +246,7 @@ pub(crate) fn test_config() -> EngineConfig {
         context_editing: None,
         db_path: base.join("loom.db"),
         persist: false,
+        read_only: false,
         catalog: None,
         scout: None,
         routing: None,

@@ -40,3 +40,30 @@ fn todo_tool_is_exposed_in_the_full_registry_and_excluded_from_bare() {
         "the bare arm is exactly the five primitives, in order"
     );
 }
+
+/// Roadmap item 40: the read-only profile is enforcement, not a label.
+/// It keeps exactly the read-only tools and drops every mutating one.
+#[test]
+fn read_only_registry_drops_every_mutating_tool() {
+    let built = build_registry(
+        &CommandPolicy::default(),
+        ToolBudgets::default(),
+        false,
+        None,
+        None,
+    )
+    .expect("built-in registry");
+    let registry = read_only_registry(built);
+    let names: Vec<&str> = registry.specs().map(|spec| spec.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["read_file", "list_dir", "search", "artifact_read"],
+        "the read-only profile exposes only read-only built-ins"
+    );
+    for name in ["write_file", "edit_file", "run_command", "verify", "todo"] {
+        assert!(
+            !names.contains(&name),
+            "the read-only profile must drop {name}: {names:?}"
+        );
+    }
+}

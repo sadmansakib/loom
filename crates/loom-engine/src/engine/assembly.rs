@@ -66,6 +66,7 @@ pub(crate) fn compose_scout(
         context_editing: None,
         db_path: parent.db_path.clone(),
         persist: false,
+        read_only: parent.read_only,
         catalog: parent.catalog.clone(),
         scout: None,
         routing: None,
@@ -95,11 +96,7 @@ pub(crate) fn compose_scout(
         |name| std::env::var(name).ok(),
     )?;
     let provider = crate::provider::build(&child, credential.secret.expose())?.provider;
-    let registry = ToolRegistry::from_arc_tools(
-        build_registry(policy, child.budgets, false, None, None)?
-            .into_arc_tools()
-            .filter(|tool| tool.is_read_only()),
-    );
+    let registry = read_only_registry(build_registry(policy, child.budgets, false, None, None)?);
     let estimator: Arc<dyn loom_kernel::context::TokenEstimator> =
         crate::estimate::estimator_for(&child.provider);
     let compiler: Box<dyn ContextCompiler> =
@@ -313,6 +310,12 @@ pub(crate) fn build_registry(
     register("verify", Box::new(verify))?;
     register("todo", Box::new(loom_kernel::tool::TodoTool::new()))?;
     Ok(registry)
+}
+
+/// The read-only profile (roadmap item 40): keep only tools that declare
+/// themselves read-only, so the model never sees a mutating schema.
+pub(crate) fn read_only_registry(built: ToolRegistry) -> ToolRegistry {
+    ToolRegistry::from_arc_tools(built.into_arc_tools().filter(|tool| tool.is_read_only()))
 }
 
 /// The bare-loop registry: the primitive tools a basic harness offers

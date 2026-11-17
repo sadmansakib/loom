@@ -299,6 +299,7 @@ fn run_parses_optional_flags() {
         "--max-turns",
         "3",
         "--no-save",
+        "--read-only",
         "--no-global-instructions",
         "go",
     ]);
@@ -311,6 +312,7 @@ fn run_parses_optional_flags() {
     assert_eq!(args.flags.account.as_deref(), Some("work"));
     assert_eq!(args.flags.max_turns, 3);
     assert!(args.flags.no_save);
+    assert!(args.flags.read_only);
     assert!(
         args.flags.no_global_instructions,
         "--no-global-instructions opts out of the user-level file"

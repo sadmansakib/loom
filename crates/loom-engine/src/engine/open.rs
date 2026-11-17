@@ -20,7 +20,7 @@ use crate::scout::{ScoutConfig, ScoutTool};
 
 use super::assembly::{
     bare_registry, build_registry, build_stall_escalation_agent, build_tier_agents, compose_scout,
-    default_system_prompt,
+    default_system_prompt, read_only_registry,
 };
 use super::budgets::prune_config_for;
 use super::config::{kernel_effort, reasoning_schedule_from_env};
@@ -284,6 +284,9 @@ impl Engine {
         for tool in lsp.tools {
             register_tool(&mut registry, "lsp", tool)?;
         }
+        if config.read_only && !overrides.bare_loop {
+            registry = read_only_registry(registry);
+        }
         let system_prompt = config
             .system_prompt
             .take()
@@ -292,12 +295,15 @@ impl Engine {
         // I/O; the loop scans once per task through this source. The
         // bare-loop arm attaches no source — the empty block is the
         // baseline's point.
+        // Menus advertise callable tools, so a read-only run hides the MCP
+        // and LSP menus rather than naming tools its registry removed.
+        let read_only = config.read_only && !overrides.bare_loop;
         let facts = (!overrides.bare_loop).then(|| {
             crate::repo::FsFactsSource::new(workspace.clone())
                 .with_skills(config.skills && !overrides.bare_loop)
                 .with_lessons(config.lessons && !overrides.bare_loop)
-                .with_mcp_menu(mcp.menu.clone())
-                .with_lsp_menu(lsp.menu.clone())
+                .with_mcp_menu(if read_only { None } else { mcp.menu.clone() })
+                .with_lsp_menu(if read_only { None } else { lsp.menu.clone() })
         });
         let mut operator_ops: Option<loom_kernel::context::PruneOpsHandle> = None;
         let compiler: Box<dyn ContextCompiler> = if let Some(compiler) = overrides.compiler {
@@ -406,7 +412,12 @@ impl Engine {
         if let Some(facts) = facts {
             agent = agent.with_facts_source(Box::new(facts));
         }
-        if let Some(surface) = mcp.surface {
+        // The deferred MCP surface has no per-tool read-only filter, so a
+        // read-only run must not attach it: a queued mutating tool would
+        // bypass the registry filter above.
+        if let Some(surface) = mcp.surface
+            && !config.read_only
+        {
             agent = agent.with_surface(surface);
         }
 

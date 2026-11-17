@@ -555,6 +555,7 @@ pub(crate) fn engine_config_from(
         context_editing: None,
         db_path,
         persist: !flags.no_save,
+        read_only: flags.read_only,
         catalog: None,
         scout,
         symbols,

@@ -113,6 +113,7 @@ pub(crate) fn engine_config(
         context_editing: None,
         db_path: options.db_path.clone(),
         persist: true,
+        read_only: false,
         catalog: None,
         scout: None,
         routing: None,

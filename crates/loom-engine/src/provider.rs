@@ -417,6 +417,7 @@ pub fn one_shot_provider(
         context_editing: None,
         db_path: std::env::temp_dir().join("loom-one-shot").join("loom.db"),
         persist: false,
+        read_only: false,
         catalog: None,
         scout: None,
         routing: None,

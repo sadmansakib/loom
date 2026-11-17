@@ -114,6 +114,7 @@ fn config(workspace: std::path::PathBuf, db_path: std::path::PathBuf) -> EngineC
         context_editing: None,
         db_path,
         persist: true,
+        read_only: false,
         catalog: None,
         scout: None,
         routing: None,

@@ -173,6 +173,11 @@ pub struct RunFlags {
     #[arg(long)]
     pub no_save: bool,
 
+    /// Restrict the run to read-only tools (roadmap item 40): writes,
+    /// edits, shell commands, and deferred MCP tools are never exposed.
+    #[arg(long)]
+    pub read_only: bool,
+
     /// Ignore the global AGENTS.md instructions file for this run.
     #[arg(long)]
     pub no_global_instructions: bool,

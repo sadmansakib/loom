@@ -213,8 +213,26 @@ pub(super) fn draw_runtime_sidebar(
             Line::default(),
             heading("TOOLS"),
             sidebar_idle_row("read", options.idle.read_permission, width, false),
-            sidebar_idle_row("write", options.idle.write_permission, width, false),
-            sidebar_idle_row("shell", options.idle.shell_permission, width, false),
+            sidebar_idle_row(
+                "write",
+                if options.task_mode == Some("read-only") {
+                    "blocked"
+                } else {
+                    options.idle.write_permission
+                },
+                width,
+                false,
+            ),
+            sidebar_idle_row(
+                "shell",
+                if options.task_mode == Some("read-only") {
+                    "blocked"
+                } else {
+                    options.idle.shell_permission
+                },
+                width,
+                false,
+            ),
         ];
         frame.render_widget(
             Paragraph::new(lines)
@@ -566,14 +584,20 @@ pub(super) fn draw_runtime_sidebar(
                 )),
             ],
         ));
-        sections_data.push((
-            "TOOLS",
+        let tools = if options.task_mode == Some("read-only") {
+            vec![
+                muted("read   allowed"),
+                muted("write  blocked"),
+                muted("shell  blocked"),
+            ]
+        } else {
             vec![
                 muted("read   allowed"),
                 muted("write  asks each time"),
                 muted("shell  asks each time"),
-            ],
-        ));
+            ]
+        };
+        sections_data.push(("TOOLS", tools));
     }
     if let Some(request) = options.approval {
         sections_data.push((
