@@ -11,9 +11,18 @@ use super::{
 #[derive(Debug, Parser)]
 #[command(name = "loom", version, about, long_about = None)]
 pub struct Cli {
-    /// The command to run.
+    /// The command to run; bare `loom` opens the terminal interface.
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
+}
+
+impl Cli {
+    /// Resolves the command, defaulting to the terminal interface.
+    #[must_use]
+    pub fn into_command(self) -> Command {
+        self.command
+            .unwrap_or(Command::Tui(TuiArgs { scene: None }))
+    }
 }
 
 /// Top-level commands.

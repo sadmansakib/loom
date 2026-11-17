@@ -671,7 +671,7 @@ mod tests {
             "x",
         ])
         .expect("arguments parse");
-        let crate::args::Command::Run(args) = cli.command else {
+        let crate::args::Command::Run(args) = cli.into_command() else {
             panic!("expected run");
         };
         assert!(
@@ -686,7 +686,7 @@ mod tests {
     fn run_requires_task_unless_tui_is_enabled() {
         let cli = Cli::try_parse_from(["loom", "run", "--provider", "glm", "--model", "glm-5"])
             .expect("provider and model are present");
-        let crate::args::Command::Run(args) = cli.command else {
+        let crate::args::Command::Run(args) = cli.into_command() else {
             panic!("expected run");
         };
         let error = run(&args).expect_err("missing task must fail in dispatch");

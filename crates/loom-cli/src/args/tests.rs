@@ -22,7 +22,7 @@ fn run_defaults_and_collects_task_words() {
         "turn",
         "loop",
     ]);
-    let Command::Run(args) = cli.command else {
+    let Command::Run(args) = cli.command.expect("command") else {
         panic!("expected `run`");
     };
     assert_eq!(args.task, vec!["find", "the", "turn", "loop"]);
@@ -46,7 +46,7 @@ fn run_tui_accepts_a_missing_task_and_parses_the_switch() {
         "--model",
         "glm-5",
     ]);
-    let Command::Run(args) = cli.command else {
+    let Command::Run(args) = cli.command.expect("command") else {
         panic!("expected `run`");
     };
     assert!(args.tui);
@@ -55,11 +55,19 @@ fn run_tui_accepts_a_missing_task_and_parses_the_switch() {
 
 #[test]
 fn tui_command_parses_picker_and_named_static_scenes() {
-    assert!(matches!(parse(&["loom", "tui"]).command, Command::Tui(args) if args.scene.is_none()));
     assert!(
-        matches!(parse(&["loom", "tui", "--scene", "retry"]).command, Command::Tui(args) if args.scene == Some(TuiScene::Retry))
+        matches!(parse(&["loom", "tui"]).into_command(), Command::Tui(args) if args.scene.is_none())
+    );
+    assert!(
+        matches!(parse(&["loom", "tui", "--scene", "retry"]).into_command(), Command::Tui(args) if args.scene == Some(TuiScene::Retry))
     );
     assert!(Cli::try_parse_from(["loom", "tui", "--scene", "unknown"]).is_err());
+}
+
+#[test]
+fn bare_loom_opens_the_tui() {
+    assert!(matches!(parse(&["loom"]).into_command(), Command::Tui(args) if args.scene.is_none()));
+    assert!(parse(&["loom"]).command.is_none());
 }
 
 #[test]
@@ -79,7 +87,7 @@ fn run_accepts_custom_provider_urls() {
         "the",
         "thing",
     ]);
-    let Command::Run(args) = cli.command else {
+    let Command::Run(args) = cli.command.expect("command") else {
         panic!("expected `run`");
     };
     assert_eq!(args.flags.provider, "custom");
@@ -110,7 +118,7 @@ fn run_collects_repeatable_and_delimited_headers() {
         "the",
         "thing",
     ]);
-    let Command::Run(args) = cli.command else {
+    let Command::Run(args) = cli.command.expect("command") else {
         panic!("expected `run`");
     };
     assert_eq!(
@@ -160,7 +168,7 @@ fn provider_subcommands_parse() {
         "--base-url",
         "https://api.orcarouter.ai/v1",
     ]);
-    let Command::Provider(args) = cli.command else {
+    let Command::Provider(args) = cli.command.expect("command") else {
         panic!("expected `provider`");
     };
     match args.command {
@@ -179,13 +187,13 @@ fn provider_subcommands_parse() {
     }
 
     assert!(matches!(
-        parse(&["loom", "provider", "list"]).command,
+        parse(&["loom", "provider", "list"]).into_command(),
         Command::Provider(ProviderArgs {
             command: ProviderCommand::List
         })
     ));
     assert!(matches!(
-        parse(&["loom", "provider", "remove", "orcarouter"]).command,
+        parse(&["loom", "provider", "remove", "orcarouter"]).into_command(),
         Command::Provider(ProviderArgs {
             command: ProviderCommand::Remove { name }
         }) if name == "orcarouter"
@@ -203,7 +211,7 @@ fn run_parses_lessons_flag_off_by_default() {
         "deepseek-flash",
         "go",
     ]);
-    let Command::Run(args) = cli.command else {
+    let Command::Run(args) = cli.command.expect("command") else {
         panic!("expected `run`");
     };
     assert!(!args.flags.lessons);
@@ -218,7 +226,7 @@ fn run_parses_lessons_flag_off_by_default() {
         "--lessons",
         "go",
     ]);
-    let Command::Run(args) = cli.command else {
+    let Command::Run(args) = cli.command.expect("command") else {
         panic!("expected `run`");
     };
     assert!(args.flags.lessons);
@@ -234,7 +242,7 @@ fn lessons_subcommand_parses() {
         "--dry-run",
         "--json",
     ]);
-    let Command::Lessons(args) = cli.command else {
+    let Command::Lessons(args) = cli.command.expect("command") else {
         panic!("expected `lessons`");
     };
     assert_eq!(args.workspace, std::path::PathBuf::from("/ws"));
@@ -294,7 +302,7 @@ fn run_parses_optional_flags() {
         "--no-global-instructions",
         "go",
     ]);
-    let Command::Run(args) = cli.command else {
+    let Command::Run(args) = cli.command.expect("command") else {
         panic!("expected `run`");
     };
     assert!(args.flags.json);
@@ -327,7 +335,7 @@ fn chat_takes_an_optional_task_and_shares_the_run_flags() {
         "glm-5",
         "--json",
     ]);
-    let Command::Chat(args) = cli.command else {
+    let Command::Chat(args) = cli.command.expect("command") else {
         panic!("expected `chat`");
     };
     assert_eq!(args.task.len(), 0);
@@ -346,7 +354,7 @@ fn chat_takes_an_optional_task_and_shares_the_run_flags() {
         "this",
         "repo",
     ]);
-    let Command::Chat(args) = cli.command else {
+    let Command::Chat(args) = cli.command.expect("command") else {
         panic!("expected `chat`");
     };
     assert_eq!(args.task, ["explain", "this", "repo"]);
@@ -365,7 +373,7 @@ fn route_flags_parse_models_and_default_off() {
         "glm-5-flash",
         "work",
     ]);
-    let Command::Run(args) = cli.command else {
+    let Command::Run(args) = cli.command.expect("command") else {
         panic!("expected `run`");
     };
     assert_eq!(args.flags.route_easy.as_deref(), Some("glm-5-flash"));
@@ -381,7 +389,7 @@ fn route_flags_parse_models_and_default_off() {
         "glm-5",
         "work",
     ]);
-    let Command::Run(args) = cli.command else {
+    let Command::Run(args) = cli.command.expect("command") else {
         panic!("expected `run`");
     };
     assert_eq!(args.flags.route_easy, None);
@@ -401,7 +409,7 @@ fn stall_escalation_model_is_opt_in() {
         "glm-5-max",
         "work",
     ]);
-    let Command::Run(args) = cli.command else {
+    let Command::Run(args) = cli.command.expect("command") else {
         panic!("expected `run`");
     };
     assert_eq!(
@@ -419,7 +427,7 @@ fn stall_escalation_model_is_opt_in() {
         "glm-5",
         "work",
     ]);
-    let Command::Run(args) = cli.command else {
+    let Command::Run(args) = cli.command.expect("command") else {
         panic!("expected `run`");
     };
     assert_eq!(args.flags.stall_escalation_model, None);
@@ -439,7 +447,7 @@ fn bg_commands_is_opt_in_and_shared_by_run_and_chat() {
         "glm-5",
         "--bg-commands",
     ]);
-    let Command::Chat(args) = cli.command else {
+    let Command::Chat(args) = cli.command.expect("command") else {
         panic!("expected `chat`");
     };
     assert!(args.flags.bg_commands);
@@ -453,7 +461,7 @@ fn bg_commands_is_opt_in_and_shared_by_run_and_chat() {
         "glm-5",
         "work",
     ]);
-    let Command::Run(args) = cli.command else {
+    let Command::Run(args) = cli.command.expect("command") else {
         panic!("expected `run`");
     };
     assert!(!args.flags.bg_commands);
@@ -462,7 +470,7 @@ fn bg_commands_is_opt_in_and_shared_by_run_and_chat() {
 #[test]
 fn auth_aliases_map_to_the_canonical_commands() {
     let cli = parse(&["loom", "auth", "add", "glm"]);
-    let Command::Auth(auth) = cli.command else {
+    let Command::Auth(auth) = cli.command.expect("command") else {
         panic!("expected `auth`");
     };
     let AuthCommand::Login(args) = auth.command else {
@@ -472,7 +480,7 @@ fn auth_aliases_map_to_the_canonical_commands() {
     assert_eq!(args.method, Method::Key);
 
     let cli = parse(&["loom", "auth", "switch", "work", "--provider", "glm"]);
-    let Command::Auth(auth) = cli.command else {
+    let Command::Auth(auth) = cli.command.expect("command") else {
         panic!("expected `auth`");
     };
     let AuthCommand::Use(args) = auth.command else {
@@ -482,7 +490,7 @@ fn auth_aliases_map_to_the_canonical_commands() {
     assert_eq!(args.provider, "glm");
 
     let cli = parse(&["loom", "auth", "logout", "work", "--provider", "glm"]);
-    let Command::Auth(auth) = cli.command else {
+    let Command::Auth(auth) = cli.command.expect("command") else {
         panic!("expected `auth`");
     };
     let AuthCommand::Remove(args) = auth.command else {
@@ -495,14 +503,14 @@ fn auth_aliases_map_to_the_canonical_commands() {
 #[test]
 fn rewind_parses_session_and_boundary() {
     let cli = parse(&["loom", "rewind", "0192e4c1-0000-7000-8000-000000000000"]);
-    let Command::Rewind(args) = cli.command else {
+    let Command::Rewind(args) = cli.command.expect("command") else {
         panic!("expected rewind");
     };
     assert_eq!(args.session, "0192e4c1-0000-7000-8000-000000000000");
     assert!(args.at.is_none());
 
     let cli = parse(&["loom", "rewind", "abc", "--at", "3"]);
-    let Command::Rewind(args) = cli.command else {
+    let Command::Rewind(args) = cli.command.expect("command") else {
         panic!("expected rewind");
     };
     assert_eq!(args.at, Some(3));
@@ -511,7 +519,7 @@ fn rewind_parses_session_and_boundary() {
 #[test]
 fn stats_parses_the_trace_source() {
     let cli = parse(&["loom", "stats", "--trace", "traces/demo"]);
-    let Command::Stats(args) = cli.command else {
+    let Command::Stats(args) = cli.command.expect("command") else {
         panic!("expected `stats`");
     };
     assert_eq!(
@@ -521,7 +529,7 @@ fn stats_parses_the_trace_source() {
     assert!(args.session.is_none());
 
     let cli = parse(&["loom", "stats"]);
-    let Command::Stats(args) = cli.command else {
+    let Command::Stats(args) = cli.command.expect("command") else {
         panic!("expected `stats`");
     };
     assert!(args.trace.is_none());

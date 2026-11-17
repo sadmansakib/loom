@@ -32,8 +32,8 @@ mod workspace;
 use args::{Cli, Command};
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let owns_terminal = match &cli.command {
+    let command = Cli::parse().into_command();
+    let owns_terminal = match &command {
         Command::Tui(_) => true,
         Command::Run(args) => args.tui,
         Command::Chat(_)
@@ -49,7 +49,7 @@ fn main() -> ExitCode {
     if !owns_terminal {
         init_tracing();
     }
-    let outcome = match cli.command {
+    let outcome = match command {
         Command::Run(args) => run::run(&args),
         Command::Tui(args) => tui_command::run(&args).map(|()| ExitCode::SUCCESS),
         Command::Chat(args) => chat::chat(&args),
