@@ -488,6 +488,16 @@ mod tests {
     }
 
     #[test]
+    fn reports_the_configured_idle_window() {
+        let provider = CustomProvider::new(
+            CustomConfig::new("http://gateway.test", "k"),
+            catalog(OPENAI_SHAPE),
+        )
+        .expect("provider");
+        assert_eq!(provider.idle_timeout_millis(), Some(300_000));
+    }
+
+    #[test]
     fn endpoint_url_appends_chat_completions() {
         let config = CustomConfig::new("http://gateway.test/v1/", "k");
         let provider = CustomProvider::new(config, catalog(OPENAI_SHAPE)).expect("provider");

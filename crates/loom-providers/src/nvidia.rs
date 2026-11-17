@@ -320,6 +320,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reports_the_configured_idle_window() {
+        let provider = NvidiaProvider::new(NvidiaConfig::new("k")).unwrap();
+        assert_eq!(provider.idle_timeout_millis(), Some(300_000));
+    }
+
+    #[test]
     fn capability_table_current_models() {
         for model in [
             "z-ai/glm-5.3",

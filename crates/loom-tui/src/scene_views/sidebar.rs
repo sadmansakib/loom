@@ -190,11 +190,19 @@ pub(super) fn draw_runtime_sidebar(
             .idle
             .wall_budget
             .map_or_else(|| "unbounded".to_owned(), format_duration);
+        // The wireframe gives each `.lb` a 14px top margin, which reads as
+        // one blank row between the three sections in a terminal.
         let lines = vec![
+            Line::default(),
             heading("SESSION"),
-            sidebar_budget_text("new", "no turns yet", width),
-            sidebar_budget_text("model", options.model.unwrap_or("not reported"), width),
-            sidebar_budget_text(
+            sidebar_idle_row("new", "no turns yet", width, true),
+            sidebar_idle_row(
+                "model",
+                options.model.unwrap_or("not reported"),
+                width,
+                false,
+            ),
+            sidebar_idle_row(
                 "effort / thinking",
                 &format!(
                     "{} · {}",
@@ -202,15 +210,18 @@ pub(super) fn draw_runtime_sidebar(
                     options.thinking.unwrap_or("not reported")
                 ),
                 width,
+                false,
             ),
+            Line::default(),
             heading("DEFAULT BUDGET"),
-            sidebar_budget_text("turns", &turns, width),
-            sidebar_budget_text("tool calls", &tool_calls, width),
-            sidebar_budget_text("wall", &wall, width),
+            sidebar_idle_row("turns", &turns, width, false),
+            sidebar_idle_row("tool calls", &tool_calls, width, false),
+            sidebar_idle_row("wall", &wall, width, false),
+            Line::default(),
             heading("TOOLS"),
-            sidebar_budget_text("read", options.idle.read_permission, width),
-            sidebar_budget_text("write", options.idle.write_permission, width),
-            sidebar_budget_text("shell", options.idle.shell_permission, width),
+            sidebar_idle_row("read", options.idle.read_permission, width, false),
+            sidebar_idle_row("write", options.idle.write_permission, width, false),
+            sidebar_idle_row("shell", options.idle.shell_permission, width, false),
         ];
         frame.render_widget(
             Paragraph::new(lines)
@@ -986,15 +997,37 @@ pub(super) fn sidebar_budget_width(
 }
 
 pub(super) fn sidebar_budget_text(label: &str, value: &str, width: u16) -> Line<'static> {
+    sidebar_row(label, value, width, fg(theme::DIM), fg(theme::IVORY))
+}
+
+/// Idle rows follow the wireframe's `r()`: the label is normal text and only
+/// the placeholder value (`no turns yet`) is dim.
+fn sidebar_idle_row(label: &str, value: &str, width: u16, value_dim: bool) -> Line<'static> {
+    sidebar_row(
+        label,
+        value,
+        width,
+        fg(theme::IVORY),
+        fg(if value_dim { theme::DIM } else { theme::IVORY }),
+    )
+}
+
+fn sidebar_row(
+    label: &str,
+    value: &str,
+    width: u16,
+    label_style: Style,
+    value_style: Style,
+) -> Line<'static> {
     let label_len = label.chars().count();
     let value_len = value.chars().count();
     let gap = usize::from(width)
         .saturating_sub(label_len.saturating_add(value_len))
         .max(2);
     Line::from(vec![
-        Span::styled(label.to_owned(), fg(theme::DIM)),
+        Span::styled(label.to_owned(), label_style),
         Span::raw(" ".repeat(gap)),
-        Span::styled(value.to_owned(), fg(theme::IVORY)),
+        Span::styled(value.to_owned(), value_style),
     ])
 }
 

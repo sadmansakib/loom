@@ -486,6 +486,13 @@ mod tests {
     }
 
     #[test]
+    fn reports_the_configured_idle_window() {
+        let provider =
+            OpenRouterProvider::new(OpenRouterConfig::new("k"), catalog()).expect("provider");
+        assert_eq!(provider.idle_timeout_millis(), Some(300_000));
+    }
+
+    #[test]
     fn attribution_headers_are_optional_and_ordered() {
         let config = OpenRouterConfig::new("k")
             .with_referer("https://example.test")

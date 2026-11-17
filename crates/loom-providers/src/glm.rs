@@ -428,6 +428,12 @@ mod tests {
     }
 
     #[test]
+    fn reports_the_configured_idle_window() {
+        let provider = GlmProvider::new(GlmConfig::new("k")).unwrap();
+        assert_eq!(provider.idle_timeout_millis(), Some(300_000));
+    }
+
+    #[test]
     fn default_base_url_is_the_metered_endpoint() {
         assert_eq!(GlmConfig::new("k").base_url, "https://api.z.ai/api/paas/v4");
     }
