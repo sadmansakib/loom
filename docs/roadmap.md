@@ -594,8 +594,8 @@ also summarized here so this section is the single source of truth.
   and cached tokens / cost / wall time / tool-cache hits, per-task
   aggregates and a gated-pass-rate suite headline; strict and tolerant
   modes.
-- **Verification bar.** 1,639 tests passing, 14 live-API tests ignored by
-  default (1,653 total), clippy clean, fmt clean.
+- **Verification bar.** 1,645 tests passing, 14 live-API tests ignored by
+  default (1,659 total), clippy clean, fmt clean.
 
 ---
 
@@ -1060,9 +1060,9 @@ adds four more framing findings and backlog items 26–31 below.
     in-turn `role: "system"` turns (leading ones still fold into the
     top-level `system` param), and `Usage` now carries
     `thinking_tokens` + `cache_creation_input_tokens` for attribution —
-    what a schedule needs to observe its own cost. The schedule itself
-    (a kernel-side effort policy emitting those in-turn notes) remains
-    open, gated on item 1.
+    what a schedule needs to observe its own cost. The schedule and the
+    Anthropic in-turn form are shipped; only the funded routed-vs-unrouted
+    A/B remains open.
    **Schedule shipped (2026-11-07, item 1 funded):** the kernel now
    carries per-turn effort as data — `ModelRequest.reasoning_effort`
    (provider-agnostic intent, additive serde, byte-off default,
@@ -1077,9 +1077,14 @@ adds four more framing findings and backlog items 26–31 below.
    moved a probe answer 54 -> 89 completion tokens). Sweeps select
    the policy with `swebench-run --reasoning-schedule
    <fixed|progressive>` (env-forwarded, recorded in sweep
-   provenance). The Anthropic in-turn system-message form above is
-   the follow-up for that adapter; routing slice zero below is the
-   other open half. **First funded A/B (2026-11-07, N=5, frozen
+   provenance). **Anthropic in-turn effort shipped (2026-11-18):**
+   the adapter appends each per-turn level as the trailing
+   `system`-role message, after cache breakpoints are placed, so the
+   stable prefix and its marker do not move and absent effort leaves
+   the wire bytes unchanged. The body-shape tests pin the trailing
+   turn and unchanged breakpoint; a wiremock test pins the outgoing
+   request. Routing slice zero below is the other open half.
+   **First funded A/B (2026-11-07, N=5, frozen
    5-instance set):** progressive vs fixed medians 4/5 vs 3/5 —
    directional, not separable from noise at this N (the whole delta
    is sympy 3/5 vs 2/5, p ~ 0.7); safe on this model (no quality
@@ -1444,7 +1449,8 @@ adds four more framing findings and backlog items 26–31 below.
        the prune trigger/floor/reclaim/tail layer over the provider
        base via pure env seams (`LOOM_*` vars) the frozen container
        script never sets — defaults byte-identical. The
-       reasoning-schedule slot stays gated with item 9;
+       reasoning schedule travels in `AgentConfig`; its funded probe
+       stays with item 9;
     3. an outer loop in the Meta-Harness shape that reads *raw* traces,
        harness source, and scores and proposes changes (compressed
        feedback measured worse). **Shipped 2026-10-25 (offline seam)**:
@@ -2196,22 +2202,23 @@ model tier under them (arXiv 2607.06906).
       and picker keys, screen shortcuts, and every command (`/retry`,
       `/copy`, `/export` included). Narrow layouts and color-depth/ASCII
       fallbacks render without corrupting the timeline.
-    - **Crate seam.** Drive the UI through the stable `loom-core`
-      frontend contract from item 22; keep engine construction in the
-      composition root and avoid making UI behavior depend on kernel
-      internals. Add event/render tests for interleaved concurrent
-      completions, serialized waves, retry reset, cancellation, narrow
-      layouts, and exported records.
+    - **Crate seam.** **Shipped 2026-11-18.** The UI drives the stable
+      `loom-core` facade, engine construction stays in the composition
+      root, and engine state never moves into the renderer. Offline
+      event/render tests now cover interleaved concurrent completions,
+      path-conflict serialized waves, retry recovery, partial
+      cancellation at wide and narrow widths, and `/export` round-trips
+      through the `loom-core` trace writer.
 
-    Gate: offline event-stream and terminal-render tests must prove the
+    Gate: offline event-stream and terminal-render tests prove the
     display agrees with committed task/tool outcomes, including partial
-    cancellation; exported records must round-trip and remain useful
-    without a live provider. Benchmark any claim that a richer display
-    changes task success, turns, or cost under item 1; visual parity alone
-    is not a task-performance claim. Seam: item 22's `loom-core` facade,
-    typed events and task summaries, `loom-tui`, and the CLI composition
-    root. Parallel execution and live per-call progress are shipped; the
-    remaining depth is the crate-seam test coverage above.
+    cancellation; exported records round-trip without a live provider.
+    Benchmark any claim that a richer display changes task success,
+    turns, or cost under item 1; visual parity alone is not a
+    task-performance claim. Seam: item 22's `loom-core` facade, typed
+    events and task summaries, `loom-tui`, and the CLI composition
+    root. Parallel execution, live per-call progress, and the crate-seam
+    test coverage above are shipped.
 
 ### 2026-12 meta-harness sweep — gap check
 

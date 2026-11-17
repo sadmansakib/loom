@@ -1924,6 +1924,44 @@ mod tests {
     }
 
     #[test]
+    fn export_task_round_trips_events_and_manifest() {
+        let base = std::env::temp_dir().join(format!("loom-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut config = default_config(None, None, None, None, None).unwrap();
+        config.provider = "deepseek".into();
+        config.model = "deepseek-flash".into();
+        let task = loom_core::TaskId::new();
+        let session = loom_core::Session::new(loom_core::SessionId::new());
+        let log = [loom_core::EventEnvelope {
+            schema_version: loom_core::kernel::event::EVENT_SCHEMA_VERSION,
+            timestamp_millis: Some(42),
+            sequence: 0,
+            task_id: task,
+            kind: loom_core::EventKind::TaskStarted,
+        }];
+
+        let notice = export_task(&base, &log, Some(&session), &config, None);
+        assert!(notice.starts_with("exported to"), "{notice}");
+
+        let dir = base.join(task.to_string());
+        let events = std::fs::read_to_string(dir.join("events.ndjson")).unwrap();
+        let decoded: loom_core::EventEnvelope =
+            serde_json::from_str(events.lines().next().unwrap()).unwrap();
+        assert_eq!(decoded.task_id, task);
+        assert_eq!(decoded.sequence, 0);
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["task_id"], task.to_string());
+        assert_eq!(manifest["harness"]["provider"], "deepseek");
+        assert_eq!(manifest["harness"]["model"], "deepseek-flash");
+        assert_eq!(manifest["outcome"]["status"], "failed");
+        assert_eq!(manifest["events_written"], 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn picker_model_capability_resolver_does_not_offer_unknown_efforts() {
         let caps = loom_core::providers::model_capabilities("deepseek-flash").unwrap();
         assert!(

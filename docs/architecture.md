@@ -1117,7 +1117,7 @@ resolve or the sweep aborts — selection never shrinks silently.
 - Blocking work on the blocking pool; hashing never under a lock.
 - Facts scanned once per task; capabilities resolved once per task.
 
-**Testing** — the workspace carries 1,653 tests (1,639 run by default;
+**Testing** — the workspace carries 1,659 tests (1,645 run by default;
 14 live-API tests are ignored): unit tests per module,
 protocol and invariant tests against in-memory seams, security regression
 tests for confinement, canary tests for secrets, and integration tests

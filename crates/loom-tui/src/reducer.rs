@@ -1659,6 +1659,49 @@ mod tests {
     }
 
     #[test]
+    fn a_completed_retry_clears_the_backoff_and_attempt_history() {
+        let task_id = TaskId::new();
+        let mut reducer = Reducer::default();
+        for (sequence, kind, timestamp) in [
+            (0, EventKind::TaskStarted, 1),
+            (1, EventKind::TurnStarted { turn: 1 }, 2),
+            (2, EventKind::ModelRequestStarted { attempt: 1 }, 3),
+            (
+                3,
+                EventKind::ModelRetry {
+                    attempt: 1,
+                    kind: ModelErrorKind::Transport,
+                    delay_ms: 5_000,
+                    response_started: false,
+                    http_status: None,
+                    policy: None,
+                    idle_timeout_ms: None,
+                },
+                4,
+            ),
+        ] {
+            reducer.reduce(&event(sequence, task_id, kind), timestamp);
+        }
+        assert!(reducer.is_retrying());
+
+        reducer.reduce(
+            &event(
+                4,
+                task_id,
+                EventKind::ModelCompleted {
+                    response: response("recovered"),
+                },
+            ),
+            5,
+        );
+
+        assert!(!reducer.is_retrying());
+        assert!(reducer.retry_wait.is_none());
+        assert_eq!(reducer.retries.len(), 0);
+        assert!(reducer.failure.is_none());
+    }
+
+    #[test]
     fn completed_response_is_authoritative_over_streamed_deltas() {
         let task_id = TaskId::new();
         let mut reducer = Reducer::default();

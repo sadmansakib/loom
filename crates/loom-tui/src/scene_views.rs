@@ -1489,7 +1489,8 @@ mod tests {
     use super::sidebar::*;
     use super::thread::*;
     use super::*;
-    use loom_core::kernel::transcript::Item;
+    use loom_core::EventKind;
+    use loom_core::kernel::transcript::{Item, ToolStatus};
     use loom_core::kernel::{
         agent::RemainingBudget,
         context::{ContextBudget, ContextCensus},
@@ -2970,6 +2971,215 @@ mod tests {
             assert!(!rendered.contains("· Ready"));
             assert!(!rendered.contains("events 0"));
             assert!(rendered.contains("tools   not available"));
+        }
+    }
+
+    fn batch_event(
+        sequence: u64,
+        task: loom_core::TaskId,
+        kind: EventKind,
+    ) -> loom_core::EventEnvelope {
+        loom_core::EventEnvelope {
+            schema_version: EVENT_SCHEMA_VERSION,
+            timestamp_millis: None,
+            sequence,
+            task_id: task,
+            kind,
+        }
+    }
+
+    fn live_rows(reducer: &Reducer, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_live(
+                    frame,
+                    reducer,
+                    "",
+                    0,
+                    LiveViewOptions {
+                        sidebar_visible: true,
+                        glyph_set: Some(GlyphSet::Unicode),
+                        depth: Some(theme::Depth::TrueColor),
+                        ..LiveViewOptions::default()
+                    },
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: ToolCallId::try_from(id.to_owned()).unwrap(),
+            name: name.to_owned(),
+            arguments: ToolArguments::try_from(serde_json::json!({})).unwrap(),
+        }
+    }
+
+    #[test]
+    fn live_batch_reports_an_interleaved_completion_at_wide_and_narrow_widths() {
+        let task = loom_core::TaskId::new();
+        let mut reducer = Reducer::default();
+        reducer.begin_task("inspect both paths");
+        for (sequence, timestamp, kind) in [
+            (0, 1_000, EventKind::TaskStarted),
+            (1, 1_000, EventKind::TurnStarted { turn: 1 }),
+            (
+                2,
+                1_100,
+                EventKind::ModelCompleted {
+                    response: ModelResponse {
+                        message: AssistantMessage {
+                            content: String::new(),
+                            reasoning: None,
+                            tool_calls: vec![call("slow", "read_file"), call("fast", "search")],
+                            stop_reason: StopReason::ToolCalls,
+                        },
+                        usage: Usage::default(),
+                    },
+                },
+            ),
+            (
+                3,
+                2_000,
+                EventKind::ToolStarted {
+                    name: "read_file".into(),
+                    call_id: ToolCallId::try_from("slow".to_owned()).unwrap(),
+                    arguments: "{}".into(),
+                },
+            ),
+            (
+                4,
+                2_001,
+                EventKind::ToolStarted {
+                    name: "search".into(),
+                    call_id: ToolCallId::try_from("fast".to_owned()).unwrap(),
+                    arguments: "{}".into(),
+                },
+            ),
+            (
+                5,
+                2_050,
+                EventKind::ToolCompleted {
+                    name: "search".into(),
+                    call_id: ToolCallId::try_from("fast".to_owned()).unwrap(),
+                    status: ToolStatus::Success,
+                    content_head: "found it".into(),
+                },
+            ),
+        ] {
+            reducer.reduce(&batch_event(sequence, task, kind), timestamp);
+        }
+
+        for (width, height) in [(140, 40), (70, 24)] {
+            let text = live_rows(&reducer, width, height).join("\n");
+            assert!(
+                text.contains("2 read-only calls · 1 active · 1 done"),
+                "live phase counts missing at {width}x{height}\n{text}"
+            );
+            assert!(
+                !text.contains("1 queued"),
+                "settled fast call queued\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_batch_settles_started_and_never_polled_calls() {
+        let task = loom_core::TaskId::new();
+        let mut reducer = Reducer::default();
+        reducer.begin_task("inspect three paths");
+        for (sequence, timestamp, kind) in [
+            (0, 1_000, EventKind::TaskStarted),
+            (1, 1_000, EventKind::TurnStarted { turn: 1 }),
+            (
+                2,
+                1_100,
+                EventKind::ModelCompleted {
+                    response: ModelResponse {
+                        message: AssistantMessage {
+                            content: String::new(),
+                            reasoning: None,
+                            tool_calls: vec![
+                                call("done", "read_file"),
+                                call("inflight", "search"),
+                                call("never", "list_dir"),
+                            ],
+                            stop_reason: StopReason::ToolCalls,
+                        },
+                        usage: Usage::default(),
+                    },
+                },
+            ),
+            (
+                3,
+                2_000,
+                EventKind::ToolStarted {
+                    name: "read_file".into(),
+                    call_id: ToolCallId::try_from("done".to_owned()).unwrap(),
+                    arguments: "{}".into(),
+                },
+            ),
+            (
+                4,
+                2_010,
+                EventKind::ToolCompleted {
+                    name: "read_file".into(),
+                    call_id: ToolCallId::try_from("done".to_owned()).unwrap(),
+                    status: ToolStatus::Success,
+                    content_head: "ok".into(),
+                },
+            ),
+            (
+                5,
+                2_020,
+                EventKind::ToolStarted {
+                    name: "search".into(),
+                    call_id: ToolCallId::try_from("inflight".to_owned()).unwrap(),
+                    arguments: "{}".into(),
+                },
+            ),
+            (
+                6,
+                2_100,
+                EventKind::ToolCompleted {
+                    name: "search".into(),
+                    call_id: ToolCallId::try_from("inflight".to_owned()).unwrap(),
+                    status: ToolStatus::Cancelled { started: true },
+                    content_head: "cancelled during execution".into(),
+                },
+            ),
+            (
+                7,
+                2_100,
+                EventKind::ToolCompleted {
+                    name: "list_dir".into(),
+                    call_id: ToolCallId::try_from("never".to_owned()).unwrap(),
+                    status: ToolStatus::Cancelled { started: false },
+                    content_head: "not started".into(),
+                },
+            ),
+            (8, 2_200, EventKind::TaskCancelled),
+        ] {
+            reducer.reduce(&batch_event(sequence, task, kind), timestamp);
+        }
+
+        for (width, height) in [(140, 40), (70, 24)] {
+            let text = live_rows(&reducer, width, height).join("\n");
+            assert!(
+                text.matches("cancelled").count() >= 2,
+                "both cancellation outcomes missing at {width}x{height}\n{text}"
+            );
+            assert!(!text.contains("1 active"), "stale active row\n{text}");
+            assert!(!text.contains("1 queued"), "stale queued row\n{text}");
         }
     }
 }

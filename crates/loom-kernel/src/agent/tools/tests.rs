@@ -993,6 +993,116 @@ async fn events_follow_each_call_under_the_concurrency_bound() {
     );
 }
 
+#[allow(clippy::wildcard_enum_match_arm)] // only the two batch events are expected
+#[tokio::test]
+async fn concurrent_completions_emit_as_each_call_finishes() {
+    let sink = RecordingSink::default();
+    let registry = registry(vec![
+        MockTool {
+            spec: spec("slow"),
+            read_only: true,
+            action: Action::Sleep { ms: 60 },
+        },
+        MockTool {
+            spec: spec("fast"),
+            read_only: true,
+            action: Action::Sleep { ms: 1 },
+        },
+    ]);
+    let exposure = ToolExposure::from_names(["slow", "fast"]);
+    let token = CancellationToken::new();
+    let ctx = test_ctx(Duration::from_secs(5), &token);
+    let calls = vec![make_call("slow"), make_call("fast")];
+    let results = ToolBatch::new(&registry, &exposure)
+        .with_max_concurrency(2)
+        .with_events(&sink, TaskId::new())
+        .execute(&calls, &ctx)
+        .await;
+    assert!(
+        results
+            .iter()
+            .all(|result| result.status == ToolStatus::Success)
+    );
+
+    let events = sink.events.lock().expect("event lock");
+    let timeline: Vec<String> = events
+        .iter()
+        .map(|kind| match kind {
+            EventKind::ToolStarted { name, .. } => format!("started {name}"),
+            EventKind::ToolCompleted { name, .. } => format!("completed {name}"),
+            other => panic!("unexpected batch event: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        timeline,
+        [
+            "started slow",
+            "started fast",
+            "completed fast",
+            "completed slow"
+        ],
+        "both starts precede the first finish, and each finish follows its own call"
+    );
+}
+
+#[allow(clippy::wildcard_enum_match_arm)] // only the two batch events are expected
+#[tokio::test]
+async fn path_conflicts_report_one_lifecycle_at_a_time() {
+    let sink = RecordingSink::default();
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_seen = Arc::new(AtomicUsize::new(0));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let tool = |name: &str| MockTool {
+        spec: spec(name),
+        read_only: false,
+        action: Action::Track {
+            reads: Vec::new(),
+            writes: vec!["same.txt".to_owned()],
+            declared: true,
+            active: active.clone(),
+            max_seen: max_seen.clone(),
+            log: log.clone(),
+            label: name.to_owned(),
+            ms: 5,
+        },
+    };
+    let registry = registry(vec![tool("first"), tool("second")]);
+    let exposure = ToolExposure::from_names(["first", "second"]);
+    let token = CancellationToken::new();
+    let ctx = test_ctx(Duration::from_secs(5), &token);
+    let calls = vec![make_call("first"), make_call("second")];
+    let results = ToolBatch::new(&registry, &exposure)
+        .with_events(&sink, TaskId::new())
+        .execute(&calls, &ctx)
+        .await;
+    assert!(
+        results
+            .iter()
+            .all(|result| result.status == ToolStatus::Success)
+    );
+    assert_eq!(max_seen.load(Ordering::SeqCst), 1);
+
+    let events = sink.events.lock().expect("event lock");
+    let timeline: Vec<String> = events
+        .iter()
+        .map(|kind| match kind {
+            EventKind::ToolStarted { name, .. } => format!("started {name}"),
+            EventKind::ToolCompleted { name, .. } => format!("completed {name}"),
+            other => panic!("unexpected batch event: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        timeline,
+        [
+            "started first",
+            "completed first",
+            "started second",
+            "completed second"
+        ],
+        "a path conflict must not expose overlapping lifecycles"
+    );
+}
+
 #[tokio::test]
 async fn pre_cancelled_calls_report_only_a_completion() {
     let sink = RecordingSink::default();
