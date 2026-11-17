@@ -67,6 +67,11 @@ struct Args {
     reasoning_schedule: String,
     /// Opening turns at high effort under `progressive`.
     reasoning_open_turns: u16,
+    /// Tools the in-container loom must not register, forwarded as
+    /// `LOOM_DENY_TOOLS`. Empty for a production sweep; the single-build
+    /// A/B passes the one tool its arm removes, and both arms run the
+    /// same binary digest.
+    deny_tool: Vec<String>,
 }
 
 fn usage() -> ! {
@@ -98,6 +103,9 @@ fn usage() -> ! {
   --build-loom         cross-build the linux binary inside a docker rust image (--agent loom only)
   --timeout-secs <n>   wall-clock budget per run (default 3600)
   --max-turns <n>      --max-turns for the in-container loom run (default 100)
+  --deny-tool <name>   leave a tool out of the in-container registry (repeatable,
+                       or --deny-tool a,b). Forwarded as LOOM_DENY_TOOLS and
+                       recorded in provenance: the single-build A/B arm
   --arm <full|bare>    harness arm (--agent loom only; default $LOOM_EVAL_ARM or full): `bare`
                        forwards LOOM_BARE=1 so the in-container loom strips
                        every harness lever (facts, pruning, completion gate,
@@ -164,6 +172,7 @@ fn parse_args() -> (Args, Vec<(String, String)>) {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(2),
+        deny_tool: csv(&std::env::var("LOOM_EVAL_DENY_TOOLS").unwrap_or_default()),
     };
     let mut raw = std::env::args().skip(1);
     while let Some(flag) = raw.next() {
@@ -192,6 +201,7 @@ fn parse_args() -> (Args, Vec<(String, String)>) {
             "--reasoning-open-turns" => {
                 args.reasoning_open_turns = value().parse().unwrap_or_else(|_| usage());
             }
+            "--deny-tool" => args.deny_tool.extend(csv(&value())),
             _ => usage(), // covers `--help`/`-h` too
         }
     }
@@ -535,9 +545,10 @@ fn main() {
     // extend an eval dir whose recorded sweeps ran a different build —
     // silently mixing builds into one number is how the v3-100
     // headline spanned two binaries.
-    let provenance =
+    let mut provenance =
         swebench::sweep_provenance(loom_bin.as_deref(), agent, &args.reasoning_schedule)
             .unwrap_or_else(|error| panic!("hashing the staged loom binary: {error}"));
+    provenance.denied_tools.clone_from(&args.deny_tool);
     for entry in std::fs::read_dir(&base).into_iter().flatten().flatten() {
         let path = entry.path();
         if path.extension().is_some_and(|e| e == "json")
@@ -642,6 +653,9 @@ fn main() {
                         "LOOM_REASONING_OPEN_TURNS".to_owned(),
                         args.reasoning_open_turns.to_string(),
                     ));
+                }
+                if !args.deny_tool.is_empty() {
+                    extra_env.push(("LOOM_DENY_TOOLS".to_owned(), args.deny_tool.join(",")));
                 }
                 let spec = ContainerSpec {
                     agent,
@@ -793,6 +807,7 @@ fn main() {
         "prompt_version": provenance.prompt_version,
         "runner_version": provenance.runner_version,
         "reasoning_schedule": provenance.reasoning_schedule,
+        "denied_tools": provenance.denied_tools,
     });
     if let Some(weak) = &suite_audit_block {
         provenance_json["suite_audit"] =

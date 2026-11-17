@@ -20,7 +20,7 @@ use crate::scout::{ScoutConfig, ScoutTool};
 
 use super::assembly::{
     bare_registry, build_registry, build_stall_escalation_agent, build_tier_agents, compose_scout,
-    default_system_prompt, read_only_registry,
+    default_system_prompt, read_only_registry, without_tools,
 };
 use super::budgets::prune_config_for;
 use super::config::{kernel_effort, reasoning_schedule_from_env};
@@ -143,6 +143,13 @@ impl Engine {
             } else {
                 built
             }
+        };
+        // The A/B seam: a denied tool is absent from an otherwise
+        // production registry, so both arms run the same binary.
+        let registry = if overrides.deny_tools.is_empty() {
+            registry
+        } else {
+            without_tools(registry, &overrides.deny_tools)
         };
         // Roadmap item 19: the read-only scout. Opt-in via
         // `EngineConfig::scout` (or injected through `overrides.scout`

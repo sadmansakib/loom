@@ -178,6 +178,11 @@ pub struct RunFlags {
     #[arg(long)]
     pub read_only: bool,
 
+    /// Leave the named tool out of the registry. Repeatable. Ignored
+    /// under `--read-only` and the bare-loop arm, which already filter.
+    #[arg(long = "deny-tool", value_name = "NAME")]
+    pub deny_tool: Vec<String>,
+
     /// Ignore the global AGENTS.md instructions file for this run.
     #[arg(long)]
     pub no_global_instructions: bool,

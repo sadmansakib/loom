@@ -69,6 +69,13 @@ pub struct EngineOverrides {
     /// per-task registry); `bare_loop` only removes what the engine
     /// itself would have added.
     pub bare_loop: bool,
+    /// Tool names to leave out of the built-in registry. The
+    /// single-build A/B seam: `swebench-contrast` refuses to compare
+    /// two binaries, so an arm that differs by one tool is measured by
+    /// denying it instead of building twice. Names that are not
+    /// registered are ignored. Ignored wholesale when an embedder
+    /// supplies [`Self::registry`].
+    pub deny_tools: Vec<String>,
     /// Overrides the fast-path default (roadmap item 3). `None` keeps
     /// the production choice — fast paths on — so a mechanical
     /// instruction costs zero model calls; `Some(false)` disables them
@@ -134,6 +141,17 @@ impl EngineOverrides {
         self
     }
 
+    /// Leaves the named tools out of the built-in registry
+    /// ([`EngineOverrides::deny_tools`]).
+    #[must_use]
+    pub fn without_tools<I>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.deny_tools.extend(names);
+        self
+    }
+
     /// Sets the approval callback for `Ask` verdicts
     /// ([`EngineOverrides::ask`]).
     #[must_use]
@@ -148,5 +166,40 @@ impl EngineOverrides {
     pub fn with_write_approval(mut self, approval: loom_tools::WriteApproval) -> Self {
         self.write_approval = Some(approval);
         self
+    }
+}
+
+/// Reads the deny list from `LOOM_DENY_TOOLS` (comma-separated tool
+/// names). The sweep forwards it as env because the container script
+/// is frozen byte-identical, so an A/B arm cannot add a flag to the
+/// in-container invocation.
+#[must_use]
+pub fn deny_tools_with_env(get: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    get("LOOM_DENY_TOOLS").map_or_else(Vec::new, |raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::deny_tools_with_env;
+
+    #[test]
+    fn deny_tools_with_env_splits_trims_and_ignores_blanks() {
+        assert_eq!(
+            deny_tools_with_env(
+                |name| (name == "LOOM_DENY_TOOLS").then(|| " replace_all , todo ,, ".to_owned())
+            ),
+            ["replace_all", "todo"]
+        );
+        assert_eq!(deny_tools_with_env(|_| None), [] as [String; 0]);
+        assert_eq!(
+            deny_tools_with_env(|_| Some("  ".to_owned())),
+            [] as [String; 0]
+        );
     }
 }

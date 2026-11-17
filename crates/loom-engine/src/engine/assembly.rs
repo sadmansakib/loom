@@ -347,6 +347,18 @@ pub(crate) fn bare_registry(built: ToolRegistry) -> ToolRegistry {
     )
 }
 
+/// A registry minus named tools: the single-build A/B seam
+/// (`--deny-tool`). A contrast across two binaries is refused by
+/// `swebench-contrast`, so an arm that must differ by one tool is
+/// produced here instead, from the same build the other arm runs.
+pub(crate) fn without_tools(built: ToolRegistry, denied: &[String]) -> ToolRegistry {
+    ToolRegistry::from_arc_tools(
+        built
+            .into_arc_tools()
+            .filter(|tool| !denied.iter().any(|name| name == &tool.spec().name)),
+    )
+}
+
 /// The replay arm's tool registry: the production registry with default
 /// policy and budgets, used only so the replay compiler sees a real
 /// `ToolSpec` set (the census's `tool_specs` source). No tool is ever

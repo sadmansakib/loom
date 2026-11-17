@@ -38,6 +38,11 @@ pub struct SweepProvenance {
     /// `fixed` or `progressive`. Recorded so an effort A/B's arms are
     /// identifiable from the report alone.
     pub reasoning_schedule: String,
+    /// Tool names the sweep denied (`LOOM_DENY_TOOLS`). Empty for a
+    /// production sweep; a single-build A/B records the one tool its
+    /// arm removed, so the contrast says which arm is which without
+    /// re-reading the command line.
+    pub denied_tools: Vec<String>,
 }
 
 /// sha256 of `bytes` as lowercase hex.
@@ -81,6 +86,7 @@ pub fn sweep_provenance(
         prompt_version: PROMPT_VERSION,
         runner_version: env!("CARGO_PKG_VERSION"),
         reasoning_schedule: reasoning_schedule.to_owned(),
+        denied_tools: Vec::new(),
     })
 }
 

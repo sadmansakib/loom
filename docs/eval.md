@@ -109,6 +109,7 @@ swebench eval verified --gold -i sympy__sympy-20590 --run-id validate-gold
 | `--build-loom` | — | build the binary in a rust docker container |
 | `--timeout-secs N` | 3600 | per-run wall clock (container is killed after) |
 | `--max-turns N` | 100 | agent turn budget (v2 default; 60 starved one run into exploration-only) |
+| `--deny-tool NAME` | — | leave a tool out of the in-container registry (repeatable). Forwarded as `LOOM_DENY_TOOLS`, recorded in provenance. The single-build A/B: `swebench-contrast` refuses to compare two binaries, so both arms run one digest and differ here. The system prompt still names the denied tool, so the denying arm wastes a call discovering it is gone — a win for the tool is understated, never overstated |
 | `--eval-dir DIR` | `$LOOM_EVAL_DIR` or `target/eval` | artifacts root |
 
 `LOOM_EVAL_SWEBENCH_INSTANCES` / `LOOM_EVAL_SWEBENCH_REPOS` are the env

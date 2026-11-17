@@ -52,7 +52,7 @@ pub mod worktrees;
 pub use engine::{
     BUDGET_ENV_VARS, Continuation, Engine, EngineConfig, EngineError, EngineOverrides,
     PRUNE_ENV_VARS, ProviderHook, TURN_BUDGET_ENV_VARS, budgets_with_env, default_system_prompt,
-    prune_with_env, turn_budget_with_env,
+    deny_tools_with_env, prune_with_env, turn_budget_with_env,
 };
 pub use estimate::{
     ANTHROPIC_TOKEN_SCALE_PER_MILLE, AnthropicEstimator, O200kEstimator, estimator_for,

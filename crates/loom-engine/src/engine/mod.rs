@@ -27,7 +27,7 @@ pub use config::EngineConfig;
 #[cfg(test)]
 pub(crate) use config::test_config;
 pub use error::EngineError;
-pub use overrides::{EngineOverrides, ProviderHook};
+pub use overrides::{EngineOverrides, ProviderHook, deny_tools_with_env};
 
 use std::sync::Arc;
 

@@ -510,6 +510,15 @@ pub(crate) fn engine_config_from(
     } else {
         EngineOverrides::default()
     };
+    // `--deny-tool` is the single-build A/B seam: the eval harness runs
+    // both arms from one binary (`swebench-contrast` refuses to compare
+    // across builds), so the tool it measures is removed here. The env
+    // form exists because the sweep's container script is frozen.
+    let overrides = overrides
+        .without_tools(flags.deny_tool.iter().cloned())
+        .without_tools(loom_core::engine::deny_tools_with_env(|name| {
+            std::env::var(name).ok()
+        }));
     let scout = scout_config(flags, bare_arm)?;
     // Feature seams share one bare-arm gate: the bare arm measures the
     // plain loop, so each feature is off there (flag asked for and
@@ -681,6 +690,30 @@ mod tests {
                 .to_string()
                 .contains("--trace")
         );
+    }
+
+    #[test]
+    fn deny_tool_flags_reach_the_engine_overrides() {
+        let cli = Cli::try_parse_from([
+            "loom",
+            "run",
+            "--provider",
+            "glm",
+            "--model",
+            "glm-5",
+            "--deny-tool",
+            "replace_all",
+            "--deny-tool",
+            "todo",
+            "x",
+        ])
+        .expect("repeatable --deny-tool parses");
+        let crate::args::Command::Run(args) = cli.into_command() else {
+            panic!("expected run");
+        };
+        let (_config, overrides) =
+            super::engine_config_from(&args.flags).expect("engine config assembles");
+        assert_eq!(overrides.deny_tools, ["replace_all", "todo"]);
     }
 
     #[test]
