@@ -204,7 +204,7 @@
 [Reset/Rgb(18, 16, 14)/NONE]│                                                                                                                                                        │
 [Reset/Rgb(18, 16, 14)/NONE]└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 === help ===
-[Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]◆ loom[Rgb(233, 227, 215)/Rgb(18, 16, 14)/BOLD]  /  keys · events · crate seam[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]    one thread per task
+[Rgb(227, 168, 87)/Rgb(18, 16, 14)/BOLD]◆ loom[Rgb(233, 227, 215)/Rgb(18, 16, 14)/BOLD]  /  keys · commands · events · crate seam[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]    one thread per task
 
 [Rgb(42, 36, 28)/Rgb(18, 16, 14)/NONE]──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 [Reset/Rgb(18, 16, 14)/NONE]┌ controls ──────────────────────────────────────────┐┌ event stream ────────────────────────────────────────────────────────────────────────────────────┐
@@ -228,20 +228,20 @@
 [Reset/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]Tab           [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]cycle reported effort levels[Reset/Rgb(18, 16, 14)/NONE]          ││                                                                                                  │
 [Reset/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]r             [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]refresh model discovery[Reset/Rgb(18, 16, 14)/NONE]               ││                                                                                                  │
 [Reset/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]Enter / Esc   [Rgb(233, 227, 215)/Rgb(18, 16, 14)/NONE]apply / return[Reset/Rgb(18, 16, 14)/NONE]                        ││                                                                                                  │
+[Reset/Rgb(18, 16, 14)/NONE]│[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]COMMANDS[Reset/Rgb(18, 16, 14)/NONE]                                            ││                                                                                                  │
+[Reset/Rgb(18, 16, 14)/NONE]│[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Type / to filter; Enter runs the selected command.[Reset/Rgb(18, 16, 14)/NONE]  ││                                                                                                  │
+[Reset/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]/model            /effort[Reset/Rgb(18, 16, 14)/NONE]                           ││                                                                                                  │
+[Reset/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]/context          /tools[Reset/Rgb(18, 16, 14)/NONE]                            ││                                                                                                  │
+[Reset/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]/account          /compare[Reset/Rgb(18, 16, 14)/NONE]                          ││                                                                                                  │
+[Reset/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]/sessions         /new[Reset/Rgb(18, 16, 14)/NONE]                              ││                                                                                                  │
+[Reset/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]/clear            /clear-history[Reset/Rgb(18, 16, 14)/NONE]                    ││                                                                                                  │
+[Reset/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]/compact          /retry[Reset/Rgb(18, 16, 14)/NONE]                            ││                                                                                                  │
+[Reset/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]/copy             /export[Reset/Rgb(18, 16, 14)/NONE]                           ││                                                                                                  │
+[Reset/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]/reasoning        /sidebar[Reset/Rgb(18, 16, 14)/NONE]                          ││                                                                                                  │
+[Reset/Rgb(18, 16, 14)/NONE]│[Rgb(227, 168, 87)/Rgb(18, 16, 14)/NONE]/help             /quit[Reset/Rgb(18, 16, 14)/NONE]                             ││                                                                                                  │
 [Reset/Rgb(18, 16, 14)/NONE]│[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]DESIGN REFERENCE[Reset/Rgb(18, 16, 14)/NONE]                                    ││                                                                                                  │
 [Reset/Rgb(18, 16, 14)/NONE]│[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]Static --scene views show no task data; live values[Reset/Rgb(18, 16, 14)/NONE] ││                                                                                                  │
 [Reset/Rgb(18, 16, 14)/NONE]│[Rgb(154, 146, 133)/Rgb(18, 16, 14)/NONE]come from events and session.[Reset/Rgb(18, 16, 14)/NONE]                       ││                                                                                                  │
-[Reset/Rgb(18, 16, 14)/NONE]│                                                    ││                                                                                                  │
-[Reset/Rgb(18, 16, 14)/NONE]│                                                    ││                                                                                                  │
-[Reset/Rgb(18, 16, 14)/NONE]│                                                    ││                                                                                                  │
-[Reset/Rgb(18, 16, 14)/NONE]│                                                    ││                                                                                                  │
-[Reset/Rgb(18, 16, 14)/NONE]│                                                    ││                                                                                                  │
-[Reset/Rgb(18, 16, 14)/NONE]│                                                    ││                                                                                                  │
-[Reset/Rgb(18, 16, 14)/NONE]│                                                    ││                                                                                                  │
-[Reset/Rgb(18, 16, 14)/NONE]│                                                    ││                                                                                                  │
-[Reset/Rgb(18, 16, 14)/NONE]│                                                    ││                                                                                                  │
-[Reset/Rgb(18, 16, 14)/NONE]│                                                    ││                                                                                                  │
-[Reset/Rgb(18, 16, 14)/NONE]│                                                    ││                                                                                                  │
 [Reset/Rgb(18, 16, 14)/NONE]│                                                    ││                                                                                                  │
 [Reset/Rgb(18, 16, 14)/NONE]└────────────────────────────────────────────────────┘└──────────────────────────────────────────────────────────────────────────────────────────────────┘
 === spec ===

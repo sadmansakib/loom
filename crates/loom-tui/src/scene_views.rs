@@ -686,12 +686,12 @@ fn draw_help(frame: &mut Frame<'_>) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(1)])
         .split(area);
-    draw_header(frame, rows[0], "keys · events · crate seam");
+    draw_header(frame, rows[0], "keys · commands · events · crate seam");
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(54), Constraint::Min(1)])
         .split(rows[1]);
-    let left = vec![
+    let mut left = vec![
         heading("WHILE A TASK RUNS"),
         help_key("Esc / Ctrl-C", "cancel current task"),
         help_key("Enter", "queue follow-up for next turn"),
@@ -714,9 +714,14 @@ fn draw_help(frame: &mut Frame<'_>) {
         help_key("Tab", "cycle reported effort levels"),
         help_key("r", "refresh model discovery"),
         help_key("Enter / Esc", "apply / return"),
-        heading("DESIGN REFERENCE"),
-        muted("Static --scene views show no task data; live values come from events and session."),
+        heading("COMMANDS"),
+        muted("Type / to filter; Enter runs the selected command."),
     ];
+    left.extend(command_rows());
+    left.push(heading("DESIGN REFERENCE"));
+    left.push(muted(
+        "Static --scene views show no task data; live values come from events and session.",
+    ));
     render_panel(frame, columns[0], "controls", left);
     let event_lines = [
         ("TaskStarted", "status becomes Running"),
@@ -1369,6 +1374,23 @@ fn help_key(key: &'static str, description: &'static str) -> Line<'static> {
     ])
 }
 
+fn command_rows() -> Vec<Line<'static>> {
+    const COLUMN_WIDTH: usize = 18;
+    crate::palette::COMMANDS
+        .chunks(2)
+        .map(|pair| {
+            let second = pair.get(1).map_or("", |command| command.name);
+            Line::from(vec![
+                Span::styled(
+                    format!("{:<width$}", pair[0].name, width = COLUMN_WIDTH),
+                    fg(theme::AMBER),
+                ),
+                Span::styled(second.to_owned(), fg(theme::AMBER)),
+            ])
+        })
+        .collect()
+}
+
 fn design_area(area: Rect) -> Rect {
     area
 }
@@ -1606,6 +1628,23 @@ mod tests {
             fs::write(path, &actual).unwrap();
         }
         assert_eq!(actual, include_str!("../tests/snapshots/scenes.snap"));
+    }
+
+    #[test]
+    fn help_lists_every_palette_command() {
+        let buffer = render(Scene::Help);
+        let text = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        for command in crate::palette::COMMANDS {
+            assert!(
+                text.contains(command.name),
+                "help is missing {}",
+                command.name
+            );
+        }
     }
 
     #[test]
