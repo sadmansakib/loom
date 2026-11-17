@@ -581,8 +581,8 @@ also summarized here so this section is the single source of truth.
   and cached tokens / cost / wall time / tool-cache hits, per-task
   aggregates and a gated-pass-rate suite headline; strict and tolerant
   modes.
-- **Verification bar.** 1,634 tests passing, 14 live-API tests ignored by
-  default (1,648 total), clippy clean, fmt clean.
+- **Verification bar.** 1,639 tests passing, 14 live-API tests ignored by
+  default (1,653 total), clippy clean, fmt clean.
 
 ---
 
@@ -1535,9 +1535,8 @@ adds four more framing findings and backlog items 26–31 below.
     official `loom-tui` crate (`crates/loom-tui`) now renders the live task
     thread, sidebar telemetry, and modal screens, and supports interactive
     steering, pause, and cancel; UI crates are isolated from the facade's
-    dependency surface. Resume + steering are both shipped.
-    Remaining workflow parity (live batch progress) stays open under
-    item 40.
+    dependency surface. Resume + steering are both shipped, and live batch
+    progress ships under item 40.
 23. **Distributed verification.** Remote or containerized `verify`
     runners with the same evidence contract. **Shipped 2026-10-23** —
     `.loom/verify.toml` declares the runner argv (docker, ssh, …) with
@@ -2139,21 +2138,21 @@ model tier under them (arXiv 2607.06906).
     G8, G9). Bring the official `loom-tui` from its current live task,
     cancel, and retry view to the full workflow shown in
     `docs/wireframes/`. This is **not** a parallel-execution item:
-    `ToolBatch` already runs conflict-free calls concurrently (bounded
-    at 8 by default), preserves model order for conflicts, and returns
-    results in call order. The UI gap is that it emits all starts before
-    batch execution and renders completions only after the batch returns;
-    it cannot show actual per-call completion timing or live in-flight
-    progress.
+    `ToolBatch` runs conflict-free calls concurrently (bounded at 8 by
+    default), preserves model order for conflicts, and returns results in
+    call order.
 
     Scope and status:
-    - **Honest live batch and cancellation view.** Emit/render lifecycle
-      updates as calls actually start and finish, with elapsed time and
-      active/queued/completed counts. Show cancellation truthfully:
-      completed results remain committed, started calls are interrupted,
-      and calls never started are marked not run. Never imply that calls
-      ran concurrently when path conflicts or wildcard access serialized
-      them. Keep transcript result ordering and replay semantics stable.
+    - **Honest live batch and cancellation view.** **Shipped 2026-11-18** —
+      `ToolBatch` emits `ToolStarted` as each call is dispatched and
+      `ToolCompleted` as it finishes; the TUI renders queued, active
+      (elapsed), and finished calls with active/queued/done counts.
+      Cancellation settles every call with the state the engine reached:
+      completed results remain committed, in-flight calls are marked
+      started then cancelled, and never-polled calls report only a
+      `started: false` completion. Calls serialized by path conflicts or
+      wildcard access never render as concurrent. Transcript result
+      ordering and replay semantics are unchanged.
     - **Visible, enforceable run profiles.** **Shipped 2026-11-18** —
       `--read-only` on `loom run`/`loom chat` and `/profile` in the TUI
       filter the engine registry, so writes, edits, shell commands, and
@@ -2194,8 +2193,8 @@ model tier under them (arXiv 2607.06906).
     changes task success, turns, or cost under item 1; visual parity alone
     is not a task-performance claim. Seam: item 22's `loom-core` facade,
     typed events and task summaries, `loom-tui`, and the CLI composition
-    root. Parallel execution itself is shipped; live per-call progress
-    is the missing capability.
+    root. Parallel execution and live per-call progress are shipped; the
+    remaining depth is the crate-seam test coverage above.
 
 ### 2026-12 meta-harness sweep — gap check
 

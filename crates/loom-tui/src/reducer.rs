@@ -560,6 +560,9 @@ pub struct Reducer {
     pub sequence: u64,
     /// Model id confirmed by `CapabilitiesResolved`, when observed.
     pub observed_model: Option<String>,
+    /// Latest caller-supplied or event-supplied timestamp, for live
+    /// elapsed-time rendering. Purely presentation state.
+    pub now_millis: u64,
     /// Most recent event labels, newest first.
     pub recent_events: Vec<String>,
     /// Latest compiled-request and remaining-budget snapshot, if observed.
@@ -673,6 +676,7 @@ impl Reducer {
     /// from the event and current reducer state.
     #[allow(clippy::too_many_lines)] // one exhaustive event-to-state transition table
     pub fn reduce(&mut self, event: &EventEnvelope, timestamp_millis: u64) {
+        self.now_millis = self.now_millis.max(timestamp_millis);
         self.sequence = event.sequence;
         self.event_count = self.event_count.saturating_add(1);
         self.recent_events.insert(
@@ -977,6 +981,7 @@ impl Reducer {
     /// Advances time-dependent presentation state with a caller-supplied
     /// monotonic timestamp. No clock is read here; replay stays deterministic.
     pub fn tick(&mut self, now_millis: u64) {
+        self.now_millis = self.now_millis.max(now_millis);
         if let Some(wait) = &mut self.retry_wait {
             wait.now_millis = now_millis.max(wait.started_at_millis);
         }

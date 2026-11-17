@@ -25,6 +25,8 @@ use futures::future::{self, Either};
 use futures::stream::{self, StreamExt};
 use tokio::time::timeout;
 
+use crate::event::{EventKind, EventSink};
+use crate::id::TaskId;
 use crate::tool::{ToolContext, ToolEffects, ToolError, ToolRegistry};
 use crate::transcript::{ToolCall, ToolFailure, ToolResult, ToolStatus};
 
@@ -253,6 +255,24 @@ pub struct ToolBatch<'a> {
     registry: &'a ToolRegistry,
     exposure: &'a ToolExposure,
     max_concurrency: usize,
+    progress: Option<ToolProgress<'a>>,
+}
+
+/// The event seam for live per-call lifecycle updates. A batch without
+/// one stays silent, which keeps the tool-engine unit tests independent
+/// of the event layer.
+#[derive(Clone, Copy)]
+struct ToolProgress<'a> {
+    sink: &'a dyn EventSink,
+    task_id: TaskId,
+}
+
+impl std::fmt::Debug for ToolProgress<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolProgress")
+            .field("task_id", &self.task_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> ToolBatch<'a> {
@@ -264,6 +284,7 @@ impl<'a> ToolBatch<'a> {
             registry,
             exposure,
             max_concurrency: DEFAULT_MAX_CONCURRENCY,
+            progress: None,
         }
     }
 
@@ -271,6 +292,15 @@ impl<'a> ToolBatch<'a> {
     #[must_use]
     pub fn with_max_concurrency(mut self, max: usize) -> Self {
         self.max_concurrency = max.max(1);
+        self
+    }
+
+    /// Reports start and completion events as each call reaches them.
+    /// Without this the batch emits nothing and the caller owns the
+    /// event timeline.
+    #[must_use]
+    pub fn with_events(mut self, sink: &'a dyn EventSink, task_id: TaskId) -> Self {
+        self.progress = Some(ToolProgress { sink, task_id });
         self
     }
 
@@ -296,6 +326,13 @@ impl<'a> ToolBatch<'a> {
             .iter()
             .map(|_| Arc::new(AtomicBool::new(false)))
             .collect();
+        // Whether this call already emitted its completion. In-flight
+        // calls dropped by cancellation, and calls the bound never
+        // polled, get one final completion after the waves.
+        let completed_flags: Vec<Arc<AtomicBool>> = calls
+            .iter()
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect();
 
         'waves: for wave in &waves {
             // Wave futures are pushed through a named `async fn`, not a
@@ -313,6 +350,8 @@ impl<'a> ToolBatch<'a> {
                     ctx,
                     &started_flags[index],
                     &slots[index],
+                    self.progress,
+                    &completed_flags[index],
                 ));
             }
             let mut stream = stream::iter(wave_futures).buffered(self.max_concurrency);
@@ -331,7 +370,7 @@ impl<'a> ToolBatch<'a> {
             }
         }
 
-        calls
+        let results: Vec<ToolResult> = calls
             .iter()
             .zip(slots.iter().zip(started_flags.iter()))
             .map(
@@ -340,7 +379,29 @@ impl<'a> ToolBatch<'a> {
                     None => cancelled_result(call, started_flag.load(Ordering::Acquire)),
                 },
             )
-            .collect()
+            .collect();
+
+        if let Some(progress) = self.progress {
+            for (call, (completed, result)) in
+                calls.iter().zip(completed_flags.iter().zip(results.iter()))
+            {
+                if !completed.load(Ordering::Acquire) {
+                    progress.sink.emit(
+                        progress.task_id,
+                        EventKind::ToolCompleted {
+                            name: call.name.clone(),
+                            call_id: call.id.clone(),
+                            status: result.status,
+                            content_head: crate::event::text_head(
+                                &result.content,
+                                crate::event::CONTENT_EVENT_HEAD,
+                            ),
+                        },
+                    );
+                }
+            }
+        }
+        results
     }
 }
 
@@ -348,14 +409,30 @@ impl<'a> ToolBatch<'a> {
 /// publish the result into its slot. Extracted from
 /// [`ToolBatch::execute`] so the wave futures are named-fn futures
 /// (see the wave-loop comment for the rustc #102211 details).
-pub(super) async fn run_wave_item(
+#[allow(clippy::too_many_arguments)] // one future per call shares the batch context
+async fn run_wave_item(
     registry: &ToolRegistry,
     exposure: &ToolExposure,
     call: &ToolCall,
     ctx: &ToolContext,
     started: &AtomicBool,
     slot: &Mutex<Option<ToolResult>>,
+    progress: Option<ToolProgress<'_>>,
+    completed: &AtomicBool,
 ) {
+    if let Some(progress) = progress {
+        progress.sink.emit(
+            progress.task_id,
+            EventKind::ToolStarted {
+                name: call.name.clone(),
+                call_id: call.id.clone(),
+                arguments: crate::event::text_head(
+                    &serde_json::to_string(&call.arguments).unwrap_or_default(),
+                    crate::event::ARGUMENTS_EVENT_HEAD,
+                ),
+            },
+        );
+    }
     let result = execute_call(registry, exposure, call, ctx, started).await;
     // Record file effects before the next call in a sequential batch
     // starts, so a `verify` later in this same batch links to a write
@@ -369,6 +446,34 @@ pub(super) async fn run_wave_item(
         && let Ok(mut cache) = cache.lock()
     {
         cache.invalidate_effects(&result.effects);
+    }
+    if let Some(progress) = progress {
+        if started.load(Ordering::Acquire)
+            && registry
+                .get(&call.name)
+                .is_some_and(|tool| tool.requires_approval(&call.arguments))
+        {
+            progress.sink.emit(
+                progress.task_id,
+                EventKind::ApprovalDecided {
+                    call_id: call.id.clone(),
+                    allowed: !matches!(result.status, ToolStatus::Error(ToolFailure::Declined)),
+                },
+            );
+        }
+        progress.sink.emit(
+            progress.task_id,
+            EventKind::ToolCompleted {
+                name: call.name.clone(),
+                call_id: call.id.clone(),
+                status: result.status,
+                content_head: crate::event::text_head(
+                    &result.content,
+                    crate::event::CONTENT_EVENT_HEAD,
+                ),
+            },
+        );
+        completed.store(true, Ordering::Release);
     }
     // Same wedged-lock policy as `lock_slot`: poison-tolerant.
     slot.lock()

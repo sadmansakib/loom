@@ -2,6 +2,7 @@
 //! result excerpts. This module reads reducer state only; it performs no I/O.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 use loom_core::kernel::transcript::{Item, ToolCall, ToolResult, ToolStatus};
 use ratatui::{
@@ -13,7 +14,7 @@ use ratatui::{
 
 use crate::{
     glyphs::{self, Glyph},
-    reducer::{Reducer, Selection},
+    reducer::{Reducer, Selection, ToolState},
     theme,
 };
 
@@ -269,15 +270,23 @@ pub(super) fn draw(
             })
             .collect::<Vec<_>>();
         if !uncommitted.is_empty() {
+            let read_only = uncommitted
+                .iter()
+                .all(|(_, tool)| READ_ONLY_TOOLS.contains(&tool.name.as_str()));
+            let (active, queued, done) =
+                uncommitted
+                    .iter()
+                    .fold((0, 0, 0), |(active, queued, done), (_, tool)| {
+                        match (tool.status, tool.started_at_millis) {
+                            (Some(_), _) => (active, queued, done + 1),
+                            (None, Some(_)) => (active + 1, queued, done),
+                            (None, None) => (active, queued + 1, done),
+                        }
+                    });
             lines.push(rail_line(
                 rail,
                 vec![Span::styled(
-                    batch_label(
-                        uncommitted.len(),
-                        uncommitted
-                            .iter()
-                            .all(|(_, tool)| READ_ONLY_TOOLS.contains(&tool.name.as_str())),
-                    ),
+                    live_batch_label(uncommitted.len(), read_only, active, queued, done),
                     fg(theme::DIM),
                 )],
             ));
@@ -298,7 +307,8 @@ pub(super) fn draw(
                     tool.arguments.as_deref().unwrap_or(""),
                     tool.status,
                     tool.content_head.as_deref(),
-                    duration_between(tool.started_at_millis, tool.completed_at_millis),
+                    live_duration(tool, reducer.now_millis),
+                    tool.status.is_none() && tool.started_at_millis.is_none(),
                     last,
                     selected,
                     call_id,
@@ -560,8 +570,30 @@ fn batch_label(count: usize, read_only: bool) -> String {
         "tool call"
     };
     let plural = if count == 1 { "" } else { "s" };
-    let concurrent = if count > 1 { " · concurrent" } else { "" };
-    format!("{count} {noun}{plural}{concurrent}")
+    format!("{count} {noun}{plural}")
+}
+
+fn live_batch_label(
+    count: usize,
+    read_only: bool,
+    active: usize,
+    queued: usize,
+    done: usize,
+) -> String {
+    let mut label = batch_label(count, read_only);
+    if active == 0 && queued == 0 {
+        return label;
+    }
+    if active > 0 {
+        let _ = write!(label, " · {active} active");
+    }
+    if queued > 0 {
+        let _ = write!(label, " · {queued} queued");
+    }
+    if done > 0 {
+        let _ = write!(label, " · {done} done");
+    }
+    label
 }
 
 #[allow(clippy::too_many_arguments)] // one row of the event stream
@@ -580,14 +612,34 @@ fn render_tool_batch(
     let Some(calls) = calls.filter(|calls| !calls.is_empty()) else {
         return Vec::new();
     };
+    let live = reducer.task.status == Some(loom_core::kernel::session::TaskStatus::Running);
+    let (active, queued, done) = calls
+        .iter()
+        .fold((0, 0, 0), |(active, queued, done), call| {
+            let call_id = call.id.to_string();
+            let state = reducer.tools.get(&call_id);
+            let has_result = results.contains_key(&call_id);
+            if state.and_then(|tool| tool.status).is_some() || has_result {
+                (active, queued, done + 1)
+            } else if state.is_some_and(|tool| tool.started_at_millis.is_some()) {
+                (active + 1, queued, done)
+            } else if live {
+                (active, queued + 1, done)
+            } else {
+                (active, queued, done)
+            }
+        });
     let mut lines = vec![rail_line(
         rail,
         vec![Span::styled(
-            batch_label(
+            live_batch_label(
                 calls.len(),
                 calls
                     .iter()
                     .all(|call| READ_ONLY_TOOLS.contains(&call.name.as_str())),
+                active,
+                queued,
+                done,
             ),
             fg(theme::DIM),
         )],
@@ -618,9 +670,10 @@ fn render_tool_batch(
             &call.arguments.to_string(),
             status,
             content,
-            state.and_then(|tool| {
-                duration_between(tool.started_at_millis, tool.completed_at_millis)
-            }),
+            state.and_then(|tool| live_duration(tool, reducer.now_millis)),
+            live && status.is_none()
+                && result.is_none()
+                && state.is_none_or(|tool| tool.started_at_millis.is_none()),
             index + 1 == calls.len(),
             selected,
             &call_id,
@@ -632,7 +685,11 @@ fn render_tool_batch(
     lines
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one row plus optional excerpt
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::fn_params_excessive_bools
+)] // one row plus optional excerpt
 fn render_live_tool_row(
     reducer: &Reducer,
     rail: Rail,
@@ -642,12 +699,14 @@ fn render_live_tool_row(
     status: Option<ToolStatus>,
     content: Option<&str>,
     duration: Option<u64>,
+    queued: bool,
     last: bool,
     selected: bool,
     call_id: &str,
     awaiting: bool,
     set: crate::glyphs::GlyphSet,
 ) -> Vec<Line<'static>> {
+    let queued = queued && status.is_none();
     let (marker, color, running) = if awaiting && status.is_none() {
         (Glyph::Needs, theme::AMBER, false)
     } else {
@@ -657,6 +716,7 @@ fn render_live_tool_row(
             Some(ToolStatus::Cancelled { started: true }) => (Glyph::Warning, theme::AMBER, false),
             Some(ToolStatus::Cancelled { started: false }) => (Glyph::Pending, theme::DIM, false),
             Some(_) => (Glyph::Check, theme::DIM, false),
+            None if queued => (Glyph::Pending, theme::DIM, false),
             None => (Glyph::Spinner, theme::AMBER, true),
         }
     };
@@ -669,6 +729,8 @@ fn render_live_tool_row(
     let mut summary = tool_summary(name, status, content, running);
     if awaiting && status.is_none() {
         "awaiting".clone_into(&mut summary);
+    } else if queued {
+        "queued".clone_into(&mut summary);
     }
     let duration = duration.map_or(String::new(), |millis| format!("{millis} ms"));
     let right_width = summary.chars().count()
@@ -914,8 +976,13 @@ fn numbered_rows(content: &str) -> Vec<(usize, String)> {
     rows
 }
 
-fn duration_between(start: Option<u64>, end: Option<u64>) -> Option<u64> {
-    start.zip(end).map(|(start, end)| end.saturating_sub(start))
+fn live_duration(tool: &ToolState, now_millis: u64) -> Option<u64> {
+    let start = tool.started_at_millis?;
+    Some(
+        tool.completed_at_millis
+            .unwrap_or(now_millis)
+            .saturating_sub(start),
+    )
 }
 
 fn rail_span(rail: Rail) -> Span<'static> {
@@ -1020,5 +1087,72 @@ fn streaming_cursor(set: crate::glyphs::GlyphSet) -> &'static str {
         "▌"
     } else {
         "|"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::glyphs::GlyphSet;
+
+    fn row_text(queued: bool) -> String {
+        let lines = render_live_tool_row(
+            &Reducer::default(),
+            Rail::Provisional,
+            80,
+            "read_file",
+            "",
+            None,
+            None,
+            None,
+            queued,
+            true,
+            false,
+            "call-1",
+            false,
+            GlyphSet::Unicode,
+        );
+        lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect()
+    }
+
+    #[test]
+    fn live_batch_label_reports_each_phase() {
+        assert_eq!(
+            live_batch_label(3, true, 1, 1, 1),
+            "3 read-only calls · 1 active · 1 queued · 1 done"
+        );
+        assert_eq!(
+            live_batch_label(1, false, 1, 0, 0),
+            "1 tool call · 1 active"
+        );
+        assert_eq!(
+            live_batch_label(2, false, 0, 0, 2),
+            "2 tool calls",
+            "a settled batch needs no live counts"
+        );
+    }
+
+    #[test]
+    fn queued_calls_do_not_spin() {
+        assert!(row_text(true).contains("queued"));
+        assert!(!row_text(false).contains("queued"));
+    }
+
+    #[test]
+    fn live_duration_advances_and_freezes_on_completion() {
+        let mut tool = ToolState {
+            name: "read_file".to_owned(),
+            arguments: None,
+            status: None,
+            content_head: None,
+            started_at_millis: Some(1_000),
+            completed_at_millis: None,
+        };
+        assert_eq!(live_duration(&tool, 2_500), Some(1_500));
+        tool.completed_at_millis = Some(1_800);
+        assert_eq!(live_duration(&tool, 9_999), Some(800));
     }
 }

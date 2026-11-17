@@ -180,6 +180,17 @@ fn registry(tools: Vec<MockTool>) -> ToolRegistry {
     registry
 }
 
+#[derive(Default)]
+struct RecordingSink {
+    events: Mutex<Vec<EventKind>>,
+}
+
+impl EventSink for RecordingSink {
+    fn emit(&self, _task_id: TaskId, kind: EventKind) {
+        self.events.lock().expect("event lock").push(kind);
+    }
+}
+
 fn test_ctx(timeout: Duration, token: &CancellationToken) -> ToolContext {
     ToolContext::new(PathBuf::new(), token.clone(), timeout)
 }
@@ -936,6 +947,79 @@ async fn batch_pre_cancelled_marks_all_not_started() {
     for result in &results {
         assert_eq!(result.status, ToolStatus::Cancelled { started: false });
     }
+}
+
+#[allow(clippy::wildcard_enum_match_arm)] // only the two batch events are expected
+#[tokio::test]
+async fn events_follow_each_call_under_the_concurrency_bound() {
+    let sink = RecordingSink::default();
+    let registry = registry(vec![
+        MockTool::text("first", "one"),
+        MockTool::text("second", "two"),
+    ]);
+    let exposure = ToolExposure::from_names(["first", "second"]);
+    let token = CancellationToken::new();
+    let ctx = test_ctx(Duration::from_secs(5), &token);
+    let calls = vec![make_call("first"), make_call("second")];
+    let results = ToolBatch::new(&registry, &exposure)
+        .with_max_concurrency(1)
+        .with_events(&sink, TaskId::new())
+        .execute(&calls, &ctx)
+        .await;
+    assert!(
+        results
+            .iter()
+            .all(|result| result.status == ToolStatus::Success)
+    );
+
+    let events = sink.events.lock().expect("event lock");
+    let timeline: Vec<String> = events
+        .iter()
+        .map(|kind| match kind {
+            EventKind::ToolStarted { name, .. } => format!("started {name}"),
+            EventKind::ToolCompleted { name, .. } => format!("completed {name}"),
+            other => panic!("unexpected batch event: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        timeline,
+        [
+            "started first",
+            "completed first",
+            "started second",
+            "completed second"
+        ],
+        "a bounded batch must report one call at a time"
+    );
+}
+
+#[tokio::test]
+async fn pre_cancelled_calls_report_only_a_completion() {
+    let sink = RecordingSink::default();
+    let registry = registry(vec![MockTool {
+        spec: spec("hang"),
+        read_only: true,
+        action: Action::Hang,
+    }]);
+    let exposure = ToolExposure::from_names(["hang"]);
+    let token = CancellationToken::new();
+    token.cancel();
+    let ctx = test_ctx(Duration::from_secs(30), &token);
+    let results = ToolBatch::new(&registry, &exposure)
+        .with_events(&sink, TaskId::new())
+        .execute(&[make_call("hang")], &ctx)
+        .await;
+    assert_eq!(results[0].status, ToolStatus::Cancelled { started: false });
+
+    let events = sink.events.lock().expect("event lock");
+    assert_eq!(events.len(), 1, "no call was dispatched");
+    assert!(matches!(
+        &events[0],
+        EventKind::ToolCompleted {
+            status: ToolStatus::Cancelled { started: false },
+            ..
+        }
+    ));
 }
 
 #[tokio::test]

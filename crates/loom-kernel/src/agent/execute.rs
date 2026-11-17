@@ -40,13 +40,13 @@ impl Agent {
     /// Executes one assistant turn's tool calls through the tool engine
     /// (§10), emitting start/complete events and counting outcomes.
     ///
-    /// Runs are bounded and order-preserving inside [`ToolBatch`]; the
-    /// per-call events are emitted in call order (all starts before the
-    /// batch, completes after), which is exact for the sequential path and
-    /// an Iteration 1 approximation under read-only concurrency. Only calls
-    /// that actually run produce start/complete events: a refused repeat
-    /// emits none, and its `RepeatedCall` result is committed to the
-    /// transcript instead.
+    /// Runs are bounded and order-preserving inside [`ToolBatch`], which
+    /// emits `ToolStarted` when a call is dispatched and `ToolCompleted`
+    /// as it finishes. A call the concurrency bound never reaches reports
+    /// only its cancelled completion (`started: false`). Only calls that
+    /// actually run produce start/complete events: a refused repeat emits
+    /// none, and its `RepeatedCall` result is committed to the transcript
+    /// instead.
     ///
     /// The loop — not the model — owns the reaction to a failure (§13):
     /// `failures` refuses an exact repeat of a call that already failed
@@ -113,17 +113,6 @@ impl Agent {
                     },
                 );
             }
-            sink.emit(
-                task_id,
-                EventKind::ToolStarted {
-                    name: call.name.clone(),
-                    call_id: call.id.clone(),
-                    arguments: crate::event::text_head(
-                        &serde_json::to_string(&call.arguments).unwrap_or_default(),
-                        crate::event::ARGUMENTS_EVENT_HEAD,
-                    ),
-                },
-            );
         }
 
         // Call ids whose results the model still sees in this request
@@ -147,8 +136,9 @@ impl Agent {
         .with_cache(Some(self.cache.clone()))
         .with_projected_calls(projected_calls)
         .with_todos(Some(todos));
-        let batch =
-            ToolBatch::new(turn_tools, &exposure).with_max_concurrency(self.max_tool_concurrency);
+        let batch = ToolBatch::new(turn_tools, &exposure)
+            .with_max_concurrency(self.max_tool_concurrency)
+            .with_events(sink, task_id);
         let ran = batch.execute(&runnable, &context).await;
         // Surface bookkeeping (slice D2): a dispatched surface tool was
         // used this turn, whatever the outcome — failures count as use
@@ -205,40 +195,11 @@ impl Agent {
                 // tool; the task outcome records the cancellation.
                 ToolStatus::Cancelled { .. } => {}
             }
-            // Pair each start with a completion: refused calls emitted no
-            // start, so they emit no completion either.
+            // A verify-call autofix reports as its own decision event
+            // (schema 14), emitted right after the call it belongs to
+            // — `kept: false` is a reverted attempt, still worth a
+            // trace line.
             if is_runnable[index] {
-                let status = result.status;
-                let content_head =
-                    crate::event::text_head(&result.content, crate::event::CONTENT_EVENT_HEAD);
-                if self
-                    .registry
-                    .get(&call.name)
-                    .is_some_and(|tool| tool.requires_approval(&call.arguments))
-                {
-                    // A gated call that ends in error was declined or failed; the
-                    // write tool reports a decline as an execution error.
-                    sink.emit(
-                        task_id,
-                        EventKind::ApprovalDecided {
-                            call_id: call.id.clone(),
-                            allowed: !matches!(status, ToolStatus::Error(ToolFailure::Declined)),
-                        },
-                    );
-                }
-                sink.emit(
-                    task_id,
-                    EventKind::ToolCompleted {
-                        name: call.name.clone(),
-                        call_id: call.id.clone(),
-                        status,
-                        content_head,
-                    },
-                );
-                // A verify-call autofix reports as its own decision event
-                // (schema 14), emitted right after the call it belongs to
-                // — `kept: false` is a reverted attempt, still worth a
-                // trace line.
                 if let Some(autofix) = &result.effects.autofix {
                     sink.emit(
                         task_id,
