@@ -1,14 +1,14 @@
 # Loom
 
 [![Status: Early release](https://img.shields.io/badge/status-early%20release-blue)]()
-[![Tests: 1482](https://img.shields.io/badge/tests-1482-brightgreen)]()
+[![Tests: 1645](https://img.shields.io/badge/tests-1645-brightgreen)]()
 [![SWE-bench Verified: 90/100 frozen subset](https://img.shields.io/badge/SWE--bench%20Verified-90%2F100%20frozen%20subset-blue)]()
 
 > **Early release.** The headless agent core is usable today: the `loom`
-> binary runs tasks end to end against real providers, a TUI foundation
-> ships (`loom tui`, `loom run --tui`; parity work open), and `loom-core`
-> exposes the embedding facade. `ask` policy verdicts fail closed in the
-> CLI, but ACP clients (e.g. Zed) answer them over
+> binary runs tasks end to end against real providers, bare `loom` opens
+> a live terminal UI (workflow parity is still in progress), and
+> `loom-core` exposes the embedding facade. `ask` policy verdicts fail
+> closed in the CLI, but ACP clients (e.g. Zed) answer them over
 > `session/request_permission` via `loom-acp`. APIs version by iteration,
 > not semver.
 
@@ -43,7 +43,7 @@ Capabilities move from model to software over time, never the reverse.
 
 ## Install
 
-Requires Rust 1.89+ (edition 2024).
+Requires Rust 1.100+ (edition 2024).
 
 ```sh
 cargo install --git https://github.com/sadmansakib/loom loom-cli
@@ -71,8 +71,9 @@ loom run --provider deepseek --model deepseek-flash \
 # the next turn boundary; /rewind, /stats, /new, /sessions work in it
 loom chat --provider deepseek --model deepseek-flash
 
-# terminal UI foundation (scene prototype; parity work open)
-loom run --provider deepseek --model deepseek-flash --tui "your task"
+# terminal UI: bare `loom` opens it; /sessions /context /tools
+# /account /compare /clear /clear-history work at the prompt
+loom
 
 # add --bg-commands to detach long builds: their completion notice
 # steers back in at the next turn boundary (loom chat/run)
@@ -88,7 +89,7 @@ loom provider add orcarouter --base-url https://api.orcarouter.ai/v1 \
     --header 'X-Title=loom' # attribution headers ride on every request
 loom run --provider orcarouter --model deepseek/deepseek-v4.1-flash-free "your task"
 
-# structured events for tooling (NDJSON, event schema 17)
+# structured events for tooling (NDJSON, event schema 23)
 loom run --provider deepseek --model deepseek-flash --json "your task" \
     | jq 'select(.kind.type=="tool_completed")'
 
@@ -232,6 +233,25 @@ so the shortcut set can be audited, not guessed at.
   a timeout, host-git filter hardening, atomic writes that refuse to
   follow planted symlinks.
 
+### Terminal UI
+
+- Bare `loom` opens the live frontend: one thread per task, streaming
+  turns, follow-up steering at the next turn boundary, cancel, retry
+  with backoff, and a completed-run record.
+- Slash-first palette: `/model`, `/effort`, `/context`, `/tools`,
+  `/account`, `/compare`, `/sessions`, `/new`, `/clear`,
+  `/clear-history`, `/compact`, `/retry`, `/copy`, `/export`,
+  `/reasoning`, `/sidebar`, `/help`, `/quit`.
+- Sidebar telemetry: task status, turn/tool/wall budgets, context
+  census, cost, retry policy, and events. Always on at 120+ columns;
+  Tab opens it at 90-119.
+- Sessions, tools, accounts, compare, and context screens open over the
+  dimmed live view; `/export` writes the task record as NDJSON plus a
+  manifest under `.loom/exports/`.
+- Truecolor, 256-color, and 16-color fallbacks adapt to `COLORTERM` /
+  `TERM` (`NO_COLOR` drops color); `LOOM_ASCII=1` switches to the ASCII
+  glyph set. Mouse-wheel scroll and bracketed paste work.
+
 ### Persistence and introspection
 
 - One SQLite database (`loom.db`; `LOOM_DB` / `LOOM_DATA_DIR` /
@@ -243,7 +263,7 @@ so the shortcut set can be audited, not guessed at.
   checked pre-image replay.
 - `loom stats`: per-tool quality, skill retire/watch verdicts,
   `--json`, and trace mode over exported `--trace` directories.
-- `--json` NDJSON event stream (schema 17) for building your own
+- `--json` NDJSON event stream (schema 23) for building your own
   frontends; `loom-core` exposes the same engine for embedding, with
   a full drive loop in `crates/loom-core/examples/frontend.rs`.
 
@@ -279,11 +299,13 @@ and its honesty rules.
 
 ## Not built yet
 
-An interactive TUI matching the full engine surface (the `loom tui`
-foundation ships; parity work is open). The argument-provenance gate
-(roadmap item 38) and repro-test tie-breaker (item 39) ran their
-evidence gates and are deferred. Delegation economics at best-of-N > 1
-remain a measurement question (roadmap item 19 trigger).
+Full terminal-harness parity (roadmap item 40): the TUI ships the live
+task loop, cancel/retry, sessions, tools, accounts, compare, and context,
+but run profiles, live per-call batch progress, and a complete published
+key map remain open. The argument-provenance gate (roadmap item 38) and
+repro-test tie-breaker (item 39) ran their evidence gates and are
+deferred. Delegation economics at best-of-N > 1 remain a measurement
+question (roadmap item 19 trigger).
 
 ## Crates
 
@@ -297,8 +319,8 @@ remain a measurement question (roadmap item 19 trigger).
 | `loom-core` | Facade re-exporting the public API for embedders. |
 | `loom-eval` | SWE-bench Verified sweep orchestration + official-scorer reporting; SWE-bench Multilingual Rust-slice runner; selfopt. |
 | `loom-acp` | Agent Client Protocol server for editors (`loom-acp`): the engine over JSON-RPC on stdio. |
-| `loom-tui` | Terminal UI foundation for `loom tui` / `loom run --tui`. |
-| `loom-cli` | `loom` binary: auth, run, chat, tui, sessions, stats, rewind, lessons, trust, tracing, signals. |
+| `loom-tui` | Interactive terminal frontend: live task thread, sidebar telemetry, slash palette, and modal screens. |
+| `loom-cli` | `loom` binary: run, chat, TUI, auth, provider, sessions, rewind, stats, lessons, replay-context, trust, tracing, signals. |
 
 Dependency direction is enforced: `loom-kernel` depends on no workspace
 crate, so provider- or tool-specific behavior cannot leak into the domain.
@@ -320,6 +342,8 @@ Workspace lints: `unsafe_code` forbidden; `missing_docs`, `unwrap_used`,
 Documentation: [`docs/architecture.md`](docs/architecture.md) (design),
 [`docs/eval.md`](docs/eval.md) (eval suite protocol + honesty rules),
 [`docs/daily-driver.md`](docs/daily-driver.md) (generalization probes),
+[`docs/wireframes/DESIGN.md`](docs/wireframes/DESIGN.md) (TUI design
+language),
 [`docs/threat-model.md`](docs/threat-model.md) (trust boundaries,
 attacker model, defenses),
 [`docs/roadmap.md`](docs/roadmap.md) (vision, iterations, evidence

@@ -111,7 +111,7 @@ Invariants the session layer enforces (and tests):
    type; a second finish attempt cannot overwrite the recorded end reason.
 
 **Events** (`event.rs`) are the observation stream: `EventEnvelope`
-(`schema_version: 17`, per-sink monotonically increasing `sequence`,
+(`schema_version: 23`, per-sink monotonically increasing `sequence`,
 snake_case `type` tag). The persisting sink (`PersistingEventSink`)
 stores every kind *except* the per-token streams — `TextDelta` and
 `ReasoningDelta` forward live but are never written (review S4: they
@@ -119,7 +119,7 @@ were ~65% of all rows at one synchronous INSERT per provider chunk;
 `ModelCompleted` and the transcript already hold the same content
 durably), so stored sequences stay contiguous from zero. The
 authoritative version history lives on
-[`EVENT_SCHEMA_VERSION`](../crates/loom-kernel/src/event.rs); in
+[`EVENT_SCHEMA_VERSION`](../crates/loom-kernel/src/event/wire.rs); in
 brief: v2 `Usage.cost_usd`; v3 `ContextPruned`; v4 `AwaitingInput`
 (engine idle marker); v5 `TaskPaused`; v6 `ContextHandoff`; v7
 `FastPathHit`; v8 the surfaced-decision kinds (`FastPathDeclined`,
@@ -129,13 +129,18 @@ head budgets; v12 `TurnBudgetExtended`; v13 the `WritingPhase` stop
 reason; v14 `AutofixApplied`; v15 the `FastPathDeclined`
 rename-reason split; v16 `ContextProgress` reports the compiled-request
 census, context allowance/reservation, and remaining task budget at the
-compile boundary. All new fields are additive, so older payloads
-still deserialize. A lock spans numbering and send, so arrival order
-equals sequence order even with concurrent emitters. The channel sink is
+compile boundary; v17 the pause-turn stop reason; v18
+`ApprovalRequested`/`ApprovalDecided`; v19 exact approval outcomes; v20
+the operator prune trigger; v21 envelope timestamps; v22 structured
+failure metadata (HTTP status, retry policy, failed-model details); v23
+the provider's idle-stream window on retries. All new fields are
+additive, so older payloads still deserialize. A lock spans numbering
+and send, so arrival order equals sequence order even with concurrent
+emitters. The channel sink is
 unbounded — a slow consumer queues rather than back-pressures the agent;
 only a closed receiver drops (counted, warned once). `FanoutSink`
 composes several sinks into one so multi-consumer frontends (the CLI's
-renderer + trace writer, future GUI/TUI) each get their own numbered
+renderer + trace writer, the TUI, future GUIs) each get their own numbered
 stream; its drop count sums the children. `StatusRecorder` is a sink
 that folds the stream into a pollable `StatusSnapshot` — current turn,
 in-flight tools (correlated by call id), running request attempt, task
@@ -1111,8 +1116,8 @@ resolve or the sweep aborts — selection never shrinks silently.
 - Blocking work on the blocking pool; hashing never under a lock.
 - Facts scanned once per task; capabilities resolved once per task.
 
-**Testing** — the workspace carries 694 tests (13 live-API tests
-ignored by default): unit tests per module,
+**Testing** — the workspace carries 1,645 tests (1,631 run by default;
+14 live-API tests are ignored): unit tests per module,
 protocol and invariant tests against in-memory seams, security regression
 tests for confinement, canary tests for secrets, and integration tests
 that run real `git`/`cargo`. CI bar: all tests green,

@@ -124,14 +124,14 @@ iterations may start early where a backlog item is cheap and measured.
 |---|---|---|---|
 | 1 | Core service | **Done** | — (see Shipped) |
 | 2 | Core efficiency & repository intelligence | **Done 2026-10-23** (funded-measurement debt in item 1) | 1, 3✓, 4✓, 5✓, 6✓, 7✗, 8✓, 10✓ᴬ, 11⏸, 12✓, 16✓, 17✓ |
-| 3 | Intelligent subagent scheduling | Not started | 19, 21, 24 |
+| 3 | Intelligent subagent scheduling | **Started 2026-10-23** (scout seam; economics trigger parked) | 19, 21, 24 |
 | 4 | Execution safety & richer tools | **Largely shipped early** (item 36 escalation shipped 2026-11-08, default-off) | 2✓, 13✓, 23✓, 36✓ |
 | 5 | Skills & contextual knowledge | **Largely shipped 2026-10-23** (skills index + `load_skill`) | 4✓ (instructions), skills✓, 20.4 |
 | 6 | MCP & LSP integration | Started 2026-10-23 (item 18 symbol tools shipped; item 34 fallback shipped 2026-11-08) | 18✓, 34✓ |
 | 7 | Plugin system | Future scope | — |
 | 8 | Intelligent model routing | **Shipped 2026-11-08** (effort schedule + task-start tier routing; funded A/Bs open) | 9✓ᴬ, 14✓ |
 | 9 | Learning & self-optimization | Not started; data path partial | 1, 20 (20.2 sweepable set shipped) |
-| — | Product surface (cross-cutting) | **CLI shipped** (`loom run` + interactive `loom chat`); TUI foundation shipped, parity work open | 15✓, 22, 25✓, 40 |
+| — | Product surface (cross-cutting) | **CLI shipped** (`loom run` + interactive `loom chat`); TUI shipped (bare `loom`), parity work open | 15✓, 22, 25✓, 40 |
 
 Legend: ✓ shipped · ✓ᴬ phase A shipped, remainder open · ✗ skipped on
 evidence · ⏸ deferred on evidence (revisit trigger recorded in the item).
@@ -371,9 +371,11 @@ orchestration — downstream of a strong core.
 
 ```text
 Current iteration:     2 closed 2026-10-23 (efficiency engineering complete;
-                      funded-measurement debt recorded in item 1); iteration
-                      3 (subagent scheduling) not started
-Language:              Rust (stable), 8 crates, unsafe forbidden
+                      item 1's weak-model G4/G5 contrast is the open
+                      measurement); iteration 3 started: scout seam and
+                      multi-model collaboration shipped, economics trigger
+                      parked
+Language:              Rust (stable), 10 crates, unsafe forbidden
 Shipped providers:     DeepSeek, OpenRouter (free + paid), Anthropic, GLM,
                       NVIDIA (NIM hosted inference), Groq (hosted inference)
 GLM status:            reachable via OpenRouter (z-ai/glm-5.3, metered, live-
@@ -392,11 +394,10 @@ Eval models in use:    DeepSeek `deepseek-flash` on a funded adapter (1M
                       completed 2026-10-23: 90 resolved / 99 completed,
                       $2.1 total, 96.9% cache-read; account balance $1.12
 Primary target:        successful work per model invocation
-Biggest open risk:     funded measurement debt (item 1): the N ≥ 5 re-runs
-                      for items 4/5/6/8/10 cost ≈$3+, the first bare-vs-full
-                      contrast (10 tasks × 2 arms × N=2) ≈$0.84, and the
-                      balance is $1.12 — engineering seams are done and
-                      validated; only credit is missing
+Biggest open risk:     G4/G5 weak-model contrast (item 1): the strong-model
+                      N=5 control showed no harness lift, so the claim that
+                      Loom raises a weaker model's success rate is still
+                      unmeasured
 ```
 
 ---
@@ -408,7 +409,7 @@ also summarized here so this section is the single source of truth.
 
 ### Foundations
 
-- **Workspace architecture.** Seven crates with strict dependency
+- **Workspace architecture.** Ten crates with strict dependency
   direction: `loom-kernel` (agent core, I/O-free behind traits, depends
   on no workspace crate) ← `loom-providers`, `loom-store`, `loom-tools`
   ← `loom-engine` (composition root) ← `loom-core` (facade for
@@ -580,8 +581,8 @@ also summarized here so this section is the single source of truth.
   and cached tokens / cost / wall time / tool-cache hits, per-task
   aggregates and a gated-pass-rate suite headline; strict and tolerant
   modes.
-- **Verification bar.** 694 tests passing (13 live-API tests ignored by
-  default), clippy clean, fmt clean.
+- **Verification bar.** 1,631 tests passing, 14 live-API tests ignored by
+  default (1,645 total), clippy clean, fmt clean.
 
 ---
 
@@ -1524,18 +1525,19 @@ adds four more framing findings and backlog items 26–31 below.
     taxonomy Harness² uses for its all-rollouts-fail fallback), then
     turns, then model requests — winner patch applied via `git apply`,
     worktrees kept on apply failure for forensics, fail-closed outside
-    a git repository. Item 24's vary-the-harness dimensioning and the
-    delegated-economics measurement remain open on top of it.
+    a git repository. The delegated-economics measurement remains open on
+    top of it.
 22. **Frontends.** A TUI or desktop client. The facade contract is now
     ready: `loom-core` roots a stable surface (driving API + `TaskControl`/
     `EventSink`/`EventKind`/`Session`/ids) with a documented semver split
     from the rolling crate aliases (ADR-021), and `examples/frontend.rs`
     shows the full drive loop — open, subscribe, steer, summarize. An
-    official `loom-tui` crate (`crates/loom-tui`) now renders events and
-    supports interactive steering, pause, and cancel; UI crates are isolated
-    from the facade's dependency surface. Resume + steering are both shipped.
-    Screenshot-driven workflow parity and auditable run actions remain open
-    under item 40.
+    official `loom-tui` crate (`crates/loom-tui`) now renders the live task
+    thread, sidebar telemetry, and modal screens, and supports interactive
+    steering, pause, and cancel; UI crates are isolated from the facade's
+    dependency surface. Resume + steering are both shipped.
+    Remaining workflow parity (run profiles, live batch progress, published
+    key map) stays open under item 40.
 23. **Distributed verification.** Remote or containerized `verify`
     runners with the same evidence contract. **Shipped 2026-10-23** —
     `.loom/verify.toml` declares the runner argv (docker, ssh, …) with
@@ -2134,9 +2136,9 @@ model tier under them (arXiv 2607.06906).
     `LedgerEntry` needs no schema change. No code changed.
 
 40. **Interactive harness TUI parity and auditable runs** (G1, G2, G3,
-    G8, G9). Bring the official `loom-tui` from its current event viewer
-    to the live-task, cancellation, retry, and run-record workflow shown
-    in `docs/screenshots/`. This is **not** a parallel-execution item:
+    G8, G9). Bring the official `loom-tui` from its current live task,
+    cancel, and retry view to the full workflow shown in
+    `docs/wireframes/`. This is **not** a parallel-execution item:
     `ToolBatch` already runs conflict-free calls concurrently (bounded
     at 8 by default), preserves model order for conflicts, and returns
     results in call order. The UI gap is that it emits all starts before
