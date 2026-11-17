@@ -148,9 +148,10 @@ pub(super) fn draw_runtime_sidebar(
             .style(Style::default().bg(theme::BG)),
         area,
     );
+    // Border-left plus the wireframe's 16px (two-cell) padding on both sides.
     let content = Rect {
-        x: area.x.saturating_add(1),
-        width: area.width.saturating_sub(1),
+        x: area.x.saturating_add(3),
+        width: area.width.saturating_sub(5),
         ..area
     };
     if content.width == 0 {
@@ -170,15 +171,7 @@ pub(super) fn draw_runtime_sidebar(
         && reducer.tools.is_empty()
         && options.approval.is_none()
     {
-        let pad = Rect {
-            x: content.x.saturating_add(2),
-            width: content.width.saturating_sub(2),
-            ..content
-        };
-        if pad.width == 0 {
-            return;
-        }
-        let width = pad.width;
+        let width = content.width;
         let turns = options
             .turn_limit
             .map_or_else(|| "unbounded".to_owned(), |limit| limit.to_string());
@@ -227,7 +220,7 @@ pub(super) fn draw_runtime_sidebar(
             Paragraph::new(lines)
                 .style(Style::default().bg(theme::BG))
                 .wrap(Wrap { trim: false }),
-            pad,
+            content,
         );
         return;
     }
@@ -497,21 +490,26 @@ pub(super) fn draw_runtime_sidebar(
             )),
             muted(&census),
             muted(&format!(
-                "input budget {} · output {}",
-                optional_budget(summary.remaining_budget.input_tokens),
+                "input budget {}",
+                optional_budget(summary.remaining_budget.input_tokens)
+            )),
+            muted(&format!(
+                "output budget {}",
                 optional_budget(summary.remaining_budget.output_tokens)
             )),
             muted(&format!(
-                "total budget {} · tools {}",
-                optional_budget(summary.remaining_budget.total_tokens),
+                "total budget {}",
+                optional_budget(summary.remaining_budget.total_tokens)
+            )),
+            muted(&format!(
+                "tools {}",
                 summary
                     .remaining_budget
                     .tool_calls
                     .map_or_else(|| "unbounded".to_owned(), |value| value.to_string())
             )),
             muted(&format!(
-                "output budget {} · wall {}",
-                optional_budget(summary.remaining_budget.output_tokens),
+                "wall {}",
                 summary
                     .remaining_budget
                     .wall_time
@@ -585,7 +583,7 @@ pub(super) fn draw_runtime_sidebar(
                     format!("◇ {}", request.path),
                     fg(theme::AMBER).add_modifier(Modifier::BOLD),
                 )),
-                muted("y once   a for this session   n deny"),
+                muted("y once   a session   n deny"),
             ],
         ));
         sections_data.push(("PERMISSIONS", vec![muted("write  asks each time")]));

@@ -66,6 +66,7 @@ pub(crate) struct LiveFrame<'a> {
     pub(crate) effort: &'a str,
 }
 
+#[allow(clippy::too_many_lines)] // one branch per frame owner, all drawing in one place
 pub(crate) fn draw_live(frame: &mut ratatui::Frame<'_>, view: &LiveFrame<'_>) {
     let LiveFrame {
         reducer,
@@ -101,7 +102,68 @@ pub(crate) fn draw_live(frame: &mut ratatui::Frame<'_>, view: &LiveFrame<'_>) {
     } = *view;
     if help {
         scene_views::draw(frame, Scene::Help);
-    } else if let Some(screen) = sessions {
+        return;
+    }
+    let modal_open = sessions.is_some()
+        || overlay.is_some()
+        || tools.is_some()
+        || compare.is_some()
+        || accounts.is_some();
+    if picker && !modal_open {
+        scene_views::draw_picker(frame, &PickerState::empty());
+        return;
+    }
+    let suggestions = input_editor
+        .mention_query()
+        .map_or_default(|query| matching_file_suggestions(file_index, query));
+    scene_views::draw_live_scrolled(
+        frame,
+        reducer,
+        input,
+        cursor,
+        scene_views::LiveViewOptions {
+            sidebar_visible: sidebar,
+            elapsed,
+            dropped,
+            thread_scroll_back,
+            sidebar_scroll_back,
+            file_suggestions: &suggestions,
+            recent,
+            approval,
+            notice,
+            palette_selected,
+            pricing,
+            workspace: Some(workspace),
+            session_id,
+            model: Some(&config.model),
+            effort: Some(effort),
+            // TODO(loom-cli): task mode/label and billing period are not
+            // on EngineConfig or the event stream yet; show "unavailable"
+            // rather than inventing benchmark metadata.
+            task_mode: None,
+            task_label: None,
+            billing_period: None,
+            thinking: capabilities.map(
+                |capabilities| {
+                    if capabilities.reasoning { "on" } else { "off" }
+                },
+            ),
+            turn_limit: Some(config.max_turns),
+            scene: None,
+            // TODO(loom-cli): fill tool permissions and non-turn budget
+            // defaults from the resolved policy once EngineConfig exposes
+            // them. Until then the idle sidebar shows the TUI's effective
+            // defaults (reads allowed, writes/shell ask, unbounded caps).
+            idle: scene_views::IdleFacts::default(),
+            // The terminal's colour depth is a capability, resolved here
+            // rather than read from the environment inside `draw`.
+            depth: Some(crate::theme::Depth::detect()),
+            glyph_set: Some(scene_views::glyph_set()),
+            hide_cursor: modal_open,
+        },
+    );
+    // Overlays sit over the dimmed live scene instead of replacing it.
+    if let Some(screen) = sessions {
         crate::sessions_screen::draw(frame, frame.area(), screen);
     } else if let Some(Overlay::Context) = overlay {
         crate::context_screen::draw(
@@ -118,57 +180,67 @@ pub(crate) fn draw_live(frame: &mut ratatui::Frame<'_>, view: &LiveFrame<'_>) {
         crate::compare_screen::draw(frame, frame.area(), screen, pricing);
     } else if let Some(screen) = accounts {
         crate::account_screen::draw(frame, frame.area(), screen);
-    } else if picker {
-        scene_views::draw_picker(frame, &PickerState::empty());
-    } else {
-        let suggestions = input_editor
-            .mention_query()
-            .map_or_default(|query| matching_file_suggestions(file_index, query));
-        scene_views::draw_live_scrolled(
-            frame,
-            reducer,
-            input,
-            cursor,
-            scene_views::LiveViewOptions {
-                sidebar_visible: sidebar,
-                elapsed,
-                dropped,
-                thread_scroll_back,
-                sidebar_scroll_back,
-                file_suggestions: &suggestions,
-                recent,
-                approval,
-                notice,
-                palette_selected,
-                pricing,
-                workspace: Some(workspace),
-                session_id,
-                model: Some(&config.model),
-                effort: Some(effort),
-                // TODO(loom-cli): task mode/label and billing period are not
-                // on EngineConfig or the event stream yet; show "unavailable"
-                // rather than inventing benchmark metadata.
-                task_mode: None,
-                task_label: None,
-                billing_period: None,
-                thinking: capabilities.map(
-                    |capabilities| {
-                        if capabilities.reasoning { "on" } else { "off" }
-                    },
-                ),
-                turn_limit: Some(config.max_turns),
-                scene: None,
-                // TODO(loom-cli): fill tool permissions and non-turn budget
-                // defaults from the resolved policy once EngineConfig exposes
-                // them. Until then the idle sidebar shows the TUI's effective
-                // defaults (reads allowed, writes/shell ask, unbounded caps).
-                idle: scene_views::IdleFacts::default(),
-                // The terminal's colour depth is a capability, resolved here
-                // rather than read from the environment inside `draw`.
-                depth: Some(crate::theme::Depth::detect()),
-                glyph_set: Some(scene_views::glyph_set()),
-            },
-        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::style::Color;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    use super::*;
+
+    #[test]
+    fn modal_frames_draw_the_live_scene_under_the_dim() {
+        let config =
+            crate::default_config(None, None, None, Some(std::env::temp_dir()), None).unwrap();
+        let reducer = Reducer::default();
+        let editor = PromptEditor::default();
+        let sessions = crate::sessions_screen::SessionsScreen::default();
+        let view = LiveFrame {
+            reducer: &reducer,
+            input: "",
+            cursor: 0,
+            help: false,
+            picker: false,
+            sidebar: true,
+            elapsed: None,
+            dropped: None,
+            thread_scroll_back: 0,
+            sidebar_scroll_back: 0,
+            pricing: None,
+            input_editor: &editor,
+            file_index: &[],
+            recent: &[],
+            approval: None,
+            notice: None,
+            palette_selected: 0,
+            sessions: Some(&sessions),
+            overlay: None,
+            tools: None,
+            compare: None,
+            accounts: None,
+            context_items: &[],
+            context_selected: 0,
+            context_command: None,
+            config: &config,
+            session_id: None,
+            capabilities: None,
+            workspace: "~/work/loom",
+            effort: "high",
+        };
+        let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
+        terminal.draw(|frame| draw_live(frame, &view)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        // The idle home sits above the modal and must survive the dim.
+        assert!(text.contains("RECENT"), "{text}");
+        // The backdrop still owns the ground instead of the terminal default.
+        assert!(buffer.content().iter().all(|cell| cell.bg != Color::Reset));
     }
 }
 

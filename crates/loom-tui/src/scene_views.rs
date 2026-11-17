@@ -155,6 +155,8 @@ pub struct LiveViewOptions<'a> {
     pub glyph_set: Option<GlyphSet>,
     /// Test/static override. `None` renders truecolor.
     pub depth: Option<theme::Depth>,
+    /// Skip the composer cursor when an overlay modal owns the frame.
+    pub hide_cursor: bool,
 }
 
 #[allow(clippy::large_types_passed_by_value)] // one options value per frame
@@ -315,7 +317,9 @@ pub fn draw_live_scrolled(
     if let Some(request) = options.approval {
         draw_approval_box(frame, thread_area, request);
     }
-    frame.set_cursor_position((cursor_x, cursor_y));
+    if !options.hide_cursor {
+        frame.set_cursor_position((cursor_x, cursor_y));
+    }
     let mut prompt_spans = vec![
         Span::styled(
             format!("{} ", glyphs::glyph(Glyph::Prompt, set)),
@@ -1505,6 +1509,26 @@ mod tests {
                 Color::Reset,
                 "a cell fell back to the terminal default background"
             );
+        }
+    }
+
+    #[test]
+    fn live_sidebar_keeps_a_two_cell_right_margin() {
+        let reducer = crate::reducer::Reducer::default();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_live(frame, &reducer, "", 0, LiveViewOptions::default());
+            })
+            .unwrap();
+        for y in 0..40 {
+            for x in [118, 119] {
+                assert_eq!(
+                    terminal.backend().buffer().cell((x, y)).unwrap().symbol(),
+                    " ",
+                    "column {x} row {y} still reaches the terminal edge"
+                );
+            }
         }
     }
 
@@ -2981,7 +3005,7 @@ mod pending_sidebar_tests {
             "pending path missing from sidebar"
         );
         assert!(
-            text.contains("y once   a for this session   n deny"),
+            text.contains("y once   a session   n deny"),
             "pending keys missing"
         );
     }

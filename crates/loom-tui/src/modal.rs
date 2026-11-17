@@ -53,7 +53,28 @@ fn blend(value: u8, ground: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::{Terminal, backend::TestBackend};
+
     use super::*;
+
+    #[test]
+    fn dimming_preserves_the_ground_painted_by_the_scene() {
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                crate::scene_views::paint_base(frame);
+                dim_scene(frame, area, centered(area, 6));
+            })
+            .unwrap();
+        for cell in terminal.backend().buffer().content() {
+            assert_ne!(
+                cell.bg,
+                Color::Reset,
+                "modal backdrop kept the terminal default background"
+            );
+        }
+    }
 
     #[test]
     fn modal_is_centered_and_capped_at_wireframe_width() {
