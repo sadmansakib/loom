@@ -691,37 +691,16 @@ fn draw_help(frame: &mut Frame<'_>) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(54), Constraint::Min(1)])
         .split(rows[1]);
-    let mut left = vec![
-        heading("WHILE A TASK RUNS"),
-        help_key("Esc / Ctrl-C", "cancel current task"),
-        help_key("Enter", "queue follow-up for next turn"),
-        help_key("Shift+Enter", "insert newline"),
-        help_key(
-            "Tab",
-            "toggle sidebar (complete @path when typing a mention)",
-        ),
-        help_key("Ctrl+B", "toggle sidebar"),
-        help_key("F1", "close help"),
-        heading("WHEN IDLE"),
-        help_key("Enter", "send task / start next task"),
-        help_key("Shift+Enter", "insert newline"),
-        help_key("F2", "open model picker"),
-        help_key("F1", "open help"),
-        help_key("@path + Tab", "complete workspace file mention"),
-        help_key("Ctrl+C", "quit"),
-        heading("IN MODEL PICKER"),
-        help_key("↑ / ↓, j / k", "move through discovered models"),
-        help_key("Tab", "cycle reported effort levels"),
-        help_key("r", "refresh model discovery"),
-        help_key("Enter / Esc", "apply / return"),
-        heading("COMMANDS"),
-        muted("Type / to filter; Enter runs the selected command."),
-    ];
-    left.extend(command_rows());
-    left.push(heading("DESIGN REFERENCE"));
-    left.push(muted(
-        "Static --scene views show no task data; live values come from events and session.",
-    ));
+    let mut left = Vec::new();
+    for section in crate::keys::KEYMAP {
+        left.push(heading(section.title));
+        left.extend(
+            section
+                .rows
+                .iter()
+                .map(|row| help_key(row.keys, row.action)),
+        );
+    }
     render_panel(frame, columns[0], "controls", left);
     let event_lines = [
         ("TaskStarted", "status becomes Running"),
@@ -740,12 +719,21 @@ fn draw_help(frame: &mut Frame<'_>) {
     right.extend(event_lines.into_iter().map(|(event, meaning)| {
         Line::from(vec![
             Span::styled(
-                format!("{event:<34}"),
+                format!("{event:<36}"),
                 fg(theme::BLUE).add_modifier(Modifier::BOLD),
             ),
             Span::styled(meaning, fg(theme::IVORY)),
         ])
     }));
+    right.push(muted(""));
+    right.push(heading("COMMANDS"));
+    right.push(muted("Type / to filter; Enter runs the selected command."));
+    right.extend(command_rows(columns[1].width));
+    right.push(muted(""));
+    right.push(heading("DESIGN REFERENCE"));
+    right.push(muted(
+        "Static --scene views show no task data; live values come from events and session.",
+    ));
     right.push(muted(""));
     right.push(heading("CRATE SEAM"));
     right.push(body(
@@ -754,7 +742,7 @@ fn draw_help(frame: &mut Frame<'_>) {
     right.push(muted(
         "Session.transcript is authoritative; events are observations.",
     ));
-    render_panel(frame, columns[1], "event stream", right);
+    render_panel(frame, columns[1], "events · commands", right);
 }
 
 fn draw_idle_home(frame: &mut Frame<'_>, area: Rect, recent: &[RecentSession], set: GlyphSet) {
@@ -1377,19 +1365,21 @@ fn help_key(key: &'static str, description: &'static str) -> Line<'static> {
     ])
 }
 
-fn command_rows() -> Vec<Line<'static>> {
+fn command_rows(width: u16) -> Vec<Line<'static>> {
     const COLUMN_WIDTH: usize = 18;
+    let inner = usize::from(width.saturating_sub(2));
+    let columns = (inner / COLUMN_WIDTH).clamp(2, 3);
     crate::palette::COMMANDS
-        .chunks(2)
-        .map(|pair| {
-            let second = pair.get(1).map_or("", |command| command.name);
-            Line::from(vec![
-                Span::styled(
-                    format!("{:<width$}", pair[0].name, width = COLUMN_WIDTH),
-                    fg(theme::AMBER),
-                ),
-                Span::styled(second.to_owned(), fg(theme::AMBER)),
-            ])
+        .chunks(columns)
+        .map(|group| {
+            Line::from(
+                (0..columns)
+                    .map(|index| {
+                        let name = group.get(index).map_or("", |command| command.name);
+                        Span::styled(format!("{name:<COLUMN_WIDTH$}"), fg(theme::AMBER))
+                    })
+                    .collect::<Vec<_>>(),
+            )
         })
         .collect()
 }
@@ -1647,6 +1637,26 @@ mod tests {
                 "help is missing {}",
                 command.name
             );
+        }
+    }
+
+    #[test]
+    fn help_lists_every_keyboard_binding() {
+        let buffer = render(Scene::Help);
+        let text = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        for section in crate::keys::KEYMAP {
+            assert!(
+                text.contains(section.title),
+                "help is missing section {}",
+                section.title
+            );
+            for row in section.rows {
+                assert!(text.contains(row.action), "help is missing {}", row.action);
+            }
         }
     }
 

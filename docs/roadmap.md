@@ -581,8 +581,8 @@ also summarized here so this section is the single source of truth.
   and cached tokens / cost / wall time / tool-cache hits, per-task
   aggregates and a gated-pass-rate suite headline; strict and tolerant
   modes.
-- **Verification bar.** 1,633 tests passing, 14 live-API tests ignored by
-  default (1,647 total), clippy clean, fmt clean.
+- **Verification bar.** 1,634 tests passing, 14 live-API tests ignored by
+  default (1,648 total), clippy clean, fmt clean.
 
 ---
 
@@ -1536,8 +1536,8 @@ adds four more framing findings and backlog items 26–31 below.
     thread, sidebar telemetry, and modal screens, and supports interactive
     steering, pause, and cancel; UI crates are isolated from the facade's
     dependency surface. Resume + steering are both shipped.
-    Remaining workflow parity (live batch progress, published key map)
-    stays open under item 40.
+    Remaining workflow parity (live batch progress) stays open under
+    item 40.
 23. **Distributed verification.** Remote or containerized `verify`
     runners with the same evidence contract. **Shipped 2026-10-23** —
     `.loom/verify.toml` declares the runner argv (docker, ssh, …) with
@@ -2174,10 +2174,12 @@ model tier under them (arXiv 2607.06906).
       copies the answer and `/export` writes an NDJSON record with a
       manifest from the existing event/session seams, without making the
       TUI the owner of engine state.
-    - **Keyboard and terminal ergonomics.** Publish the actual key map
-      in help, including pause/resume, cancel, steer, retry, copy, and
-      export; handle narrow terminals and terminal color capability
-      fallbacks without corrupting the timeline.
+    - **Keyboard and terminal ergonomics.** **Shipped 2026-11-18** —
+      `F1` help renders `keys::KEYMAP` beside the handlers, covering task
+      control, approval pause/resume, cancel, steer, scrolling, palette
+      and picker keys, screen shortcuts, and every command (`/retry`,
+      `/copy`, `/export` included). Narrow layouts and color-depth/ASCII
+      fallbacks render without corrupting the timeline.
     - **Crate seam.** Drive the UI through the stable `loom-core`
       frontend contract from item 22; keep engine construction in the
       composition root and avoid making UI behavior depend on kernel
@@ -2193,7 +2195,7 @@ model tier under them (arXiv 2607.06906).
     is not a task-performance claim. Seam: item 22's `loom-core` facade,
     typed events and task summaries, `loom-tui`, and the CLI composition
     root. Parallel execution itself is shipped; live per-call progress
-    and the complete published key map are the missing capabilities.
+    is the missing capability.
 
 ### 2026-12 meta-harness sweep — gap check
 

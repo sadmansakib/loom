@@ -85,6 +85,162 @@ pub(crate) fn scroll_from_mouse(kind: MouseEventKind, scroll_back: &mut usize) {
     );
 }
 
+/// The published key map. It lives beside the handlers so a new binding
+/// lands with its documentation; the help screen renders this table.
+pub(crate) struct KeyBinding {
+    pub(crate) keys: &'static str,
+    pub(crate) action: &'static str,
+}
+
+pub(crate) struct KeySection {
+    pub(crate) title: &'static str,
+    pub(crate) rows: &'static [KeyBinding],
+}
+
+pub(crate) const KEYMAP: &[KeySection] = &[
+    KeySection {
+        title: "MAIN",
+        rows: &[
+            KeyBinding {
+                keys: "Enter",
+                action: "send task / steer next turn",
+            },
+            KeyBinding {
+                keys: "Shift+Enter",
+                action: "insert newline (Alt+Enter too)",
+            },
+            KeyBinding {
+                keys: "Esc",
+                action: "cancel the running task",
+            },
+            KeyBinding {
+                keys: "Ctrl-C",
+                action: "cancel; twice quits; idle quits",
+            },
+            KeyBinding {
+                keys: "F1 / F2",
+                action: "toggle help / model picker (idle)",
+            },
+            KeyBinding {
+                keys: "Up",
+                action: "recall the last task (idle, empty)",
+            },
+        ],
+    },
+    KeySection {
+        title: "APPROVAL · TASK PAUSED",
+        rows: &[
+            KeyBinding {
+                keys: "y",
+                action: "allow once and resume",
+            },
+            KeyBinding {
+                keys: "a",
+                action: "allow writes this session, resume",
+            },
+            KeyBinding {
+                keys: "e",
+                action: "edit the write, then resume",
+            },
+            KeyBinding {
+                keys: "n",
+                action: "deny the write and resume",
+            },
+        ],
+    },
+    KeySection {
+        title: "SCROLL AND VIEW",
+        rows: &[
+            KeyBinding {
+                keys: "PgUp / PgDn",
+                action: "scroll thread (Ctrl+U / Ctrl+D)",
+            },
+            KeyBinding {
+                keys: "Ctrl+End",
+                action: "jump to the latest output",
+            },
+            KeyBinding {
+                keys: "Shift+PgUp/Dn",
+                action: "scroll sidebar; Shift+Home top",
+            },
+            KeyBinding {
+                keys: "Ctrl+B / Tab",
+                action: "toggle the sidebar",
+            },
+            KeyBinding {
+                keys: "Up / Down",
+                action: "select result; Ctrl+O expands",
+            },
+            KeyBinding {
+                keys: "Ctrl+R / L",
+                action: "reasoning / redraw",
+            },
+            KeyBinding {
+                keys: "@path Tab",
+                action: "complete a workspace file mention",
+            },
+        ],
+    },
+    KeySection {
+        title: "PALETTE AND PICKER",
+        rows: &[
+            KeyBinding {
+                keys: "/",
+                action: "open the command palette",
+            },
+            KeyBinding {
+                keys: "Up / Down",
+                action: "move; j/k in picker",
+            },
+            KeyBinding {
+                keys: "Tab / r",
+                action: "complete / effort / refresh",
+            },
+            KeyBinding {
+                keys: "F2",
+                action: "open model picker",
+            },
+            KeyBinding {
+                keys: "Enter / Esc",
+                action: "run or apply / close",
+            },
+        ],
+    },
+    KeySection {
+        title: "SCREENS",
+        rows: &[
+            KeyBinding {
+                keys: "Esc",
+                action: "close screen; Up/Down move",
+            },
+            KeyBinding {
+                keys: "Sessions",
+                action: "Enter resume · e export · d delete",
+            },
+            KeyBinding {
+                keys: "Ctrl+N",
+                action: "new session (Sessions)",
+            },
+            KeyBinding {
+                keys: "Tools",
+                action: "Space allow writes · r retry MCP",
+            },
+            KeyBinding {
+                keys: "Compare",
+                action: "Space/b mark baseline · e/c export",
+            },
+            KeyBinding {
+                keys: "Account",
+                action: "Enter switch · a/d/t add/remove/test",
+            },
+            KeyBinding {
+                keys: "Context",
+                action: "/pin /drop /compact /close",
+            },
+        ],
+    },
+];
+
 pub(crate) fn handle_key(key: KeyEvent, context: &mut KeyContext<'_>) {
     let KeyContext {
         input,
