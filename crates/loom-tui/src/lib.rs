@@ -432,6 +432,16 @@ async fn run_interactive(
     }
 
     loop {
+        // Opening the picker later (for example with `/model`) starts from the
+        // configured choice. Discover the full catalog on first open just as
+        // the launch-time picker does.
+        if picker && !picker_loaded && discovery.is_none() {
+            let discover_config = config.clone();
+            discovery = Some(tokio::spawn(async move {
+                PickerState::discover(&discover_config).await
+            }));
+            picker_state.notice = Some("discovering models…".into());
+        }
         if picker
             && !picker_loaded
             && discovery
