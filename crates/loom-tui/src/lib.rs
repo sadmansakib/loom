@@ -561,7 +561,11 @@ async fn run_interactive(
             let session_id = session.id.to_string();
             let effort = format!("{:?}", config.reasoning_effort).to_lowercase();
             let mut run = Box::pin(engine.run_task(session, task, &sink, &task_control));
+            let mut last_ctrl_c: Option<std::time::Instant> = None;
             let result = loop {
+                if should_quit {
+                    break None;
+                }
                 tick_notice(&mut notice, &mut notice_clock, false);
                 terminal.draw(|frame| {
                     draw_live(
@@ -622,11 +626,31 @@ async fn run_interactive(
                         }
                     }
                     result = &mut run => {
-                        break result;
+                        break Some(result);
                     }
                     () = tokio::time::sleep(FRAME_TICK) => {
                         if event::poll(Duration::ZERO)? {
                             let event = event::read()?;
+                            // Esc and ^C cancel through the token. A second
+                            // ^C within two seconds leaves the TUI at once.
+                            if let Event::Key(crossterm::event::KeyEvent {
+                                code: KeyCode::Char('c'),
+                                modifiers: crossterm::event::KeyModifiers::CONTROL,
+                                ..
+                            }) = &event
+                            {
+                                task_control.cancel();
+                                let now = std::time::Instant::now();
+                                if last_ctrl_c
+                                    .is_some_and(|last| now.duration_since(last) <= Duration::from_secs(2))
+                                {
+                                    should_quit = true;
+                                } else {
+                                    last_ctrl_c = Some(now);
+                                    notice = Some("cancelling… · ^C again to force quit".into());
+                                }
+                                continue;
+                            }
                             // While a task runs, Enter on a slash command must
                             // run it instead of queueing the command as a
                             // follow-up for the model.
@@ -710,6 +734,9 @@ async fn run_interactive(
                 }
             };
             drop(run);
+            if result.is_none() {
+                return Ok(());
+            }
             // A request left unanswered by an abandoned or retried call must
             // not outlive the run: decline it so the box cannot linger.
             if let Some(stale) = pending_approval.take() {
@@ -720,8 +747,9 @@ async fn run_interactive(
                 reducer.reduce(&event, timestamp);
             }
             match result {
-                Ok(summary) => reducer.set_summary(summary),
-                Err(error) => tracing::warn!(%error, "task finished with an error"),
+                Some(Ok(summary)) => reducer.set_summary(summary),
+                Some(Err(error)) => tracing::warn!(%error, "task finished with an error"),
+                None => unreachable!("returned above"),
             }
             last_elapsed = Some(started_at.elapsed());
             last_dropped = Some(sink.dropped());

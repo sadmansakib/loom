@@ -133,7 +133,7 @@ pub(crate) fn handle_key(key: KeyEvent, context: &mut KeyContext<'_>) {
         (KeyCode::Tab, _) if input.has_file_mention() => input.complete_file(workspace),
         (KeyCode::Char('b'), KeyModifiers::CONTROL) | (KeyCode::Tab, _) => **sidebar = !**sidebar,
         (KeyCode::Char('r'), KeyModifiers::CONTROL) => reducer.toggle_reasoning(),
-        (KeyCode::Char('o'), KeyModifiers::CONTROL) => reducer.toggle_details(),
+        (KeyCode::Char('o'), KeyModifiers::CONTROL) => reducer.toggle_selected_result(),
         (KeyCode::Enter, modifiers)
             if modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
         {
@@ -191,10 +191,21 @@ pub(crate) fn route_event(
     let (thread_scroll_back, sidebar_scroll_back) = scroll;
     match event {
         Event::Key(key) => {
+            let selecting = matches!(key.code, KeyCode::Up | KeyCode::Down)
+                && context.control.is_some()
+                && context.input.text.is_empty();
+            if selecting {
+                context.reducer.move_selection(key.code == KeyCode::Down);
+                *thread_scroll_back = 0;
+                return Ok(());
+            }
             if !update_sidebar_scroll(key, sidebar_scroll_back)
                 && !update_thread_scroll(key, thread_scroll_back)
             {
                 handle_key(key, context);
+            } else if key.code == KeyCode::End && key.modifiers == KeyModifiers::CONTROL {
+                // Jump to latest also drops the selection, restoring follow mode.
+                context.reducer.selected = None;
             }
         }
         Event::Mouse(mouse) => {
