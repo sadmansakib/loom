@@ -145,6 +145,12 @@ pub(crate) fn draw_live(frame: &mut ratatui::Frame<'_>, view: &LiveFrame<'_>) {
                 session_id,
                 model: Some(&config.model),
                 effort: Some(effort),
+                // TODO(loom-cli): task mode/label and billing period are not
+                // on EngineConfig or the event stream yet; show "unavailable"
+                // rather than inventing benchmark metadata.
+                task_mode: None,
+                task_label: None,
+                billing_period: None,
                 thinking: capabilities.map(
                     |capabilities| {
                         if capabilities.reasoning { "on" } else { "off" }

@@ -12,6 +12,7 @@ use ratatui::{
 
 pub(crate) mod sidebar;
 mod thread;
+mod thread_live;
 
 use sidebar::{draw_runtime_sidebar, draw_scene_sidebar};
 use thread::draw_reducer_thread;
@@ -128,6 +129,12 @@ pub struct LiveViewOptions<'a> {
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
     pub thinking: Option<&'a str>,
+    /// Task mode shown under TASK, e.g. `read-only`.
+    pub task_mode: Option<&'a str>,
+    /// Human label shown under TASK, e.g. `benchmark B1`.
+    pub task_label: Option<&'a str>,
+    /// Billing period label, `off-peak` or `peak`.
+    pub billing_period: Option<&'a str>,
     pub turn_limit: Option<u32>,
     pub thread_scroll_back: usize,
     pub sidebar_scroll_back: usize,
@@ -190,7 +197,7 @@ pub fn draw_live_scrolled(
     let prompt_label = if approval.is_some() {
         "Task paused. Answer the prompt above, or type to queue a follow-up."
     } else if reducer.task.status == Some(TaskStatus::Running) {
-        "Task running… type to queue a follow-up."
+        "Task running. Type to queue a follow-up."
     } else {
         "Describe a task…"
     };
@@ -296,11 +303,15 @@ pub fn draw_live_scrolled(
             },
         ),
     ];
-    if queue_count > 0 {
-        prompt_spans.push(Span::styled(
-            format!("   queued {queue_count}"),
-            fg(theme::AMBER),
-        ));
+    let show_queue = reducer.task.status == Some(TaskStatus::Running);
+    if show_queue {
+        // Right-align the queue count on the composer's first line.
+        let queued = format!("queued {queue_count}");
+        let first_line = prompt_display.lines().next().unwrap_or("").chars().count();
+        let inner = usize::from(composer.width.saturating_sub(2));
+        let pad = inner.saturating_sub(first_line + 2 + queued.chars().count());
+        prompt_spans.push(Span::raw(" ".repeat(pad)));
+        prompt_spans.push(Span::styled(queued, fg(theme::DIM)));
     }
     frame.render_widget(
         Paragraph::new(Line::from(prompt_spans))
@@ -344,13 +355,17 @@ pub fn draw_live_scrolled(
         // Narrow keeps one hint only; the counters share the status row.
         key_hint_line(&[("/help", "help")])
     } else if reducer.task.status == Some(TaskStatus::Running) {
-        key_hint_line(&[
+        let mut hints = vec![
             ("Esc", "cancel"),
-            ("^O", "details"),
-            ("^R", "reasoning"),
-            ("↑↓", "scroll"),
-            ("/help", "help"),
-        ])
+            ("^O", "expand"),
+            ("/reasoning", "reasoning"),
+            ("/sidebar", "sidebar"),
+        ];
+        if thread_scroll_back > 0 || reducer.selected.is_some() {
+            hints.push(("^End", "latest"));
+        }
+        hints.push(("/help", "help"));
+        key_hint_line(&hints)
     } else {
         key_hint_line(&[
             ("Enter", "send"),
@@ -980,7 +995,14 @@ fn draw_live_header(
     // Narrow: one status line carries state, turn and cost instead of the
     // full header. The brand stays visible for orientation.
     if scene.is_none() && area.width < 90 {
-        let (_, label, color) = header_state(reducer, options.approval.is_some(), set);
+        let (_, label, color) = live_header_state(reducer, options.approval.is_some(), set)
+            .unwrap_or_else(|| {
+                (
+                    glyphs::glyph(Glyph::Spinner, set).to_owned(),
+                    "running".to_owned(),
+                    theme::AMBER,
+                )
+            });
         let turn = reducer.turn.unwrap_or(0);
         let cost = if reducer.usage_reported {
             pricing_label(pricing_value(options.pricing, reducer))
@@ -1015,9 +1037,9 @@ fn draw_live_header(
     let state = if scene.is_some() {
         None
     } else {
-        Some(header_state(reducer, options.approval.is_some(), set))
+        live_header_state(reducer, options.approval.is_some(), set)
     };
-    let state_text = state.map(|(glyph, label, _)| {
+    let state_text = state.as_ref().map(|(glyph, label, _)| {
         if glyph.is_empty() {
             label.to_owned()
         } else {
@@ -1066,34 +1088,32 @@ fn draw_live_header(
         ])
     };
 
-    let right = if let Some((_, _, color)) = state {
-        let mut spans = Vec::new();
-        if let Some(state_text) = state_text {
-            spans.push(Span::styled(
-                state_text,
-                header_fg(color).add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::raw("   "));
-        }
-        spans.push(Span::styled(model, header_fg(theme::BLUE)));
-        if show_effort {
-            spans.push(Span::styled("   effort ", header_fg(theme::DIM)));
-            spans.push(Span::styled(
-                effort,
-                header_fg(theme::IVORY).add_modifier(Modifier::BOLD),
-            ));
-        }
-        if show_thinking {
-            spans.push(Span::styled("   thinking ", header_fg(theme::DIM)));
-            spans.push(Span::styled(
-                thinking,
-                header_fg(theme::IVORY).add_modifier(Modifier::BOLD),
-            ));
-        }
-        Line::from(spans)
-    } else {
-        Line::from(Span::styled(model, header_fg(theme::BLUE)))
-    };
+    let mut right_spans = Vec::new();
+    if let Some((_, _, color)) = &state
+        && let Some(state_text) = state_text
+    {
+        right_spans.push(Span::styled(
+            state_text,
+            header_fg(*color).add_modifier(Modifier::BOLD),
+        ));
+        right_spans.push(Span::raw("   "));
+    }
+    right_spans.push(Span::styled(model, header_fg(theme::BLUE)));
+    if show_effort {
+        right_spans.push(Span::styled("   effort ", header_fg(theme::DIM)));
+        right_spans.push(Span::styled(
+            effort,
+            header_fg(theme::IVORY).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if show_thinking {
+        right_spans.push(Span::styled("   thinking ", header_fg(theme::DIM)));
+        right_spans.push(Span::styled(
+            thinking,
+            header_fg(theme::IVORY).add_modifier(Modifier::BOLD),
+        ));
+    }
+    let right = Line::from(right_spans);
 
     frame.render_widget(Paragraph::new(left), columns[0]);
     frame.render_widget(
@@ -1138,6 +1158,29 @@ fn header_state(
         // Idle is quiet: the word carries the meaning, no glyph needed.
         _ => ("", "idle", theme::DIM),
     }
+}
+
+/// The header chip is reserved for anything not plainly running; a live
+/// model request borrows it to show the attempt (mapping in the design notes).
+fn live_header_state(
+    reducer: &Reducer,
+    approval_pending: bool,
+    set: GlyphSet,
+) -> Option<(String, String, Color)> {
+    if approval_pending
+        || reducer.task.status == Some(TaskStatus::Paused)
+        || reducer.task.status != Some(TaskStatus::Running)
+    {
+        let (glyph, label, color) = header_state(reducer, approval_pending, set);
+        return Some((glyph.to_owned(), label.to_owned(), color));
+    }
+    reducer.provisional.attempt.map(|attempt| {
+        (
+            glyphs::glyph(Glyph::Spinner, set).to_owned(),
+            format!("streaming · attempt {attempt}"),
+            theme::AMBER,
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1282,7 +1325,9 @@ fn tinted(text: &str, color: Color) -> Line<'static> {
 
 #[allow(clippy::cast_precision_loss)] // compact display rounds to one decimal anyway
 fn format_compact_tokens(tokens: u64) -> String {
-    if tokens >= 1_000 {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
         format!("{:.1}K", tokens as f64 / 1000.0)
     } else {
         tokens.to_string()
@@ -1630,7 +1675,7 @@ mod tests {
         }
     }
 
-    fn snapshot(buffer: &ratatui::buffer::Buffer) -> String {
+    pub(super) fn snapshot(buffer: &ratatui::buffer::Buffer) -> String {
         let mut output = String::new();
         for y in 0..buffer.area.height {
             let mut row = Vec::<(String, String)>::new();
@@ -2001,6 +2046,10 @@ mod tests {
         let mut session = loom_core::Session::new(loom_core::SessionId::new());
         session.transcript.clone_from(&reducer.committed_transcript);
         reducer.reconcile_session(&session);
+        reducer.selected = Some(crate::reducer::Selection::ToolCall {
+            turn: 1,
+            call_id: "read-1".to_owned(),
+        });
         let mut terminal = Terminal::new(TestBackend::new(154, 40)).unwrap();
         terminal
             .draw(|frame| draw_test_live(frame, &reducer, "inspect the file"))
@@ -2021,7 +2070,7 @@ mod tests {
         assert!(rendered.contains("3 │     first_visible_call()"));
         // Lines past the collapsed cap are elided with an honest count.
         assert!(!rendered.contains("fourth_line_hidden_when_collapsed"));
-        assert!(rendered.contains("… +3 more lines"));
+        assert!(rendered.contains("… 3 more lines · ^O"));
     }
 
     #[test]
@@ -2126,10 +2175,10 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
 
-        assert!(rendered.contains("error · timeout"));
-        assert!(rendered.contains("timed out after 30s waiting for cargo test"));
+        assert!(rendered.contains("Timeout"));
+        assert!(rendered.contains("model sees: error: timed out after 30s waiting for cargo test"));
         // Duration stays visible even though the call failed.
-        assert!(rendered.contains("250ms"));
+        assert!(rendered.contains("250 ms"), "{rendered}");
         assert!(!rendered.contains("· done"));
     }
 
@@ -2142,6 +2191,16 @@ mod tests {
                 schema_version: loom_core::kernel::event::EVENT_SCHEMA_VERSION,
                 timestamp_millis: None,
                 sequence: 0,
+                task_id: loom_core::TaskId::new(),
+                kind: loom_core::EventKind::TaskStarted,
+            },
+            0,
+        );
+        reducer.reduce(
+            &loom_core::EventEnvelope {
+                schema_version: loom_core::kernel::event::EVENT_SCHEMA_VERSION,
+                timestamp_millis: None,
+                sequence: 1,
                 task_id: loom_core::TaskId::new(),
                 kind: loom_core::EventKind::TurnStarted { turn: 1 },
             },
@@ -2161,7 +2220,8 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
 
-        assert!(rendered.contains("reasoning · provisional · streaming"));
+        assert!(rendered.contains("reasoning ·"));
+        assert!(rendered.contains("weighing two approaches"));
         assert!(rendered.contains("partial answer so far"));
         assert!(rendered.contains("▌"));
     }
@@ -2418,7 +2478,7 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(text.contains("800 remaining"));
-        assert!(text.contains("repository facts"));
+        assert!(text.contains("system + tools"));
         assert!(text.contains("7 / 9"));
         assert!(text.contains("01:42 / 09:40"), "{text:?}");
         assert!(
@@ -2485,6 +2545,39 @@ mod tests {
     }
 
     #[test]
+    fn dropped_events_turn_the_footer_into_an_incomplete_trace() {
+        let mut reducer = Reducer::default();
+        reducer.task.status = Some(loom_core::kernel::session::TaskStatus::Running);
+        reducer.event_count = 12;
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_live(
+                    frame,
+                    &reducer,
+                    "",
+                    0,
+                    LiveViewOptions {
+                        dropped: Some(3),
+                        ..idle_options()
+                    },
+                );
+            })
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(
+            rendered.contains("events 12 · dropped 3 · trace incomplete"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn context_bar_uses_proportional_census_categories_and_legend_colors() {
         let census: ContextCensus = serde_json::from_value(serde_json::json!({
             "system_prompt": 50,
@@ -2522,7 +2615,7 @@ mod tests {
         assert_eq!(segments[0].spans[0].style, system_style);
         assert_eq!(segments[1].spans[0].style, user_style);
         assert_eq!(segments[2].spans[0].style, tools_style);
-        assert!(segments[0].to_string().contains("system prompt"));
+        assert!(segments[0].to_string().contains("system + tools"));
         assert!(segments[1].to_string().contains("user"));
         assert!(segments[2].to_string().contains("tool results"));
     }
@@ -2612,7 +2705,7 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(rendered.contains("unbounded"), "{rendered}");
-        assert!(rendered.contains("estimated 0/20000"));
+        assert!(rendered.contains("total (est.) 0"));
         assert!(!rendered.contains("0 remaining"));
         assert!(
             terminal
@@ -2770,8 +2863,14 @@ mod approval_render_tests {
 #[cfg(test)]
 mod pending_sidebar_tests {
     use crate::approval::Request;
+    use crate::glyphs::GlyphSet;
+    use crate::picker::ModelPricing;
+    use crate::reducer::Reducer;
     use crate::scene_views::{LiveViewOptions, draw_live};
+    use crate::theme;
     use ratatui::{Terminal, backend::TestBackend};
+    use std::env;
+    use std::time::Duration;
     use tokio::sync::oneshot;
 
     #[test]
@@ -2898,6 +2997,90 @@ mod pending_sidebar_tests {
             .collect::<String>();
         assert!(text.contains("write_file"), "tool row missing");
         assert!(text.contains("awaiting"), "needs-you state missing");
+    }
+    #[test]
+    #[allow(clippy::wildcard_enum_match_arm)] // only the four checkpoint events matter
+    fn live_fixture_replays_through_the_pure_reducer_at_layout_checkpoints() {
+        use std::fmt::Write as _;
+
+        let fixture = include_str!("../tests/fixtures/live-read-only.ndjson");
+        let events = fixture
+            .lines()
+            .map(serde_json::from_str::<loom_core::EventEnvelope>)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("fixture is valid NDJSON");
+        let mut reducer = Reducer::default();
+        reducer.begin_task("Inspect this repository and report the event-sink call chain");
+        let mut snapshots = String::new();
+        let mut tool_completions = 0;
+        let mut model_completions = 0;
+
+        for event in &events {
+            reducer.reduce(event, event.timestamp_millis.unwrap_or(0));
+            let checkpoint = match &event.kind {
+                loom_core::EventKind::TurnStarted { turn: 1 } => Some("after-turn-started"),
+                loom_core::EventKind::ToolCompleted { .. } => {
+                    tool_completions += 1;
+                    (tool_completions == 2).then_some("mid-batch")
+                }
+                loom_core::EventKind::ModelCompleted { .. } => {
+                    model_completions += 1;
+                    (model_completions == 2).then_some("after-model-completed")
+                }
+                loom_core::EventKind::ReasoningDelta { .. } => Some("mid-stream"),
+                _ => None,
+            };
+            let Some(checkpoint) = checkpoint else {
+                continue;
+            };
+            for (width, height) in [(140, 40), (100, 30), (70, 24)] {
+                for (mode, glyph_set) in
+                    [("unicode", GlyphSet::Unicode), ("ascii", GlyphSet::Ascii)]
+                {
+                    let mut state = reducer.clone();
+                    if checkpoint == "after-model-completed" {
+                        state.expanded_result = Some("call-read".to_owned());
+                    }
+                    let options = LiveViewOptions {
+                        sidebar_visible: true,
+                        elapsed: Some(Duration::from_secs(102)),
+                        dropped: Some(0),
+                        workspace: Some("~/work/loom"),
+                        session_id: Some("0194a7e2-1f9c-7c3e-9b2a-4d5e6f7a8b9c"),
+                        model: Some("deepseek-flash"),
+                        effort: Some("high"),
+                        thinking: Some("on"),
+                        task_mode: Some("read-only"),
+                        task_label: Some("benchmark B1"),
+                        billing_period: Some("off-peak"),
+                        turn_limit: Some(50),
+                        pricing: Some(ModelPricing {
+                            input_per_million: Some(0.14),
+                            output_per_million: Some(0.28),
+                        }),
+                        depth: Some(theme::Depth::TrueColor),
+                        glyph_set: Some(glyph_set),
+                        ..LiveViewOptions::default()
+                    };
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    terminal
+                        .draw(|frame| draw_live(frame, &state, "", 0, options))
+                        .unwrap();
+                    let _ = writeln!(snapshots, "=== {checkpoint} {width}x{height} {mode} ===");
+                    snapshots.push_str(&super::tests::snapshot(terminal.backend().buffer()));
+                }
+            }
+        }
+
+        if env::var_os("UPDATE_TUI_SNAPSHOTS").is_some() {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/snapshots/live-replay.snap");
+            std::fs::write(path, &snapshots).unwrap();
+        }
+        assert_eq!(
+            snapshots,
+            include_str!("../tests/snapshots/live-replay.snap")
+        );
     }
 }
 

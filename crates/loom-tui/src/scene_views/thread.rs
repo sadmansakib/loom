@@ -39,6 +39,10 @@ pub(super) fn draw_reducer_thread(
     scene: Option<Scene>,
     approval_path: Option<&str>,
 ) {
+    if scene.is_none() && !reducer.restored {
+        super::thread_live::draw(frame, area, reducer, thread_scroll_back, approval_path);
+        return;
+    }
     let mut lines = Vec::new();
     if !reducer.restored
         && let Some(prompt) = reducer
@@ -942,7 +946,22 @@ pub(super) fn render_thread_scrolled(
     lines: Vec<Line<'_>>,
     thread_scroll_back: usize,
 ) {
+    render_thread_scrolled_to(frame, area, lines, thread_scroll_back, None);
+}
+
+/// Same renderer, optionally pinned to one logical line (the selected turn or
+/// call). Pinning wins over the scroll-back offset.
+pub(super) fn render_thread_scrolled_to(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    lines: Vec<Line<'_>>,
+    thread_scroll_back: usize,
+    anchor: Option<usize>,
+) {
     let inner_height = usize::from(area.height);
+    let anchor_prefix = anchor
+        .filter(|anchor| *anchor < lines.len())
+        .map(|anchor| lines[..=anchor].to_vec());
     let paragraph = Paragraph::new(lines)
         .style(Style::default().bg(theme::BG))
         .wrap(Wrap { trim: false });
@@ -958,12 +977,18 @@ pub(super) fn render_thread_scrolled(
         visual_lines = paragraph.line_count(u16::try_from(text_width).unwrap_or(u16::MAX));
     }
     let max_scroll = visual_lines.saturating_sub(inner_height);
-    let scroll = u16::try_from(
-        max_scroll
-            .saturating_sub(thread_scroll_back)
-            .min(usize::from(u16::MAX)),
-    )
-    .unwrap_or(u16::MAX);
+    let scroll = anchor_prefix.map_or_else(
+        || max_scroll.saturating_sub(thread_scroll_back),
+        |prefix| {
+            let width = u16::try_from(text_width.max(1)).unwrap_or(u16::MAX);
+            Paragraph::new(prefix)
+                .wrap(Wrap { trim: false })
+                .line_count(width)
+                .saturating_sub(3)
+                .min(max_scroll)
+        },
+    );
+    let scroll = u16::try_from(scroll.min(usize::from(u16::MAX))).unwrap_or(u16::MAX);
     let text_area = Rect {
         width: u16::try_from(text_width).unwrap_or(area.width),
         ..area

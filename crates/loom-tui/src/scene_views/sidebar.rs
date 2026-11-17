@@ -248,12 +248,22 @@ pub(super) fn draw_runtime_sidebar(
         };
     let task_lines = vec![
         heading("TASK"),
-        Line::from(vec![
-            Span::styled(format!("{status_glyph} "), fg(status_color)),
-            Span::styled(status_text, fg(status_color).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("  {elapsed_label}"), fg(theme::DIM)),
-        ]),
-        muted(&task_id),
+        {
+            let gap = usize::from(content.width)
+                .saturating_sub(status_text.chars().count() + elapsed_label.chars().count() + 2)
+                .max(1);
+            Line::from(vec![
+                Span::styled(format!("{status_glyph} "), fg(status_color)),
+                Span::styled(status_text, fg(status_color).add_modifier(Modifier::BOLD)),
+                Span::raw(" ".repeat(gap)),
+                Span::styled(elapsed_label.clone(), fg(theme::DIM)),
+            ])
+        },
+        muted(&format!(
+            "{task_id} · {} · {}",
+            options.task_mode.unwrap_or("mode unavailable"),
+            options.task_label.unwrap_or("no label"),
+        )),
     ];
 
     let turns = reducer.turn.map(u64::from);
@@ -367,11 +377,31 @@ pub(super) fn draw_runtime_sidebar(
             "capacity unavailable".to_owned()
         };
         context_lines.push(muted(&format!(
-            "total (est.) {} · estimated {}/{} · {utilization}",
+            "total (est.) {} · {utilization}",
             format_compact_tokens(u64::from(census.total)),
-            census.total,
-            capacity,
         )));
+        if let Some(prefix) = reducer.cacheable_prefix_tokens {
+            let (mark, word, color) = match reducer.cacheable_prefix_stable {
+                Some(true) => (
+                    crate::glyphs::glyph(crate::glyphs::Glyph::Check, super::glyph_set()),
+                    "stable",
+                    theme::TEAL,
+                ),
+                Some(false) => (
+                    crate::glyphs::glyph(crate::glyphs::Glyph::Cross, super::glyph_set()),
+                    "changed since last request",
+                    theme::CORAL,
+                ),
+                None => ("?", "unverified", theme::DIM),
+            };
+            context_lines.push(Line::from(Span::styled(
+                format!(
+                    "cacheable prefix {} {mark} {word}",
+                    format_compact_tokens(prefix)
+                ),
+                fg(color),
+            )));
+        }
     } else {
         context_lines.push(muted("not reported before request compilation"));
     }
@@ -384,21 +414,30 @@ pub(super) fn draw_runtime_sidebar(
             "not reported".to_owned()
         }
     };
+    let period = options
+        .billing_period
+        .unwrap_or("billing unknown")
+        .to_owned();
+    let cost_gap = usize::from(content.width)
+        .saturating_sub(cost.chars().count() + period.chars().count())
+        .max(1);
+    let cached = usage_value(reducer.usage.cached_input_tokens);
     let cost_lines = vec![
         heading("COST"),
-        Line::from(vec![Span::styled(
-            cost,
-            fg(theme::AMBER).add_modifier(Modifier::BOLD),
-        )]),
+        Line::from(vec![
+            Span::styled(cost, fg(theme::AMBER).add_modifier(Modifier::BOLD)),
+            Span::raw(" ".repeat(cost_gap)),
+            Span::styled(period, fg(theme::DIM)),
+        ]),
         muted(&format!(
-            "in {} · {} cached",
-            usage_value(Some(reducer.usage.input_tokens)),
-            usage_value(reducer.usage.cached_input_tokens)
+            "in {}",
+            usage_value(Some(reducer.usage.input_tokens))
         )),
         muted(&format!(
             "out {}",
             usage_value(Some(reducer.usage.output_tokens))
         )),
+        Line::from(Span::styled(format!("{cached} cached"), fg(theme::TEAL))),
     ];
 
     if let Some(summary) = &reducer.summary {
@@ -579,7 +618,7 @@ pub(super) fn draw_runtime_sidebar(
             .recent_events
             .iter()
             .skip(options.sidebar_scroll_back)
-            .take(event_rows.saturating_sub(1))
+            .take(event_rows.saturating_sub(1).min(3))
             .map(|event| event_line(event)),
     );
     frame.render_widget(
@@ -622,8 +661,14 @@ pub(super) fn sidebar_limit_bar(used: u64, limit: u64, width: u16) -> Line<'stat
             usize::try_from((used.saturating_mul(cap) / limit).min(cap)).unwrap_or(inner)
         }
     };
+    let over_ninety = limit > 0 && used.saturating_mul(100) / limit >= 90;
+    let color = if over_ninety {
+        theme::CORAL
+    } else {
+        theme::AMBER
+    };
     Line::from(vec![
-        Span::styled("━".repeat(filled), fg(theme::AMBER)),
+        Span::styled("━".repeat(filled), fg(color)),
         Span::styled("━".repeat(inner.saturating_sub(filled)), fg(theme::BORDER)),
     ])
 }
@@ -735,13 +780,18 @@ pub(crate) fn context_bar(census: ContextCensus, width: u16) -> Line<'static> {
 
 pub(super) fn context_categories(census: ContextCensus) -> Vec<(&'static str, u32, Color)> {
     [
-        ("system prompt", census.system_prompt, theme::DIM),
-        ("repository facts", census.repo_facts, theme::THREAD),
+        (
+            "system + tools",
+            census
+                .system_prompt
+                .saturating_add(census.repo_facts)
+                .saturating_add(census.tool_specs),
+            theme::DIM,
+        ),
         ("user", census.user_items, theme::BLUE),
         ("reasoning", census.reasoning_replay, theme::VIOLET),
         ("assistant", census.assistant_history, theme::IVORY),
         ("tool results", census.tool_results, theme::SAGE),
-        ("tool specs", census.tool_specs, theme::AMBER),
     ]
     .into_iter()
     .filter(|(_, tokens, _)| *tokens > 0)
@@ -781,18 +831,7 @@ pub(super) fn context_segments(census: ContextCensus, width: u16) -> Vec<Line<'s
 }
 
 pub(super) fn event_line(event: &str) -> Line<'static> {
-    let color = if event.contains("ToolCompleted") || event.contains("TaskCompleted") {
-        theme::SAGE
-    } else if event.contains("Failed") || event.contains("Retry") || event.contains("Cancelled") {
-        theme::CORAL
-    } else if event.contains("Reasoning") {
-        theme::VIOLET
-    } else if event.contains("Model") {
-        theme::BLUE
-    } else {
-        theme::DIM
-    };
-    Line::from(Span::styled(event.to_owned(), fg(color)))
+    muted(event)
 }
 
 pub(super) fn optional_budget(value: Option<u64>) -> String {
