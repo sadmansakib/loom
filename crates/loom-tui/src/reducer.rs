@@ -4,7 +4,7 @@
 //! In particular, streamed model deltas live only in [`ProvisionalResponse`]
 //! until a `ModelCompleted` event commits the complete assistant message.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const RECENT_EVENT_LIMIT: usize = 256;
 
@@ -226,6 +226,15 @@ pub struct Reducer {
     applied_display_prompts: usize,
     /// UI expansion toggles for optional transcript details.
     pub expanded: ExpandedDetails,
+    /// Tokens in the cacheable request prefix, from the latest compile.
+    pub cacheable_prefix_tokens: Option<u64>,
+    /// Whether the prefix matched the previous compile. `None` means the
+    /// event stream does not yet contain a second sample.
+    pub cacheable_prefix_stable: Option<bool>,
+    /// Keyboard cursor over turns and tool calls; presentation state only.
+    pub selected: Option<Selection>,
+    /// Tool call whose result excerpt is expanded.
+    pub expanded_result: Option<String>,
 }
 
 /// Independently controlled optional details in the execution timeline.
@@ -235,6 +244,20 @@ pub struct ExpandedDetails {
     pub reasoning: bool,
     /// Show complete tool arguments and available output previews.
     pub tools: bool,
+}
+
+/// A selectable row in the live thread, in display order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selection {
+    /// A turn node.
+    Turn(u32),
+    /// One tool call inside a turn.
+    ToolCall {
+        /// Display key of the parent turn.
+        turn: u32,
+        /// Correlation id of the call.
+        call_id: String,
+    },
 }
 
 impl Reducer {
@@ -325,6 +348,16 @@ impl Reducer {
                     }),
                     tool_calls_used: self.tool_calls_started,
                 });
+                // TODO: the wire format carries no prefix-stability signal.
+                // stability here means "the same three prefix categories
+                // compiled to the same token count as last request".
+                let prefix = u64::from(census.system_prompt)
+                    + u64::from(census.repo_facts)
+                    + u64::from(census.tool_specs);
+                self.cacheable_prefix_stable = self
+                    .cacheable_prefix_tokens
+                    .map(|previous| previous == prefix);
+                self.cacheable_prefix_tokens = Some(prefix);
             }
             EventKind::TaskStarted => {
                 self.task.task_id = Some(event.task_id);
@@ -332,6 +365,10 @@ impl Reducer {
                 self.task.started_at_millis = Some(timestamp_millis);
                 self.task.completed_at_millis = None;
                 self.task.failure_reason = None;
+                self.selected = None;
+                self.expanded_result = None;
+                self.cacheable_prefix_tokens = None;
+                self.cacheable_prefix_stable = None;
             }
             EventKind::TurnStarted { turn } => {
                 if let Some(previous) = self.turn
@@ -522,6 +559,9 @@ impl Reducer {
             | EventKind::AwaitingInput { .. }
             | _ => {}
         }
+        if matches!(&event.kind, EventKind::ContextPruned { .. }) {
+            self.cacheable_prefix_stable = Some(false);
+        }
     }
 
     /// Updates the externally-owned queued follow-up indicator.
@@ -540,6 +580,80 @@ impl Reducer {
     /// Toggles expanded tool arguments and output previews.
     pub fn toggle_details(&mut self) {
         self.expanded.tools = !self.expanded.tools;
+    }
+
+    /// Rows the keyboard cursor can reach, in display order.
+    #[must_use]
+    pub fn selection_targets(&self) -> Vec<Selection> {
+        let mut targets = Vec::new();
+        for (turn_number, turn) in &self.execution_turns {
+            targets.push(Selection::Turn(*turn_number));
+            let mut seen = BTreeSet::new();
+            for item in &turn.transcript {
+                if let TranscriptItem::Assistant(message) = item {
+                    for call in &message.tool_calls {
+                        let id = call.id.to_string();
+                        if seen.insert(id.clone()) {
+                            targets.push(Selection::ToolCall {
+                                turn: *turn_number,
+                                call_id: id,
+                            });
+                        }
+                    }
+                }
+            }
+            // Calls can be observed before ModelCompleted commits the message.
+            for call_id in self.tools.keys() {
+                if self.tool_call_turns.get(call_id) == Some(turn_number)
+                    && seen.insert(call_id.clone())
+                {
+                    targets.push(Selection::ToolCall {
+                        turn: *turn_number,
+                        call_id: call_id.clone(),
+                    });
+                }
+            }
+        }
+        targets
+    }
+
+    /// Moves the cursor one row forward or backward, stopping at the ends.
+    pub fn move_selection(&mut self, forward: bool) {
+        let targets = self.selection_targets();
+        let current = self
+            .selected
+            .as_ref()
+            .and_then(|selected| targets.iter().position(|row| row == selected));
+        let next = match (current, forward) {
+            (Some(index), true) => (index + 1).min(targets.len().saturating_sub(1)),
+            (Some(index), false) => index.saturating_sub(1),
+            (None, true) => 0,
+            (None, false) => targets.len().saturating_sub(1),
+        };
+        if let Some(row) = targets.get(next) {
+            self.selected = Some(row.clone());
+        }
+    }
+
+    /// Call id under the cursor, when it is a tool row.
+    #[must_use]
+    pub fn selected_call_id(&self) -> Option<&str> {
+        match &self.selected {
+            Some(Selection::ToolCall { call_id, .. }) => Some(call_id),
+            Some(Selection::Turn(_)) | None => None,
+        }
+    }
+
+    /// Expands or collapses the selected call's result excerpt.
+    pub fn toggle_selected_result(&mut self) {
+        let Some(call_id) = self.selected_call_id().map(str::to_owned) else {
+            return;
+        };
+        if self.expanded_result.as_deref() == Some(call_id.as_str()) {
+            self.expanded_result = None;
+        } else {
+            self.expanded_result = Some(call_id);
+        }
     }
 
     /// Retains the engine's authoritative successful run record.
@@ -1119,6 +1233,132 @@ mod tests {
             &reducer.committed_transcript[0],
             Item::Assistant(message) if message.content == "final answer"
         ));
+    }
+
+    #[test]
+    fn deltas_never_touch_a_committed_turn() {
+        let task_id = TaskId::new();
+        let mut reducer = Reducer::default();
+        reducer.begin_task("summarize the sink");
+        reducer.reduce(&event(0, task_id, EventKind::TaskStarted), 0);
+        reducer.reduce(&event(1, task_id, EventKind::TurnStarted { turn: 1 }), 0);
+        reducer.reduce(
+            &event(
+                2,
+                task_id,
+                EventKind::ModelCompleted {
+                    response: response("committed"),
+                },
+            ),
+            1,
+        );
+        reducer.reduce(
+            &event(
+                3,
+                task_id,
+                EventKind::TextDelta {
+                    text: " provisional".into(),
+                },
+            ),
+            2,
+        );
+        reducer.reduce(
+            &event(
+                4,
+                task_id,
+                EventKind::ReasoningDelta {
+                    text: "thinking".into(),
+                },
+            ),
+            3,
+        );
+
+        assert_eq!(reducer.provisional.text, " provisional");
+        assert_eq!(reducer.provisional.reasoning, "thinking");
+        assert!(matches!(
+            reducer
+                .committed_transcript
+                .iter()
+                .find(|item| matches!(item, Item::Assistant(_))),
+            Some(Item::Assistant(message)) if message.content == "committed"
+        ));
+        let committed = &reducer.execution_turns[&1].transcript;
+        assert!(matches!(
+            committed.last(),
+            Some(Item::Assistant(message)) if message.content == "committed"
+        ));
+        assert!(
+            !committed
+                .iter()
+                .any(|item| matches!(item, Item::Assistant(message) if message.content.contains("provisional")))
+        );
+    }
+
+    #[test]
+    fn tool_completion_updates_only_its_own_row() {
+        use loom_core::kernel::transcript::ToolCallId;
+
+        let task_id = TaskId::new();
+        let call = |id: &str| ToolCallId::try_from(id.to_owned()).unwrap();
+        let mut reducer = Reducer::default();
+        reducer.reduce(
+            &event(
+                0,
+                task_id,
+                EventKind::ToolStarted {
+                    name: "read_file".into(),
+                    call_id: call("first"),
+                    arguments: "{}".into(),
+                },
+            ),
+            0,
+        );
+        reducer.reduce(
+            &event(
+                1,
+                task_id,
+                EventKind::ToolStarted {
+                    name: "search".into(),
+                    call_id: call("second"),
+                    arguments: "{}".into(),
+                },
+            ),
+            1,
+        );
+        reducer.reduce(
+            &event(
+                2,
+                task_id,
+                EventKind::ToolCompleted {
+                    name: "search".into(),
+                    call_id: call("second"),
+                    status: ToolStatus::Success,
+                    content_head: "14 matches · 9 files".into(),
+                },
+            ),
+            2,
+        );
+
+        assert_eq!(reducer.tools["first"].status, None);
+        assert_eq!(reducer.tools["second"].status, Some(ToolStatus::Success));
+        assert_eq!(reducer.tools["second"].completed_at_millis, Some(2));
+    }
+
+    #[test]
+    fn terminal_events_are_accepted_without_panicking() {
+        let task_id = TaskId::new();
+        let kinds = [
+            EventKind::TaskCompleted,
+            EventKind::TaskFailed {
+                reason: "provider gave up".into(),
+            },
+            EventKind::TaskCancelled,
+            EventKind::TaskPaused,
+        ];
+        for kind in kinds {
+            let mut reducer = Reducer::default();
+            reducer.reduce(&event(0, task_id, kind), 1);
+        }
     }
 
     #[test]
