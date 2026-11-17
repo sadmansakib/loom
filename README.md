@@ -1,7 +1,7 @@
 # Loom
 
 [![Status: Early release](https://img.shields.io/badge/status-early%20release-blue)]()
-[![Tests: 1659](https://img.shields.io/badge/tests-1659-brightgreen)]()
+[![Tests: 1696](https://img.shields.io/badge/tests-1696-brightgreen)]()
 [![SWE-bench Verified: 90/100 frozen subset](https://img.shields.io/badge/SWE--bench%20Verified-90%2F100%20frozen%20subset-blue)]()
 
 > **Early release.** The headless agent core is usable today: the `loom`

@@ -594,8 +594,8 @@ also summarized here so this section is the single source of truth.
   and cached tokens / cost / wall time / tool-cache hits, per-task
   aggregates and a gated-pass-rate suite headline; strict and tolerant
   modes.
-- **Verification bar.** 1,645 tests passing, 14 live-API tests ignored by
-  default (1,659 total), clippy clean, fmt clean.
+- **Verification bar.** 1,675 tests passing, 21 live-API tests ignored by
+  default (1,696 total), clippy clean, fmt clean.
 
 ---
 
