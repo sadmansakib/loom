@@ -3,7 +3,7 @@
 
 use futures::future::BoxFuture;
 use loom_kernel::tool::{
-    BeforeImage, PathTouch, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec,
+    PathTouch, Tool, ToolContext, ToolEffects, ToolError, ToolOutput, ToolSpec,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -13,13 +13,13 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::budget::ToolBudgets;
-use crate::confinement::{resolve_within, workspace_relative};
+use crate::confinement::resolve_within;
 use crate::policy::CommandPolicy;
 
 use super::echo::{edit_detail, render_echo};
 use super::matching::{
     EditOutcome, load_edit_files, near_miss_hint, normalized_old, normalized_view, replace_span,
-    trimmed_match,
+    trimmed_match, write_touched,
 };
 
 /// One edit in a batch. The optional `path` defaults to the top-level
@@ -377,43 +377,9 @@ fn apply_edits(
             &mut repairs,
         )?;
     }
-    // Syntax guard (roadmap item 5 phase B): every candidate buffer
-    // must parse before anything reaches the disk, so a batch that
-    // would leave any file unparsable refuses as a whole — nothing is
-    // written, exactly like a failed match.
-    for (path, original, text) in &files {
-        crate::syntax::guard_against(original, text, path).map_err(|err| {
-            ToolError::InvalidInput(format!(
-                "refusing to write \"{}\": {err}",
-                workspace_relative(root, path)
-            ))
-        })?;
-    }
-    // Tier-2 rewind capture (roadmap gap 1): the loaded originals are
-    // exactly the pre-image of every touched file — capture them before
-    // the writes below, content-addressed into the artifact store.
-    let before_images: Vec<BeforeImage> = files
-        .iter()
-        .filter_map(|(path, original, _)| {
-            crate::pre_image::capture_before_image(
-                artifacts.map(|arc| &**arc),
-                &workspace_relative(root, path),
-                Some(original.as_bytes()),
-            )
-        })
-        .collect();
-    // Every edit matched exactly once: write everything back. Each
-    // write re-verifies confinement at use time (review item 2.2) and
-    // lands atomically (review item 2.3).
-    for (path, _, text) in &files {
-        crate::confinement::verify_parent_within(root, path)?;
-        crate::atomic::atomic_write(path, text.as_bytes())
-            .map_err(|err| ToolError::Execution(format!("cannot write: {err}")))?;
-    }
-    let resolved: Vec<(String, String)> = files
-        .into_iter()
-        .map(|(path, _, text)| (workspace_relative(root, &path), text))
-        .collect();
+    // Syntax guard, rewind capture, and the atomic writes all live in
+    // the shared pipeline so `replace_all` cannot write around them.
+    let (resolved, before_images) = write_touched(root, &files, artifacts.map(|arc| &**arc))?;
     let per_file_counts: Vec<usize> = spans.iter().map(Vec::len).collect();
     let mut echoes = Vec::new();
     for (file_idx, file_spans) in spans.iter().enumerate() {

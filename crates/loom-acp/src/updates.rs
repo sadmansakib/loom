@@ -133,7 +133,7 @@ pub(crate) fn tool_kind(name: &str) -> acp::ToolKind {
     match name {
         "read_file" | "list_dir" | "artifact_read" => acp::ToolKind::Read,
         "search" => acp::ToolKind::Search,
-        "write_file" | "edit_file" | "replace_symbol" => acp::ToolKind::Edit,
+        "write_file" | "edit_file" | "replace_all" | "replace_symbol" => acp::ToolKind::Edit,
         "run_command" | "verify" => acp::ToolKind::Execute,
         "todo" => acp::ToolKind::Think,
         _ => acp::ToolKind::Other,

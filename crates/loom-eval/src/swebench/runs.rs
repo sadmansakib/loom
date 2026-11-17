@@ -115,6 +115,30 @@ pub fn run_turns(run_json: &Path) -> u64 {
         .count() as u64
 }
 
+/// Tool calls in a run's JSONL, by tool name: the `replace_all` /
+/// `edit_file` split a codemod gate needs (roadmap item 1). Counts
+/// `tool_started` names, so a call that failed or was cancelled still
+/// counts — this is "what the model asked for", not "what landed".
+#[must_use]
+pub fn tool_calls(run_json: &Path) -> std::collections::BTreeMap<String, u64> {
+    let Ok(body) = std::fs::read_to_string(run_json) else {
+        return std::collections::BTreeMap::new();
+    };
+    let mut counts = std::collections::BTreeMap::new();
+    for line in body.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let kind = &value["kind"];
+        if kind["type"].as_str() == Some("tool_started")
+            && let Some(name) = kind["name"].as_str()
+        {
+            *counts.entry(name.to_owned()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
 /// The per-run numbers a paired contrast reports (roadmap item 1):
 /// turns plus the token totals from [`run_usage`].
 #[derive(Debug, Default, Clone, Copy)]
@@ -301,6 +325,34 @@ fn run_outcome_reads_the_event_stream() {
     // Malformed trailing junk must not sink the scan.
     std::fs::write(&path, "not json\n").unwrap();
     assert_eq!(run_outcome(&path), (0, None));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tool_calls_counts_starts_by_name() {
+    let dir = std::env::temp_dir().join(format!("loom-swe-tools-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("run.json");
+
+    // Missing file: nothing to count.
+    assert!(tool_calls(&path).is_empty());
+
+    std::fs::write(
+        &path,
+        "{\"kind\":{\"type\":\"tool_started\",\"name\":\"edit_file\"}}\n\
+         {\"kind\":{\"type\":\"tool_started\",\"name\":\"edit_file\"}}\n\
+         {\"kind\":{\"type\":\"tool_started\",\"name\":\"replace_all\"}}\n\
+         {\"kind\":{\"type\":\"tool_started\"}}\n\
+         {\"kind\":{\"type\":\"tool_completed\",\"name\":\"run_command\"}}\n\
+         not json\n",
+    )
+    .unwrap();
+    let counts = tool_calls(&path);
+    assert_eq!(counts.get("edit_file"), Some(&2));
+    assert_eq!(counts.get("replace_all"), Some(&1));
+    // Completion events and nameless starts are not calls.
+    assert_eq!(counts.get("run_command"), None);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

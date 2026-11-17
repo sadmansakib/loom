@@ -20,6 +20,10 @@ fn tools() -> Vec<(&'static str, Box<dyn Tool>)> {
         ("search", Box::new(loom_tools::SearchTool)),
         ("write_file", Box::new(loom_tools::WriteFileTool::default())),
         ("edit_file", Box::new(loom_tools::EditFileTool::default())),
+        (
+            "replace_all",
+            Box::new(loom_tools::ReplaceAllTool::default()),
+        ),
         ("run_command", Box::new(loom_tools::RunCommandTool::new())),
         ("verify", Box::new(loom_tools::VerifyTool::new())),
         (

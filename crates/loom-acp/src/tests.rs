@@ -149,6 +149,7 @@ fn tool_kind_table_covers_the_registry() {
     assert!(matches!(tool_kind("search"), acp::ToolKind::Search));
     assert!(matches!(tool_kind("write_file"), acp::ToolKind::Edit));
     assert!(matches!(tool_kind("edit_file"), acp::ToolKind::Edit));
+    assert!(matches!(tool_kind("replace_all"), acp::ToolKind::Edit));
     assert!(matches!(tool_kind("replace_symbol"), acp::ToolKind::Edit));
     assert!(matches!(tool_kind("run_command"), acp::ToolKind::Execute));
     assert!(matches!(tool_kind("verify"), acp::ToolKind::Execute));

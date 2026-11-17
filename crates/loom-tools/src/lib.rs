@@ -27,6 +27,7 @@ pub mod policy;
 mod pre_image;
 pub mod read_file;
 mod reduce;
+mod replace_all;
 mod run_command;
 pub mod sandbox;
 mod schema;
@@ -53,6 +54,7 @@ pub use lsp::{
 pub use mcp::{McpError, McpManifest, McpServerDecl, McpToolPolicy};
 pub use policy::{AskResolver, CommandPolicy, CommandRule, PolicyError, PolicyVerdict};
 pub use read_file::ReadFileTool;
+pub use replace_all::ReplaceAllTool;
 pub use run_command::RunCommandTool;
 pub use search::SearchTool;
 pub use skills::LoadSkillTool;

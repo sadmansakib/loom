@@ -11,8 +11,8 @@ use loom_kernel::tool::ToolRegistry;
 use loom_store::SqliteStore;
 use loom_tools::policy::{AskResolver, CommandPolicy};
 use loom_tools::{
-    ArtifactReadTool, EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool,
-    ToolBudgets, VerifyTool, WriteApproval, WriteFileTool,
+    ArtifactReadTool, EditFileTool, ListDirTool, ReadFileTool, ReplaceAllTool, RunCommandTool,
+    SearchTool, ToolBudgets, VerifyTool, WriteApproval, WriteFileTool,
 };
 
 use crate::auth::{self, KeychainBackend, SqliteAuthStore};
@@ -298,6 +298,15 @@ pub(crate) fn build_registry(
                 .with_policy(policy.clone()),
         ),
     )?;
+    register(
+        "replace_all",
+        Box::new(
+            ReplaceAllTool::default()
+                .with_budgets(budgets)
+                .with_autofix(autofix)
+                .with_policy(policy.clone()),
+        ),
+    )?;
     let mut run_command = RunCommandTool::with_policy(policy.clone()).with_budgets(budgets);
     let mut verify = VerifyTool::with_policy(policy.clone())
         .with_budgets(budgets)
@@ -365,7 +374,9 @@ pub fn default_system_prompt() -> String {
          read before editing, write or edit files to make changes, and verify \
          changes with cargo. Raw commands run inside an OS sandbox — writes stay \
          in the workspace and the network is off — so run any bare program the \
-         task needs. Prefer the smallest change that works. When you \
+         task needs. Prefer the smallest change that works; when one change \
+         repeats across many files, make it with `replace_all` in one call \
+         instead of one `edit_file` per file. When you \
          answer, be concise and name the workspace-relative paths you relied on. \
          Never repeat a call that already failed with the same arguments: change \
          the arguments or the approach, or the identical retry is refused.\n\

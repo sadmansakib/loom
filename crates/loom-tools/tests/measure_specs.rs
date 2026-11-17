@@ -12,11 +12,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use loom_kernel::tool::Tool;
 use loom_tools::{
-    ArtifactReadTool, EditFileTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool,
-    VerifyTool, WriteFileTool,
+    ArtifactReadTool, EditFileTool, ListDirTool, ReadFileTool, ReplaceAllTool, RunCommandTool,
+    SearchTool, VerifyTool, WriteFileTool,
 };
 
-/// Sum of `serde_json::to_string(spec)` over all eight shipped tools.
+/// Sum of `serde_json::to_string(spec)` over all nine shipped tools.
 /// Action fusion (2M) adds a `verify` argument (an inlined check/test
 /// enum) to `write_file` and `edit_file`, ~280 B each. Multi-ecosystem
 /// verify (roadmap: verification beyond cargo) adds the `ecosystem`
@@ -30,13 +30,18 @@ use loom_tools::{
 /// well-shaped output may arrive reduced with an artifact refetch.
 /// The budget rose to 6,250 B with that; per-tool budgets keep every
 /// other tool honest.
-const TOTAL_SPEC_BUDGET_BYTES: usize = 6_250;
+/// `replace_all` (the whole-workspace codemod `edit_file` cannot do —
+/// it refuses a non-unique `old_string`) adds ~1,020 B at eight calls
+/// per codemod avoided; ~150 B of that is the fused `verify` argument
+/// every write tool carries (a codemod is where a semantic break is
+/// likeliest). The total rose to 6,900 B with it.
+const TOTAL_SPEC_BUDGET_BYTES: usize = 6_900;
 /// No single tool's serialized spec may exceed this, except those with
 /// an explicit entry in [`SPEC_BUDGETS`].
 const PER_SPEC_BUDGET_BYTES: usize = 840;
 /// Per-tool overrides, for tools whose schema itself (not prose) is the
 /// cost: a nested batch schema cannot be shortened, only justified.
-const SPEC_BUDGETS: &[(&str, usize)] = &[("edit_file", 1_700)];
+const SPEC_BUDGETS: &[(&str, usize)] = &[("edit_file", 1_700), ("replace_all", 1_100)];
 
 #[test]
 fn serialized_specs_stay_within_budget() {
@@ -46,12 +51,14 @@ fn serialized_specs_stay_within_budget() {
     let artifact = ArtifactReadTool::default();
     let edit = EditFileTool::default();
     let write = WriteFileTool::default();
+    let replace_all = ReplaceAllTool::default();
     let tools: Vec<&dyn Tool> = vec![
         &read,
         &ListDirTool,
         &SearchTool,
         &write,
         &edit,
+        &replace_all,
         &run,
         &verify,
         &artifact,

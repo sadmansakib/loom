@@ -2,8 +2,11 @@
 //! rescue view), unique exact matching with the whitespace-repair and
 //! near-miss probes, and byte-span replacement on char boundaries.
 
+use loom_kernel::store::ArtifactStore;
 use loom_kernel::tool::{BeforeImage, ToolError};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use crate::confinement::workspace_relative;
 
 /// Edits larger than this are refused: the whole file is read into memory and
 /// rewritten, so an unbounded read is a memory spike (a large generated file
@@ -125,37 +128,96 @@ pub(super) fn load_edit_files(
         if files.iter().any(|(p, _, _)| p == path) {
             continue;
         }
-        // Review E3: checking metadata and then reading is a TOCTOU —
-        // a file growing between the two calls loaded unbounded. Read
-        // through a bounded handle instead: the limit is enforced on
-        // what was actually read, not on a stat that may be stale.
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(
-            &mut std::io::Read::take(
-                std::fs::File::open(path).map_err(|err| {
-                    ToolError::Execution(format!("cannot read \"{}\": {err}", path.display()))
-                })?,
-                MAX_EDIT_FILE_BYTES + 1,
-            ),
-            &mut bytes,
-        )
-        .map_err(|err| {
-            ToolError::Execution(format!("cannot read \"{}\": {err}", path.display()))
-        })?;
-        if bytes.len() as u64 > MAX_EDIT_FILE_BYTES {
-            return Err(ToolError::Execution(format!(
-                "file is too large to edit ({} bytes; limit {MAX_EDIT_FILE_BYTES} bytes)",
-                bytes.len()
-            )));
-        }
-        let text = String::from_utf8(bytes)
-            .map_err(|_| ToolError::Execution(String::from("file is not valid UTF-8")))?;
+        let text = load_text(path)?;
         // The untouched text rides along so the syntax guard below can
         // tell a genuine breakage from a file that already failed to
         // parse before this edit.
         files.push((path.clone(), text.clone(), text));
     }
     Ok(files)
+}
+
+/// Reads one editable file under [`MAX_EDIT_FILE_BYTES`] and requires
+/// UTF-8. Shared by `edit_file` and `replace_all` so both write paths
+/// agree on the cap and the error text.
+pub(crate) fn load_text(path: &Path) -> Result<String, ToolError> {
+    // Review E3: checking metadata and then reading is a TOCTOU —
+    // a file growing between the two calls loaded unbounded. Read
+    // through a bounded handle instead: the limit is enforced on
+    // what was actually read, not on a stat that may be stale.
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(
+            std::fs::File::open(path).map_err(|err| {
+                ToolError::Execution(format!("cannot read \"{}\": {err}", path.display()))
+            })?,
+            MAX_EDIT_FILE_BYTES + 1,
+        ),
+        &mut bytes,
+    )
+    .map_err(|err| ToolError::Execution(format!("cannot read \"{}\": {err}", path.display())))?;
+    if bytes.len() as u64 > MAX_EDIT_FILE_BYTES {
+        return Err(ToolError::Execution(format!(
+            "file is too large to edit ({} bytes; limit {MAX_EDIT_FILE_BYTES} bytes)",
+            bytes.len()
+        )));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| ToolError::Execution(String::from("file is not valid UTF-8")))
+}
+
+/// What a finished write reports: `(workspace_relative, final_text)`
+/// per written file, plus the rewind pre-images captured before it
+/// touched the disk.
+pub(crate) type WriteOutcome = (Vec<(String, String)>, Vec<BeforeImage>);
+
+/// The shared write pipeline for every tool that rewrites whole files:
+/// the parse guard over the candidate set first, then the rewind
+/// pre-images, then one atomic write per file. Nothing lands unless
+/// every guard passes, so a batch is all-or-nothing on the guard too.
+pub(crate) fn write_touched(
+    root: &Path,
+    files: &[(PathBuf, String, String)],
+    artifacts: Option<&dyn ArtifactStore>,
+) -> Result<WriteOutcome, ToolError> {
+    // Syntax guard (roadmap item 5 phase B): every candidate buffer
+    // must parse before anything reaches the disk, so a batch that
+    // would leave any file unparsable refuses as a whole — nothing is
+    // written, exactly like a failed match.
+    for (path, original, text) in files {
+        crate::syntax::guard_against(original, text, path).map_err(|err| {
+            ToolError::InvalidInput(format!(
+                "refusing to write \"{}\": {err}",
+                workspace_relative(root, path)
+            ))
+        })?;
+    }
+    // Tier-2 rewind capture (roadmap gap 1): the loaded originals are
+    // exactly the pre-image of every touched file — capture them before
+    // the writes below, content-addressed into the artifact store.
+    let before_images: Vec<BeforeImage> = files
+        .iter()
+        .filter_map(|(path, original, _)| {
+            crate::pre_image::capture_before_image(
+                artifacts,
+                &workspace_relative(root, path),
+                Some(original.as_bytes()),
+            )
+        })
+        .collect();
+    // Every candidate passed: write everything back. Each write
+    // re-verifies confinement at use time (review item 2.2) and lands
+    // atomically (review item 2.3).
+    for (path, _, text) in files {
+        crate::confinement::verify_parent_within(root, path)?;
+        crate::atomic::atomic_write(path, text.as_bytes())
+            .map_err(|err| ToolError::Execution(format!("cannot write: {err}")))?;
+    }
+    let resolved = files
+        .iter()
+        .map(|(path, _, text)| (workspace_relative(root, path), text.clone()))
+        .collect();
+    Ok((resolved, before_images))
 }
 
 /// Replaces `old_len` bytes at `start` with `new` in `text`, dropping

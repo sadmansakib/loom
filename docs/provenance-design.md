@@ -56,8 +56,9 @@ can move this before anything ships.
 **Sensitive tools (proposed, evidence-pending).**
 
 - `run_command` — arguments are the executed program text.
-- `write_file` / `edit_file` / `replace_symbol` when the destination
-  is a *trusted path* (`.loom/**`, manifest-adjacent files) —
+- `write_file` / `edit_file` / `replace_all` / `replace_symbol` when
+  the destination is a *trusted path* (`.loom/**`, manifest-adjacent
+  files) —
   scenario 2 of the threat model. Plain workspace edits are the
   agent's job; the expected benign-derived rate for ordinary edits
   (read a file, then edit it) is the reason this half needs evidence
@@ -108,8 +109,8 @@ bodies of the same session. Report:
 
 1. `run_command` calls with a fragment ≥ K (the target flow), plus
    the fragment-length distribution.
-2. `write_file`/`edit_file`/`replace_symbol` calls with a fragment
-   ≥ K split by destination (trusted-path vs not) — the
+2. `write_file`/`edit_file`/`replace_all`/`replace_symbol` calls with a
+   fragment ≥ K split by destination (trusted-path vs not) — the
    benign-derived rate.
 
 Decision rule, fixed in advance:

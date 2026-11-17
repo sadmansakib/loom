@@ -102,9 +102,9 @@ and explicit:
 
 Tool-kind table (best effort, `other` as fallback): `read_file` /
 `list_dir` / `artifact_read` → `read`; `search` → `search`;
-`write_file` / `edit_file` / `replace_symbol` → `edit` (ACP v1 has no
-`create` kind); `run_command` / `verify` → `execute`; `todo` →
-`think`; everything else → `other`.
+`write_file` / `edit_file` / `replace_all` / `replace_symbol` → `edit`
+(ACP v1 has no `create` kind); `run_command` / `verify` → `execute`;
+`todo` → `think`; everything else → `other`.
 
 ### The ask bridge seam (discovered during the build)
 

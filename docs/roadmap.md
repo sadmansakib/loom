@@ -479,16 +479,29 @@ also summarized here so this section is the single source of truth.
 
 ### Tools
 
-- **Eight shipped tools** behind an object-safe trait with JSON-schema
+- **Nine shipped tools** behind an object-safe trait with JSON-schema
   parameters compacted for token cost: `read_file` (windowed, 8 MiB
   cap), `search` (regex, gitignore-aware, binary-skipping,
   summary-throttled), `list_dir`, `read_artifact`, `run_command`,
-  `verify`, `edit_file`, `write_file`. `edit_file` is unique exact-match
-  with an atomic `edits: [...]` batch form across files, an echo of the
-  edited region (±3 numbered lines) so no re-read is needed, and a
-  whitespace-trim repair when exactly one trimmed match exists (recorded
-  in `effects.repairs`). Repeat read-only calls whose earlier result is
-  still unpruned in the projection return `unchanged since call <id>`.
+  `verify`, `edit_file`, `replace_all`, `write_file`. `edit_file` is
+  unique exact-match with an atomic `edits: [...]` batch form across
+  files, an echo of the edited region (±3 numbered lines) so no re-read
+  is needed, and a whitespace-trim repair when exactly one trimmed match
+  exists (recorded in `effects.repairs`). `replace_all` is the codemod
+  form `edit_file` cannot do (it refuses a non-unique `old_string`):
+  one regex sweep over the gitignore-aware walk, rewritten through the
+  same parse guard, rewind pre-images and atomic writes, refusing the
+  whole call if any file would stop parsing or matches exceed 500, and
+  returning per-file counts instead of the edited text. It declares no
+  touched paths, so the wave scheduler serializes it, and it carries
+  the same fused `verify` argument as the other write tools (a no-match
+  sweep skips the check). Not yet measured: the gate is `edit_file`
+  calls per codemod task, not success rate, and the instrument for it
+  now exists — `swebench-contrast` prints the tool mix delta per shared
+  instance (`swebench::tool_calls`), so a sweep says whether the batch
+  form was used and what it displaced. Repeat read-only
+  calls whose earlier result is still unpruned in the projection return
+  `unchanged since call <id>`.
 - **Path confinement.** Symlink-hardened component-wise resolution on
   every tool path: in-root symlink targets allowed, escapes rejected,
   dangling links and cycles bounded with loud errors. Regression-tested
@@ -1372,7 +1385,11 @@ adds four more framing findings and backlog items 26–31 below.
     `/`-separated suffix addressing (a leading `/` anchors at top
     level), refuses ambiguous or missing matches with the candidates
     listed, re-runs the item 5 parse guard before the single atomic
-    write, and records the write in its effects. Measurement —
+    write, and records the write in its effects. A `changes: [...]`
+    batch form applies several symbols in order — each reread from
+    disk, so two changes to one file compose — stopping at the first
+    failure with the count of changes already applied, and declaring
+    every written path to the wave scheduler. Measurement —
     whether the tools cut exploratory turns — is item 1's funded
     debt, not a gate on the seam.
 19. **Delegation by measured economics** (G6). A read-only scout on a

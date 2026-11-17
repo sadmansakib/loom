@@ -18,6 +18,7 @@ mod tool;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use matching::{load_text, write_touched};
 pub use tool::EditFileTool;
 
 #[cfg(test)]

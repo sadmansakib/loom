@@ -40,7 +40,7 @@ pub use provenance::{
 };
 pub use runs::{
     RunMetrics, RunUsage, integrity_flags, run_metrics, run_outcome, run_turns, run_usage,
-    scorer_outcomes,
+    scorer_outcomes, tool_calls,
 };
 
 /// Shared with the Multilingual module, whose rows use the same

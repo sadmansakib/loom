@@ -428,3 +428,89 @@ async fn overview_reports_read_touch_replace_reports_write_touch() {
         loom_kernel::tool::PathAccess::Write
     ));
 }
+
+#[tokio::test]
+async fn a_changes_batch_rewrites_each_symbol_in_order() {
+    let (dir, root) = temp_root();
+    std::fs::write(root.join("a.rs"), "fn one() {}\n").expect("seed");
+    std::fs::write(root.join("b.rs"), "fn two() {}\n").expect("seed");
+    let out = call_replace(
+        &root,
+        serde_json::json!({
+            "changes": [
+                {"path": "a.rs", "name_path": "one", "body": "fn one() { /* first */ }"},
+                {"path": "b.rs", "name_path": "two", "body": "fn two() { /* second */ }"},
+                {"path": "a.rs", "name_path": "one", "body": "fn one() { /* third */ }"},
+            ]
+        }),
+    )
+    .await;
+    // One line per change, no definition echoes.
+    assert_eq!(out.lines().count(), 3, "{out}");
+    assert_eq!(out.matches("in a.rs").count(), 2, "{out}");
+    assert_eq!(out.matches("in b.rs").count(), 1, "{out}");
+    // The third change composed on top of the first, same file.
+    let text = std::fs::read_to_string(root.join("a.rs")).expect("read");
+    assert!(text.contains("third"), "{text}");
+    assert!(!text.contains("first"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("b.rs")).expect("read"),
+        "fn two() { /* second */ }\n"
+    );
+    drop(dir);
+}
+
+#[tokio::test]
+async fn a_batch_stops_at_the_first_failure_and_says_what_landed() {
+    let (dir, root) = temp_root();
+    std::fs::write(root.join("a.rs"), "fn one() {}\n").expect("seed");
+    let err = err_of(
+        &root,
+        serde_json::json!({
+            "changes": [
+                {"path": "a.rs", "name_path": "one", "body": "fn one() { appled(); }"},
+                {"path": "a.rs", "name_path": "missing", "body": "fn missing() {}"},
+            ]
+        }),
+    );
+    assert!(err.contains("1 earlier change(s) were applied"), "{err}");
+    let text = std::fs::read_to_string(root.join("a.rs")).expect("read");
+    assert!(text.contains("appled"), "{text}");
+    drop(dir);
+}
+
+#[test]
+fn a_mixed_or_empty_batch_is_rejected() {
+    let (dir, root) = temp_root();
+    std::fs::write(root.join("a.rs"), "fn one() {}\n").expect("seed");
+    let mixed = err_of(
+        &root,
+        serde_json::json!({
+            "path": "a.rs",
+            "changes": [{"path": "a.rs", "name_path": "one", "body": "fn one() {}"}]
+        }),
+    );
+    assert!(mixed.contains("not a mix"), "{mixed}");
+    let empty = err_of(&root, serde_json::json!({"changes": []}));
+    assert!(empty.contains("at least one change"), "{empty}");
+    drop(dir);
+}
+
+#[test]
+fn a_batch_declares_every_written_path_once() {
+    let touches = ReplaceSymbolTool::default()
+        .touched_paths(&serde_json::json!({
+            "changes": [
+                {"path": "a.rs", "name_path": "one", "body": "fn one() {}"},
+                {"path": "b.rs", "name_path": "two", "body": "fn two() {}"},
+                {"path": "a.rs", "name_path": "one", "body": "fn one() { x(); }"},
+            ]
+        }))
+        .expect("touches");
+    assert_eq!(touches.len(), 2, "{touches:?}");
+    assert!(
+        touches
+            .iter()
+            .all(|touch| matches!(touch.access, loom_kernel::tool::PathAccess::Write))
+    );
+}

@@ -20,11 +20,11 @@
 // Terminal output is this harness's product; the workspace-wide
 // `clippy::print_stdout`/`print_stderr` denies target library crates.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use loom_eval::swebench::{RunMetrics, run_metrics, scorer_outcomes};
+use loom_eval::swebench::{RunMetrics, run_metrics, scorer_outcomes, tool_calls};
 
 struct Args {
     a: PathBuf,
@@ -109,13 +109,18 @@ fn glyph(resolved: bool) -> &'static str {
 
 /// Loads run-1 metrics for one instance from an eval dir, if present.
 fn metrics_for(dir: Option<&Path>, id: &str) -> Option<RunMetrics> {
+    run_json_for(dir, id).map(|path| run_metrics(&path))
+}
+
+/// The run-1 `run.json` an instance's metrics come from.
+fn run_json_for(dir: Option<&Path>, id: &str) -> Option<std::path::PathBuf> {
     let path = dir?
         .join("swebench")
         .join("instances")
         .join(id)
         .join("run-1")
         .join("run.json");
-    path.is_file().then(|| run_metrics(&path))
+    path.is_file().then_some(path)
 }
 
 #[allow(clippy::too_many_lines)] // linear honesty-check → parity-check → render pipeline
@@ -399,8 +404,51 @@ fn render(
             );
         }
         out.push('\n');
+        // The tool mix is what a codemod claim is about: `edit_file`
+        // calls per task, and whether `replace_all` took the batch.
+        let (calls_a, calls_b) = tool_mix(dir_a, dir_b, &shared);
+        let names: BTreeSet<&String> = calls_a.keys().chain(calls_b.keys()).collect();
+        let mut mix = String::new();
+        for name in names {
+            let (a, b) = (
+                calls_a.get(name).copied().unwrap_or(0),
+                calls_b.get(name).copied().unwrap_or(0),
+            );
+            if a != b {
+                let _ = write!(mix, "{name} {a} → {b}, ");
+            }
+        }
+        if mix.is_empty() {
+            out.push_str("Tool calls: identical mix\n");
+        } else {
+            mix.truncate(mix.trim_end_matches(", ").len());
+            let _ = writeln!(out, "Tool calls (Δ only): {mix}");
+        }
     }
     out
+}
+
+/// Aggregate `tool_started` counts per side over the shared instances.
+fn tool_mix(
+    dir_a: Option<&Path>,
+    dir_b: Option<&Path>,
+    shared: &[&str],
+) -> (BTreeMap<String, u64>, BTreeMap<String, u64>) {
+    let collect = |dir: Option<&Path>| {
+        let mut counts = BTreeMap::new();
+        for id in shared {
+            let Some(path) = run_json_for(dir, id) else {
+                continue;
+            };
+            for (name, count) in tool_calls(&path) {
+                *counts.entry(name).or_insert(0u64) += count;
+            }
+        }
+        counts
+    };
+    let a = collect(dir_a);
+    let b = collect(dir_b);
+    (a, b)
 }
 
 #[cfg(test)]
@@ -438,5 +486,47 @@ mod tests {
         assert!(report.contains("3 shared, 1 A-only, 1 B-only"), "{report}");
         assert!(report.contains("Resolved: A 2/3, B 2/3"), "{report}");
         assert!(report.contains("A wins 1, losses 1, ties 1"), "{report}");
+    }
+
+    #[test]
+    fn the_footer_names_the_tool_mix_delta() {
+        let dir = std::env::temp_dir().join(format!("loom-contrast-mix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let write = |side: &str, body: &str| {
+            let run = dir
+                .join(side)
+                .join("swebench")
+                .join("instances")
+                .join("a__a-1")
+                .join("run-1");
+            std::fs::create_dir_all(&run).unwrap();
+            std::fs::write(run.join("run.json"), body).unwrap();
+        };
+        let call = |name: &str| {
+            format!("{{\"kind\":{{\"type\":\"tool_started\",\"name\":\"{name}\"}}}}\n")
+        };
+        write("a", &format!("{}{}", call("edit_file"), call("edit_file")));
+        write(
+            "b",
+            &format!("{}{}", call("edit_file"), call("replace_all")),
+        );
+
+        let mut args = no_dirs_args();
+        args.dir_a = Some(dir.join("a"));
+        args.dir_b = Some(dir.join("b"));
+        let outcomes = vec![("a__a-1".to_owned(), true)];
+        let report = render(
+            &outcomes,
+            &outcomes,
+            Some(&dir.join("a")),
+            Some(&dir.join("b")),
+            &args,
+            "A",
+            "B",
+        );
+
+        assert!(report.contains("replace_all 0 → 1"), "{report}");
+        assert!(report.contains("edit_file 2 → 1"), "{report}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

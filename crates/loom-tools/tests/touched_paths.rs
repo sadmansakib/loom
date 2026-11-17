@@ -92,6 +92,27 @@ fn run_command_and_verify_are_wildcards() {
 }
 
 #[test]
+fn replace_all_is_a_wildcard() {
+    // The files it rewrites come from a regex over the tree, not from the
+    // arguments, so the call serializes against the batch like
+    // `run_command` — it must never run beside another write.
+    assert_eq!(
+        touches(
+            &loom_tools::ReplaceAllTool::default(),
+            &json!({"pattern": "foo", "replacement": "bar"})
+        ),
+        None
+    );
+    assert_eq!(
+        touches(
+            &loom_tools::ReplaceAllTool::default(),
+            &json!({"pattern": "foo", "replacement": "bar", "path": "src"})
+        ),
+        None
+    );
+}
+
+#[test]
 fn unparseable_arguments_declare_nothing() {
     // An invalid call fails without touching anything, so it must not create a
     // false dependency.

@@ -46,6 +46,11 @@ pub(crate) const SKILL_BODY_HEAD_BYTES: usize = 16 * 1024;
 /// payload; past this it is cut with the standard head marker.
 pub(crate) const REPLACED_HEAD_BYTES: usize = 400;
 
+/// Bytes a `replace_all` summary may occupy. The result is per-file
+/// counts, not an echo: a codemod across dozens of files must not pay
+/// dozens of results, so the tail is cut with the standard marker.
+pub(crate) const REPLACE_ALL_SUMMARY_MAX_BYTES: usize = 4 * 1024;
+
 /// Turns an MCP tool stays on the session surface after its last use
 /// before the deferral system evicts it (slice D2). Eight idle turns
 /// matches the kernel default; `0` means "never evict" and is set in
@@ -90,6 +95,9 @@ pub struct ToolBudgets {
     /// `replace_symbol` echo — the previous definition is context, not
     /// payload (default [`REPLACED_HEAD_BYTES`]).
     pub replace_symbol_head_bytes: usize,
+    /// Bytes a `replace_all` summary may occupy
+    /// (default [`REPLACE_ALL_SUMMARY_MAX_BYTES`]).
+    pub replace_all_summary_max_bytes: usize,
     /// Turns an idle MCP tool stays loaded before the deferral system
     /// evicts it from the session surface (default
     /// [`MCP_IDLE_EVICT_TURNS`]; `0` never evicts).
@@ -107,6 +115,7 @@ impl Default for ToolBudgets {
             symbols_overview_max_bytes: SYMBOLS_OVERVIEW_MAX_BYTES,
             skill_body_head_bytes: SKILL_BODY_HEAD_BYTES,
             replace_symbol_head_bytes: REPLACED_HEAD_BYTES,
+            replace_all_summary_max_bytes: REPLACE_ALL_SUMMARY_MAX_BYTES,
             mcp_idle_evict_turns: MCP_IDLE_EVICT_TURNS,
         }
     }

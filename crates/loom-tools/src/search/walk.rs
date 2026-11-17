@@ -11,20 +11,24 @@ use super::Match;
 use super::read_capped_text;
 use super::render::capped_line;
 
-/// Walks `scope` and collects matching lines. Entries are sorted by
+/// Walks `scope` and hands each non-ignored file to `visit` as
+/// `(absolute_path, workspace_relative_path)`. Entries are sorted by
 /// name within each directory, so the walk order — and therefore
-/// which matches survive `max_results` truncation — is the same on
+/// which files a caller sees first under its own cap — is the same on
 /// every machine (§8.1.3 determinism). `.gitignore` files between
-/// the workspace root and `scope` apply, so a scoped search matches
-/// a whole-workspace search. Matched lines longer than
-/// [`MAX_MATCH_LINE_BYTES`] are truncated.
-pub(super) fn search_tree(
-    regex: &Regex,
+/// the workspace root and `scope` apply, so a scoped walk matches a
+/// whole-workspace walk. `visit` returns `false` to stop the walk.
+///
+/// Shared by `search` (which reads each file and collects lines) and
+/// `replace_all` (which reads through the edit size cap and rewrites):
+/// one traversal, so the two tools can never disagree about which
+/// files are in scope.
+pub(crate) fn walk_files(
     scope: &Path,
-    max_results: usize,
     rel_base: &Path,
     cancellation: &CancellationToken,
-) -> Result<(Vec<Match>, bool), String> {
+    mut visit: impl FnMut(&Path, &Path) -> Result<bool, String>,
+) -> Result<(), String> {
     // Ancestor ignore files, shallowest (workspace root) first, so the
     // nearest file wins like git. Only ignore files INSIDE the workspace
     // participate; global ignores and parent lookups above the root
@@ -104,14 +108,12 @@ pub(super) fn search_tree(
     }
     let walker = builder.build();
 
-    let mut hits: Vec<Match> = Vec::new();
-    let mut truncated = false;
     for entry in walker {
         if cancellation.is_cancelled() {
             return Err("cancelled".to_owned());
         }
         // Unreadable entries (permission denials, racing deletes)
-        // are skipped, not fatal: search reports what it can see.
+        // are skipped, not fatal: the walk reports what it can see.
         let Ok(entry) = entry else {
             continue;
         };
@@ -119,13 +121,34 @@ pub(super) fn search_tree(
             continue;
         }
         let path = entry.path();
+        let rel = path.strip_prefix(rel_base).unwrap_or(path);
+        if !visit(path, rel)? {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Walks `scope` and collects matching lines. Matched lines longer than
+/// [`MAX_MATCH_LINE_BYTES`] are truncated, and the walk stops at
+/// `max_results` (reporting truncation) rather than buffering the tree.
+pub(super) fn search_tree(
+    regex: &Regex,
+    scope: &Path,
+    max_results: usize,
+    rel_base: &Path,
+    cancellation: &CancellationToken,
+) -> Result<(Vec<Match>, bool), String> {
+    let mut hits: Vec<Match> = Vec::new();
+    let mut truncated = false;
+    walk_files(scope, rel_base, cancellation, |path, rel| {
+        // Binary and non-UTF-8 files are not text to search.
         if let Some(text) = read_capped_text(path) {
-            let rel = path.strip_prefix(rel_base).unwrap_or(path);
             for (index, line) in text.lines().enumerate() {
                 if regex.is_match(line) {
                     if hits.len() == max_results {
                         truncated = true;
-                        return Ok((hits, truncated));
+                        return Ok(false);
                     }
                     hits.push(Match {
                         rel: rel.display().to_string(),
@@ -135,7 +158,8 @@ pub(super) fn search_tree(
                 }
             }
         }
-    }
+        Ok(true)
+    })?;
     Ok((hits, truncated))
 }
 

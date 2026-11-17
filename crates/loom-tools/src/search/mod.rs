@@ -41,6 +41,8 @@ use std::path::Path;
 use std::sync::OnceLock;
 use walk::search_tree;
 
+pub(crate) use walk::walk_files;
+
 use crate::confinement::resolve_within;
 
 /// Default cap on reported matching lines.

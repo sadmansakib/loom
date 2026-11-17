@@ -38,15 +38,62 @@ impl ReplaceSymbolTool {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 struct ReplaceInput {
     /// Workspace-relative path of the file holding the symbol.
-    path: String,
+    #[serde(default)]
+    path: Option<String>,
     /// Name-path addressing the symbol (`Class/method`). Suffix match by
     /// default; a leading `/` anchors at the top level.
-    name_path: String,
+    #[serde(default)]
+    name_path: Option<String>,
     /// The full replacement definition, including the signature and
     /// decorators where the language uses them. Must parse on its own.
+    #[serde(default)]
+    body: Option<String>,
+    /// Batch: several symbols rewritten in order, stopping at the first
+    /// failure (earlier changes stay).
+    #[serde(default)]
+    changes: Option<Vec<SymbolChange>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+struct SymbolChange {
+    /// Workspace-relative path of the file holding the symbol.
+    path: String,
+    /// Name-path addressing the symbol.
+    name_path: String,
+    /// The full replacement definition.
     body: String,
+}
+
+impl ReplaceInput {
+    /// Splits the call into ordered changes, rejecting the missing and
+    /// mixed forms once, up front.
+    fn batch(self) -> Result<Vec<SymbolChange>, ToolError> {
+        match (self.path, self.name_path, self.body, self.changes) {
+            (Some(path), Some(name_path), Some(body), None) => Ok(vec![SymbolChange {
+                path,
+                name_path,
+                body,
+            }]),
+            (None, None, None, Some(changes)) => {
+                if changes.is_empty() {
+                    return Err(ToolError::InvalidInput(String::from(
+                        "changes must contain at least one change",
+                    )));
+                }
+                Ok(changes)
+            }
+            _ => Err(ToolError::InvalidInput(String::from(
+                "pass either path + name_path + body (single symbol) or changes (batch), \
+                 not a mix",
+            ))),
+        }
+    }
 }
 
 impl Tool for ReplaceSymbolTool {
@@ -58,9 +105,10 @@ impl Tool for ReplaceSymbolTool {
                           Python, or TypeScript file, addressed by name-path \
                           (e.g. `Class/method`, suffix-matched; leading `/` \
                           anchors at top level). `body` is the complete new \
-                          definition including its signature. One atomic \
-                          write; the file must still parse. Find name-paths \
-                          with `symbols_overview`."
+                          definition including its signature; `changes` does \
+                          several in order, stopping at the first failure. One \
+                          atomic write per file; the file must still parse. Find \
+                          name-paths with `symbols_overview`."
                 .to_owned(),
             parameters: crate::schema::parameters::<ReplaceInput>(),
         })
@@ -73,7 +121,17 @@ impl Tool for ReplaceSymbolTool {
     fn touched_paths(&self, input: &serde_json::Value) -> Option<Vec<PathTouch>> {
         Some(
             match serde_json::from_value::<ReplaceInput>(input.clone()) {
-                Ok(parsed) => vec![PathTouch::write(parsed.path)],
+                Ok(parsed) => {
+                    let mut paths: Vec<String> = Vec::new();
+                    if let Ok(changes) = parsed.batch() {
+                        for change in changes {
+                            if !paths.contains(&change.path) {
+                                paths.push(change.path);
+                            }
+                        }
+                    }
+                    paths.into_iter().map(PathTouch::write).collect()
+                }
                 Err(_) => Vec::new(),
             },
         )
@@ -100,29 +158,64 @@ impl Tool for ReplaceSymbolTool {
         Box::pin(async move {
             let input: ReplaceInput = serde_json::from_value(input)
                 .map_err(|err| ToolError::InvalidInput(format!("invalid arguments: {err}")))?;
+            let batch = input.batch()?;
             let root = ctx.workspace_root.clone();
-            let display = input.path.clone();
-            let name_path = input.name_path.clone();
-            let body = input.body;
             let artifacts = ctx.artifacts.clone();
-            let (relative, new_text, replaced, matches, before_images) =
-                tokio::task::spawn_blocking(move || {
-                    replace_symbol(&root, &display, &name_path, &body, artifacts.as_ref())
+            let head_bytes = self.budgets.replace_symbol_head_bytes;
+            // Applied one at a time, each reread from disk, so several
+            // changes to one file compose. A single change keeps the
+            // previous-definition echo; a batch reports one line each
+            // instead, because the model wrote every body it sent.
+            let mut applied: Vec<(String, String, usize, String)> = Vec::with_capacity(batch.len());
+            let mut effects = ToolEffects::none();
+            for change in batch {
+                let root = root.clone();
+                let artifacts = artifacts.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    replace_symbol(
+                        &root,
+                        &change.path,
+                        &change.name_path,
+                        &change.body,
+                        artifacts.as_ref(),
+                    )
                 })
                 .await
-                .map_err(|err| ToolError::Execution(format!("replace task failed: {err}")))??;
-
-            let content = format!(
-                "replaced {} in {relative} ({} byte body); previous \
-                 definition started with:\n{}",
-                matches.display(),
-                new_text.len(),
-                replaced_head(&replaced, self.budgets.replace_symbol_head_bytes),
-            );
-            let mut effects = ToolEffects::none().with_file_written(relative);
-            for image in before_images {
-                effects = effects.with_before_image(image);
+                .map_err(|err| ToolError::Execution(format!("replace task failed: {err}")))?;
+                let (relative, new_text, replaced, matches, before_images) = match result {
+                    Ok(value) => value,
+                    // Stop at the first failure; say what already landed
+                    // so the model does not redo it.
+                    Err(err) if !applied.is_empty() => {
+                        return Err(ToolError::Execution(format!(
+                            "{err} ({} earlier change(s) were applied)",
+                            applied.len()
+                        )));
+                    }
+                    Err(err) => return Err(err),
+                };
+                effects = effects.with_file_written(relative.clone());
+                for image in before_images {
+                    effects = effects.with_before_image(image);
+                }
+                applied.push((relative, matches.display(), new_text.len(), replaced));
             }
+
+            let content = if let [(relative, display, len, replaced)] = applied.as_slice() {
+                format!(
+                    "replaced {display} in {relative} ({len} byte body); previous \
+                     definition started with:\n{}",
+                    replaced_head(replaced, head_bytes),
+                )
+            } else {
+                applied
+                    .iter()
+                    .map(|(relative, display, len, _)| {
+                        format!("replaced {display} in {relative} ({len} byte body)")
+                    })
+                    .collect::<Vec<String>>()
+                    .join("\n")
+            };
             Ok(ToolOutput::new(content).with_effects(effects))
         })
     }
