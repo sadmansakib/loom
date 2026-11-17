@@ -1536,8 +1536,8 @@ adds four more framing findings and backlog items 26–31 below.
     thread, sidebar telemetry, and modal screens, and supports interactive
     steering, pause, and cancel; UI crates are isolated from the facade's
     dependency surface. Resume + steering are both shipped.
-    Remaining workflow parity (run profiles, live batch progress, published
-    key map) stays open under item 40.
+    Remaining workflow parity (live batch progress, published key map)
+    stays open under item 40.
 23. **Distributed verification.** Remote or containerized `verify`
     runners with the same evidence contract. **Shipped 2026-10-23** —
     `.loom/verify.toml` declares the runner argv (docker, ssh, …) with
@@ -2146,7 +2146,7 @@ model tier under them (arXiv 2607.06906).
     it cannot show actual per-call completion timing or live in-flight
     progress.
 
-    Scope, in order:
+    Scope and status:
     - **Honest live batch and cancellation view.** Emit/render lifecycle
       updates as calls actually start and finish, with elapsed time and
       active/queued/completed counts. Show cancellation truthfully:
@@ -2154,27 +2154,26 @@ model tier under them (arXiv 2607.06906).
       and calls never started are marked not run. Never imply that calls
       ran concurrently when path conflicts or wildcard access serialized
       them. Keep transcript result ordering and replay semantics stable.
-    - **Visible, enforceable run profiles.** Allow selecting a
-      read-only profile (the screenshots' B1 mode) that restricts the
-      exposed tool set in the engine, rather than merely labeling the
-      display; show the selected profile and its task/tool/time budgets.
-      Surface reasoning-effort controls only for models that support
-      them, with the effective setting visible before the first request.
-      Shipped: `--read-only` on `loom run`/`loom chat` and `/profile` in
-      the TUI filter the engine registry; the header shows the mode.
-    - **Decision-relevant live telemetry.** Show request/turn and retry
-      state (including eligible retry countdown and an explicit retry-now
-      action), per-source context census, current and next-request context
-      budget bars, remaining task/tool/time budgets, and
-      provider-reported cost when available. Unknown cost or unsupported
-      telemetry stays explicitly unavailable; do not estimate it as fact.
-      Include per-call duration and useful failure/cancellation reasons.
-    - **Useful finished-run record.** Keep completed task summaries
-      available when starting a follow-up task; add copy-answer and
-      NDJSON run-record export actions, including task/run ids, final
-      status, usage/cost availability, retries, tool outcomes, and timing.
-      Persist or export from the existing event/session seams without
-      making the TUI the owner of engine state.
+    - **Visible, enforceable run profiles.** **Shipped 2026-11-18** —
+      `--read-only` on `loom run`/`loom chat` and `/profile` in the TUI
+      filter the engine registry, so writes, edits, shell commands, and
+      deferred MCP tools are never exposed. The screenshots' B1 mode maps
+      to this profile. The header shows the mode, the sidebar reports
+      write and shell as blocked, and the selected task/tool/time budgets
+      stay live. Reasoning-effort choices remain limited to
+      catalog-reported levels.
+    - **Decision-relevant live telemetry.** **Shipped 2026-11.** The
+      sidebar shows request/turn and retry state (including the eligible
+      retry countdown and `/retry`), per-source context census, current
+      and next-request context budget bars, remaining task/tool/time
+      budgets, and provider-reported cost when available. Unknown cost
+      and unsupported telemetry stay explicitly unavailable rather than
+      estimated, and failure/cancellation reasons are rendered.
+    - **Useful finished-run record.** **Shipped 2026-11.** Completed task
+      summaries stay available when starting a follow-up task; `/copy`
+      copies the answer and `/export` writes an NDJSON record with a
+      manifest from the existing event/session seams, without making the
+      TUI the owner of engine state.
     - **Keyboard and terminal ergonomics.** Publish the actual key map
       in help, including pause/resume, cancel, steer, retry, copy, and
       export; handle narrow terminals and terminal color capability
@@ -2193,8 +2192,8 @@ model tier under them (arXiv 2607.06906).
     changes task success, turns, or cost under item 1; visual parity alone
     is not a task-performance claim. Seam: item 22's `loom-core` facade,
     typed events and task summaries, `loom-tui`, and the CLI composition
-    root. Parallel execution itself is shipped; live progress reporting
-    is the missing capability.
+    root. Parallel execution itself is shipped; live per-call progress
+    and the complete published key map are the missing capabilities.
 
 ### 2026-12 meta-harness sweep — gap check
 
